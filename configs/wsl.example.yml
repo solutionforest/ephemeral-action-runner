@@ -11,6 +11,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  customInstallScripts:
+    # - examples/custom-install/install-extra-apt-tools.sh
 
 pool:
   minIdle: 2
@@ -19,7 +21,7 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, X64, epar-wsl-ubuntu-24.04-docker]
+  labels: [self-hosted, linux, X64, epar-wsl-ubuntu-24.04-base]
   ephemeral: true
 
 provider:

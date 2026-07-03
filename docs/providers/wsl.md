@@ -26,6 +26,8 @@ Use `configs/wsl.example.yml` as the starting point:
 image:
   sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
   outputImage: work/images/epar-ubuntu-24-wsl.tar
+  customInstallScripts:
+    # - scripts/guest/ubuntu/install-web-e2e.sh
 
 provider:
   type: wsl
@@ -36,21 +38,35 @@ provider:
 `image.sourceImage` is the clean Ubuntu tar used only for image building.
 `image.outputImage` is the reusable runner tar produced by `image build`.
 `provider.sourceImage` is the tar imported for disposable runner instances.
+Use `configs/wsl.web-e2e.example.yml` when workflows need the larger web/E2E
+install script and its `epar-wsl-ubuntu-24.04-web-e2e` label.
 
-## Systemd And Docker
+## Systemd And Optional Docker
 
-The WSL image build writes `/etc/wsl.conf` with systemd enabled, restarts the
-temporary distro, then installs Docker Engine and the GitHub Actions runner
-inside the distro. EPAR validates the built image with:
+The WSL image build writes `/etc/wsl.conf` with systemd enabled and
+`appendWindowsPath=false`, restarts the temporary distro, then installs the
+GitHub Actions runner inside the distro. Disabling Windows PATH injection keeps
+validation and jobs from accidentally resolving host-installed tools such as
+Windows Docker or Node. The default WSL image is runner-only. Docker Engine and
+browser support are installed only when `image.customInstallScripts` includes
+`scripts/guest/ubuntu/install-docker-browser.sh` or
+`scripts/guest/ubuntu/install-web-e2e.sh`.
+
+Docker-enabled images are validated with:
 
 ```bash
-docker info
-docker run --rm hello-world
-chromium --headless --no-sandbox --dump-dom https://www.w3.org/
+sudo -u runner -H docker version
+sudo -u runner -H docker compose version
+sudo -u runner -H docker buildx version
+sudo -u runner -H docker run --rm hello-world
+sudo -u runner -H chromium --headless --no-sandbox --dump-dom https://www.w3.org/
 ```
 
-The provider does not mount the Windows Docker Desktop socket. Jobs run against
-Docker Engine inside the WSL distro.
+The provider does not mount the Windows Docker Desktop socket. Docker-enabled
+jobs run against Docker Engine inside the WSL distro.
+
+WSL x64 is the preferred EPAR target for workflows that pull amd64-only Docker
+runtime images.
 
 ## Caveats
 

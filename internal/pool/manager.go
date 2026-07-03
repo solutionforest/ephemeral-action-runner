@@ -297,7 +297,7 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 	}
 	vm.IP = ip
 	fmt.Printf("[%s] reachable at %s\n", name, ip)
-	fmt.Printf("[%s] validating Docker and browser\n", name)
+	fmt.Printf("[%s] validating runner runtime\n", name)
 	if err := m.validateRuntime(ctx, name); err != nil {
 		return vm, err
 	}

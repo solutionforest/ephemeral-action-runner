@@ -27,11 +27,12 @@ type GitHubConfig struct {
 }
 
 type ImageConfig struct {
-	SourceImage   string
-	OutputImage   string
-	UpstreamDir   string
-	UpstreamLock  string
-	RunnerVersion string
+	SourceImage          string
+	OutputImage          string
+	UpstreamDir          string
+	UpstreamLock         string
+	RunnerVersion        string
+	CustomInstallScripts []string
 }
 
 type PoolConfig struct {
@@ -79,7 +80,7 @@ func Default() Config {
 			LogDir:       "work/logs",
 		},
 		Runner: RunnerConfig{
-			Labels:    []string{"self-hosted", "linux", "ARM64", "epar-ubuntu-24.04-docker"},
+			Labels:    []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
 			Ephemeral: true,
 		},
 		Provider: ProviderConfig{
@@ -110,6 +111,7 @@ func Load(path string) (Config, error) {
 	section := ""
 	scanner := bufio.NewScanner(file)
 	lineNo := 0
+	var pendingList *pendingListKey
 	for scanner.Scan() {
 		lineNo++
 		raw := strings.TrimRight(scanner.Text(), " \t")
@@ -118,6 +120,19 @@ func Load(path string) (Config, error) {
 			continue
 		}
 		indent := leadingSpaces(raw)
+		if pendingList != nil {
+			if indent > pendingList.indent && strings.HasPrefix(line, "-") {
+				item := strings.TrimSpace(strings.TrimPrefix(line, "-"))
+				if item == "" {
+					return cfg, fmt.Errorf("%s:%d: empty list item for %s.%s", path, lineNo, pendingList.section, pendingList.key)
+				}
+				if err := appendListValue(&cfg, pendingList.section, pendingList.key, item); err != nil {
+					return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
+				}
+				continue
+			}
+			pendingList = nil
+		}
 		key, value, ok := strings.Cut(line, ":")
 		if !ok {
 			return cfg, fmt.Errorf("%s:%d: expected key: value", path, lineNo)
@@ -131,6 +146,13 @@ func Load(path string) (Config, error) {
 		if section == "" {
 			return cfg, fmt.Errorf("%s:%d: key %q must be under a section", path, lineNo, key)
 		}
+		if value == "" && isListKey(section, key) {
+			if err := setListValue(&cfg, section, key, nil); err != nil {
+				return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
+			}
+			pendingList = &pendingListKey{section: section, key: key, indent: indent}
+			continue
+		}
 		if err := apply(&cfg, section, key, value); err != nil {
 			return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 		}
@@ -140,6 +162,12 @@ func Load(path string) (Config, error) {
 	}
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
 	return cfg, nil
+}
+
+type pendingListKey struct {
+	section string
+	key     string
+	indent  int
 }
 
 func apply(cfg *Config, section, key, value string) error {
@@ -174,6 +202,10 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Image.UpstreamLock = value
 		case "runnerVersion":
 			cfg.Image.RunnerVersion = value
+		case "profile":
+			return fmt.Errorf("image.profile is not supported; use image.customInstallScripts")
+		case "customInstallScripts":
+			return setListValue(cfg, section, key, parseList(value))
 		}
 	case "pool":
 		switch key {
@@ -197,7 +229,7 @@ func apply(cfg *Config, section, key, value string) error {
 	case "runner":
 		switch key {
 		case "labels":
-			cfg.Runner.Labels = parseList(value)
+			return setListValue(cfg, section, key, parseList(value))
 		case "ephemeral":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -235,6 +267,53 @@ func apply(cfg *Config, section, key, value string) error {
 	return nil
 }
 
+func isListKey(section, key string) bool {
+	switch section {
+	case "image":
+		return key == "customInstallScripts"
+	case "runner":
+		return key == "labels"
+	default:
+		return false
+	}
+}
+
+func setListValue(cfg *Config, section, key string, values []string) error {
+	switch section {
+	case "image":
+		if key == "customInstallScripts" {
+			cfg.Image.CustomInstallScripts = values
+			return nil
+		}
+	case "runner":
+		if key == "labels" {
+			cfg.Runner.Labels = values
+			return nil
+		}
+	}
+	return fmt.Errorf("unsupported list key %s.%s", section, key)
+}
+
+func appendListValue(cfg *Config, section, key, value string) error {
+	item := trimQuotes(strings.TrimSpace(value))
+	if item == "" {
+		return fmt.Errorf("%s.%s must not contain empty list items", section, key)
+	}
+	switch section {
+	case "image":
+		if key == "customInstallScripts" {
+			cfg.Image.CustomInstallScripts = append(cfg.Image.CustomInstallScripts, item)
+			return nil
+		}
+	case "runner":
+		if key == "labels" {
+			cfg.Runner.Labels = append(cfg.Runner.Labels, item)
+			return nil
+		}
+	}
+	return fmt.Errorf("unsupported list key %s.%s", section, key)
+}
+
 func Validate(cfg Config) error {
 	if cfg.Provider.Type == "" {
 		return fmt.Errorf("provider.type is required")
@@ -246,6 +325,11 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Provider.SourceImage == "" {
 		return fmt.Errorf("provider.sourceImage is required")
+	}
+	for _, script := range cfg.Image.CustomInstallScripts {
+		if strings.TrimSpace(script) == "" {
+			return fmt.Errorf("image.customInstallScripts must not contain empty paths")
+		}
 	}
 	if cfg.Pool.MinIdle < 0 || cfg.Pool.MaxInstances < 1 || cfg.Pool.MinIdle > cfg.Pool.MaxInstances {
 		return fmt.Errorf("pool sizing must satisfy 0 <= minIdle <= maxInstances")

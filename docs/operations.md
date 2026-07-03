@@ -41,8 +41,10 @@ Do not set `namePrefix` to a broad value such as `ubuntu` or `runner`.
 
 ## Troubleshooting
 
-- If image build fails before package installation, run `image update-upstream`.
-- If Docker validation fails, inspect `work/logs/<image>.guest.log`.
+- If a Docker/browser or web/E2E image build fails before package installation,
+  run `image update-upstream`.
+- If Docker validation fails for a Docker-enabled image, inspect
+  `work/logs/<image>.guest.log`.
 - If browser validation fails on ARM64, confirm `epar-browser` exists inside the
   guest and inspect `/opt/epar/browser`.
 - If GitHub registration fails, confirm the app has permission to manage

@@ -31,6 +31,17 @@ New-Item -ItemType Directory -Force .local
 Copy-Item configs/wsl.example.yml .local/config.yml
 ```
 
+For common web app and browser E2E workflows, use the opt-in web-E2E examples
+instead:
+
+```bash
+cp configs/tart.web-e2e.example.yml .local/config.yml
+```
+
+```powershell
+Copy-Item configs/wsl.web-e2e.example.yml .local/config.yml
+```
+
 EPAR looks for config in this order:
 
 1. `--config <path>`
@@ -55,9 +66,12 @@ Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on PATH.
 For Tart on macOS:
 
 ```bash
-./bin/ephemeral-action-runner image update-upstream
 ./bin/ephemeral-action-runner image build --replace
 ```
+
+Run `image update-upstream` before `image build` only when the selected
+`image.customInstallScripts` use EPAR's built-in Docker/browser or web/E2E
+install scripts.
 
 The default output image is `epar-ubuntu-24-arm64`. This is a Tart VM image name,
 not a file or folder in the repository. Confirm it with:
@@ -78,6 +92,16 @@ For WSL on Windows, first create or export a clean Ubuntu 24.04 rootfs tar at
 The default WSL output image is `work/images/epar-ubuntu-24-wsl.tar`, which EPAR
 imports for disposable runner distros.
 
+The default examples leave `image.customInstallScripts` empty and build a
+runner-only image. The web-E2E examples include
+`scripts/guest/ubuntu/install-web-e2e.sh` and build distinct images/labels for
+workflows that need Node.js/npm, Docker Compose, Buildx, browser support,
+archive tools, `rsync`, and `mysql-client`.
+
+To pre-install additional public or organization-specific tools, add a shell
+script to `image.customInstallScripts`. See
+[Image Build](image-build.md#image-install-scripts) for a complete example.
+
 After changing only files under `scripts/guest/ubuntu`, refresh the existing
 image without reinstalling packages:
 
@@ -96,13 +120,20 @@ Register two ephemeral runners, verify both are online and idle, then clean up:
 Expected healthy output includes progress for both generated instance names,
 runtime validation, GitHub online/idle confirmation, cleanup, and log paths.
 
-Local runtime validation inside each instance runs:
+Local runtime validation always checks the base runner user and runner files. If
+the image was built with `install-docker-browser.sh` or `install-web-e2e.sh`, it
+also runs:
 
 ```bash
-docker info
-docker run --rm hello-world
-chromium --headless --no-sandbox --dump-dom https://www.w3.org/
+sudo -u runner -H docker version
+sudo -u runner -H docker compose version
+sudo -u runner -H docker buildx version
+sudo -u runner -H docker run --rm hello-world
+sudo -u runner -H chromium --headless --no-sandbox --dump-dom https://www.w3.org/
 ```
+
+The bundled web/E2E install script also marks the image so cloned instances
+check `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
 
 ## Start A Foreground Pool
 

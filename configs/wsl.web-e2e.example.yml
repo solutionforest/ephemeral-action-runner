@@ -6,28 +6,29 @@ github:
   webBaseUrl: https://github.com
 
 image:
-  sourceImage: ghcr.io/cirruslabs/ubuntu:latest
-  outputImage: epar-ubuntu-24-arm64
+  sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
+  outputImage: work/images/epar-ubuntu-24-wsl-web-e2e.tar
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
   customInstallScripts:
-    # - examples/custom-install/install-extra-apt-tools.sh
+    - scripts/guest/ubuntu/install-web-e2e.sh
 
 pool:
   minIdle: 2
   maxInstances: 2
-  namePrefix: epar-tart
+  namePrefix: epar-wsl-web
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-base]
+  labels: [self-hosted, linux, X64, epar-wsl-ubuntu-24.04-web-e2e]
   ephemeral: true
 
 provider:
-  type: tart
-  sourceImage: epar-ubuntu-24-arm64
+  type: wsl
+  sourceImage: work/images/epar-ubuntu-24-wsl-web-e2e.tar
   network: default
+  installRoot: work/wsl
 
 timeouts:
   bootSeconds: 180

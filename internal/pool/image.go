@@ -59,9 +59,11 @@ func (m *Manager) UpdateUpstream(ctx context.Context) error {
 
 func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error {
 	upstreamDir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
-	if !opts.SkipUpstreamCheck {
-		if _, err := os.Stat(filepath.Join(upstreamDir, "images", "ubuntu", "scripts", "build", "install-docker.sh")); err != nil {
-			return fmt.Errorf("runner-images checkout missing; run `ephemeral-action-runner image update-upstream` first: %w", err)
+	if !opts.SkipUpstreamCheck && m.needsRunnerImagesSubset() {
+		for _, name := range m.runnerImageBuildScripts() {
+			if _, err := os.Stat(filepath.Join(upstreamDir, "images", "ubuntu", "scripts", "build", name)); err != nil {
+				return fmt.Errorf("runner-images checkout missing script %s; run `ephemeral-action-runner image update-upstream` first: %w", name, err)
+			}
 		}
 	}
 	switch m.Config.Provider.Type {
@@ -104,11 +106,15 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	if err := m.installGuestScripts(ctx, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
-	fmt.Printf("copying runner-images script subset\n")
-	if err := m.copyRunnerImagesSubset(ctx, m.Config.Image.OutputImage, upstreamDir); err != nil {
-		return err
+	if m.needsRunnerImagesSubset() {
+		fmt.Printf("copying runner-images script subset\n")
+		if err := m.copyRunnerImagesSubset(ctx, m.Config.Image.OutputImage, upstreamDir); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("skipping runner-images script subset; no selected install script requires it\n")
 	}
-	fmt.Printf("installing base runtime: Docker and browser support\n")
+	fmt.Printf("installing base runner runtime\n")
 	if _, err := m.execGuest(ctx, m.Config.Image.OutputImage, []string{"sudo", "bash", "/opt/epar/install-base.sh", "/opt/epar/upstream/runner-images"}, provider.ExecOptions{}); err != nil {
 		return err
 	}
@@ -116,7 +122,10 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	if _, err := m.execGuest(ctx, m.Config.Image.OutputImage, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
 		return err
 	}
-	fmt.Printf("validating Docker and browser inside the instance\n")
+	if err := m.installCustomInstallScripts(ctx, m.Config.Image.OutputImage); err != nil {
+		return err
+	}
+	fmt.Printf("validating runner runtime inside the instance\n")
 	if err := m.validateRuntime(ctx, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
@@ -195,11 +204,15 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if err := m.installGuestScripts(ctx, buildName); err != nil {
 		return err
 	}
-	fmt.Printf("copying runner-images script subset\n")
-	if err := m.copyRunnerImagesSubset(ctx, buildName, upstreamDir); err != nil {
-		return err
+	if m.needsRunnerImagesSubset() {
+		fmt.Printf("copying runner-images script subset\n")
+		if err := m.copyRunnerImagesSubset(ctx, buildName, upstreamDir); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("skipping runner-images script subset; no selected install script requires it\n")
 	}
-	fmt.Printf("installing base runtime: Docker and browser support\n")
+	fmt.Printf("installing base runner runtime\n")
 	if _, err := m.execGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-base.sh", "/opt/epar/upstream/runner-images"}, provider.ExecOptions{}); err != nil {
 		return err
 	}
@@ -207,7 +220,10 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if _, err := m.execGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
 		return err
 	}
-	fmt.Printf("validating Docker and browser inside the distro\n")
+	if err := m.installCustomInstallScripts(ctx, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("validating runner runtime inside the distro\n")
 	if err := m.validateRuntime(ctx, buildName); err != nil {
 		return err
 	}
@@ -403,7 +419,7 @@ func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDi
 	if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand(mkdirGuestCommand(buildGuestDir)), provider.ExecOptions{}); err != nil {
 		return err
 	}
-	for _, name := range []string{"install-docker.sh", "install-google-chrome.sh"} {
+	for _, name := range m.runnerImageBuildScripts() {
 		hostPath := filepath.Join(upstreamDir, "images", "ubuntu", "scripts", "build", name)
 		content, err := os.ReadFile(hostPath)
 		if err != nil {
@@ -420,8 +436,122 @@ func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDi
 	return nil
 }
 
+func (m *Manager) runnerImageBuildScripts() []string {
+	return []string{"install-docker.sh", "install-google-chrome.sh", "install-nodejs.sh"}
+}
+
+func (m *Manager) needsRunnerImagesSubset() bool {
+	for _, script := range m.Config.Image.CustomInstallScripts {
+		normalized := m.normalizedCustomInstallScript(script)
+		switch normalized {
+		case "scripts/guest/ubuntu/install-docker-browser.sh",
+			"scripts/guest/ubuntu/install-web-e2e.sh":
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) normalizedCustomInstallScript(script string) string {
+	script = strings.TrimSpace(script)
+	if script == "" {
+		return ""
+	}
+	if filepath.IsAbs(script) && m.ProjectRoot != "" {
+		root, rootErr := filepath.Abs(m.ProjectRoot)
+		path, pathErr := filepath.Abs(script)
+		if rootErr == nil && pathErr == nil {
+			if rel, err := filepath.Rel(root, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+				script = rel
+			}
+		}
+	}
+	return filepath.ToSlash(filepath.Clean(script))
+}
+
+func (m *Manager) installCustomInstallScripts(ctx context.Context, vmName string) error {
+	scripts := m.Config.Image.CustomInstallScripts
+	if len(scripts) == 0 {
+		return nil
+	}
+	fmt.Printf("running %d image install script(s)\n", len(scripts))
+	if _, err := m.execGuest(ctx, vmName, provider.ShellCommand("mkdir -p /opt/epar/custom-install"), provider.ExecOptions{}); err != nil {
+		return err
+	}
+	for i, script := range scripts {
+		hostPath, err := m.customInstallScriptHostPath(script)
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(hostPath)
+		if err != nil {
+			return fmt.Errorf("read custom install script %s: %w", hostPath, err)
+		}
+		guestPath := fmt.Sprintf("/opt/epar/custom-install/%03d-%s", i+1, guestScriptName(filepath.Base(hostPath)))
+		if err := provider.CopyText(ctx, m.Provider, vmName, guestPath, "0755", guestText(content)); err != nil {
+			return err
+		}
+		fmt.Printf("running image install script %d/%d: %s\n", i+1, len(scripts), script)
+		if _, err := m.execGuest(ctx, vmName, []string{"sudo", "bash", guestPath}, provider.ExecOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) customInstallScriptHostPath(script string) (string, error) {
+	script = strings.TrimSpace(script)
+	if script == "" {
+		return "", fmt.Errorf("custom install script path is empty")
+	}
+	if filepath.IsAbs(script) {
+		return filepath.Clean(script), nil
+	}
+	root, err := filepath.Abs(m.ProjectRoot)
+	if err != nil {
+		return "", err
+	}
+	path, err := filepath.Abs(filepath.Join(root, script))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("relative custom install script %q escapes project root", script)
+	}
+	return path, nil
+}
+
+func guestScriptName(name string) string {
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return "install.sh"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "install.sh"
+	}
+	return b.String()
+}
+
 func (m *Manager) enableWSLSystemd(ctx context.Context, name string) error {
-	content := "[boot]\nsystemd=true\n\n[user]\ndefault=root\n"
+	content := "[boot]\nsystemd=true\n\n[interop]\nappendWindowsPath=false\n\n[user]\ndefault=root\n"
 	_, err := m.Provider.Exec(ctx, name, provider.ShellCommand("mkdir -p /etc && cat >/etc/wsl.conf"), provider.ExecOptions{Stdin: content})
 	return err
 }
