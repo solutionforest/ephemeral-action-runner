@@ -13,6 +13,19 @@ export TOOLSET_JSON="${TOOLSET_JSON:-/opt/epar/toolset.json}"
 
 bash /opt/epar/install-docker-browser.sh "${UPSTREAM_DIR}"
 
+cat >/usr/local/bin/apt-get <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+timeout="${EPAR_APT_LOCK_TIMEOUT:-600}"
+if [[ "${1:-}" == "install" ]]; then
+  shift
+  exec /usr/bin/apt-get -o "DPkg::Lock::Timeout=${timeout}" install -y "$@"
+fi
+exec /usr/bin/apt-get -o "DPkg::Lock::Timeout=${timeout}" "$@"
+SH
+chmod +x /usr/local/bin/apt-get
+trap 'rm -f /usr/local/bin/apt-get' EXIT
+
 if [[ ! -f "${TOOLSET_JSON}" ]]; then
   install -d "$(dirname "${TOOLSET_JSON}")"
   if [[ "${ARCH}" == "arm64" && -f "${UPSTREAM_DIR}/images/ubuntu/toolsets/toolset-2404-arm64.json" ]]; then

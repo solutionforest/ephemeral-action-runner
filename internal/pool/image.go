@@ -475,7 +475,7 @@ func (m *Manager) installCustomInstallScripts(ctx context.Context, vmName string
 		return nil
 	}
 	fmt.Printf("running %d image install script(s)\n", len(scripts))
-	if _, err := m.execGuest(ctx, vmName, provider.ShellCommand("mkdir -p /opt/epar/custom-install"), provider.ExecOptions{}); err != nil {
+	if _, err := m.execGuest(ctx, vmName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo mkdir -p /opt/epar/custom-install; else mkdir -p /opt/epar/custom-install; fi"), provider.ExecOptions{}); err != nil {
 		return err
 	}
 	for i, script := range scripts {
