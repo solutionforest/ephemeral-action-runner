@@ -1,0 +1,23 @@
+* text=auto eol=lf
+
+*.go text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.lock text eol=lf
+*.gitignore text eol=lf
+LICENSE text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.tgz binary

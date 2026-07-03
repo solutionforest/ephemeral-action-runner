@@ -1,45 +1,48 @@
 # Usage
 
+This page is the operational walkthrough. Start with the supported host you already have:
+
+- Tart on Apple Silicon macOS
+- WSL2 on Windows
+
 ## Prerequisites
 
-Install:
+Install the host tools you need:
 
-- Go 1.22 or newer
-- Git
-- Tart, for the macOS provider
-- WSL2, for the Windows provider
+| Required for | Tool |
+| --- | --- |
+| All hosts | Go 1.22 or newer, Git |
+| macOS provider | Tart |
+| Windows provider | WSL2 |
+| Runner registration | GitHub App with organization self-hosted runner read/write permission |
 
 Packer, GitHub CLI, and sshpass are not required.
 
-Runner registration also requires a GitHub App that can manage organization
-self-hosted runners. See [GitHub App Setup](github-app.md).
+Set up the GitHub App before registering runners. The image build command can run without GitHub credentials, but `pool verify --register-only`, `pool up`, `status`, and GitHub cleanup need the app settings. See [GitHub App Setup](github-app.md).
 
 ## Configure
 
-Copy the provider example to an ignored local config and fill in your GitHub App
-settings. On macOS:
+Copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
+
+| Host and image | Example config |
+| --- | --- |
+| macOS Tart, runner-only | `configs/tart.example.yml` |
+| macOS Tart, web/E2E | `configs/tart.web-e2e.example.yml` |
+| Windows WSL2, runner-only | `configs/wsl.example.yml` |
+| Windows WSL2, web/E2E | `configs/wsl.web-e2e.example.yml` |
+
+macOS:
 
 ```bash
 mkdir -p .local
 cp configs/tart.example.yml .local/config.yml
 ```
 
-On Windows with WSL:
+Windows:
 
 ```powershell
 New-Item -ItemType Directory -Force .local
 Copy-Item configs/wsl.example.yml .local/config.yml
-```
-
-For common web app and browser E2E workflows, use the opt-in web-E2E examples
-instead:
-
-```bash
-cp configs/tart.web-e2e.example.yml .local/config.yml
-```
-
-```powershell
-Copy-Item configs/wsl.web-e2e.example.yml .local/config.yml
 ```
 
 EPAR looks for config in this order:
@@ -49,9 +52,7 @@ EPAR looks for config in this order:
 3. `./.local/config.yml`
 4. `~/.config/ephemeral-action-runner/config.yml`
 
-Image-only commands do not require GitHub settings. Registration, GitHub status,
-and GitHub cleanup do require `github.appId`, `github.organization`, and
-`github.privateKeyPath`.
+Tracked configs are examples only. Keep real app IDs and private key paths in an ignored config file.
 
 ## Build The CLI
 
@@ -59,97 +60,105 @@ and GitHub cleanup do require `github.appId`, `github.organization`, and
 go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
 ```
 
-Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on PATH.
+Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on `PATH`.
+
+## Prepare A WSL Source Tar
+
+Skip this section for Tart.
+
+The WSL provider builds reusable rootfs tar images. Create the clean Ubuntu 24.04 source tar once:
+
+```powershell
+New-Item -ItemType Directory -Force work/images
+wsl --install -d Ubuntu-24.04 --no-launch
+wsl --export Ubuntu-24.04 work/images/ubuntu-24.04-clean.rootfs.tar
+```
+
+After that, EPAR imports disposable temporary distros for image builds and pool instances.
 
 ## Build The Runner Image
 
-For Tart on macOS:
+Runner-only images do not need the upstream `actions/runner-images` checkout:
 
 ```bash
 ./bin/ephemeral-action-runner image build --replace
 ```
 
-Run `image update-upstream` before `image build` only when the selected
-`image.customInstallScripts` use EPAR's built-in Docker/browser or web/E2E
-install scripts.
+If `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
 
-The default output image is `epar-ubuntu-24-arm64`. This is a Tart VM image name,
-not a file or folder in the repository. Confirm it with:
+```bash
+./bin/ephemeral-action-runner image update-upstream
+./bin/ephemeral-action-runner image build --replace
+```
+
+Tart output is a local Tart image name, such as `epar-ubuntu-24-arm64`. Confirm it with:
 
 ```bash
 tart list
 ```
 
-Build logs are written under `work/logs`:
+WSL output is a rootfs tar path, such as:
 
 ```text
-work/logs/epar-ubuntu-24-arm64.build.log
-work/logs/epar-ubuntu-24-arm64.guest.log
+work/images/epar-ubuntu-24-wsl.tar
 ```
 
-For WSL on Windows, first create or export a clean Ubuntu 24.04 rootfs tar at
-`work/images/ubuntu-24.04-clean.rootfs.tar`, then run the same image commands.
-The default WSL output image is `work/images/epar-ubuntu-24-wsl.tar`, which EPAR
-imports for disposable runner distros.
+Build logs are written under `work/logs`.
 
-The default examples leave `image.customInstallScripts` empty and build a
-runner-only image. The web-E2E examples include
-`scripts/guest/ubuntu/install-web-e2e.sh` and build distinct images/labels for
-workflows that need Node.js/npm, Docker Compose, Buildx, browser support,
-archive tools, `rsync`, and `mysql-client`.
+## Customize The Image
 
-To pre-install additional public or organization-specific tools, add a shell
-script to `image.customInstallScripts`. See
-[Image Build](image-build.md#image-install-scripts) for a complete example.
+The public default image is runner-only. Add tooling through `image.customInstallScripts`:
 
-After changing only files under `scripts/guest/ubuntu`, refresh the existing
-image without reinstalling packages:
+```yaml
+image:
+  customInstallScripts:
+    - scripts/guest/ubuntu/install-web-e2e.sh
+    - examples/custom-install/install-extra-apt-tools.sh
+```
+
+Scripts run as root during image build, after the GitHub Actions runner is installed and before validation/finalization. See [Image Build](image-build.md) for the full layering model and custom script guidance.
+
+## Verify Runners
+
+For a local runtime check without GitHub registration:
 
 ```bash
-./bin/ephemeral-action-runner image refresh-scripts
+./bin/ephemeral-action-runner pool verify --instances 1 --cleanup
 ```
 
-## Verify Two Runners
-
-Register two ephemeral runners, verify both are online and idle, then clean up:
+For a full registration check:
 
 ```bash
 ./bin/ephemeral-action-runner pool verify --instances 2 --register-only --cleanup
 ```
 
-Expected healthy output includes progress for both generated instance names,
-runtime validation, GitHub online/idle confirmation, cleanup, and log paths.
+Healthy output should show each generated instance name moving through:
 
-Local runtime validation always checks the base runner user and runner files. If
-the image was built with `install-docker-browser.sh` or `install-web-e2e.sh`, it
-also runs:
+1. clone
+2. start
+3. runtime validation
+4. GitHub online/idle, when registration is enabled
+5. cleanup
 
-```bash
-sudo -u runner -H docker version
-sudo -u runner -H docker compose version
-sudo -u runner -H docker buildx version
-sudo -u runner -H docker run --rm hello-world
-sudo -u runner -H chromium --headless --no-sandbox --dump-dom https://www.w3.org/
-```
+Runtime validation always checks the base runner files and runner user. Images with optional feature markers also validate those features:
 
-The bundled web/E2E install script also marks the image so cloned instances
-check `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
+- Docker/browser images validate Docker, Compose v2, Buildx, `hello-world`, and a headless browser.
+- Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
 
-## Start A Foreground Pool
+## Run A Foreground Pool
 
 ```bash
 ./bin/ephemeral-action-runner pool up --instances 2
 ```
 
-`pool up` is a foreground supervisor. It starts the requested number of
-ephemeral runners, monitors them, and keeps replacing completed runners. When a
-GitHub Actions job is assigned to one of these ephemeral runners, the runner
-exits after that one job finishes, whether the job succeeds or fails. EPAR then
-stops/deletes that instance and creates a fresh replacement.
-When you stop the supervisor with Ctrl-C, EPAR also cleans up the active
-instances and matching GitHub runner records.
+`pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement.
 
-Use `--keep-on-exit` or `--replace-completed=false` only when debugging.
+Stop the supervisor with Ctrl-C. By default, EPAR cleans up active instances and matching GitHub runner records before it exits.
+
+Use these flags only for debugging:
+
+- `--keep-on-exit`: leave instances running when the supervisor exits.
+- `--replace-completed=false`: do not create replacements after completed jobs.
 
 ## Status And Cleanup
 
@@ -158,13 +167,11 @@ Use `--keep-on-exit` or `--replace-completed=false` only when debugging.
 ./bin/ephemeral-action-runner cleanup
 ```
 
-Cleanup only touches local instances and GitHub runners whose names match
-`pool.namePrefix`.
+Cleanup only touches local instances and GitHub runners whose names match `pool.namePrefix`.
 
 ## Dry Run
 
-Use `--dry-run` to inspect provider command construction without mutating local
-instances:
+Use `--dry-run` to inspect provider command construction without mutating local instances:
 
 ```bash
 ./bin/ephemeral-action-runner pool verify --dry-run --instances 2
