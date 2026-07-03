@@ -6,18 +6,29 @@ Install:
 
 - Go 1.22 or newer
 - Git
-- Tart, for the current macOS provider
+- Tart, for the macOS provider
+- WSL2, for the Windows provider
 
 Packer, GitHub CLI, and sshpass are not required.
 
+Runner registration also requires a GitHub App that can manage organization
+self-hosted runners. See [GitHub App Setup](github-app.md).
+
 ## Configure
 
-Copy the Tart example to an ignored local config and fill in your GitHub App
-settings:
+Copy the provider example to an ignored local config and fill in your GitHub App
+settings. On macOS:
 
 ```bash
 mkdir -p .local
 cp configs/tart.example.yml .local/config.yml
+```
+
+On Windows with WSL:
+
+```powershell
+New-Item -ItemType Directory -Force .local
+Copy-Item configs/wsl.example.yml .local/config.yml
 ```
 
 EPAR looks for config in this order:
@@ -39,7 +50,9 @@ go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
 
 Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on PATH.
 
-## Build The Tart Runner Image
+## Build The Runner Image
+
+For Tart on macOS:
 
 ```bash
 ./bin/ephemeral-action-runner image update-upstream
@@ -59,6 +72,11 @@ Build logs are written under `work/logs`:
 work/logs/epar-ubuntu-24-arm64.build.log
 work/logs/epar-ubuntu-24-arm64.guest.log
 ```
+
+For WSL on Windows, first create or export a clean Ubuntu 24.04 rootfs tar at
+`work/images/ubuntu-24.04-clean.rootfs.tar`, then run the same image commands.
+The default WSL output image is `work/images/epar-ubuntu-24-wsl.tar`, which EPAR
+imports for disposable runner distros.
 
 After changing only files under `scripts/guest/ubuntu`, refresh the existing
 image without reinstalling packages:

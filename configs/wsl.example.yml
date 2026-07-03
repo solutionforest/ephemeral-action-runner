@@ -6,8 +6,8 @@ github:
   webBaseUrl: https://github.com
 
 image:
-  sourceImage: ubuntu-24.04-rootfs.tar
-  outputImage: epar-ubuntu-24-wsl
+  sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
+  outputImage: work/images/epar-ubuntu-24-wsl.tar
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -24,8 +24,9 @@ runner:
 
 provider:
   type: wsl
-  sourceImage: ubuntu-24.04-rootfs.tar
+  sourceImage: work/images/epar-ubuntu-24-wsl.tar
   network: default
+  installRoot: work/wsl
 
 timeouts:
   bootSeconds: 180

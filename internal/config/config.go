@@ -50,6 +50,7 @@ type ProviderConfig struct {
 	Type        string
 	SourceImage string
 	Network     string
+	InstallRoot string
 }
 
 type TimeoutConfig struct {
@@ -85,6 +86,7 @@ func Default() Config {
 			Type:        "tart",
 			SourceImage: "epar-ubuntu-24-arm64",
 			Network:     "default",
+			InstallRoot: "work/wsl",
 		},
 		Timeouts: TimeoutConfig{
 			BootSeconds:         180,
@@ -211,6 +213,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Provider.SourceImage = value
 		case "network":
 			cfg.Provider.Network = value
+		case "installRoot":
+			cfg.Provider.InstallRoot = value
 		}
 	case "timeouts":
 		v, err := strconv.Atoi(value)

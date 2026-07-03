@@ -46,7 +46,7 @@ type Provider interface {
 
 func CopyText(ctx context.Context, p Provider, vmName, path, mode, content string) error {
 	tmp := "/tmp/epar-copy"
-	cmd := []string{"bash", "-lc", fmt.Sprintf("cat > %s && sudo install -m %s %s %s && rm -f %s", shellQuote(tmp), shellQuote(mode), shellQuote(tmp), shellQuote(path), shellQuote(tmp))}
+	cmd := []string{"bash", "-lc", fmt.Sprintf("cat > %s && if command -v sudo >/dev/null 2>&1; then sudo install -m %s %s %s; else install -m %s %s %s; fi && rm -f %s", shellQuote(tmp), shellQuote(mode), shellQuote(tmp), shellQuote(path), shellQuote(mode), shellQuote(tmp), shellQuote(path), shellQuote(tmp))}
 	_, err := p.Exec(ctx, vmName, cmd, ExecOptions{Stdin: content})
 	return err
 }

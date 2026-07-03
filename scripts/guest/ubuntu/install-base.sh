@@ -9,6 +9,18 @@ apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git gnupg jq lsb-release sudo tar unzip wget
 
 install -d /opt/epar
+cat >/usr/local/bin/apt-get <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "install" ]]; then
+  shift
+  exec /usr/bin/apt-get install -y "$@"
+fi
+exec /usr/bin/apt-get "$@"
+SH
+chmod +x /usr/local/bin/apt-get
+trap 'rm -f /usr/local/bin/apt-get /usr/local/bin/docker' EXIT
+
 cat >/usr/local/bin/invoke_tests <<'SH'
 #!/usr/bin/env bash
 echo "epar: skipping upstream invoke_tests $*"

@@ -15,6 +15,6 @@ The GitHub App private key remains on the host. Guest instances receive only
 short-lived registration tokens at runtime. Do not bake tokens or private keys
 into runner images.
 
-WSL2 is planned but has a weaker isolation story than one full VM per job. Treat
-the future WSL provider as trusted-job infrastructure unless your environment
-has reviewed and accepted that model.
+WSL2 has a weaker isolation story than one full VM per job. Treat the WSL
+provider as trusted-job infrastructure unless your environment has reviewed and
+accepted that model.

@@ -15,6 +15,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	tartprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
+	wslprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
 )
 
 const binaryName = "ephemeral-action-runner"
@@ -212,14 +213,14 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	if err := config.Validate(cfg); err != nil {
 		return nil, err
 	}
-	var client *gh.Client
+	var client pool.GitHubClient
 	if githubEnabled && !dryRun {
 		if err := config.ValidateGitHub(cfg); err != nil {
 			return nil, err
 		}
 		client = gh.New(cfg.GitHub)
 	}
-	provider, err := newProvider(cfg.Provider, dryRun)
+	provider, err := newProvider(cfg.Provider, projectRoot, dryRun)
 	if err != nil {
 		return nil, err
 	}
@@ -256,12 +257,12 @@ func resolveConfigPath(projectRoot, explicit string) (string, error) {
 	return "", nil
 }
 
-func newProvider(cfg config.ProviderConfig, dryRun bool) (provider.Provider, error) {
+func newProvider(cfg config.ProviderConfig, projectRoot string, dryRun bool) (provider.Provider, error) {
 	switch cfg.Type {
 	case "tart":
 		return tartprovider.New("", dryRun), nil
 	case "wsl":
-		return nil, provider.WSLNotImplementedError()
+		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.InstallRoot), projectRoot, dryRun), nil
 	default:
 		return nil, provider.UnsupportedTypeError(cfg.Type)
 	}

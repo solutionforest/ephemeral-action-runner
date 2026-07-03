@@ -1,15 +1,15 @@
 # WSL Provider
 
-The WSL provider is intentionally scaffolded but not implemented yet.
+This package implements the Windows WSL2 provider.
 
-The planned mapping is:
+It imports disposable Ubuntu distros from a reusable rootfs tar, executes guest
+commands through `wsl.exe -d <name> --user root --exec`, exports built images
+with `wsl --export`, and unregisters completed distros with `wsl --unregister`.
 
-- clone/import: `wsl --import <name> <install-dir> <rootfs.tar>`
-- start/exec: `wsl -d <name> --exec <command>`
-- stop: `wsl --terminate <name>`
-- delete: `wsl --unregister <name>`
-- list: `wsl --list --verbose`
+`Start` keeps one quiet host-side `wsl.exe -d <name>` process open for each
+running distro. WSL can auto-stop imported distros that only have systemd
+services left, so this keepalive is required for registered runners to stay
+online while waiting for jobs.
 
-WSL2 instances share the WSL kernel and are not equivalent to separate hardware
-virtual machines. Use this provider only for trusted jobs unless the isolation
-model is reviewed for your environment.
+WSL2 is treated as trusted-job infrastructure. It is not equivalent to one full
+hardware VM isolation boundary per job.

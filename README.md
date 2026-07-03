@@ -5,13 +5,15 @@ runners on local machines. It keeps a small warm pool of disposable runner
 instances, registers them with GitHub, deletes each instance after one job, and
 creates replacements.
 
-The first working provider is Tart on Apple Silicon macOS for Ubuntu ARM64
-runners. The code is structured so WSL, Hyper-V, libvirt, or Multipass providers
-can be added without rewriting the GitHub runner lifecycle.
+The currently implemented providers are Tart on Apple Silicon macOS and WSL2 on
+Windows. The code is structured so additional providers such as Hyper-V,
+libvirt, or Multipass can be added without rewriting the GitHub runner
+lifecycle.
 
 Start here:
 
 - [docs/usage.md](docs/usage.md)
+- [docs/github-app.md](docs/github-app.md)
 - [docs/design.md](docs/design.md)
 - [docs/image-build.md](docs/image-build.md)
 - [docs/operations.md](docs/operations.md)

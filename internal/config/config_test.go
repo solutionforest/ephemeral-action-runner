@@ -25,6 +25,7 @@ provider:
   type: tart
   sourceImage: runner-base
   network: softnet
+  installRoot: work/custom-wsl
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +38,9 @@ provider:
 	}
 	if got, want := cfg.Runner.Labels[3], "custom"; got != want {
 		t.Fatalf("label = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.InstallRoot, "work/custom-wsl"; got != want {
+		t.Fatalf("provider.installRoot = %q, want %q", got, want)
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)

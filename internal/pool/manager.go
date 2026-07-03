@@ -17,9 +17,19 @@ import (
 type Manager struct {
 	Config      config.Config
 	Provider    provider.Provider
-	GitHub      *gh.Client
+	GitHub      GitHubClient
 	ProjectRoot string
 	DryRun      bool
+}
+
+type GitHubClient interface {
+	OrganizationURL() string
+	RegistrationToken(ctx context.Context) (gh.RegistrationToken, error)
+	ListRunners(ctx context.Context) ([]gh.Runner, error)
+	RunnerByName(ctx context.Context, name string) (gh.Runner, bool, error)
+	WaitRunnerOnlineIdle(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error)
+	DeleteRunnerIfExists(ctx context.Context, id int64) error
+	DeleteRunnersByPrefix(ctx context.Context, prefix string) ([]gh.Runner, error)
 }
 
 type VerifyOptions struct {
@@ -163,6 +173,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				fmt.Printf("[%s] runner is finished or unhealthy: %s\n", name, reason)
 				if err := m.retireInstance(context.Background(), vm, reason); err != nil {
 					fmt.Printf("[%s] retirement warning: %v\n", name, err)
+					continue
 				}
 				delete(active, name)
 			}
@@ -266,7 +277,7 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 
 func (m *Manager) provisionOne(ctx context.Context, name string, register bool) (ProvisionedInstance, error) {
 	logPath := config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir)
-	logPath = filepath.Join(logPath, name+".tart.log")
+	logPath = filepath.Join(logPath, name+"."+m.Config.Provider.Type+".log")
 	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
 	vm := ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
@@ -330,24 +341,26 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 }
 
 func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
+	if m.GitHub != nil {
+		runner, found, err := m.GitHub.RunnerByName(ctx, vm.Name)
+		if err != nil {
+			return true, "", err
+		}
+		if !found {
+			return false, "GitHub runner record is gone", nil
+		}
+		if runner.Busy {
+			return true, "", nil
+		}
+		if runner.Status != "online" {
+			return false, fmt.Sprintf("GitHub runner status is %q", runner.Status), nil
+		}
+	}
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	_, serviceErr := m.Provider.Exec(checkCtx, vm.Name, provider.ShellCommand("systemctl is-active --quiet actions-runner.service"), provider.ExecOptions{})
 	if serviceErr != nil {
 		return false, "actions-runner.service is no longer active", nil
-	}
-	if m.GitHub == nil {
-		return true, "", nil
-	}
-	runner, found, err := m.GitHub.RunnerByName(ctx, vm.Name)
-	if err != nil {
-		return true, "", err
-	}
-	if !found {
-		return false, "GitHub runner record is gone", nil
-	}
-	if runner.Status != "online" {
-		return false, fmt.Sprintf("GitHub runner status is %q", runner.Status), nil
 	}
 	return true, "", nil
 }
@@ -357,8 +370,9 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 	var firstErr error
 	if m.GitHub != nil && vm.RunnerID != 0 {
 		deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		if err := m.GitHub.DeleteRunnerIfExists(deleteCtx, vm.RunnerID); err != nil && firstErr == nil {
-			firstErr = err
+		if err := m.GitHub.DeleteRunnerIfExists(deleteCtx, vm.RunnerID); err != nil {
+			cancel()
+			return err
 		}
 		cancel()
 	}

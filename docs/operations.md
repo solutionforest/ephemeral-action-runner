@@ -50,3 +50,5 @@ Do not set `namePrefix` to a broad value such as `ubuntu` or `runner`.
   the host user.
 - If stale runners remain, run `ephemeral-action-runner cleanup`.
 - If using Tart `softnet`, verify the host has the privileges Tart requires.
+- If WSL image build fails before systemd is ready, confirm WSL2 is enabled and
+  that the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.

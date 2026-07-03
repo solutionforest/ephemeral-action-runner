@@ -18,6 +18,10 @@ type ImageBuildOptions struct {
 	SkipUpstreamCheck bool
 }
 
+type wslExporter interface {
+	Export(ctx context.Context, name, outputPath string) error
+}
+
 func (m *Manager) UpdateUpstream(ctx context.Context) error {
 	dir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
 	fmt.Printf("updating runner-images checkout at %s\n", dir)
@@ -60,8 +64,19 @@ func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error 
 			return fmt.Errorf("runner-images checkout missing; run `ephemeral-action-runner image update-upstream` first: %w", err)
 		}
 	}
-	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), m.Config.Image.OutputImage+".build.log")
-	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), m.Config.Image.OutputImage+".guest.log")
+	switch m.Config.Provider.Type {
+	case "tart":
+		return m.buildTartImage(ctx, opts, upstreamDir)
+	case "wsl":
+		return m.buildWSLImage(ctx, opts, upstreamDir)
+	default:
+		return fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
+	}
+}
+
+func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".build.log")
+	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".guest.log")
 	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
 		return err
 	}
@@ -117,8 +132,113 @@ func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error 
 	return nil
 }
 
+func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	exporter, ok := m.Provider.(wslExporter)
+	if !ok {
+		return fmt.Errorf("provider.type=wsl requires provider export support")
+	}
+	sourcePath := config.ProjectPath(m.ProjectRoot, m.Config.Image.SourceImage)
+	outputPath := config.ProjectPath(m.ProjectRoot, m.Config.Image.OutputImage)
+	if !m.DryRun {
+		if _, err := os.Stat(sourcePath); err != nil {
+			return fmt.Errorf("wsl source image %s: %w", sourcePath, err)
+		}
+		if _, err := os.Stat(outputPath); err == nil && !opts.Replace {
+			return fmt.Errorf("wsl output image %s already exists; rerun with --replace", outputPath)
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if opts.Replace {
+			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	buildName := RunnerName(m.Config.Pool.NamePrefix+"-image", 1, time.Now())
+	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".wsl-build.log")
+	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), buildName+".guest.log")
+	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
+		return err
+	}
+	fmt.Printf("building WSL image %s from %s using temporary distro %s\n", outputPath, sourcePath, buildName)
+	fmt.Printf("logs: %s, %s\n", buildLogPath, guestLogPath)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		_ = m.Provider.Stop(cleanupCtx, buildName)
+		_ = m.Provider.Delete(cleanupCtx, buildName)
+	}()
+	fmt.Printf("importing source rootfs\n")
+	if err := m.Provider.Clone(ctx, m.Config.Image.SourceImage, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("enabling WSL systemd\n")
+	if err := m.enableWSLSystemd(ctx, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("restarting temporary distro for systemd\n")
+	if err := m.Provider.Stop(ctx, buildName); err != nil {
+		return err
+	}
+	if _, err := m.Provider.Start(ctx, buildName, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: buildLogPath}); err != nil {
+		return err
+	}
+	ip, err := m.Provider.IP(ctx, buildName, m.Config.Timeouts.BootSeconds)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("guest reachable at %s\n", ip)
+	if err := m.waitForSystemd(ctx, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("copying guest scripts\n")
+	if err := m.installGuestScripts(ctx, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("copying runner-images script subset\n")
+	if err := m.copyRunnerImagesSubset(ctx, buildName, upstreamDir); err != nil {
+		return err
+	}
+	fmt.Printf("installing base runtime: Docker and browser support\n")
+	if _, err := m.execGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-base.sh", "/opt/epar/upstream/runner-images"}, provider.ExecOptions{}); err != nil {
+		return err
+	}
+	fmt.Printf("installing GitHub Actions runner\n")
+	if _, err := m.execGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
+		return err
+	}
+	fmt.Printf("validating Docker and browser inside the distro\n")
+	if err := m.validateRuntime(ctx, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("finalizing image for clean WSL imports\n")
+	if _, err := m.execGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/finalize-image.sh"}, provider.ExecOptions{}); err != nil {
+		return err
+	}
+	if err := m.Provider.Stop(ctx, buildName); err != nil {
+		return err
+	}
+	fmt.Printf("exporting reusable WSL image to %s\n", outputPath)
+	if err := exporter.Export(ctx, buildName, m.Config.Image.OutputImage); err != nil {
+		return err
+	}
+	fmt.Printf("image build complete: %s is available for WSL imports\n", outputPath)
+	return nil
+}
+
 func (m *Manager) RefreshScripts(ctx context.Context) error {
-	logPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), m.Config.Image.OutputImage+".refresh.log")
+	switch m.Config.Provider.Type {
+	case "tart":
+		return m.refreshTartScripts(ctx)
+	case "wsl":
+		return m.refreshWSLScripts(ctx)
+	default:
+		return fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
+	}
+}
+
+func (m *Manager) refreshTartScripts(ctx context.Context) error {
+	logPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".refresh.log")
 	fmt.Printf("refreshing guest scripts in Tart image %s\n", m.Config.Image.OutputImage)
 	fmt.Printf("log: %s\n", logPath)
 	if _, err := m.Provider.Start(ctx, m.Config.Image.OutputImage, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: logPath}); err != nil {
@@ -152,13 +272,62 @@ func (m *Manager) RefreshScripts(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) refreshWSLScripts(ctx context.Context) error {
+	exporter, ok := m.Provider.(wslExporter)
+	if !ok {
+		return fmt.Errorf("provider.type=wsl requires provider export support")
+	}
+	imagePath := config.ProjectPath(m.ProjectRoot, m.Config.Image.OutputImage)
+	if !m.DryRun {
+		if _, err := os.Stat(imagePath); err != nil {
+			return fmt.Errorf("wsl image %s: %w", imagePath, err)
+		}
+	}
+	name := RunnerName(m.Config.Pool.NamePrefix+"-refresh", 1, time.Now())
+	logPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".wsl-refresh.log")
+	fmt.Printf("refreshing guest scripts in WSL image %s using temporary distro %s\n", imagePath, name)
+	fmt.Printf("log: %s\n", logPath)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		_ = m.Provider.Stop(cleanupCtx, name)
+		_ = m.Provider.Delete(cleanupCtx, name)
+	}()
+	if err := m.Provider.Clone(ctx, m.Config.Image.OutputImage, name); err != nil {
+		return err
+	}
+	if _, err := m.Provider.Start(ctx, name, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: logPath}); err != nil {
+		return err
+	}
+	if _, err := m.Provider.IP(ctx, name, m.Config.Timeouts.BootSeconds); err != nil {
+		return err
+	}
+	if err := m.waitForSystemd(ctx, name); err != nil {
+		return err
+	}
+	if err := m.installGuestScripts(ctx, name); err != nil {
+		return err
+	}
+	if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/finalize-image.sh"}, provider.ExecOptions{}); err != nil {
+		return err
+	}
+	if err := m.Provider.Stop(ctx, name); err != nil {
+		return err
+	}
+	if err := exporter.Export(ctx, name, m.Config.Image.OutputImage); err != nil {
+		return err
+	}
+	fmt.Printf("script refresh complete: %s is available for WSL imports\n", imagePath)
+	return nil
+}
+
 func (m *Manager) installGuestScripts(ctx context.Context, vmName string) error {
 	scriptDir := filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu")
 	entries, err := os.ReadDir(scriptDir)
 	if err != nil {
 		return err
 	}
-	if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand("sudo mkdir -p /opt/epar"), provider.ExecOptions{}); err != nil {
+	if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo mkdir -p /opt/epar; else mkdir -p /opt/epar; fi"), provider.ExecOptions{}); err != nil {
 		return err
 	}
 	for _, entry := range entries {
@@ -170,7 +339,7 @@ func (m *Manager) installGuestScripts(ctx context.Context, vmName string) error 
 		if err != nil {
 			return err
 		}
-		if err := provider.CopyText(ctx, m.Provider, vmName, "/opt/epar/"+entry.Name(), "0755", string(content)); err != nil {
+		if err := provider.CopyText(ctx, m.Provider, vmName, "/opt/epar/"+entry.Name(), "0755", guestText(content)); err != nil {
 			return err
 		}
 	}
@@ -193,7 +362,7 @@ func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDi
 		},
 	}
 	for _, root := range roots {
-		if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand("sudo mkdir -p "+shellQuote(root.guest)), provider.ExecOptions{}); err != nil {
+		if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand(mkdirGuestCommand(root.guest)), provider.ExecOptions{}); err != nil {
 			return err
 		}
 		if _, err := os.Stat(root.host); err != nil {
@@ -222,16 +391,16 @@ func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDi
 			if err != nil {
 				return err
 			}
-			if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand("sudo mkdir -p "+shellQuote(filepath.ToSlash(filepath.Dir(guestPath)))), provider.ExecOptions{}); err != nil {
+			if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand(mkdirGuestCommand(filepath.ToSlash(filepath.Dir(guestPath)))), provider.ExecOptions{}); err != nil {
 				return err
 			}
-			return provider.CopyText(ctx, m.Provider, vmName, guestPath, "0644", string(content))
+			return provider.CopyText(ctx, m.Provider, vmName, guestPath, "0644", guestText(content))
 		}); err != nil {
 			return err
 		}
 	}
 	buildGuestDir := "/opt/epar/upstream/runner-images/images/ubuntu/scripts/build"
-	if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand("sudo mkdir -p "+shellQuote(buildGuestDir)), provider.ExecOptions{}); err != nil {
+	if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand(mkdirGuestCommand(buildGuestDir)), provider.ExecOptions{}); err != nil {
 		return err
 	}
 	for _, name := range []string{"install-docker.sh", "install-google-chrome.sh"} {
@@ -244,11 +413,59 @@ func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDi
 			}
 			return err
 		}
-		if err := provider.CopyText(ctx, m.Provider, vmName, buildGuestDir+"/"+name, "0644", string(content)); err != nil {
+		if err := provider.CopyText(ctx, m.Provider, vmName, buildGuestDir+"/"+name, "0644", guestText(content)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (m *Manager) enableWSLSystemd(ctx context.Context, name string) error {
+	content := "[boot]\nsystemd=true\n\n[user]\ndefault=root\n"
+	_, err := m.Provider.Exec(ctx, name, provider.ShellCommand("mkdir -p /etc && cat >/etc/wsl.conf"), provider.ExecOptions{Stdin: content})
+	return err
+}
+
+func (m *Manager) waitForSystemd(ctx context.Context, name string) error {
+	waitSeconds := m.Config.Timeouts.BootSeconds
+	if waitSeconds <= 0 {
+		waitSeconds = 180
+	}
+	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+	var lastErr error
+	for {
+		result, err := m.Provider.Exec(ctx, name, provider.ShellCommand(`test "$(ps -p 1 -o comm=)" = systemd && state="$(systemctl is-system-running 2>/dev/null || true)" && case "$state" in running|degraded) echo "$state"; exit 0 ;; *) echo "$state"; exit 1 ;; esac`), provider.ExecOptions{
+			LogPath: filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log"),
+		})
+		if err == nil {
+			fmt.Printf("systemd is %s\n", strings.TrimSpace(result.Stdout))
+			return nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("systemd did not become ready in WSL distro %s within %d seconds: %w", name, waitSeconds, lastErr)
+		}
+		if err := sleepContext(ctx, 2*time.Second); err != nil {
+			return err
+		}
+	}
+}
+
+func mkdirGuestCommand(path string) string {
+	return "if command -v sudo >/dev/null 2>&1; then sudo mkdir -p " + shellQuote(path) + "; else mkdir -p " + shellQuote(path) + "; fi"
+}
+
+func imageLogStem(image string) string {
+	stem := strings.ReplaceAll(filepath.ToSlash(image), "/", "-")
+	stem = strings.ReplaceAll(stem, ":", "")
+	if stem == "" {
+		return "image"
+	}
+	return stem
+}
+
+func guestText(content []byte) string {
+	return strings.ReplaceAll(string(content), "\r\n", "\n")
 }
 
 func runHost(ctx context.Context, name string, args ...string) error {

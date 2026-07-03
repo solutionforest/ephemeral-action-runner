@@ -1,7 +1,7 @@
 # Tart Provider
 
-The Tart provider is the first working provider. It targets Apple Silicon macOS
-hosts and can run Ubuntu ARM64 or macOS ARM64 VMs.
+The Tart provider targets Apple Silicon macOS hosts and can run Ubuntu ARM64 or
+macOS ARM64 VMs.
 
 EPAR currently validates the Ubuntu path:
 

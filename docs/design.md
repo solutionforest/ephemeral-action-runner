@@ -4,8 +4,8 @@ EPAR has three main layers:
 
 - `cmd/ephemeral-action-runner`: CLI for image builds, pool lifecycle,
   verification, cleanup, and status.
-- `internal/provider`: a local instance provider interface. Tart is implemented;
-  WSL is scaffolded for a future Windows implementation.
+- `internal/provider`: a local instance provider interface. Tart and WSL are
+  implemented providers.
 - `internal/github`: GitHub App authentication and self-hosted runner API calls.
 
 ## Lifecycle
@@ -39,12 +39,15 @@ for example `epar-20260703-010530-003`.
 The foreground supervisor checks each instance every 15 seconds by default. A
 runner is considered healthy when:
 
-- `actions-runner.service` is active inside the instance.
 - The matching GitHub runner record exists and reports `online`.
+- A GitHub runner with `busy=true` is kept alive even if the local service check
+  is temporarily inconclusive.
+- When the runner is idle, `actions-runner.service` is active inside the
+  instance.
 
-The instance is retired when the service exits, the runner record disappears, or
-the runner reports a non-online status. Service exit is expected after an
-ephemeral runner finishes one job.
+The instance is retired when an idle runner service exits, the runner record
+disappears, or the runner reports a non-online status. Service exit is expected
+after an ephemeral runner finishes one job.
 
 ## Provider Boundary
 
