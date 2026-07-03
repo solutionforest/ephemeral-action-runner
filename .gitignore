@@ -1,0 +1,8 @@
+.DS_Store
+bin/
+work/
+.local/
+configs/*.local.yml
+*.pem
+*.key
+third_party/runner-images/

@@ -1,0 +1,33 @@
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  sourceImage: ghcr.io/cirruslabs/ubuntu:latest
+  outputImage: epar-ubuntu-24-arm64
+  upstreamDir: third_party/runner-images
+  upstreamLock: third_party/runner-images.lock
+  runnerVersion: latest
+
+pool:
+  minIdle: 2
+  maxInstances: 2
+  namePrefix: epar-tart
+  logDir: work/logs
+
+runner:
+  labels: [self-hosted, linux, ARM64, epar-ubuntu-24.04-docker]
+  ephemeral: true
+
+provider:
+  type: tart
+  sourceImage: epar-ubuntu-24-arm64
+  network: default
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900
