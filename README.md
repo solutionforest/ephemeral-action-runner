@@ -177,6 +177,7 @@ Operational context:
 - [Security](docs/security.md): trust boundaries and secret handling.
 - [Background](docs/background.md): why Linux guests are preferred for Docker and Compose-heavy jobs.
 - [Docker Registry Mirrors](docs/advanced/docker-registry-mirrors.md): optional pull-through cache setup and private image cautions.
+- [macOS Startup](docs/advanced/macos-startup.md): Open at Login and LaunchAgent examples for starting `pool up`.
 - [Adding A Provider](docs/providers/adding-provider.md): provider interface expectations.
 
 Tracked configs are examples only. Put real GitHub App IDs, private key paths, and local runner settings in `.local/config.yml`, `configs/*.local.yml`, or `~/.config/ephemeral-action-runner/config.yml`; those paths are not intended for Git.

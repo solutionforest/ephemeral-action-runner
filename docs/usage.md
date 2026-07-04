@@ -201,6 +201,8 @@ The expected output is `x86_64`.
 
 Stop the supervisor with Ctrl-C. By default, EPAR cleans up active instances and matching GitHub runner records before it exits.
 
+On macOS, see [macOS Startup](advanced/macos-startup.md) for an example `.command` file that waits for Docker and starts `pool up` after login.
+
 Use these flags only for debugging:
 
 - `--keep-on-exit`: leave instances running when the supervisor exits.
