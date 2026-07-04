@@ -10,7 +10,7 @@ runs-on: [self-hosted, linux, ARM64, m3-ubuntu-24.04-docker]
 
 Do not label these runners as `ubuntu-latest`. GitHub-hosted `ubuntu-latest` is a GitHub-managed image environment, and x64 assumptions may break on ARM64.
 
-WSL on Windows is the preferred EPAR provider for Docker-enabled workflows that need x64 Linux Docker images, including `linux/amd64` application runtime images. Tart on Apple Silicon remains ARM64. Workflows that depend on amd64-only images should target the WSL x64 label or handle cross-architecture execution explicitly in the workflow.
+WSL on Windows x64 remains the preferred EPAR provider for Docker-enabled workflows that need native x64 Linux Docker images, including `linux/amd64` application runtime images. Tart on Apple Silicon remains an ARM64 VM, but it can optionally run Linux amd64 user-space containers through Apple's Rosetta support by setting `provider.rosettaTag: rosetta` and using a Rosetta-capable Tart image. Workflows that depend on amd64-only images should target a distinct label such as `epar-tart-rosetta-amd64` or a WSL x64 label instead of assuming every ARM64 Tart runner can do this.
 
 ## OCI Clarification
 

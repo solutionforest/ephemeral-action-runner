@@ -27,7 +27,7 @@ Copy one example config into `.local/config.yml`, then edit the GitHub App field
 | Host and image | Example config |
 | --- | --- |
 | macOS Tart, runner-only | `configs/tart.example.yml` |
-| macOS Tart, web/E2E | `configs/tart.web-e2e.example.yml` |
+| macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
 | Windows WSL2, runner-only | `configs/wsl.example.yml` |
 | Windows WSL2, web/E2E | `configs/wsl.web-e2e.example.yml` |
 
@@ -91,6 +91,8 @@ If `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E script
 ./bin/ephemeral-action-runner image build --replace
 ```
 
+The Tart web/E2E example sets `provider.rosettaTag: rosetta`. Tart builds with that option start with `tart run --rosetta rosetta`, install Rosetta guest support, and validate that Docker can run a `linux/amd64` Alpine container returning `x86_64`.
+
 Tart output is a local Tart image name, such as `epar-ubuntu-24-arm64`. Confirm it with:
 
 ```bash
@@ -143,6 +145,7 @@ Healthy output should show each generated instance name moving through:
 Runtime validation always checks the base runner files and runner user. Images with optional feature markers also validate those features:
 
 - Docker/browser images validate Docker, Compose v2, Buildx, `hello-world`, and a headless browser.
+- Tart Rosetta images validate `docker run --platform linux/amd64 alpine:3.20` and expect `uname -m` to return `x86_64`.
 - Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
 
 ## Run A Foreground Pool
@@ -168,6 +171,16 @@ Use these flags only for debugging:
 ```
 
 Cleanup only touches local instances and GitHub runners whose names match `pool.namePrefix`.
+
+## Runner Labels
+
+Use provider-specific labels in workflows. For the Tart web/E2E Rosetta image, target the existing web/E2E label plus the Rosetta label when the job needs amd64 Docker images:
+
+```yaml
+runs-on: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-rosetta-amd64]
+```
+
+Do not use `ubuntu-latest` for these self-hosted runners.
 
 ## Dry Run
 

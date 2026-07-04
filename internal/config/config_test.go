@@ -29,6 +29,7 @@ provider:
   type: tart
   sourceImage: runner-base
   network: softnet
+  rosettaTag: rosetta
   installRoot: work/custom-wsl
 image:
   customInstallScripts:
@@ -49,6 +50,9 @@ image:
 	}
 	if got, want := cfg.Provider.InstallRoot, "work/custom-wsl"; got != want {
 		t.Fatalf("provider.installRoot = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.RosettaTag, "rosetta"; got != want {
+		t.Fatalf("provider.rosettaTag = %q, want %q", got, want)
 	}
 	if got, want := len(cfg.Image.CustomInstallScripts), 2; got != want {
 		t.Fatalf("custom install scripts = %d, want %d", got, want)
@@ -85,6 +89,30 @@ runner:
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidateRosettaTag(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.RosettaTag = "rosetta"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid rosetta tag rejected: %v", err)
+	}
+
+	for _, tag := range []string{"bad tag", "bad/tag", "../rosetta", "-bad"} {
+		cfg := Default()
+		cfg.Provider.RosettaTag = tag
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("provider.rosettaTag %q accepted", tag)
+		}
+	}
+
+	cfg = Default()
+	cfg.Provider.Type = "wsl"
+	cfg.Provider.SourceImage = "image.tar"
+	cfg.Provider.RosettaTag = "rosetta"
+	if err := Validate(cfg); err == nil {
+		t.Fatal("provider.rosettaTag accepted for WSL")
 	}
 }
 

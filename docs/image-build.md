@@ -21,7 +21,8 @@ flowchart TD
   Source["Clean Ubuntu source<br/>Tart image or WSL rootfs tar"] --> Build["Temporary build instance"]
   Build --> Scripts["EPAR guest scripts"]
   Scripts --> Runner["GitHub Actions runner"]
-  Runner --> Custom["Optional custom install scripts"]
+  Runner --> Rosetta["Optional Tart Rosetta layer"]
+  Rosetta --> Custom["Optional custom install scripts"]
   Custom --> Validate["Runtime validation"]
   Validate --> Output["Reusable runner image"]
   Output --> Pool["Disposable pool instances"]
@@ -29,16 +30,18 @@ flowchart TD
 
 ## Image Install Scripts
 
-Three layers control what is pre-installed in the Ubuntu image:
+Four layers control what is pre-installed in the Ubuntu image:
 
 1. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
 2. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
-3. `image.customInstallScripts` adds optional tool layers.
+3. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
+4. `image.customInstallScripts` adds optional tool layers.
 
 ```mermaid
 flowchart LR
   Base["Runner-only base"] --> Runner["GitHub Actions runner"]
-  Runner --> Optional["customInstallScripts"]
+  Runner --> Rosetta["Optional Tart Rosetta layer"]
+  Rosetta --> Optional["customInstallScripts"]
   Optional --> Docker["Docker/browser layer"]
   Optional --> Web["web/E2E layer"]
   Optional --> Yours["your scripts"]
@@ -50,6 +53,8 @@ EPAR ships reusable install scripts for common cases:
 
 - `scripts/guest/ubuntu/install-docker-browser.sh` installs Docker Engine, Docker CLI, Compose v2, Buildx, and a Chromium-compatible browser.
 - `scripts/guest/ubuntu/install-web-e2e.sh` includes Docker/browser support and adds Node.js/npm, `zip`, `rsync`, and `mysql-client` for common web app and browser E2E workflows.
+
+Built-in install scripts call `scripts/guest/ubuntu/wait-apt-ready.sh` before package installs. It stops active `apt-daily` jobs for the current boot only, waits for dpkg locks to clear, and leaves Ubuntu's normal apt timer enablement unchanged in the finalized image.
 
 ```yaml
 image:
@@ -78,7 +83,7 @@ image:
     - examples/custom-install/install-extra-apt-tools.sh
 ```
 
-Relative paths are resolved from the repository root and must stay inside the repository; absolute paths are also accepted. EPAR copies and runs these scripts as root, in the order listed, after the GitHub Actions runner is installed and before image validation/finalization.
+Relative paths are resolved from the repository root and must stay inside the repository; absolute paths are also accepted. EPAR copies and runs these scripts as root, in the order listed, after the GitHub Actions runner is installed and before image validation/finalization. On Tart, if `provider.rosettaTag` is set, EPAR installs the Rosetta guest support before these custom scripts run.
 
 Example script:
 
@@ -151,6 +156,18 @@ The ARM64 Docker harness prefers upstream `toolset-2404-arm64.json`. If an older
 
 The harness skips upstream Docker image cache pulls by default. Set `EPAR_SKIP_UPSTREAM_DOCKER_IMAGE_CACHE=false` inside the guest environment before `install-docker-browser.sh` if exact upstream cache behavior is required.
 
+## Tart Rosetta Layer
+
+Set `provider.rosettaTag: rosetta` on a Tart config to start image-build and pool instances with `tart run --rosetta rosetta`. During Tart image build EPAR installs:
+
+- `/opt/epar/setup-rosetta.sh`
+- `epar-rosetta.service`
+- `/opt/epar/features/rosetta-amd64`
+
+The setup script mounts the Tart Rosetta virtiofs share at `/run/rosetta`, mounts `binfmt_misc` if needed, and registers x86_64 ELF execution through `/run/rosetta/rosetta` with `OCF` flags.
+
+Rosetta is not installed for WSL builds and is not enabled for Tart unless `provider.rosettaTag` is non-empty.
+
 At the end of a build, `/opt/epar/finalize-image.sh` stops Docker/containerd if they exist, clears Docker's persisted default bridge database, removes temporary validation files, and syncs the filesystem. This avoids cloned instances inheriting stale `docker0` bridge metadata from build-time validation.
 
 Runtime validation always verifies the base runner user and runner files. If the Docker/browser feature marker is present, validation also starts Docker and verifies Docker access as the same Linux user that runs the GitHub Actions runner:
@@ -162,6 +179,14 @@ sudo -u runner -H docker buildx version
 sudo -u runner -H docker run --rm hello-world
 sudo -u runner -H chromium --headless --no-sandbox --dump-dom https://www.w3.org/
 ```
+
+If the Rosetta feature marker is present, validation also verifies a real amd64 Linux container:
+
+```bash
+sudo -u runner -H docker run --rm --platform linux/amd64 alpine:3.20 sh -c 'uname -m'
+```
+
+The expected output is `x86_64`.
 
 The bundled `scripts/guest/ubuntu/install-web-e2e.sh` script creates a feature marker so `pool verify` also validates `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql` on cloned instances.
 

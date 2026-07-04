@@ -29,7 +29,7 @@ Use the provider that matches the machine you have available. EPAR is meant to m
 
 | Machine you have | EPAR provider | Runner architecture | Notes |
 | --- | --- | --- | --- |
-| Apple Silicon macOS | Tart | Ubuntu ARM64 | Good for Linux jobs that can run on ARM64. Workflows needing amd64-only Docker images should use a different label or handle cross-arch in the workflow. |
+| Apple Silicon macOS | Tart | Ubuntu ARM64 | Good for Linux jobs that can run on ARM64. Can optionally run `linux/amd64` Docker containers through Tart Rosetta when configured with a distinct label. |
 | Windows with WSL2 | WSL2 | Ubuntu x64 | Good for Linux jobs and Docker workflows that pull `linux/amd64` images. Use for trusted internal jobs unless your environment has accepted the WSL isolation model. |
 
 Future providers can fit the same model: if EPAR supports the machine, that machine can contribute disposable runner capacity with its own labels.
@@ -42,7 +42,7 @@ EPAR does not force Docker, browsers, Node, or project tools into the public def
 | --- | --- | --- |
 | Runner-only base | `configs/tart.example.yml` or `configs/wsl.example.yml` | GitHub Actions runner and minimal runtime dependencies |
 | Docker/browser | add `scripts/guest/ubuntu/install-docker-browser.sh` to `image.customInstallScripts` | Docker Engine, Docker CLI, Compose v2, Buildx, and a Chromium-compatible browser |
-| Web/E2E | `configs/tart.web-e2e.example.yml` or `configs/wsl.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client |
+| Web/E2E | `configs/tart.web-e2e.example.yml` or `configs/wsl.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client. The Tart example also enables Rosetta amd64 Docker validation. |
 | Custom | add your own script path to `image.customInstallScripts` | Whatever your script installs inside Ubuntu |
 
 Example:

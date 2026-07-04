@@ -13,8 +13,9 @@ type Instance struct {
 }
 
 type StartOptions struct {
-	Network string
-	LogPath string
+	Network    string
+	RosettaTag string
+	LogPath    string
 }
 
 type RunningProcess struct {

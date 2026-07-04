@@ -41,6 +41,9 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 	default:
 		return nil, fmt.Errorf("unsupported tart network mode %q", opts.Network)
 	}
+	if opts.RosettaTag != "" {
+		args = append(args, "--rosetta", opts.RosettaTag)
+	}
 	args = append(args, name)
 	if p.DryRun {
 		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))

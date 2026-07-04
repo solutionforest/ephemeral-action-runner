@@ -5,7 +5,10 @@ UPSTREAM_DIR="${1:-/opt/epar/upstream/runner-images}"
 ARCH="$(dpkg --print-architecture)"
 
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
 APT_LOCK_TIMEOUT="${EPAR_APT_LOCK_TIMEOUT:-600}"
+bash /opt/epar/wait-apt-ready.sh
 apt-get -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT}" update
 apt-get -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT}" install -y --no-install-recommends ca-certificates curl git gnupg jq lsb-release sudo tar unzip wget
 
@@ -33,6 +36,8 @@ export HELPER_SCRIPTS="${UPSTREAM_DIR}/images/ubuntu/scripts/helpers"
 export INSTALLER_SCRIPT_FOLDER="/opt/epar"
 export IMAGE_OS="${IMAGE_OS:-ubuntu24}"
 export IMAGE_VERSION="${IMAGE_VERSION:-epar}"
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
 
 if [[ ! -d "${HELPER_SCRIPTS}" ]]; then
   echo "Missing runner-images helper scripts at ${HELPER_SCRIPTS}" >&2

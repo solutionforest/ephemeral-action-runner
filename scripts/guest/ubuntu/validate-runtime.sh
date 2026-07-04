@@ -21,6 +21,10 @@ if [[ -f /opt/epar/features/docker-browser ]]; then
   bash /opt/epar/validate-docker-browser.sh
 fi
 
+if [[ -f /opt/epar/features/rosetta-amd64 ]]; then
+  bash /opt/epar/validate-rosetta-amd64.sh
+fi
+
 if [[ -f /opt/epar/features/web-e2e ]]; then
   bash /opt/epar/validate-web-e2e.sh
 fi

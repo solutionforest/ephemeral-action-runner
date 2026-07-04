@@ -21,13 +21,14 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e]
+  labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-rosetta-amd64]
   ephemeral: true
 
 provider:
   type: tart
   sourceImage: epar-ubuntu-24-arm64-web-e2e
   network: default
+  rosettaTag: rosetta
 
 timeouts:
   bootSeconds: 180

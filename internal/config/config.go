@@ -51,6 +51,7 @@ type ProviderConfig struct {
 	Type        string
 	SourceImage string
 	Network     string
+	RosettaTag  string
 	InstallRoot string
 }
 
@@ -245,6 +246,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Provider.SourceImage = value
 		case "network":
 			cfg.Provider.Network = value
+		case "rosettaTag":
+			cfg.Provider.RosettaTag = value
 		case "installRoot":
 			cfg.Provider.InstallRoot = value
 		}
@@ -326,6 +329,14 @@ func Validate(cfg Config) error {
 	if cfg.Provider.SourceImage == "" {
 		return fmt.Errorf("provider.sourceImage is required")
 	}
+	if cfg.Provider.RosettaTag != "" {
+		if cfg.Provider.Type != "tart" {
+			return fmt.Errorf("provider.rosettaTag is only supported with provider.type=tart")
+		}
+		if err := ValidateRosettaTag(cfg.Provider.RosettaTag); err != nil {
+			return err
+		}
+	}
 	for _, script := range cfg.Image.CustomInstallScripts {
 		if strings.TrimSpace(script) == "" {
 			return fmt.Errorf("image.customInstallScripts must not contain empty paths")
@@ -339,6 +350,28 @@ func Validate(cfg Config) error {
 	}
 	if len(cfg.Runner.Labels) == 0 {
 		return fmt.Errorf("runner.labels must not be empty")
+	}
+	return nil
+}
+
+func ValidateRosettaTag(tag string) error {
+	if strings.TrimSpace(tag) != tag || tag == "" {
+		return fmt.Errorf("provider.rosettaTag must be a non-empty simple Tart virtiofs tag")
+	}
+	if strings.ContainsAny(tag, `/\`) {
+		return fmt.Errorf("provider.rosettaTag must not be path-like")
+	}
+	if len(tag) > 64 {
+		return fmt.Errorf("provider.rosettaTag must be 64 characters or fewer")
+	}
+	for i, r := range tag {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.'
+		if !ok {
+			return fmt.Errorf("provider.rosettaTag contains unsupported character %q", r)
+		}
+		if i == 0 && !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return fmt.Errorf("provider.rosettaTag must start with a letter or digit")
+		}
 	}
 	return nil
 }

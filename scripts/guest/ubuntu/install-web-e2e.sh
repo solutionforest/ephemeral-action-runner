@@ -5,6 +5,8 @@ UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/epar/upstream/runner-images}"
 ARCH="$(dpkg --print-architecture)"
 
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
 export HELPER_SCRIPTS="${UPSTREAM_DIR}/images/ubuntu/scripts/helpers"
 export INSTALLER_SCRIPT_FOLDER="/opt/epar"
 export IMAGE_OS="${IMAGE_OS:-ubuntu24}"
@@ -13,6 +15,7 @@ export TOOLSET_JSON="${TOOLSET_JSON:-/opt/epar/toolset.json}"
 
 bash /opt/epar/install-docker-browser.sh "${UPSTREAM_DIR}"
 
+bash /opt/epar/wait-apt-ready.sh
 cat >/usr/local/bin/apt-get <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail

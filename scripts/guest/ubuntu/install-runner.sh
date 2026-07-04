@@ -10,6 +10,9 @@ case "${ARCH}" in
 esac
 
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
+bash /opt/epar/wait-apt-ready.sh
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl jq sudo tar
 

@@ -94,7 +94,7 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 		return err
 	}
 	fmt.Printf("starting image with Tart network mode %q\n", m.Config.Provider.Network)
-	if _, err := m.Provider.Start(ctx, m.Config.Image.OutputImage, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: buildLogPath}); err != nil {
+	if _, err := m.Provider.Start(ctx, m.Config.Image.OutputImage, m.startOptions(buildLogPath)); err != nil {
 		return err
 	}
 	ip, err := m.Provider.IP(ctx, m.Config.Image.OutputImage, m.Config.Timeouts.BootSeconds)
@@ -120,6 +120,9 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	}
 	fmt.Printf("installing GitHub Actions runner\n")
 	if _, err := m.execGuest(ctx, m.Config.Image.OutputImage, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
+		return err
+	}
+	if err := m.installRosettaSupport(ctx, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
 	if err := m.installCustomInstallScripts(ctx, m.Config.Image.OutputImage); err != nil {
@@ -189,7 +192,7 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if err := m.Provider.Stop(ctx, buildName); err != nil {
 		return err
 	}
-	if _, err := m.Provider.Start(ctx, buildName, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: buildLogPath}); err != nil {
+	if _, err := m.Provider.Start(ctx, buildName, m.startOptions(buildLogPath)); err != nil {
 		return err
 	}
 	ip, err := m.Provider.IP(ctx, buildName, m.Config.Timeouts.BootSeconds)
@@ -257,7 +260,7 @@ func (m *Manager) refreshTartScripts(ctx context.Context) error {
 	logPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".refresh.log")
 	fmt.Printf("refreshing guest scripts in Tart image %s\n", m.Config.Image.OutputImage)
 	fmt.Printf("log: %s\n", logPath)
-	if _, err := m.Provider.Start(ctx, m.Config.Image.OutputImage, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: logPath}); err != nil {
+	if _, err := m.Provider.Start(ctx, m.Config.Image.OutputImage, m.startOptions(logPath)); err != nil {
 		return err
 	}
 	shouldStop := true
@@ -312,7 +315,7 @@ func (m *Manager) refreshWSLScripts(ctx context.Context) error {
 	if err := m.Provider.Clone(ctx, m.Config.Image.OutputImage, name); err != nil {
 		return err
 	}
-	if _, err := m.Provider.Start(ctx, name, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: logPath}); err != nil {
+	if _, err := m.Provider.Start(ctx, name, m.startOptions(logPath)); err != nil {
 		return err
 	}
 	if _, err := m.Provider.IP(ctx, name, m.Config.Timeouts.BootSeconds); err != nil {
@@ -360,6 +363,25 @@ func (m *Manager) installGuestScripts(ctx context.Context, vmName string) error 
 		}
 	}
 	return nil
+}
+
+func (m *Manager) startOptions(logPath string) provider.StartOptions {
+	return provider.StartOptions{
+		Network:    m.Config.Provider.Network,
+		RosettaTag: m.Config.Provider.RosettaTag,
+		LogPath:    logPath,
+	}
+}
+
+func (m *Manager) installRosettaSupport(ctx context.Context, vmName string) error {
+	if m.Config.Provider.Type != "tart" || strings.TrimSpace(m.Config.Provider.RosettaTag) == "" {
+		return nil
+	}
+	fmt.Printf("installing Tart Rosetta amd64 support with tag %q\n", m.Config.Provider.RosettaTag)
+	_, err := m.execGuest(ctx, vmName, []string{"sudo", "-E", "bash", "/opt/epar/install-rosetta.sh"}, provider.ExecOptions{
+		Env: map[string]string{"EPAR_ROSETTA_TAG": m.Config.Provider.RosettaTag},
+	})
+	return err
 }
 
 func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDir string) error {

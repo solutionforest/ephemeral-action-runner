@@ -288,7 +288,7 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 		return vm, err
 	}
 	fmt.Printf("[%s] starting instance\n", name)
-	if _, err := m.Provider.Start(ctx, name, provider.StartOptions{Network: m.Config.Provider.Network, LogPath: logPath}); err != nil {
+	if _, err := m.Provider.Start(ctx, name, m.startOptions(logPath)); err != nil {
 		return vm, err
 	}
 	ip, err := m.Provider.IP(ctx, name, m.Config.Timeouts.BootSeconds)
