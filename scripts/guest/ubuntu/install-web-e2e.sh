@@ -27,7 +27,12 @@ fi
 exec /usr/bin/apt-get -o "DPkg::Lock::Timeout=${timeout}" "$@"
 SH
 chmod +x /usr/local/bin/apt-get
-trap 'rm -f /usr/local/bin/apt-get' EXIT
+cat >/usr/local/bin/invoke_tests <<'SH'
+#!/usr/bin/env bash
+echo "epar: skipping upstream invoke_tests $*"
+SH
+chmod +x /usr/local/bin/invoke_tests
+trap 'rm -f /usr/local/bin/apt-get /usr/local/bin/invoke_tests' EXIT
 
 if [[ ! -f "${TOOLSET_JSON}" ]]; then
   install -d "$(dirname "${TOOLSET_JSON}")"

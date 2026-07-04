@@ -53,6 +53,7 @@ type ProviderConfig struct {
 	Network     string
 	RosettaTag  string
 	InstallRoot string
+	Platform    string
 }
 
 type TimeoutConfig struct {
@@ -250,6 +251,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Provider.RosettaTag = value
 		case "installRoot":
 			cfg.Provider.InstallRoot = value
+		case "platform":
+			cfg.Provider.Platform = value
 		}
 	case "timeouts":
 		v, err := strconv.Atoi(value)
@@ -322,7 +325,9 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("provider.type is required")
 	}
 	switch cfg.Provider.Type {
-	case "tart", "wsl":
+	case "tart", "wsl", "docker-dind":
+	case "docker-socket":
+		return fmt.Errorf("provider.type docker-socket is intentionally unsupported; use provider.type=docker-dind for a private Docker daemon")
 	default:
 		return fmt.Errorf("unsupported provider.type %q", cfg.Provider.Type)
 	}
@@ -334,6 +339,14 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("provider.rosettaTag is only supported with provider.type=tart")
 		}
 		if err := ValidateRosettaTag(cfg.Provider.RosettaTag); err != nil {
+			return err
+		}
+	}
+	if cfg.Provider.Platform != "" {
+		if cfg.Provider.Type != "docker-dind" {
+			return fmt.Errorf("provider.platform is only supported with provider.type=docker-dind")
+		}
+		if err := ValidateDockerPlatform(cfg.Provider.Platform); err != nil {
 			return err
 		}
 	}
@@ -350,6 +363,25 @@ func Validate(cfg Config) error {
 	}
 	if len(cfg.Runner.Labels) == 0 {
 		return fmt.Errorf("runner.labels must not be empty")
+	}
+	return nil
+}
+
+func ValidateDockerPlatform(platform string) error {
+	if strings.TrimSpace(platform) != platform || platform == "" {
+		return fmt.Errorf("provider.platform must be a non-empty Docker platform")
+	}
+	if len(platform) > 80 {
+		return fmt.Errorf("provider.platform must be 80 characters or fewer")
+	}
+	for i, r := range platform {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == '/'
+		if !ok {
+			return fmt.Errorf("provider.platform contains unsupported character %q", r)
+		}
+		if i == 0 && !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return fmt.Errorf("provider.platform must start with a letter or digit")
+		}
 	}
 	return nil
 }

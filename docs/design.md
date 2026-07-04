@@ -3,7 +3,7 @@
 EPAR has three main layers:
 
 - `cmd/ephemeral-action-runner`: CLI for image builds, pool lifecycle, verification, cleanup, and status.
-- `internal/provider`: a local instance provider interface. Tart and WSL are implemented providers.
+- `internal/provider`: a local instance provider interface. Tart, WSL, and Docker-DinD are implemented providers.
 - `internal/github`: GitHub App authentication and self-hosted runner API calls.
 
 ```mermaid
@@ -13,6 +13,7 @@ flowchart LR
   Manager --> GitHub["GitHub App client"]
   Provider --> Tart["Tart"]
   Provider --> WSL["WSL2"]
+  Provider --> DinD["Docker-DinD"]
   GitHub --> API["GitHub Actions runner APIs"]
 ```
 
@@ -26,7 +27,7 @@ For each runner instance:
 4. Run `/opt/epar/validate-runtime.sh`.
 5. Fetch a short-lived GitHub registration token on the host.
 6. Run `config.sh --ephemeral --unattended` inside the instance.
-7. Start the runner service.
+7. Start the runner process. VM and WSL images use systemd; Docker-DinD falls back to a PID-file managed background process.
 8. Poll GitHub until the runner is online and idle.
 9. Monitor the runner service and GitHub runner record.
 10. Delete the instance after the ephemeral runner exits, then create a replacement to maintain pool size.
@@ -42,7 +43,7 @@ sequenceDiagram
   M->>I: Validate runtime
   M->>G: Request registration token
   M->>I: Configure ephemeral runner
-  M->>I: Start actions-runner.service
+  M->>I: Start runner process
   I-->>G: Runner online
   G-->>I: Assign one job
   I-->>G: Runner exits after job
@@ -62,10 +63,12 @@ The foreground supervisor checks each instance every 15 seconds by default. A ru
 
 - The matching GitHub runner record exists and reports `online`.
 - A GitHub runner with `busy=true` is kept alive even if the local service check is temporarily inconclusive.
-- When the runner is idle, `actions-runner.service` is active inside the instance.
+- When the runner is idle, `/opt/epar/check-runner.sh` reports the runner process is active. The script checks `actions-runner.service` on systemd instances and `/var/run/actions-runner.pid` on non-systemd instances such as Docker-DinD containers.
 
-The instance is retired when an idle runner service exits, the runner record disappears, or the runner reports a non-online status. Service exit is expected after an ephemeral runner finishes one job.
+The instance is retired when an idle runner process exits, the runner record disappears, or the runner reports a non-online status. Runner process exit is expected after an ephemeral runner finishes one job.
 
 ## Provider Boundary
 
-The controller depends on provider operations for clone/create, start, exec, address discovery, stop, delete, and list. Provider implementations own host-specific details such as Tart VM names, WSL distro names, or future Hyper-V VM names.
+The controller depends on provider operations for clone/create, start, exec, address discovery, stop, delete, and list. Provider implementations own host-specific details such as Tart VM names, WSL distro names, Docker-DinD container names, or future Hyper-V VM names.
+
+Docker-DinD is intentionally modeled as an instance provider, not a host Docker socket shortcut. Each instance is a privileged outer container that starts its own Docker daemon. Workflow `docker compose` resources are created inside that private daemon and disappear when EPAR removes the runner container with its volumes.

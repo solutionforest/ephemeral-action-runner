@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,9 +72,47 @@ func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error 
 		return m.buildTartImage(ctx, opts, upstreamDir)
 	case "wsl":
 		return m.buildWSLImage(ctx, opts, upstreamDir)
+	case "docker-dind":
+		return m.buildDockerDindImage(ctx, opts, upstreamDir)
 	default:
 		return fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
 	}
+}
+
+func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".docker-build.log")
+	if err := resetLogs(buildLogPath); err != nil {
+		return err
+	}
+	if !m.DryRun && !opts.Replace {
+		if err := exec.CommandContext(ctx, "docker", "image", "inspect", m.Config.Image.OutputImage).Run(); err == nil {
+			return fmt.Errorf("docker image %s already exists; rerun with --replace", m.Config.Image.OutputImage)
+		}
+	}
+	buildCtx, err := os.MkdirTemp("", "epar-docker-dind-build-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(buildCtx)
+	if err := m.prepareDockerDindBuildContext(buildCtx, upstreamDir); err != nil {
+		return err
+	}
+	fmt.Printf("building Docker-DinD image %s from %s\n", m.Config.Image.OutputImage, m.Config.Image.SourceImage)
+	fmt.Printf("log: %s\n", buildLogPath)
+	args := []string{"build", "--progress=plain", "-t", m.Config.Image.OutputImage}
+	if m.Config.Provider.Platform != "" {
+		args = append(args, "--platform", m.Config.Provider.Platform)
+	}
+	args = append(args,
+		"--build-arg", "BASE_IMAGE="+m.Config.Image.SourceImage,
+		"--build-arg", "RUNNER_VERSION="+m.Config.Image.RunnerVersion,
+		buildCtx,
+	)
+	if err := runHostLogged(ctx, buildLogPath, "docker", args...); err != nil {
+		return err
+	}
+	fmt.Printf("image build complete: %s is available in `docker image ls`\n", m.Config.Image.OutputImage)
+	return nil
 }
 
 func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
@@ -251,6 +290,8 @@ func (m *Manager) RefreshScripts(ctx context.Context) error {
 		return m.refreshTartScripts(ctx)
 	case "wsl":
 		return m.refreshWSLScripts(ctx)
+	case "docker-dind":
+		return m.buildDockerDindImage(ctx, ImageBuildOptions{Replace: true}, config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir))
 	default:
 		return fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
 	}
@@ -463,6 +504,9 @@ func (m *Manager) runnerImageBuildScripts() []string {
 }
 
 func (m *Manager) needsRunnerImagesSubset() bool {
+	if m.Config.Provider.Type == "docker-dind" {
+		return true
+	}
 	for _, script := range m.Config.Image.CustomInstallScripts {
 		normalized := m.normalizedCustomInstallScript(script)
 		switch normalized {
@@ -472,6 +516,57 @@ func (m *Manager) needsRunnerImagesSubset() bool {
 		}
 	}
 	return false
+}
+
+func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) error {
+	if err := copyDir(filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu"), filepath.Join(buildCtx, "scripts", "guest", "ubuntu")); err != nil {
+		return err
+	}
+	if err := copyDir(filepath.Join(m.ProjectRoot, "scripts", "container", "ubuntu"), filepath.Join(buildCtx, "scripts", "container", "ubuntu")); err != nil {
+		return err
+	}
+	upstreamDest := filepath.Join(buildCtx, "upstream", "runner-images")
+	if err := os.MkdirAll(upstreamDest, 0755); err != nil {
+		return err
+	}
+	if err := copyRunnerImagesSubsetToDir(upstreamDir, upstreamDest, m.runnerImageBuildScripts()); err != nil {
+		return err
+	}
+	customDir := filepath.Join(buildCtx, "custom-install")
+	if err := os.MkdirAll(customDir, 0755); err != nil {
+		return err
+	}
+	var customRuns strings.Builder
+	for i, script := range m.Config.Image.CustomInstallScripts {
+		hostPath, err := m.customInstallScriptHostPath(script)
+		if err != nil {
+			return err
+		}
+		name := fmt.Sprintf("%03d-%s", i+1, guestScriptName(filepath.Base(hostPath)))
+		if err := copyFile(hostPath, filepath.Join(customDir, name), 0755); err != nil {
+			return err
+		}
+		fmt.Fprintf(&customRuns, "RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/custom-install/%s\n", name)
+	}
+	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+ARG RUNNER_VERSION=latest
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NEEDRESTART_MODE=l
+ENV NEEDRESTART_SUSPEND=1
+COPY scripts/guest/ubuntu/ /opt/epar/
+COPY scripts/container/ubuntu/entrypoint.sh /opt/epar/container-entrypoint.sh
+COPY upstream/runner-images/ /opt/epar/upstream/runner-images/
+COPY custom-install/ /opt/epar/custom-install/
+RUN chmod +x /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
+RUN bash /opt/epar/install-base.sh /opt/epar/upstream/runner-images
+RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}"
+RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/install-docker-engine.sh /opt/epar/upstream/runner-images
+%sRUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/validate-runtime.sh
+RUN bash /opt/epar/finalize-image.sh
+ENTRYPOINT ["/opt/epar/container-entrypoint.sh"]
+`, customRuns.String())
+	return os.WriteFile(filepath.Join(buildCtx, "Dockerfile"), []byte(dockerfile), 0644)
 }
 
 func (m *Manager) normalizedCustomInstallScript(script string) string {
@@ -625,6 +720,91 @@ func runHost(ctx context.Context, name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func runHostLogged(ctx context.Context, logPath, name string, args ...string) error {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if logPath != "" {
+		cmd.Stdout = io.MultiWriter(os.Stdout, logFile)
+		cmd.Stderr = io.MultiWriter(os.Stderr, logFile)
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func copyRunnerImagesSubsetToDir(upstreamDir, dest string, buildScripts []string) error {
+	roots := []struct {
+		src string
+		dst string
+	}{
+		{
+			src: filepath.Join(upstreamDir, "images", "ubuntu", "scripts", "helpers"),
+			dst: filepath.Join(dest, "images", "ubuntu", "scripts", "helpers"),
+		},
+		{
+			src: filepath.Join(upstreamDir, "images", "ubuntu", "toolsets"),
+			dst: filepath.Join(dest, "images", "ubuntu", "toolsets"),
+		},
+	}
+	for _, root := range roots {
+		if err := copyDir(root.src, root.dst); err != nil {
+			return err
+		}
+	}
+	buildDst := filepath.Join(dest, "images", "ubuntu", "scripts", "build")
+	if err := os.MkdirAll(buildDst, 0755); err != nil {
+		return err
+	}
+	for _, name := range buildScripts {
+		if err := copyFile(filepath.Join(upstreamDir, "images", "ubuntu", "scripts", "build", name), filepath.Join(buildDst, name), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return copyFile(path, target, info.Mode().Perm())
+	})
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	content, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(dst, content, mode)
 }
 
 func resetLogs(paths ...string) error {

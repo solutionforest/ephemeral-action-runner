@@ -4,6 +4,7 @@ This page is the operational walkthrough. Start with the supported host you alre
 
 - Tart on Apple Silicon macOS
 - WSL2 on Windows
+- Docker-DinD on a Docker-capable host
 
 ## Prerequisites
 
@@ -14,6 +15,7 @@ Install the host tools you need:
 | All hosts | Go 1.22 or newer, Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |
+| Docker-DinD provider | Docker Engine, OrbStack, or Docker Desktop with privileged container support |
 | Runner registration | GitHub App with organization self-hosted runner read/write permission |
 
 Packer, GitHub CLI, and sshpass are not required.
@@ -30,6 +32,8 @@ Copy one example config into `.local/config.yml`, then edit the GitHub App field
 | macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
 | Windows WSL2, runner-only | `configs/wsl.example.yml` |
 | Windows WSL2, web/E2E | `configs/wsl.web-e2e.example.yml` |
+| Docker-DinD, runner-only | `configs/docker-dind.example.yml` |
+| Docker-DinD, web/E2E | `configs/docker-dind.web-e2e.example.yml` |
 
 macOS:
 
@@ -43,6 +47,13 @@ Windows:
 ```powershell
 New-Item -ItemType Directory -Force .local
 Copy-Item configs/wsl.example.yml .local/config.yml
+```
+
+Docker-DinD:
+
+```bash
+mkdir -p .local
+cp configs/docker-dind.example.yml .local/config.yml
 ```
 
 EPAR looks for config in this order:
@@ -64,7 +75,7 @@ Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on `PATH
 
 ## Prepare A WSL Source Tar
 
-Skip this section for Tart.
+Skip this section for Tart and Docker-DinD.
 
 The WSL provider builds reusable rootfs tar images. Create the clean Ubuntu 24.04 source tar once:
 
@@ -78,13 +89,13 @@ After that, EPAR imports disposable temporary distros for image builds and pool 
 
 ## Build The Runner Image
 
-Runner-only images do not need the upstream `actions/runner-images` checkout:
+Runner-only Tart and WSL images do not need the upstream `actions/runner-images` checkout:
 
 ```bash
 ./bin/ephemeral-action-runner image build --replace
 ```
 
-If `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
+If `provider.type: docker-dind`, or if `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
 
 ```bash
 ./bin/ephemeral-action-runner image update-upstream
@@ -103,6 +114,12 @@ WSL output is a rootfs tar path, such as:
 
 ```text
 work/images/epar-ubuntu-24-wsl.tar
+```
+
+Docker-DinD output is a Docker image tag, such as `epar-docker-dind-ubuntu-24`. Confirm it with:
+
+```bash
+docker image ls epar-docker-dind-ubuntu-24
 ```
 
 Build logs are written under `work/logs`.
@@ -145,8 +162,17 @@ Healthy output should show each generated instance name moving through:
 Runtime validation always checks the base runner files and runner user. Images with optional feature markers also validate those features:
 
 - Docker/browser images validate Docker, Compose v2, Buildx, `hello-world`, and a headless browser.
+- Docker-DinD images validate the private inner Docker daemon inside each runner container.
 - Tart Rosetta images validate `docker run --platform linux/amd64 alpine:3.20` and expect `uname -m` to return `x86_64`.
 - Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
+
+If a Docker-DinD workflow depends on amd64-only images while the host is ARM64, validate host emulation inside a running EPAR instance:
+
+```bash
+docker exec <epar-instance> docker run --rm --platform linux/amd64 alpine:3.20 uname -m
+```
+
+The expected output is `x86_64`.
 
 ## Run A Foreground Pool
 
@@ -179,6 +205,14 @@ Use provider-specific labels in workflows. For the Tart web/E2E Rosetta image, t
 ```yaml
 runs-on: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-rosetta-amd64]
 ```
+
+For Docker-DinD web/E2E images, target the Docker-DinD label:
+
+```yaml
+runs-on: [self-hosted, linux, ARM64, epar-docker-dind-ubuntu-24.04-web-e2e]
+```
+
+When that Docker-DinD runner is used for amd64-only runtime images, keep the workflow's Docker platform explicit, for example `DOCKER_PLATFORM=linux/amd64` or the equivalent variable used by your compose scripts, and verify the host runtime supports amd64 emulation as described above.
 
 Do not use `ubuntu-latest` for these self-hosted runners.
 

@@ -358,9 +358,9 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, serviceErr := m.Provider.Exec(checkCtx, vm.Name, provider.ShellCommand("systemctl is-active --quiet actions-runner.service"), provider.ExecOptions{})
+	_, serviceErr := m.Provider.Exec(checkCtx, vm.Name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
 	if serviceErr != nil {
-		return false, "actions-runner.service is no longer active", nil
+		return false, "actions runner process is no longer active", nil
 	}
 	return true, "", nil
 }

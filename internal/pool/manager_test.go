@@ -47,7 +47,7 @@ func TestRunnerAliveRetiresIdleRunnerWhenServiceIsInactive(t *testing.T) {
 	if alive {
 		t.Fatal("runnerAlive() alive = true, want false")
 	}
-	if reason != "actions-runner.service is no longer active" {
+	if reason != "actions runner process is no longer active" {
 		t.Fatalf("reason = %q", reason)
 	}
 	if got := atomic.LoadInt32(&provider.execCalls); got != 1 {

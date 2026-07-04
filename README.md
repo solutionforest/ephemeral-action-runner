@@ -7,7 +7,7 @@ It is built for teams that want fast self-hosted Linux runners without keeping l
 ```mermaid
 flowchart LR
   Workflow["GitHub Actions job"] --> Runner["Ephemeral runner"]
-  EPAR["EPAR supervisor"] --> Provider["Local provider<br/>Tart or WSL2"]
+  EPAR["EPAR supervisor"] --> Provider["Local provider<br/>Tart, WSL2, or Docker-DinD"]
   Provider --> Runner
   Runner --> Job["One job runs"]
   Job --> Delete["Delete instance"]
@@ -19,16 +19,21 @@ flowchart LR
 
 - **Disposable runners:** every runner is expected to handle one job and then disappear.
 - **Warm pool:** `pool up` keeps ready runners online so jobs do not wait for a full image build.
-- **Use spare hosts:** turn a supported Mac or Windows machine into a pool of disposable Linux GitHub runners.
+- **Use spare hosts:** turn a supported Mac, Windows, Linux, or Docker-capable machine into a pool of disposable Linux GitHub runners.
 - **Image control:** the default image is runner-only, and extra tooling is added with explicit install scripts.
 - **GitHub App auth:** the host uses a GitHub App to request short-lived runner registration tokens.
 
-## Supported Hosts
+## Choosing A Provider
 
-Use the provider that matches the machine you have available. EPAR is meant to make spare supported hosts useful as GitHub self-hosted runner capacity, not to make users compare providers in the abstract.
+For Docker-heavy Linux CI, start with Docker-DinD when the host already has a Docker runtime that supports privileged containers. It is usually the least intrusive path for existing workflows because jobs still get their own private Docker daemon, fixed Compose names and ports stay inside that runner instance, and the workflow can keep using explicit Docker platforms such as `linux/amd64`.
+
+Use Tart or WSL when their host model is the reason you are choosing them: Tart for Apple Silicon VM-based isolation and macOS-host workflows, WSL for Windows-hosted Linux runners and native x64 Docker workloads on x64 Windows.
+
+Choose the provider whose isolation model, CPU architecture, and Docker behavior match the workflows you plan to run.
 
 | Machine you have | EPAR provider | Runner architecture | Notes |
 | --- | --- | --- | --- |
+| Docker-capable host | Docker-DinD | Host-selected Linux container platform | Recommended first choice for Docker Compose-heavy Linux CI when privileged containers are acceptable. Deleting the runner container deletes the job's inner Docker world. |
 | Apple Silicon macOS | Tart | Ubuntu ARM64 | Good for Linux jobs that can run on ARM64. Can optionally run `linux/amd64` Docker containers through Tart Rosetta when configured with a distinct label. |
 | Windows with WSL2 | WSL2 | Ubuntu x64 | Good for Linux jobs and Docker workflows that pull `linux/amd64` images. Use for trusted internal jobs unless your environment has accepted the WSL isolation model. |
 
@@ -36,13 +41,13 @@ Future providers can fit the same model: if EPAR supports the machine, that mach
 
 ## Image Choice
 
-EPAR does not force Docker, browsers, Node, or project tools into the public default image.
+EPAR does not include Docker, browsers, Node, or project tools in every image by default.
 
 | Image style | Config | Includes |
 | --- | --- | --- |
-| Runner-only base | `configs/tart.example.yml` or `configs/wsl.example.yml` | GitHub Actions runner and minimal runtime dependencies |
+| Runner-only base | `configs/tart.example.yml`, `configs/wsl.example.yml`, or `configs/docker-dind.example.yml` | GitHub Actions runner and minimal runtime dependencies. Docker-DinD also includes Docker Engine for its private inner daemon. |
 | Docker/browser | add `scripts/guest/ubuntu/install-docker-browser.sh` to `image.customInstallScripts` | Docker Engine, Docker CLI, Compose v2, Buildx, and a Chromium-compatible browser |
-| Web/E2E | `configs/tart.web-e2e.example.yml` or `configs/wsl.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client. The Tart example also enables Rosetta amd64 Docker validation. |
+| Web/E2E | `configs/tart.web-e2e.example.yml`, `configs/wsl.web-e2e.example.yml`, or `configs/docker-dind.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client. The Tart example also enables Rosetta amd64 Docker validation. |
 | Custom | add your own script path to `image.customInstallScripts` | Whatever your script installs inside Ubuntu |
 
 Example:
@@ -65,6 +70,13 @@ image:
 2. Create a GitHub App that can manage organization self-hosted runners. See [docs/github-app.md](docs/github-app.md).
 
 3. Copy one example config into `.local/config.yml` and fill in the GitHub App values.
+
+   Docker-DinD, recommended for Docker-heavy Linux CI when your host Docker runtime supports privileged containers:
+
+   ```bash
+   mkdir -p .local
+   cp configs/docker-dind.example.yml .local/config.yml
+   ```
 
    macOS with Tart:
 
@@ -94,7 +106,7 @@ image:
    ./bin/ephemeral-action-runner image build --replace
    ```
 
-   If your selected install scripts use EPAR's Docker/browser or web/E2E scripts, first run:
+   If your provider is Docker-DinD, or if your selected install scripts use EPAR's Docker/browser or web/E2E scripts, first run:
 
    ```bash
    ./bin/ephemeral-action-runner image update-upstream
@@ -149,6 +161,7 @@ Provider details:
 
 - [Tart Provider](docs/providers/tart.md): Apple Silicon macOS and Ubuntu ARM64.
 - [WSL Provider](docs/providers/wsl.md): Windows WSL2, rootfs tar images, and WSL caveats.
+- [Docker-DinD Provider](docs/providers/docker-dind.md): privileged runner containers with private Docker daemons.
 
 Operational context:
 

@@ -7,7 +7,7 @@ test -x /opt/actions-runner/run.sh
 test -x /opt/epar/configure-runner.sh
 test -x /opt/epar/run-runner.sh
 
-if command -v systemctl >/dev/null 2>&1; then
+if command -v systemctl >/dev/null 2>&1 && [[ "$(ps -p 1 -o comm= 2>/dev/null || true)" == "systemd" ]]; then
   state="$(systemctl is-system-running 2>/dev/null || true)"
   case "${state}" in
     running|degraded) ;;
@@ -16,6 +16,10 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 sudo -u runner -H bash -lc 'test -d "$HOME" && test -w "$HOME" && echo "Base runner validation passed"'
+
+if [[ -f /opt/epar/features/docker-engine ]]; then
+  bash /opt/epar/validate-docker-engine.sh
+fi
 
 if [[ -f /opt/epar/features/docker-browser ]]; then
   bash /opt/epar/validate-docker-browser.sh

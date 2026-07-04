@@ -36,8 +36,6 @@ export HELPER_SCRIPTS="${UPSTREAM_DIR}/images/ubuntu/scripts/helpers"
 export INSTALLER_SCRIPT_FOLDER="/opt/epar"
 export IMAGE_OS="${IMAGE_OS:-ubuntu24}"
 export IMAGE_VERSION="${IMAGE_VERSION:-epar}"
-export NEEDRESTART_MODE=l
-export NEEDRESTART_SUSPEND=1
 
 if [[ ! -d "${HELPER_SCRIPTS}" ]]; then
   echo "Missing runner-images helper scripts at ${HELPER_SCRIPTS}" >&2
@@ -48,8 +46,7 @@ if [[ "${ARCH}" == "arm64" ]]; then
   if [[ -f "${UPSTREAM_DIR}/images/ubuntu/toolsets/toolset-2404-arm64.json" ]]; then
     cp "${UPSTREAM_DIR}/images/ubuntu/toolsets/toolset-2404-arm64.json" /opt/epar/toolset.json
   else
-    TOOLSET_JSON="/opt/epar/toolset.json"
-    cat >"${TOOLSET_JSON}" <<'JSON'
+    cat >/opt/epar/toolset.json <<'JSON'
 {
   "docker": {
     "components": [
@@ -66,16 +63,12 @@ if [[ "${ARCH}" == "arm64" ]]; then
 JSON
   fi
 else
-  TOOLSET_JSON="${UPSTREAM_DIR}/images/ubuntu/toolsets/toolset-2404.json"
-  cp "${TOOLSET_JSON}" /opt/epar/toolset.json
+  cp "${UPSTREAM_DIR}/images/ubuntu/toolsets/toolset-2404.json" /opt/epar/toolset.json
 fi
 export TOOLSET_JSON="/opt/epar/toolset.json"
 
-if [[ -f /opt/epar/features/docker-engine ]]; then
-  echo "Docker Engine already installed; skipping Docker install step"
-else
-  if [[ "${EPAR_SKIP_UPSTREAM_DOCKER_IMAGE_CACHE:-true}" == "true" ]]; then
-    cat >/usr/local/bin/docker <<'SH'
+if [[ "${EPAR_SKIP_UPSTREAM_DOCKER_IMAGE_CACHE:-true}" == "true" ]]; then
+  cat >/usr/local/bin/docker <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "pull" ]]; then
@@ -88,23 +81,22 @@ if [[ "${1:-}" == "pull" ]]; then
 fi
 exec /usr/bin/docker "$@"
 SH
-    chmod +x /usr/local/bin/docker
-  fi
-
-  bash "${UPSTREAM_DIR}/images/ubuntu/scripts/build/install-docker.sh"
-  rm -f /usr/local/bin/docker
+  chmod +x /usr/local/bin/docker
 fi
-bash /opt/epar/install-browser.sh "${UPSTREAM_DIR}"
+
+bash "${UPSTREAM_DIR}/images/ubuntu/scripts/build/install-docker.sh"
+rm -f /usr/local/bin/docker
 
 usermod -aG docker admin 2>/dev/null || true
 usermod -aG docker runner 2>/dev/null || true
 
 install -d /opt/epar/features
-touch /opt/epar/features/docker-browser
+touch /opt/epar/features/docker-engine
 if [[ "${EPAR_CONTAINER_IMAGE_BUILD:-false}" != "true" ]]; then
   systemctl enable containerd.service docker.service
   systemctl enable docker.socket >/dev/null 2>&1 || true
   systemctl restart containerd.service
   systemctl restart docker.service
 fi
-bash /opt/epar/validate-docker-browser.sh
+bash /opt/epar/validate-docker-engine.sh
+

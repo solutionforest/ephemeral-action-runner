@@ -1,0 +1,36 @@
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  sourceImage: ubuntu:24.04
+  outputImage: epar-docker-dind-ubuntu-24
+  upstreamDir: third_party/runner-images
+  upstreamLock: third_party/runner-images.lock
+  runnerVersion: latest
+  customInstallScripts:
+
+pool:
+  minIdle: 2
+  maxInstances: 2
+  namePrefix: epar-dind
+  logDir: work/logs
+
+runner:
+  labels: [self-hosted, linux, ARM64, epar-docker-dind-ubuntu-24.04-base]
+  ephemeral: true
+
+provider:
+  type: docker-dind
+  sourceImage: epar-docker-dind-ubuntu-24
+  network: default
+  platform: linux/arm64
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900
+

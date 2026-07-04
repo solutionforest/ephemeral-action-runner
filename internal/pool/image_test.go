@@ -47,6 +47,13 @@ func TestNeedsRunnerImagesSubsetOnlyForBuiltInScripts(t *testing.T) {
 	}
 }
 
+func TestDockerDindAlwaysNeedsRunnerImagesSubset(t *testing.T) {
+	manager := Manager{Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}}}
+	if !manager.needsRunnerImagesSubset() {
+		t.Fatal("docker-dind image build should always copy runner-images Docker scripts")
+	}
+}
+
 func TestInstallCustomScriptsRunsInOrder(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, ".local"), 0755); err != nil {

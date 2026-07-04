@@ -62,6 +62,35 @@ image:
 	}
 }
 
+func TestLoadDockerDindPlatform(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+pool:
+  minIdle: 1
+  maxInstances: 1
+  namePrefix: epar-dind
+runner:
+  labels: [self-hosted, linux, ARM64, epar-docker-dind]
+provider:
+  type: docker-dind
+  sourceImage: epar-docker-dind-ubuntu-24
+  platform: linux/arm64
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider.Platform, "linux/arm64"; got != want {
+		t.Fatalf("provider.platform = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadAllowsEmptyBlockList(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -113,6 +142,46 @@ func TestValidateRosettaTag(t *testing.T) {
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err == nil {
 		t.Fatal("provider.rosettaTag accepted for WSL")
+	}
+}
+
+func TestValidateDockerPlatform(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-dind"
+	cfg.Provider.SourceImage = "runner-image"
+	cfg.Provider.Platform = "linux/amd64"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid docker platform rejected: %v", err)
+	}
+
+	for _, platform := range []string{"bad platform", "-linux/amd64", "linux/$bad"} {
+		cfg := Default()
+		cfg.Provider.Type = "docker-dind"
+		cfg.Provider.SourceImage = "runner-image"
+		cfg.Provider.Platform = platform
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("provider.platform %q accepted", platform)
+		}
+	}
+
+	cfg = Default()
+	cfg.Provider.Type = "tart"
+	cfg.Provider.Platform = "linux/arm64"
+	if err := Validate(cfg); err == nil {
+		t.Fatal("provider.platform accepted for Tart")
+	}
+}
+
+func TestValidateRejectsDockerSocketProvider(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-socket"
+	cfg.Provider.SourceImage = "runner-image"
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("docker-socket provider accepted")
+	}
+	if got := err.Error(); got != "provider.type docker-socket is intentionally unsupported; use provider.type=docker-dind for a private Docker daemon" {
+		t.Fatalf("error = %q", got)
 	}
 }
 

@@ -16,12 +16,20 @@ For WSL, the image build uses tar files:
 
 The WSL build imports the clean tar into a temporary distro, enables systemd, installs the runner runtime, runs any configured install scripts, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
 
+For Docker-DinD, the image build uses Docker images:
+
+- `image.sourceImage`: clean Ubuntu container base image, default `ubuntu:24.04`.
+- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-ubuntu-24`.
+
+Docker-DinD builds an Ubuntu-based container image, installs the GitHub Actions runner, installs Docker Engine/CLI/Compose/Buildx for the private inner daemon, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
+
 ```mermaid
 flowchart TD
-  Source["Clean Ubuntu source<br/>Tart image or WSL rootfs tar"] --> Build["Temporary build instance"]
+  Source["Clean Ubuntu source<br/>Tart image, WSL rootfs tar, or Docker image"] --> Build["Temporary build instance or Docker build"]
   Build --> Scripts["EPAR guest scripts"]
   Scripts --> Runner["GitHub Actions runner"]
-  Runner --> Rosetta["Optional Tart Rosetta layer"]
+  Runner --> DockerDind["Docker-DinD-only private daemon layer"]
+  DockerDind --> Rosetta["Optional Tart Rosetta layer"]
   Rosetta --> Custom["Optional custom install scripts"]
   Custom --> Validate["Runtime validation"]
   Validate --> Output["Reusable runner image"]
@@ -34,20 +42,22 @@ Four layers control what is pre-installed in the Ubuntu image:
 
 1. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
 2. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
-3. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
-4. `image.customInstallScripts` adds optional tool layers.
+3. Docker-DinD builds install Docker Engine and the private `dockerd` entrypoint.
+4. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
+5. `image.customInstallScripts` adds optional tool layers.
 
 ```mermaid
 flowchart LR
   Base["Runner-only base"] --> Runner["GitHub Actions runner"]
-  Runner --> Rosetta["Optional Tart Rosetta layer"]
+  Runner --> DinD["Docker-DinD-only daemon layer"]
+  DinD --> Rosetta["Optional Tart Rosetta layer"]
   Rosetta --> Optional["customInstallScripts"]
   Optional --> Docker["Docker/browser layer"]
   Optional --> Web["web/E2E layer"]
   Optional --> Yours["your scripts"]
 ```
 
-The public default examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Use this when workflows install their own dependencies or only need plain shell/GitHub Actions runner behavior.
+The public Tart and WSL default examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always includes Docker Engine because the provider depends on a private inner Docker daemon, even when no extra custom install scripts are selected. Use the runner-only Tart/WSL images when workflows install their own dependencies or only need plain shell/GitHub Actions runner behavior.
 
 EPAR ships reusable install scripts for common cases:
 
@@ -100,7 +110,7 @@ apt-get install -y --no-install-recommends \
   shellcheck
 ```
 
-The same script can be used by Tart and WSL because it runs inside the Ubuntu guest. If the customized image changes workflow capabilities, give it distinct image names and labels so workflows can opt into it explicitly:
+The same script can be used by Tart, WSL, and Docker-DinD because it runs inside Ubuntu. If the customized image changes workflow capabilities, give it distinct image names and labels so workflows can opt into it explicitly:
 
 ```yaml
 image:
@@ -120,9 +130,9 @@ Do not bake secrets, private keys, Docker credentials, project `node_modules`, l
 
 ## Upstream Runner Images
 
-The runner-only base image does not require `actions/runner-images`.
+Runner-only Tart and WSL base images do not require `actions/runner-images`. Docker-DinD images do require it because the container image always installs Docker Engine for the private daemon.
 
-The built-in Docker/browser and web/E2E scripts do require a pinned checkout of `actions/runner-images`:
+Docker-DinD builds, and the built-in Docker/browser and web/E2E scripts, require a pinned checkout of `actions/runner-images`:
 
 ```bash
 ephemeral-action-runner image update-upstream
@@ -130,13 +140,31 @@ ephemeral-action-runner image update-upstream
 
 That writes the checked-out commit to `third_party/runner-images.lock`. The checkout directory itself is ignored by Git.
 
-When one of those built-in scripts is selected, the build copies only the required upstream Ubuntu script subset into the guest:
+When Docker-DinD is selected or one of those built-in scripts is selected, the build copies only the required upstream Ubuntu script subset into the guest or Docker build context:
 
 - `images/ubuntu/scripts/helpers`
 - `images/ubuntu/scripts/build/install-docker.sh`
 - `images/ubuntu/scripts/build/install-google-chrome.sh`
 - `images/ubuntu/scripts/build/install-nodejs.sh`
 - `images/ubuntu/toolsets`
+
+## Docker-DinD Images
+
+Use `configs/docker-dind.example.yml` for a runner container with a private Docker daemon, or `configs/docker-dind.web-e2e.example.yml` for Docker/browser plus common web/E2E tools.
+
+```bash
+cp configs/docker-dind.web-e2e.example.yml .local/config.yml
+./bin/ephemeral-action-runner image update-upstream
+./bin/ephemeral-action-runner image build --replace
+```
+
+The output image is a Docker image tag:
+
+```bash
+docker image ls epar-docker-dind-ubuntu-24-web-e2e
+```
+
+The provider creates each runner instance with `docker create --privileged` and no host socket mount. The image entrypoint starts a private `dockerd`, waits for `docker info`, and keeps the container alive while EPAR configures and monitors the GitHub runner process. Workflow Docker resources live inside that inner daemon.
 
 ## Installed Runtime
 
@@ -151,6 +179,8 @@ The optional `install-docker-browser.sh` layer installs:
 - Docker through upstream `install-docker.sh`
 - upstream Google Chrome on x64
 - Playwright-managed Chromium on ARM64, exposed as `epar-browser`, `chromium`, and `chromium-browser`
+
+The Docker-DinD provider always installs Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`, then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`.
 
 The ARM64 Docker harness prefers upstream `toolset-2404-arm64.json`. If an older upstream checkout does not contain that file, EPAR falls back to a minimal ARM-aware Docker toolset.
 

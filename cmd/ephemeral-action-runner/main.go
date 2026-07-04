@@ -14,6 +14,7 @@ import (
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	dockerdindprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockerdind"
 	tartprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
 	wslprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
 )
@@ -263,6 +264,8 @@ func newProvider(cfg config.ProviderConfig, projectRoot string, dryRun bool) (pr
 		return tartprovider.New("", dryRun), nil
 	case "wsl":
 		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.InstallRoot), projectRoot, dryRun), nil
+	case "docker-dind":
+		return dockerdindprovider.New("", cfg.Platform, dryRun), nil
 	default:
 		return nil, provider.UnsupportedTypeError(cfg.Type)
 	}
