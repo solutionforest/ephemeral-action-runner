@@ -23,6 +23,12 @@ flowchart LR
 - **Image control:** the default image is runner-only, and extra tooling is added with explicit install scripts.
 - **GitHub App auth:** the host uses a GitHub App to request short-lived runner registration tokens.
 
+## Security Model
+
+EPAR adds cleanup and isolation around GitHub self-hosted runners, but it does not make an existing host safe for arbitrary untrusted workflows. The project is intended for trusted jobs where disposable instances reduce host pollution, stale runner state, and accidental cross-job interference.
+
+GitHub's self-hosted runner warning still applies: GitHub recommends using self-hosted runners only with private repositories because public repository forks can run code on the runner machine through pull request workflows. Read the official GitHub guidance before exposing any self-hosted runner to public or untrusted workflows: [Adding self-hosted runners](https://docs.github.com/actions/hosting-your-own-runners/adding-self-hosted-runners).
+
 ## Choosing A Provider
 
 For Docker-heavy Linux CI, start with Docker-DinD when the host already has a Docker runtime that supports privileged containers. It is usually the least intrusive path for existing workflows because jobs still get their own private Docker daemon, fixed Compose names and ports stay inside that runner instance, and the workflow can keep using explicit Docker platforms such as `linux/amd64`.
