@@ -1,0 +1,71 @@
+name: Sync GitHub Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - README.md
+      - docs/**
+      - scripts/sync-wiki.sh
+      - .github/workflows/sync-wiki.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-github-wiki
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync wiki
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Generate wiki pages
+        run: bash scripts/sync-wiki.sh "$RUNNER_TEMP/wiki-pages"
+
+      - name: Publish wiki pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          wiki_remote="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          wiki_repo="$RUNNER_TEMP/wiki-repo"
+
+          if git clone "$wiki_remote" "$wiki_repo"; then
+            wiki_branch="$(git -C "$wiki_repo" branch --show-current)"
+            if [ -z "$wiki_branch" ]; then
+              wiki_branch="master"
+              git -C "$wiki_repo" checkout -B "$wiki_branch"
+            fi
+          else
+            echo "Wiki repository is empty or not initialized yet; creating the first wiki commit."
+            git init "$wiki_repo"
+            git -C "$wiki_repo" checkout -b master
+            git -C "$wiki_repo" remote add origin "$wiki_remote"
+            wiki_branch="master"
+          fi
+
+          find "$wiki_repo" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R "$RUNNER_TEMP/wiki-pages/." "$wiki_repo/"
+
+          git -C "$wiki_repo" config user.name "github-actions[bot]"
+          git -C "$wiki_repo" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$wiki_repo" add -A
+
+          if git -C "$wiki_repo" diff --cached --quiet; then
+            echo "Wiki is already up to date."
+            exit 0
+          fi
+
+          git -C "$wiki_repo" commit -m "Sync wiki from ${GITHUB_SHA::7}"
+          git -C "$wiki_repo" push origin "HEAD:${wiki_branch}"
