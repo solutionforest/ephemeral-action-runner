@@ -17,6 +17,8 @@ When Docker/browser support is selected on ARM64, EPAR exposes a Chromium-compat
 
 The default network mode is Tart NAT. `softnet` is accepted by the provider, but it can require host-side privileges.
 
+If Docker is installed in the guest, optional `docker.registryMirrors` settings are applied to the guest Docker daemon when each disposable VM starts. Use a mirror URL that is reachable from inside the Tart VM; `host.docker.internal` is Docker-container-specific and may not resolve in Tart guests. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
+
 ## Rosetta For Linux Amd64 Containers
 
 Tart on Apple Silicon runs ARM64 VMs, but Tart can expose Apple's Linux Rosetta runtime to the guest with `tart run --rosetta <tag>`. EPAR supports this as an opt-in Tart-only setting:

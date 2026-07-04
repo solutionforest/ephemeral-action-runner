@@ -31,3 +31,11 @@ WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provid
 `image.customInstallScripts` run as root during image build and their effects are captured in the reusable image. Use them only for non-secret tooling and configuration. Do not bake Docker credentials, GitHub tokens, private keys, or project secrets into runner images.
 
 The GitHub App private key remains on the host. Guest instances receive only short-lived registration tokens at runtime. Do not bake tokens or private keys into runner images.
+
+## Registry Mirrors
+
+Docker registry mirrors are optional infrastructure outside EPAR. Treat them as part of your trusted CI environment.
+
+Do not assume a mirror makes private image pulls safe or anonymous. A private image still needs authorization from the workflow's `docker login` or from credentials configured on the mirror itself. If the mirror is configured with upstream registry credentials, secure the mirror because it may be able to serve private images that credential can access.
+
+Host-side Docker login state is not copied into EPAR instances. Keep Docker Hub, cloud registry, and package registry credentials in GitHub secrets or in a deliberately secured mirror service.

@@ -297,6 +297,9 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 	}
 	vm.IP = ip
 	fmt.Printf("[%s] reachable at %s\n", name, ip)
+	if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
+		return vm, err
+	}
 	fmt.Printf("[%s] validating runner runtime\n", name)
 	if err := m.validateRuntime(ctx, name); err != nil {
 		return vm, err
@@ -389,6 +392,27 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 
 func (m *Manager) validateRuntime(ctx context.Context, name string) error {
 	_, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/validate-runtime.sh"}, provider.ExecOptions{})
+	return err
+}
+
+func (m *Manager) configureDockerRegistryMirrors(ctx context.Context, name string) error {
+	if len(m.Config.Docker.RegistryMirrors) == 0 {
+		return nil
+	}
+	fmt.Printf("[%s] configuring Docker registry mirror(s): %s\n", name, strings.Join(m.Config.Docker.RegistryMirrors, ", "))
+	hostPath := filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu", "configure-docker-daemon.sh")
+	content, err := os.ReadFile(hostPath)
+	if err != nil {
+		return fmt.Errorf("read Docker daemon configuration script %s: %w", hostPath, err)
+	}
+	if err := provider.CopyText(ctx, m.Provider, name, "/opt/epar/configure-docker-daemon.sh", "0755", guestText(content)); err != nil {
+		return err
+	}
+	_, err = m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-docker-daemon.sh"}, provider.ExecOptions{
+		Env: map[string]string{
+			"EPAR_DOCKER_REGISTRY_MIRRORS": strings.Join(m.Config.Docker.RegistryMirrors, "\n"),
+		},
+	})
 	return err
 }
 

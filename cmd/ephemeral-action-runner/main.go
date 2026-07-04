@@ -221,7 +221,7 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		}
 		client = gh.New(cfg.GitHub)
 	}
-	provider, err := newProvider(cfg.Provider, projectRoot, dryRun)
+	provider, err := newProvider(cfg, projectRoot, dryRun)
 	if err != nil {
 		return nil, err
 	}
@@ -258,16 +258,17 @@ func resolveConfigPath(projectRoot, explicit string) (string, error) {
 	return "", nil
 }
 
-func newProvider(cfg config.ProviderConfig, projectRoot string, dryRun bool) (provider.Provider, error) {
-	switch cfg.Type {
+func newProvider(cfg config.Config, projectRoot string, dryRun bool) (provider.Provider, error) {
+	switch cfg.Provider.Type {
 	case "tart":
 		return tartprovider.New("", dryRun), nil
 	case "wsl":
-		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.InstallRoot), projectRoot, dryRun), nil
+		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.Provider.InstallRoot), projectRoot, dryRun), nil
 	case "docker-dind":
-		return dockerdindprovider.New("", cfg.Platform, dryRun), nil
+		hostGateway := config.DockerRegistryMirrorsNeedHostGateway(cfg.Docker.RegistryMirrors)
+		return dockerdindprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, dryRun), nil
 	default:
-		return nil, provider.UnsupportedTypeError(cfg.Type)
+		return nil, provider.UnsupportedTypeError(cfg.Provider.Type)
 	}
 }
 

@@ -16,6 +16,7 @@ Install the host tools you need:
 | macOS provider | Tart |
 | Windows provider | WSL2 |
 | Docker-DinD provider | Docker Engine, OrbStack, or Docker Desktop with privileged container support |
+| Optional Docker registry mirrors | A running mirror service on the host, LAN, intranet, or cloud registry cache |
 | Runner registration | GitHub App with organization self-hosted runner read/write permission |
 
 Packer, GitHub CLI, and sshpass are not required.
@@ -64,6 +65,20 @@ EPAR looks for config in this order:
 4. `~/.config/ephemeral-action-runner/config.yml`
 
 Tracked configs are examples only. Keep real app IDs and private key paths in an ignored config file.
+
+## Optional Docker Registry Mirrors
+
+If repeated jobs spend time pulling the same Docker Hub images into fresh runner Docker daemons, configure mirrors in your ignored local config:
+
+```yaml
+docker:
+  registryMirrors:
+    - http://host.docker.internal:5050
+```
+
+This is optional. Without it, EPAR behaves normally and pulls directly from registries. Mirror benefits vary by workflow and mainly affect Docker image pull time; they do not make application startup, volume sync, health checks, browser tests, or CPU-bound work faster.
+
+EPAR only configures runner-side Docker daemons; it does not run or secure the mirror service. Docker Engine, Docker Desktop, or OrbStack can run a local `registry:2` pull-through cache on the EPAR host, or you can use a mirror reachable on the LAN/intranet. For private images, keep using `docker login` inside the workflow unless your mirror is deliberately configured and secured with upstream credentials. See [Docker Registry Mirrors](advanced/docker-registry-mirrors.md).
 
 ## Build The CLI
 
@@ -165,6 +180,8 @@ Runtime validation always checks the base runner files and runner user. Images w
 - Docker-DinD images validate the private inner Docker daemon inside each runner container.
 - Tart Rosetta images validate `docker run --platform linux/amd64 alpine:3.20` and expect `uname -m` to return `x86_64`.
 - Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
+
+When `docker.registryMirrors` is configured, EPAR applies the mirror configuration before runtime validation.
 
 If a Docker-DinD workflow depends on amd64-only images while the host is ARM64, validate host emulation inside a running EPAR instance:
 

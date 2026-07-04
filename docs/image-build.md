@@ -128,6 +128,8 @@ provider:
 
 Do not bake secrets, private keys, Docker credentials, project `node_modules`, language package caches, or application runtime artifacts into the image. Those belong in the workflow, repository dependency lock files, or GitHub secrets.
 
+Docker registry mirrors are runtime configuration, not image content. Keep them in local config under `docker.registryMirrors`; EPAR applies them to each disposable instance before validation. See [Docker Registry Mirrors](advanced/docker-registry-mirrors.md).
+
 ## Upstream Runner Images
 
 Runner-only Tart and WSL base images do not require `actions/runner-images`. Docker-DinD images do require it because the container image always installs Docker Engine for the private daemon.

@@ -13,6 +13,8 @@ On systemd instances, the runner process is launched with `systemd-run` as `acti
 
 Docker-DinD containers also write inner Docker daemon logs to `/var/log/epar-dockerd.log` inside the runner container. Host-side Docker commands only show the outer runner container; job-created Compose resources live in the inner daemon.
 
+When `docker.registryMirrors` is configured, EPAR writes `/etc/docker/daemon.json` inside each instance before runtime validation. For Docker-DinD, inspect both `/etc/docker/daemon.json` and `/var/log/epar-dockerd.log` inside the outer runner container.
+
 ## Supervisor Exit
 
 `pool up` cleans up prefixed instances and GitHub runner records when it exits. Use `--keep-on-exit` only when intentionally debugging a live instance after the supervisor stops. While the supervisor is not running, EPAR cannot retire or replace completed runners.
@@ -43,6 +45,8 @@ For Docker-DinD, cleanup removes the outer runner container with `docker rm -f -
 - If browser validation fails on ARM64, confirm `epar-browser` exists inside the guest and inspect `/opt/epar/browser`.
 - If a Docker Compose job uses an amd64-only runtime image on an ARM64 Tart runner and fails with `exec format error` or repeated container exits such as status `139`, use a runner label that supports that image instead of changing application runtime settings only for runner compatibility. Suitable targets include Docker-DinD with verified `linux/amd64` emulation, WSL x64, an x64 Linux host, or a Tart image with Rosetta enabled and validated.
 - If a workflow uses fixed Compose project names, fixed container names, or fixed ports, Docker-DinD is often a better fit than a shared host Docker socket because each runner gets a private inner Docker daemon. Verify by starting two unregistered instances, running the same compose stack in both, and confirming host Docker only shows the outer EPAR runner containers.
+- If repeated jobs still pull slowly after configuring a registry mirror, verify the mirror is reachable from inside the runner instance and that it supports the requested registry, image platform, and authentication model. Docker daemon mirrors primarily target Docker Hub; other registry caches may require workflow image references to use the cache registry URL.
+- If a mirrored workflow only improves modestly, check where the time is going. Registry mirrors mainly reduce image pull time; container startup, Compose health checks, database initialization, volume sync, browser tests, private image authentication, and CPU-bound or emulated workloads can still dominate the total job time.
 - If GitHub registration fails, confirm the app has permission to manage organization self-hosted runners and that the private key path is readable by the host user.
 - If stale runners remain, run `ephemeral-action-runner cleanup`.
 - If using Tart `softnet`, verify the host has the privileges Tart requires.

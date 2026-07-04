@@ -24,13 +24,14 @@ For each runner instance:
 1. Clone or create an instance from `provider.sourceImage`.
 2. Start the instance headless when the provider supports that distinction.
 3. Wait for provider-level reachability.
-4. Run `/opt/epar/validate-runtime.sh`.
-5. Fetch a short-lived GitHub registration token on the host.
-6. Run `config.sh --ephemeral --unattended` inside the instance.
-7. Start the runner process. VM and WSL images use systemd; Docker-DinD falls back to a PID-file managed background process.
-8. Poll GitHub until the runner is online and idle.
-9. Monitor the runner service and GitHub runner record.
-10. Delete the instance after the ephemeral runner exits, then create a replacement to maintain pool size.
+4. Apply optional Docker daemon registry mirror settings.
+5. Run `/opt/epar/validate-runtime.sh`.
+6. Fetch a short-lived GitHub registration token on the host.
+7. Run `config.sh --ephemeral --unattended` inside the instance.
+8. Start the runner process. VM and WSL images use systemd; Docker-DinD falls back to a PID-file managed background process.
+9. Poll GitHub until the runner is online and idle.
+10. Monitor the runner service and GitHub runner record.
+11. Delete the instance after the ephemeral runner exits, then create a replacement to maintain pool size.
 
 ```mermaid
 sequenceDiagram
@@ -40,6 +41,7 @@ sequenceDiagram
   participant G as GitHub
   M->>P: Clone provider.sourceImage
   M->>P: Start instance
+  M->>I: Apply optional Docker registry mirrors
   M->>I: Validate runtime
   M->>G: Request registration token
   M->>I: Configure ephemeral runner

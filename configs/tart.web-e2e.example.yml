@@ -30,6 +30,10 @@ provider:
   network: default
   rosettaTag: rosetta
 
+docker:
+  registryMirrors:
+    # - https://mirror.example.test
+
 timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180

@@ -50,6 +50,8 @@ The provider does not mount the Windows Docker Desktop socket. Docker-enabled jo
 
 WSL x64 is the preferred EPAR target for workflows that pull amd64-only Docker runtime images.
 
+If `docker.registryMirrors` is configured, EPAR applies it to Docker Engine inside each disposable WSL distro before validation. Use a mirror URL reachable from inside WSL, such as an organization DNS name or a host/LAN address. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
+
 ## Caveats
 
 - WSL2 is not the same isolation boundary as a full VM per job.

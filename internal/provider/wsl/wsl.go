@@ -97,6 +97,10 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
+	if p.DryRun && p.runCommand == nil {
+		fmt.Printf("[dry-run] %s -d %s --user root --exec /bin/sh -lc hostname -I 2>/dev/null || hostname -i 2>/dev/null || echo 127.0.0.1\n", p.Binary, name)
+		return "127.0.0.1", nil
+	}
 	if waitSeconds <= 0 {
 		waitSeconds = 1
 	}

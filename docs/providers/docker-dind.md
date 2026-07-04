@@ -45,6 +45,16 @@ provider:
 
 `provider.platform` is optional and maps to Docker's `--platform` flag for image builds and runner containers. Use a label that reflects the actual platform your workflows should target.
 
+Optional Docker registry mirrors are configured under the provider-neutral `docker` section:
+
+```yaml
+docker:
+  registryMirrors:
+    - http://host.docker.internal:5050
+```
+
+When a Docker-DinD mirror URL uses `host.docker.internal`, EPAR adds Docker's `host-gateway` alias to the outer runner container so the inner daemon can reach a host-published mirror on Linux Docker Engine. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
+
 ## Image Build
 
 Docker-DinD images are Docker image tags, not Tart images or rootfs tar files:
@@ -119,6 +129,7 @@ For Docker Compose-heavy jobs that use fixed project names or ports, a useful is
 - Docker-DinD requires privileged containers. Treat it as trusted-job infrastructure.
 - It is not a security boundary for hostile code.
 - Inner Docker image cache is per runner instance and disappears on cleanup.
+- Optional registry mirrors can reduce repeated pull time, but they are external services that must be secured and monitored separately.
 - Cross-architecture containers, for example `linux/amd64` images on an ARM64 host, depend on the host Docker runtime's emulation support.
 - Host Docker resource usage still matters because each runner container and inner daemon consumes CPU, memory, and disk on the same host.
 - Docker Desktop, OrbStack, and Linux Docker Engine can have different privileged-container behavior. Validate on the exact host runtime you plan to use.

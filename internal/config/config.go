@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ type Config struct {
 	Pool     PoolConfig
 	Runner   RunnerConfig
 	Provider ProviderConfig
+	Docker   DockerConfig
 	Timeouts TimeoutConfig
 }
 
@@ -54,6 +56,10 @@ type ProviderConfig struct {
 	RosettaTag  string
 	InstallRoot string
 	Platform    string
+}
+
+type DockerConfig struct {
+	RegistryMirrors []string
 }
 
 type TimeoutConfig struct {
@@ -254,6 +260,11 @@ func apply(cfg *Config, section, key, value string) error {
 		case "platform":
 			cfg.Provider.Platform = value
 		}
+	case "docker":
+		switch key {
+		case "registryMirrors":
+			return setListValue(cfg, section, key, parseList(value))
+		}
 	case "timeouts":
 		v, err := strconv.Atoi(value)
 		if err != nil {
@@ -279,6 +290,8 @@ func isListKey(section, key string) bool {
 		return key == "customInstallScripts"
 	case "runner":
 		return key == "labels"
+	case "docker":
+		return key == "registryMirrors"
 	default:
 		return false
 	}
@@ -294,6 +307,11 @@ func setListValue(cfg *Config, section, key string, values []string) error {
 	case "runner":
 		if key == "labels" {
 			cfg.Runner.Labels = values
+			return nil
+		}
+	case "docker":
+		if key == "registryMirrors" {
+			cfg.Docker.RegistryMirrors = values
 			return nil
 		}
 	}
@@ -314,6 +332,11 @@ func appendListValue(cfg *Config, section, key, value string) error {
 	case "runner":
 		if key == "labels" {
 			cfg.Runner.Labels = append(cfg.Runner.Labels, item)
+			return nil
+		}
+	case "docker":
+		if key == "registryMirrors" {
+			cfg.Docker.RegistryMirrors = append(cfg.Docker.RegistryMirrors, item)
 			return nil
 		}
 	}
@@ -364,7 +387,51 @@ func Validate(cfg Config) error {
 	if len(cfg.Runner.Labels) == 0 {
 		return fmt.Errorf("runner.labels must not be empty")
 	}
+	for _, mirror := range cfg.Docker.RegistryMirrors {
+		if err := ValidateDockerRegistryMirror(mirror); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func ValidateDockerRegistryMirror(mirror string) error {
+	if strings.TrimSpace(mirror) != mirror || mirror == "" {
+		return fmt.Errorf("docker.registryMirrors must contain non-empty mirror URLs without surrounding whitespace")
+	}
+	if strings.ContainsAny(mirror, " \t\r\n") {
+		return fmt.Errorf("docker.registryMirrors URL %q must not contain whitespace", mirror)
+	}
+	parsed, err := url.Parse(mirror)
+	if err != nil {
+		return fmt.Errorf("docker.registryMirrors URL %q is invalid: %w", mirror, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("docker.registryMirrors URL %q must use http or https", mirror)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("docker.registryMirrors URL %q must include a host", mirror)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("docker.registryMirrors URL %q must not include credentials, query, or fragment", mirror)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return fmt.Errorf("docker.registryMirrors URL %q must point at the registry root", mirror)
+	}
+	return nil
+}
+
+func DockerRegistryMirrorsNeedHostGateway(mirrors []string) bool {
+	for _, mirror := range mirrors {
+		parsed, err := url.Parse(mirror)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(parsed.Hostname(), "host.docker.internal") {
+			return true
+		}
+	}
+	return false
 }
 
 func ValidateDockerPlatform(platform string) error {

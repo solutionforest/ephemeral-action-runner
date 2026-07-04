@@ -119,6 +119,40 @@ func TestEnableWSLSystemdDisablesWindowsPathInjection(t *testing.T) {
 	}
 }
 
+func TestConfigureDockerRegistryMirrors(t *testing.T) {
+	root := t.TempDir()
+	scriptDir := filepath.Join(root, "scripts", "guest", "ubuntu")
+	if err := os.MkdirAll(scriptDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scriptDir, "configure-docker-daemon.sh"), []byte("#!/usr/bin/env bash\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingProvider{}
+	manager := Manager{
+		Config: config.Config{
+			Docker: config.DockerConfig{
+				RegistryMirrors: []string{"http://host.docker.internal:5000", "https://mirror.example.test"},
+			},
+			Pool: config.PoolConfig{LogDir: "logs"},
+		},
+		Provider:    provider,
+		ProjectRoot: root,
+	}
+	if err := manager.configureDockerRegistryMirrors(context.Background(), "runner-1"); err != nil {
+		t.Fatal(err)
+	}
+	wantCommand := []string{"sudo", "-E", "bash", "/opt/epar/configure-docker-daemon.sh"}
+	if !reflect.DeepEqual(provider.commands[1], wantCommand) {
+		t.Fatalf("command = %#v, want %#v", provider.commands[1], wantCommand)
+	}
+	gotEnv := provider.execOptions[1].Env["EPAR_DOCKER_REGISTRY_MIRRORS"]
+	wantEnv := "http://host.docker.internal:5000\nhttps://mirror.example.test"
+	if gotEnv != wantEnv {
+		t.Fatalf("mirror env = %q, want %q", gotEnv, wantEnv)
+	}
+}
+
 type recordingProvider struct {
 	commands    [][]string
 	execOptions []provider.ExecOptions

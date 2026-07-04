@@ -20,19 +20,24 @@ const (
 )
 
 type Provider struct {
-	Binary     string
-	Platform   string
-	DryRun     bool
-	runCommand runCommandFunc
+	Binary      string
+	Platform    string
+	HostGateway bool
+	DryRun      bool
+	runCommand  runCommandFunc
 }
 
 type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error)
 
 func New(binary, platform string, dryRun bool) *Provider {
+	return NewWithOptions(binary, platform, false, dryRun)
+}
+
+func NewWithOptions(binary, platform string, hostGateway bool, dryRun bool) *Provider {
 	if binary == "" {
 		binary = "docker"
 	}
-	return &Provider{Binary: binary, Platform: platform, DryRun: dryRun}
+	return &Provider{Binary: binary, Platform: platform, HostGateway: hostGateway, DryRun: dryRun}
 }
 
 func (p *Provider) Clone(ctx context.Context, source, name string) error {
@@ -148,6 +153,11 @@ func (p *Provider) createArgs(source, name string) []string {
 	args = append(args,
 		"--name", name,
 		"--privileged",
+	)
+	if p.HostGateway {
+		args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	}
+	args = append(args,
 		"--label", labelManaged,
 		"--label", labelProvider,
 		"--label", "epar.instance="+name,

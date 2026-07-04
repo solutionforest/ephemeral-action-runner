@@ -76,6 +76,9 @@ provider:
   type: docker-dind
   sourceImage: epar-docker-dind-ubuntu-24
   platform: linux/arm64
+docker:
+  registryMirrors:
+    - http://host.docker.internal:5000
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -86,8 +89,14 @@ provider:
 	if got, want := cfg.Provider.Platform, "linux/arm64"; got != want {
 		t.Fatalf("provider.platform = %q, want %q", got, want)
 	}
+	if got, want := cfg.Docker.RegistryMirrors[0], "http://host.docker.internal:5000"; got != want {
+		t.Fatalf("docker.registryMirrors[0] = %q, want %q", got, want)
+	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
+	}
+	if !DockerRegistryMirrorsNeedHostGateway(cfg.Docker.RegistryMirrors) {
+		t.Fatal("host.docker.internal mirror should request docker-dind host gateway")
 	}
 }
 
@@ -169,6 +178,30 @@ func TestValidateDockerPlatform(t *testing.T) {
 	cfg.Provider.Platform = "linux/arm64"
 	if err := Validate(cfg); err == nil {
 		t.Fatal("provider.platform accepted for Tart")
+	}
+}
+
+func TestValidateDockerRegistryMirror(t *testing.T) {
+	cfg := Default()
+	cfg.Docker.RegistryMirrors = []string{"https://mirror.example.test", "http://host.docker.internal:5000/"}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid registry mirrors rejected: %v", err)
+	}
+
+	for _, mirror := range []string{
+		"mirror.example.test",
+		"ftp://mirror.example.test",
+		"https://user:pass@mirror.example.test",
+		"https://mirror.example.test/path",
+		"https://mirror.example.test?x=1",
+		"https://mirror example.test",
+		" https://mirror.example.test",
+	} {
+		cfg := Default()
+		cfg.Docker.RegistryMirrors = []string{mirror}
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("docker.registryMirrors %q accepted", mirror)
+		}
 	}
 }
 

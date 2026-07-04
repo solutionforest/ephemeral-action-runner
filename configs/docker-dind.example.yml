@@ -29,8 +29,11 @@ provider:
   network: default
   platform: linux/arm64
 
+docker:
+  registryMirrors:
+    # - http://host.docker.internal:5050
+
 timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-

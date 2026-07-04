@@ -75,6 +75,17 @@ func TestNoInstalledDistrosReturnsEmptyList(t *testing.T) {
 	}
 }
 
+func TestDryRunIPReturnsPlaceholder(t *testing.T) {
+	p := New("wsl.exe", t.TempDir(), t.TempDir(), true)
+	ip, err := p.IP(context.Background(), "epar-wsl-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip != "127.0.0.1" {
+		t.Fatalf("ip = %q, want placeholder", ip)
+	}
+}
+
 func TestInstanceDirRejectsPathTraversal(t *testing.T) {
 	p := New("wsl.exe", t.TempDir(), t.TempDir(), true)
 	for _, name := range []string{"..", `bad\name`, "bad/name", ""} {

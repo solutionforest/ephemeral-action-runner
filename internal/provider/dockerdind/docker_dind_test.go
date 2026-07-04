@@ -11,7 +11,7 @@ import (
 )
 
 func TestCreateArgsUsePrivilegedWithoutHostSocketOrPorts(t *testing.T) {
-	p := New("docker", "linux/arm64", true)
+	p := NewWithOptions("docker", "linux/arm64", true, true)
 	args := p.createArgs("runner-image", "epar-dind-1")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
@@ -19,6 +19,7 @@ func TestCreateArgsUsePrivilegedWithoutHostSocketOrPorts(t *testing.T) {
 		"--platform linux/arm64",
 		"--name epar-dind-1",
 		"--privileged",
+		"--add-host host.docker.internal:host-gateway",
 		"--label epar.provider=docker-dind",
 		"runner-image",
 	} {

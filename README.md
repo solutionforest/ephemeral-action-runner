@@ -21,6 +21,7 @@ flowchart LR
 - **Warm pool:** `pool up` keeps ready runners online so jobs do not wait for a full image build.
 - **Use spare hosts:** turn a supported Mac, Windows, Linux, or Docker-capable machine into a pool of disposable Linux GitHub runners.
 - **Image control:** the default image is runner-only, and extra tooling is added with explicit install scripts.
+- **Optional pull caching:** point runner Docker daemons at a registry mirror service to reduce repeated Docker Hub image pull time when that is a meaningful part of the job.
 - **GitHub App auth:** the host uses a GitHub App to request short-lived runner registration tokens.
 
 ## Security Model
@@ -175,6 +176,7 @@ Operational context:
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
 - [Security](docs/security.md): trust boundaries and secret handling.
 - [Background](docs/background.md): why Linux guests are preferred for Docker and Compose-heavy jobs.
+- [Docker Registry Mirrors](docs/advanced/docker-registry-mirrors.md): optional pull-through cache setup and private image cautions.
 - [Adding A Provider](docs/providers/adding-provider.md): provider interface expectations.
 
 Tracked configs are examples only. Put real GitHub App IDs, private key paths, and local runner settings in `.local/config.yml`, `configs/*.local.yml`, or `~/.config/ephemeral-action-runner/config.yml`; those paths are not intended for Git.
