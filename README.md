@@ -7,7 +7,7 @@ It is built for teams that want fast self-hosted Linux runners without keeping l
 ```mermaid
 flowchart LR
   Workflow["GitHub Actions job"] --> Runner["Ephemeral runner"]
-  EPAR["EPAR supervisor"] --> Provider["Local provider<br/>Tart, WSL2, or Docker-DinD"]
+  EPAR["EPAR supervisor"] --> Provider["Your host machine<br/>macOS, Windows, Linux, or Docker host"]
   Provider --> Runner
   Runner --> Job["One job runs"]
   Job --> Delete["Delete instance"]
@@ -32,17 +32,21 @@ GitHub's self-hosted runner warning still applies: GitHub recommends using self-
 
 ## Choosing A Provider
 
-For Docker-heavy Linux CI, start with Docker-DinD when the host already has a Docker runtime that supports privileged containers. It is usually the least intrusive path for existing workflows because jobs still get their own private Docker daemon, fixed Compose names and ports stay inside that runner instance, and the workflow can keep using explicit Docker platforms such as `linux/amd64`.
+Start with the operating system or host tool you already have. The provider name is just the way EPAR creates and deletes the disposable Linux runner on that machine.
 
-Use Tart or WSL when their host model is the reason you are choosing them: Tart for Apple Silicon VM-based isolation and macOS-host workflows, WSL for Windows-hosted Linux runners and native x64 Docker workloads on x64 Windows.
+If your Mac, Windows PC, or Linux server already has Docker installed and supports privileged containers, try Docker-DinD first. In this project, Docker-DinD means "Docker-in-Docker": EPAR starts each runner as a Docker container, and that runner gets its own private Docker daemon inside it. This is usually the easiest first choice for Docker-heavy Linux CI because workflow containers, Compose projects, names, ports, and volumes stay inside that one disposable runner.
 
-Choose the provider whose isolation model, CPU architecture, and Docker behavior match the workflows you plan to run.
+Use Tart when you specifically want Apple Silicon macOS to run each Linux runner as a lightweight virtual machine. Tart is the macOS VM tool EPAR uses under the hood; users do not need to know Tart before reading this README, just that this option is for Apple Silicon Macs.
 
-| Machine you have | EPAR provider | Runner architecture | Notes |
+Use WSL2 when your host is Windows and you want runners inside Windows Subsystem for Linux. WSL2 is Microsoft's Linux environment for Windows, and EPAR uses it to create disposable Ubuntu-based runners.
+
+Choose the row that matches the machine you already have:
+
+| Host you have | EPAR provider | What that means | Notes |
 | --- | --- | --- | --- |
-| Docker-capable host | Docker-DinD | Host-selected Linux container platform | Recommended first choice for Docker Compose-heavy Linux CI when privileged containers are acceptable. Deleting the runner container deletes the job's inner Docker world. |
-| Apple Silicon macOS | Tart | Ubuntu ARM64 | Good for Linux jobs that can run on ARM64. Can optionally run `linux/amd64` Docker containers through Tart Rosetta when configured with a distinct label. |
-| Windows with WSL2 | WSL2 | Ubuntu x64 | Good for Linux jobs and Docker workflows that pull `linux/amd64` images. Use for trusted internal jobs unless your environment has accepted the WSL isolation model. |
+| macOS, Windows, or Linux with Docker installed | Docker-DinD | Each runner is a Docker container with its own Docker daemon | Recommended first choice for Docker Compose-heavy Linux CI when privileged containers are acceptable. Deleting the runner container deletes the job's inner Docker world. |
+| Apple Silicon macOS | Tart | Each runner is an Ubuntu ARM64 virtual machine on your Mac | Good for Linux jobs that can run on ARM64. Can optionally run `linux/amd64` Docker containers through Tart Rosetta when configured with a distinct label. |
+| Windows with WSL2 enabled | WSL2 | Each runner is an Ubuntu x64 WSL distro on your Windows machine | Good for Linux jobs and Docker workflows that pull `linux/amd64` images. Use for trusted internal jobs unless your environment has accepted the WSL isolation model. |
 
 Future providers can fit the same model: if EPAR supports the machine, that machine can contribute disposable runner capacity with its own labels.
 
@@ -78,28 +82,28 @@ image:
 
 3. Copy one example config into `.local/config.yml` and fill in the GitHub App values.
 
-   Docker-DinD, recommended for Docker-heavy Linux CI when your host Docker runtime supports privileged containers:
+   If your macOS, Windows, or Linux host already has Docker and supports privileged containers, start with Docker-DinD:
 
    ```bash
    mkdir -p .local
    cp configs/docker-dind.example.yml .local/config.yml
    ```
 
-   macOS with Tart:
+   If you are on an Apple Silicon Mac and want VM-based runners, use Tart:
 
    ```bash
    mkdir -p .local
    cp configs/tart.example.yml .local/config.yml
    ```
 
-   Windows with WSL2:
+   If you are on Windows and want WSL2-based runners, use WSL2:
 
    ```powershell
    New-Item -ItemType Directory -Force .local
    Copy-Item configs/wsl.example.yml .local/config.yml
    ```
 
-4. For WSL, export a clean Ubuntu 24.04 rootfs once:
+4. If you chose WSL2 on Windows, export a clean Ubuntu 24.04 rootfs once:
 
    ```powershell
    New-Item -ItemType Directory -Force work/images
