@@ -8,11 +8,30 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=l
 export NEEDRESTART_SUSPEND=1
 APT_LOCK_TIMEOUT="${EPAR_APT_LOCK_TIMEOUT:-600}"
+
+install -d /opt/epar
+
+base_image_has_docker_engine() {
+  command -v docker >/dev/null 2>&1 &&
+    command -v dockerd >/dev/null 2>&1 &&
+    command -v iptables >/dev/null 2>&1 &&
+    docker compose version >/dev/null 2>&1 &&
+    docker buildx version >/dev/null 2>&1
+}
+
+if [[ "${EPAR_FORCE_UPSTREAM_DOCKER_INSTALL:-false}" != "true" ]] && base_image_has_docker_engine; then
+  echo "EPAR Docker-DinD: using Docker Engine/CLI/Compose/Buildx from the base image."
+  usermod -aG docker admin 2>/dev/null || true
+  usermod -aG docker runner 2>/dev/null || true
+  install -d /opt/epar/features
+  touch /opt/epar/features/docker-engine
+  bash /opt/epar/validate-docker-engine.sh
+  exit 0
+fi
+
 bash /opt/epar/wait-apt-ready.sh
 apt-get -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT}" update
 apt-get -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT}" install -y --no-install-recommends ca-certificates curl git gnupg jq lsb-release sudo tar unzip wget
-
-install -d /opt/epar
 cat >/usr/local/bin/apt-get <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -99,4 +118,3 @@ if [[ "${EPAR_CONTAINER_IMAGE_BUILD:-false}" != "true" ]]; then
   systemctl restart docker.service
 fi
 bash /opt/epar/validate-docker-engine.sh
-

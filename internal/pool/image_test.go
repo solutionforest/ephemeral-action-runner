@@ -26,13 +26,13 @@ func TestNeedsRunnerImagesSubsetOnlyForBuiltInScripts(t *testing.T) {
 	tests := []struct {
 		name    string
 		scripts []string
-		want    bool
+		want    runnerImagesCopyMode
 	}{
-		{name: "empty", scripts: nil, want: false},
-		{name: "generic custom apt script", scripts: []string{"examples/custom-install/install-extra-apt-tools.sh"}, want: false},
-		{name: "docker browser", scripts: []string{"scripts/guest/ubuntu/install-docker-browser.sh"}, want: true},
-		{name: "web e2e", scripts: []string{"scripts/guest/ubuntu/install-web-e2e.sh"}, want: true},
-		{name: "absolute web e2e", scripts: []string{filepath.Join(root, "scripts", "guest", "ubuntu", "install-web-e2e.sh")}, want: true},
+		{name: "empty", scripts: nil, want: runnerImagesCopyNone},
+		{name: "generic custom apt script", scripts: []string{"examples/custom-install/install-extra-apt-tools.sh"}, want: runnerImagesCopyNone},
+		{name: "docker browser", scripts: []string{"scripts/guest/ubuntu/install-docker-browser.sh"}, want: runnerImagesCopySubset},
+		{name: "web e2e", scripts: []string{"scripts/guest/ubuntu/install-web-e2e.sh"}, want: runnerImagesCopySubset},
+		{name: "absolute web e2e", scripts: []string{filepath.Join(root, "scripts", "guest", "ubuntu", "install-web-e2e.sh")}, want: runnerImagesCopySubset},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -40,17 +40,48 @@ func TestNeedsRunnerImagesSubsetOnlyForBuiltInScripts(t *testing.T) {
 				Config:      config.Config{Image: config.ImageConfig{CustomInstallScripts: tt.scripts}},
 				ProjectRoot: root,
 			}
-			if got := manager.needsRunnerImagesSubset(); got != tt.want {
-				t.Fatalf("needsRunnerImagesSubset() = %t, want %t", got, tt.want)
+			if got := manager.runnerImagesCopyMode(); got != tt.want {
+				t.Fatalf("runnerImagesCopyMode() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestDockerDindAlwaysNeedsRunnerImagesSubset(t *testing.T) {
+func TestDockerDindBaseImageDoesNotRequireRunnerImages(t *testing.T) {
 	manager := Manager{Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}}}
-	if !manager.needsRunnerImagesSubset() {
-		t.Fatal("docker-dind image build should always copy runner-images Docker scripts")
+	if got := manager.runnerImagesCopyMode(); got != runnerImagesCopyNone {
+		t.Fatalf("runnerImagesCopyMode() = %v, want none", got)
+	}
+}
+
+func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{
+		filepath.Join(root, "scripts", "guest", "ubuntu"),
+		filepath.Join(root, "scripts", "container", "ubuntu"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buildCtx := t.TempDir()
+	manager := Manager{
+		Config: config.Config{
+			Image: config.ImageConfig{
+				UpstreamLock: "missing.lock",
+			},
+		},
+		ProjectRoot: root,
+	}
+	if err := manager.prepareDockerDindBuildContext(buildCtx, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(buildCtx, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "FROM ${BASE_IMAGE}\nUSER root\n") {
+		t.Fatalf("Dockerfile does not force root user after FROM:\n%s", content)
 	}
 }
 

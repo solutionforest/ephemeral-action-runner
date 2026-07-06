@@ -19,6 +19,13 @@ type ImageBuildOptions struct {
 	SkipUpstreamCheck bool
 }
 
+type runnerImagesCopyMode int
+
+const (
+	runnerImagesCopyNone runnerImagesCopyMode = iota
+	runnerImagesCopySubset
+)
+
 type wslExporter interface {
 	Export(ctx context.Context, name, outputPath string) error
 }
@@ -60,7 +67,8 @@ func (m *Manager) UpdateUpstream(ctx context.Context) error {
 
 func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error {
 	upstreamDir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
-	if !opts.SkipUpstreamCheck && m.needsRunnerImagesSubset() {
+	copyMode := m.runnerImagesCopyMode()
+	if !opts.SkipUpstreamCheck && copyMode != runnerImagesCopyNone {
 		for _, name := range m.runnerImageBuildScripts() {
 			if _, err := os.Stat(filepath.Join(upstreamDir, "images", "ubuntu", "scripts", "build", name)); err != nil {
 				return fmt.Errorf("runner-images checkout missing script %s; run `ephemeral-action-runner image update-upstream` first: %w", name, err)
@@ -108,6 +116,11 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 		"--build-arg", "RUNNER_VERSION="+m.Config.Image.RunnerVersion,
 		buildCtx,
 	)
+	if m.DryRun {
+		fmt.Printf("[dry-run] docker %s\n", strings.Join(args, " "))
+		fmt.Printf("image build dry run complete: %s\n", m.Config.Image.OutputImage)
+		return nil
+	}
 	if err := runHostLogged(ctx, buildLogPath, "docker", args...); err != nil {
 		return err
 	}
@@ -145,12 +158,13 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	if err := m.installGuestScripts(ctx, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
-	if m.needsRunnerImagesSubset() {
+	switch m.runnerImagesCopyMode() {
+	case runnerImagesCopySubset:
 		fmt.Printf("copying runner-images script subset\n")
 		if err := m.copyRunnerImagesSubset(ctx, m.Config.Image.OutputImage, upstreamDir); err != nil {
 			return err
 		}
-	} else {
+	case runnerImagesCopyNone:
 		fmt.Printf("skipping runner-images script subset; no selected install script requires it\n")
 	}
 	fmt.Printf("installing base runner runtime\n")
@@ -246,12 +260,13 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if err := m.installGuestScripts(ctx, buildName); err != nil {
 		return err
 	}
-	if m.needsRunnerImagesSubset() {
+	switch m.runnerImagesCopyMode() {
+	case runnerImagesCopySubset:
 		fmt.Printf("copying runner-images script subset\n")
 		if err := m.copyRunnerImagesSubset(ctx, buildName, upstreamDir); err != nil {
 			return err
 		}
-	} else {
+	case runnerImagesCopyNone:
 		fmt.Printf("skipping runner-images script subset; no selected install script requires it\n")
 	}
 	fmt.Printf("installing base runner runtime\n")
@@ -496,26 +511,37 @@ func (m *Manager) copyRunnerImagesSubset(ctx context.Context, vmName, upstreamDi
 			return err
 		}
 	}
+	if err := m.copyRunnerImagesCommitToGuest(ctx, vmName); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (m *Manager) copyRunnerImagesCommitToGuest(ctx context.Context, vmName string) error {
+	commit, err := m.runnerImagesCommit()
+	if err != nil {
+		return err
+	}
+	if commit == "" {
+		return nil
+	}
+	return provider.CopyText(ctx, m.Provider, vmName, "/opt/epar/upstream/runner-images/epar-commit", "0644", commit+"\n")
 }
 
 func (m *Manager) runnerImageBuildScripts() []string {
 	return []string{"install-docker.sh", "install-google-chrome.sh", "install-nodejs.sh"}
 }
 
-func (m *Manager) needsRunnerImagesSubset() bool {
-	if m.Config.Provider.Type == "docker-dind" {
-		return true
-	}
+func (m *Manager) runnerImagesCopyMode() runnerImagesCopyMode {
 	for _, script := range m.Config.Image.CustomInstallScripts {
 		normalized := m.normalizedCustomInstallScript(script)
 		switch normalized {
 		case "scripts/guest/ubuntu/install-docker-browser.sh",
 			"scripts/guest/ubuntu/install-web-e2e.sh":
-			return true
+			return runnerImagesCopySubset
 		}
 	}
-	return false
+	return runnerImagesCopyNone
 }
 
 func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) error {
@@ -529,8 +555,17 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) er
 	if err := os.MkdirAll(upstreamDest, 0755); err != nil {
 		return err
 	}
-	if err := copyRunnerImagesSubsetToDir(upstreamDir, upstreamDest, m.runnerImageBuildScripts()); err != nil {
-		return err
+	switch m.runnerImagesCopyMode() {
+	case runnerImagesCopySubset:
+		fmt.Printf("preparing Docker-DinD build context with runner-images script subset\n")
+		if err := copyRunnerImagesSubsetToDir(upstreamDir, upstreamDest, m.runnerImageBuildScripts()); err != nil {
+			return err
+		}
+		if err := m.writeRunnerImagesCommitFile(upstreamDest); err != nil {
+			return err
+		}
+	case runnerImagesCopyNone:
+		fmt.Printf("preparing Docker-DinD build context without runner-images resources\n")
 	}
 	customDir := filepath.Join(buildCtx, "custom-install")
 	if err := os.MkdirAll(customDir, 0755); err != nil {
@@ -548,9 +583,16 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) er
 		}
 		fmt.Fprintf(&customRuns, "RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/custom-install/%s\n", name)
 	}
-	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=ubuntu:24.04
+	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=gitea/runner-images:ubuntu-latest-full
 FROM ${BASE_IMAGE}
+USER root
 ARG RUNNER_VERSION=latest
+ARG OCI_SOURCE=https://github.com/solutionforest/ephemeral-action-runner
+ARG OCI_DESCRIPTION="EPAR Docker-DinD runner image"
+ARG OCI_LICENSES=MIT
+LABEL org.opencontainers.image.source="${OCI_SOURCE}"
+LABEL org.opencontainers.image.description="${OCI_DESCRIPTION}"
+LABEL org.opencontainers.image.licenses="${OCI_LICENSES}"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NEEDRESTART_MODE=l
 ENV NEEDRESTART_SUSPEND=1
@@ -773,6 +815,29 @@ func copyRunnerImagesSubsetToDir(upstreamDir, dest string, buildScripts []string
 		}
 	}
 	return nil
+}
+
+func (m *Manager) runnerImagesCommit() (string, error) {
+	lockPath := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamLock)
+	content, err := os.ReadFile(lockPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(content)), nil
+}
+
+func (m *Manager) writeRunnerImagesCommitFile(dest string) error {
+	commit, err := m.runnerImagesCommit()
+	if err != nil {
+		return err
+	}
+	if commit == "" {
+		return nil
+	}
+	return os.WriteFile(filepath.Join(dest, "epar-commit"), []byte(commit+"\n"), 0644)
 }
 
 func copyDir(src, dst string) error {

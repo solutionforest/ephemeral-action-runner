@@ -18,10 +18,10 @@ The WSL build imports the clean tar into a temporary distro, enables systemd, in
 
 For Docker-DinD, the image build uses Docker images:
 
-- `image.sourceImage`: clean Ubuntu container base image, default `ubuntu:24.04`.
-- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-ubuntu-24`.
+- `image.sourceImage`: maintained Gitea Ubuntu runner image, default `gitea/runner-images:ubuntu-latest-full`.
+- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-gitea-ubuntu`.
 
-Docker-DinD builds an Ubuntu-based container image, installs the GitHub Actions runner, installs Docker Engine/CLI/Compose/Buildx for the private inner daemon, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
+Docker-DinD builds a thin wrapper over the source image, installs the GitHub Actions runner, reuses Docker Engine/CLI/Compose/Buildx from the base image when they are already present, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
 
 ```mermaid
 flowchart TD
@@ -42,7 +42,7 @@ Four layers control what is pre-installed in the Ubuntu image:
 
 1. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
 2. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
-3. Docker-DinD builds install Docker Engine and the private `dockerd` entrypoint.
+3. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
 4. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
 5. `image.customInstallScripts` adds optional tool layers.
 
@@ -57,7 +57,7 @@ flowchart LR
   Optional --> Yours["your scripts"]
 ```
 
-The public Tart and WSL default examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always includes Docker Engine because the provider depends on a private inner Docker daemon, even when no extra custom install scripts are selected. Use the runner-only Tart/WSL images when workflows install their own dependencies or only need plain shell/GitHub Actions runner behavior.
+The public Tart and WSL default examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always needs Docker Engine because the provider depends on a private inner Docker daemon; the default Gitea full source image already provides Docker plus a broad runner tool stack, so the EPAR build usually only adds the GitHub runner and EPAR lifecycle helpers.
 
 EPAR ships reusable install scripts for common cases:
 
@@ -132,9 +132,9 @@ Docker registry mirrors are runtime configuration, not image content. Keep them 
 
 ## Upstream Runner Images
 
-Runner-only Tart and WSL base images do not require `actions/runner-images`. Docker-DinD images do require it because the container image always installs Docker Engine for the private daemon.
+Runner-only Tart and WSL base images do not require `actions/runner-images`. The default Docker-DinD image also does not require it because it starts from `gitea/runner-images:ubuntu-latest-full`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Gitea runner tool stack.
 
-Docker-DinD builds, and the built-in Docker/browser and web/E2E scripts, require a pinned checkout of `actions/runner-images`:
+The built-in Docker/browser and web/E2E scripts require a pinned checkout of `actions/runner-images`:
 
 ```bash
 ephemeral-action-runner image update-upstream
@@ -142,7 +142,7 @@ ephemeral-action-runner image update-upstream
 
 That writes the checked-out commit to `third_party/runner-images.lock`. The checkout directory itself is ignored by Git.
 
-When Docker-DinD is selected or one of those built-in scripts is selected, the build copies only the required upstream Ubuntu script subset into the guest or Docker build context:
+When one of those built-in scripts is selected, the build copies only the required upstream Ubuntu script subset into the guest or Docker build context:
 
 - `images/ubuntu/scripts/helpers`
 - `images/ubuntu/scripts/build/install-docker.sh`
@@ -152,23 +152,26 @@ When Docker-DinD is selected or one of those built-in scripts is selected, the b
 
 ## Docker-DinD Images
 
-Use `configs/docker-dind.example.yml` for a runner container with a private Docker daemon, or `configs/docker-dind.web-e2e.example.yml` for Docker/browser plus common web/E2E tools.
+Use `configs/docker-dind.example.yml` for the default full Gitea runner container with a private Docker daemon. Use `configs/docker-dind.web-e2e.example.yml` as the smaller customized-image example when you want to start from `gitea/runner-images:ubuntu-latest` and add only the web/E2E layer.
 
 ```bash
-cp configs/docker-dind.web-e2e.example.yml .local/config.yml
-./bin/ephemeral-action-runner image update-upstream
+cp configs/docker-dind.example.yml .local/config.yml
 ./bin/ephemeral-action-runner image build --replace
 ```
+
+Run `image update-upstream` first when using `configs/docker-dind.web-e2e.example.yml`, because that optional layer installs browser and Node.js pieces from the pinned upstream runner-images scripts.
 
 The output image is a Docker image tag:
 
 ```bash
-docker image ls epar-docker-dind-ubuntu-24-web-e2e
+docker image ls epar-docker-dind-gitea-ubuntu
 ```
 
-The provider creates each runner instance with `docker create --privileged` and no host socket mount. The image entrypoint starts a private `dockerd`, waits for `docker info`, and keeps the container alive while EPAR configures and monitors the GitHub runner process. Workflow Docker resources live inside that inner daemon.
+The provider creates each runner instance with `docker create --privileged` and no host socket mount. The image entrypoint starts a private `dockerd`, waits for `docker info`, and keeps the container alive while EPAR configures and monitors the GitHub runner process. Workflow Docker resources live inside that inner daemon. The inner daemon defaults to the `vfs` storage driver because it is reliable for nested Docker across Docker Desktop, OrbStack, and Linux Docker hosts; users can bake a different `EPAR_DOCKERD_STORAGE_DRIVER` into a derived image after validating the host.
 
 ## Installed Runtime
+
+The default Docker-DinD build uses `gitea/runner-images:ubuntu-latest-full` as the source image. It is larger than the lightweight Gitea image, but it is the recommended default for public users because common tools such as Node/npm are already present. The web/E2E Docker-DinD example uses `gitea/runner-images:ubuntu-latest` to demonstrate a smaller custom image that layers only selected dependencies.
 
 The default build installs:
 
@@ -182,7 +185,7 @@ The optional `install-docker-browser.sh` layer installs:
 - upstream Google Chrome on x64
 - Playwright-managed Chromium on ARM64, exposed as `epar-browser`, `chromium`, and `chromium-browser`
 
-The Docker-DinD provider always installs Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`, then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`.
+The Docker-DinD provider validates or installs Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`, then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside the image build only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
 
 The ARM64 Docker harness prefers upstream `toolset-2404-arm64.json`. If an older upstream checkout does not contain that file, EPAR falls back to a minimal ARM-aware Docker toolset.
 
@@ -238,5 +241,4 @@ References:
 
 - [WSL basic commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands)
 - [Systemd support in WSL](https://learn.microsoft.com/en-us/windows/wsl/systemd)
-- [GitHub Ubuntu 24.04 runner image software](https://raw.githubusercontent.com/actions/runner-images/main/images/ubuntu/Ubuntu2404-Readme.md)
 - [GitHub Ubuntu runner image build scripts](https://github.com/actions/runner-images/tree/main/images/ubuntu/scripts/build)

@@ -52,4 +52,5 @@ For Docker-DinD, cleanup removes the outer runner container with `docker rm -f -
 - If using Tart `softnet`, verify the host has the privileges Tart requires.
 - If WSL image build fails before systemd is ready, confirm WSL2 is enabled and that the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.
 - If Docker-DinD startup fails, confirm the host Docker runtime supports privileged containers and inspect `/var/log/epar-dockerd.log` inside the runner container.
-- If a Docker-DinD build fails before Docker is installed, run `image update-upstream` because Docker-DinD images use EPAR's pinned `actions/runner-images` Docker install harness.
+- If Docker-DinD `docker run` fails with nested overlay mount errors, keep the default `EPAR_DOCKERD_STORAGE_DRIVER=vfs`. Only switch to `overlay2` or `auto` in a derived image after proving that storage driver works on the exact host runtime.
+- If the default Docker-DinD build cannot validate Docker, confirm the source image still provides `docker`, `dockerd`, Compose, Buildx, and `iptables`. If you intentionally use a clean Ubuntu source image instead of Gitea's runner image, run `image update-upstream` first so EPAR can use its pinned `actions/runner-images` Docker install harness.

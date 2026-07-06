@@ -33,8 +33,8 @@ Copy one example config into `.local/config.yml`, then edit the GitHub App field
 | macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
 | Windows WSL2, runner-only | `configs/wsl.example.yml` |
 | Windows WSL2, web/E2E | `configs/wsl.web-e2e.example.yml` |
-| Docker-DinD, runner-only | `configs/docker-dind.example.yml` |
-| Docker-DinD, web/E2E | `configs/docker-dind.web-e2e.example.yml` |
+| Docker-DinD, default full Gitea runner image | `configs/docker-dind.example.yml` |
+| Docker-DinD, smaller web/E2E custom image | `configs/docker-dind.web-e2e.example.yml` |
 
 macOS:
 
@@ -110,7 +110,7 @@ Runner-only Tart and WSL images do not need the upstream `actions/runner-images`
 ./bin/ephemeral-action-runner image build --replace
 ```
 
-If `provider.type: docker-dind`, or if `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
+If `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
 
 ```bash
 ./bin/ephemeral-action-runner image update-upstream
@@ -131,17 +131,17 @@ WSL output is a rootfs tar path, such as:
 work/images/epar-ubuntu-24-wsl.tar
 ```
 
-Docker-DinD output is a Docker image tag, such as `epar-docker-dind-ubuntu-24`. Confirm it with:
+Docker-DinD output is a Docker image tag, such as `epar-docker-dind-gitea-ubuntu`. Confirm it with:
 
 ```bash
-docker image ls epar-docker-dind-ubuntu-24
+docker image ls epar-docker-dind-gitea-ubuntu
 ```
 
 Build logs are written under `work/logs`.
 
 ## Customize The Image
 
-The public default image is runner-only. Add tooling through `image.customInstallScripts`:
+Tart and WSL default images are runner-only. Docker-DinD uses the full Gitea runner image by default; use `image.customInstallScripts` when you want a different image shape, such as the smaller Docker-DinD web/E2E example:
 
 ```yaml
 image:
@@ -225,10 +225,16 @@ Use provider-specific labels in workflows. For the Tart web/E2E Rosetta image, t
 runs-on: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-rosetta-amd64]
 ```
 
-For Docker-DinD web/E2E images, target the Docker-DinD label:
+For the default Docker-DinD image, target the default Docker-DinD label:
 
 ```yaml
-runs-on: [self-hosted, linux, ARM64, epar-docker-dind-ubuntu-24.04-web-e2e]
+runs-on: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
+```
+
+For Docker-DinD web/E2E images, target the custom web/E2E label:
+
+```yaml
+runs-on: [self-hosted, linux, epar-docker-dind-gitea-ubuntu-web-e2e]
 ```
 
 When that Docker-DinD runner is used for amd64-only runtime images, keep the workflow's Docker platform explicit, for example `DOCKER_PLATFORM=linux/amd64` or the equivalent variable used by your compose scripts, and verify the host runtime supports amd64 emulation as described above.

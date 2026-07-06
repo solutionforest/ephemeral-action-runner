@@ -18,29 +18,29 @@ Use `configs/docker-dind.example.yml` for a base runner image:
 
 ```yaml
 image:
-  sourceImage: ubuntu:24.04
-  outputImage: epar-docker-dind-ubuntu-24
+  sourceImage: gitea/runner-images:ubuntu-latest-full
+  outputImage: epar-docker-dind-gitea-ubuntu
 
 provider:
   type: docker-dind
-  sourceImage: epar-docker-dind-ubuntu-24
+  sourceImage: epar-docker-dind-gitea-ubuntu
   network: default
-  platform: linux/arm64
 ```
 
-Use `configs/docker-dind.web-e2e.example.yml` when workflows need Docker/browser and common web/E2E tools:
+Use `configs/docker-dind.web-e2e.example.yml` as a smaller customized-image example. It starts from `gitea/runner-images:ubuntu-latest` and layers only the web/E2E add-on:
 
 ```yaml
 image:
-  outputImage: epar-docker-dind-ubuntu-24-web-e2e
+  sourceImage: gitea/runner-images:ubuntu-latest
+  outputImage: epar-docker-dind-gitea-ubuntu-web-e2e
   customInstallScripts:
     - scripts/guest/ubuntu/install-web-e2e.sh
 
 runner:
-  labels: [self-hosted, linux, ARM64, epar-docker-dind-ubuntu-24.04-web-e2e]
+  labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu-web-e2e]
 
 provider:
-  sourceImage: epar-docker-dind-ubuntu-24-web-e2e
+  sourceImage: epar-docker-dind-gitea-ubuntu-web-e2e
 ```
 
 `provider.platform` is optional and maps to Docker's `--platform` flag for image builds and runner containers. Use a label that reflects the actual platform your workflows should target.
@@ -60,12 +60,13 @@ When a Docker-DinD mirror URL uses `host.docker.internal`, EPAR adds Docker's `h
 Docker-DinD images are Docker image tags, not Tart images or rootfs tar files:
 
 ```bash
-./bin/ephemeral-action-runner image update-upstream
 ./bin/ephemeral-action-runner image build --replace
-docker image ls epar-docker-dind-ubuntu-24-web-e2e
+docker image ls epar-docker-dind-gitea-ubuntu
 ```
 
-The build uses the pinned `actions/runner-images` checkout to install Docker Engine/CLI/Compose/Buildx. The generated image also includes `/opt/epar/container-entrypoint.sh`, which starts the private inner `dockerd` when the runner container starts.
+The default build starts from `gitea/runner-images:ubuntu-latest-full`, installs the GitHub Actions runner and EPAR helper scripts, and reuses the base image's Docker Engine/CLI/Compose/Buildx. The generated image also includes `/opt/epar/container-entrypoint.sh`, which starts the private inner `dockerd` when the runner container starts.
+
+Run `image update-upstream` only when selected install scripts need EPAR's pinned `actions/runner-images` checkout, such as the web/E2E script.
 
 ## Runtime Behavior
 
@@ -80,6 +81,8 @@ EPAR maps provider operations to Docker commands:
 - list: `docker ps -a --filter label=epar.provider=docker-dind`
 
 The provider does not mount `/var/run/docker.sock`, an OrbStack socket, or any host Docker socket into the runner container. It also does not publish host ports by default. If two jobs use the same Docker Compose project name or container ports, they are separated by their private inner Docker daemons.
+
+The inner daemon starts with `EPAR_DOCKERD_STORAGE_DRIVER=vfs` by default. `vfs` is slower than `overlay2`, but it is the most reliable default for nested Docker on Docker Desktop, OrbStack, and other privileged-container hosts where overlay mounts can fail inside the runner container. Advanced users can bake `EPAR_DOCKERD_STORAGE_DRIVER=overlay2` or `EPAR_DOCKERD_STORAGE_DRIVER=auto` into a derived image after validating that the exact host runtime supports it.
 
 On Apple Silicon hosts using Docker Desktop or OrbStack, the inner daemon may be able to run `linux/amd64` containers through the host runtime's emulation support. Validate this on the exact host before routing amd64-only workflows to Docker-DinD:
 

@@ -4,7 +4,16 @@ set -euo pipefail
 install -d /var/log /var/run /var/lib/docker
 rm -f /var/run/docker.pid
 
-dockerd --host=unix:///var/run/docker.sock >/var/log/epar-dockerd.log 2>&1 &
+dockerd_args=(--host=unix:///var/run/docker.sock)
+storage_driver="${EPAR_DOCKERD_STORAGE_DRIVER-vfs}"
+if [[ -n "${storage_driver}" && "${storage_driver}" != "auto" ]]; then
+  dockerd_args+=(--storage-driver="${storage_driver}")
+  echo "EPAR Docker-DinD: starting inner Docker daemon with ${storage_driver} storage driver"
+else
+  echo "EPAR Docker-DinD: starting inner Docker daemon with Docker's default storage driver"
+fi
+
+dockerd "${dockerd_args[@]}" >/var/log/epar-dockerd.log 2>&1 &
 dockerd_pid="$!"
 echo "${dockerd_pid}" >/var/run/epar-dockerd.pid
 

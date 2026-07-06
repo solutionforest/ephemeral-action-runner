@@ -20,7 +20,7 @@ flowchart LR
 - **Disposable runners:** every runner is expected to handle one job and then disappear.
 - **Warm pool:** `pool up` keeps ready runners online so jobs do not wait for a full image build.
 - **Use spare hosts:** turn a supported Mac, Windows, Linux, or Docker-capable machine into a pool of disposable Linux GitHub runners.
-- **Image control:** the default image is runner-only, and extra tooling is added with explicit install scripts.
+- **Image control:** Tart and WSL start lean, while Docker-DinD defaults to Gitea's full runner image for broad out-of-the-box tooling.
 - **Optional pull caching:** point runner Docker daemons at a registry mirror service to reduce repeated Docker Hub image pull time when that is a meaningful part of the job.
 - **GitHub App auth:** the host uses a GitHub App to request short-lived runner registration tokens.
 
@@ -52,13 +52,14 @@ Future providers can fit the same model: if EPAR supports the machine, that mach
 
 ## Image Choice
 
-EPAR does not include Docker, browsers, Node, or project tools in every image by default.
+EPAR keeps Tart and WSL base images lean. Docker-DinD defaults to Gitea's full Ubuntu runner image because it is the most convenient public path for Docker-heavy Linux workflows.
 
 | Image style | Config | Includes |
 | --- | --- | --- |
-| Runner-only base | `configs/tart.example.yml`, `configs/wsl.example.yml`, or `configs/docker-dind.example.yml` | GitHub Actions runner and minimal runtime dependencies. Docker-DinD also includes Docker Engine for its private inner daemon. |
+| Docker-DinD default | `configs/docker-dind.example.yml` | Docker-DinD wrapper over Gitea's larger `ubuntu-latest-full` runner image, plus the GitHub Actions runner and EPAR lifecycle helpers. |
+| Runner-only base | `configs/tart.example.yml` or `configs/wsl.example.yml` | GitHub Actions runner and minimal runtime dependencies. |
 | Docker/browser | add `scripts/guest/ubuntu/install-docker-browser.sh` to `image.customInstallScripts` | Docker Engine, Docker CLI, Compose v2, Buildx, and a Chromium-compatible browser |
-| Web/E2E | `configs/tart.web-e2e.example.yml`, `configs/wsl.web-e2e.example.yml`, or `configs/docker-dind.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client. The Tart example also enables Rosetta amd64 Docker validation. |
+| Web/E2E custom | `configs/tart.web-e2e.example.yml`, `configs/wsl.web-e2e.example.yml`, or `configs/docker-dind.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client. The Docker-DinD example demonstrates a smaller custom image starting from `gitea/runner-images:ubuntu-latest`. |
 | Custom | add your own script path to `image.customInstallScripts` | Whatever your script installs inside Ubuntu |
 
 Example:
@@ -117,7 +118,7 @@ image:
    ./bin/ephemeral-action-runner image build --replace
    ```
 
-   If your provider is Docker-DinD, or if your selected install scripts use EPAR's Docker/browser or web/E2E scripts, first run:
+   If your selected install scripts use EPAR's Docker/browser or web/E2E scripts, first run:
 
    ```bash
    ./bin/ephemeral-action-runner image update-upstream

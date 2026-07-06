@@ -6,8 +6,8 @@ github:
   webBaseUrl: https://github.com
 
 image:
-  sourceImage: ubuntu:24.04
-  outputImage: epar-docker-dind-ubuntu-24
+  sourceImage: gitea/runner-images:ubuntu-latest-full
+  outputImage: epar-docker-dind-gitea-ubuntu
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -20,14 +20,13 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, ARM64, epar-docker-dind-ubuntu-24.04-base]
+  labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
   ephemeral: true
 
 provider:
   type: docker-dind
-  sourceImage: epar-docker-dind-ubuntu-24
+  sourceImage: epar-docker-dind-gitea-ubuntu
   network: default
-  platform: linux/arm64
 
 docker:
   registryMirrors:
