@@ -1,5 +1,7 @@
 # Ephemeral Action Runner
 
+![Ephemeral Action Runner banner](docs/assets/brand/epar-banner.jpg)
+
 Ephemeral Action Runner (EPAR) keeps a warm pool of disposable GitHub Actions self-hosted runners on your own machines.
 
 It is built for teams that want fast self-hosted Linux runners without keeping long-lived runner VMs around. EPAR creates an instance, registers it as an ephemeral GitHub runner, lets GitHub run one job on it, deletes the instance after that job, and creates a replacement.
