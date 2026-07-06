@@ -6,6 +6,7 @@ github:
   webBaseUrl: https://github.com
 
 image:
+  sourceType: rootfs-tar
   sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
   outputImage: work/images/epar-ubuntu-24-wsl-web-e2e.tar
   upstreamDir: third_party/runner-images

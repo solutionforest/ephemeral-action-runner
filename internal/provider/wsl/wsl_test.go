@@ -30,7 +30,7 @@ func TestCommandConstruction(t *testing.T) {
 		t.Fatalf("exec args = %#v, want %#v", execArgs, wantExec)
 	}
 	keepAliveArgs := p.keepAliveArgs("epar-test-1")
-	wantKeepAlive := []string{"-d", "epar-test-1", "--user", "root", "--exec", "/bin/sh", "-lc", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"}
+	wantKeepAlive := []string{"-d", "epar-test-1", "--user", "root", "--exec", "/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"}
 	if !reflect.DeepEqual(keepAliveArgs, wantKeepAlive) {
 		t.Fatalf("keepalive args = %#v, want %#v", keepAliveArgs, wantKeepAlive)
 	}

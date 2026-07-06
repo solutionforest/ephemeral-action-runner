@@ -20,13 +20,19 @@ base_image_has_docker_engine() {
 }
 
 if [[ "${EPAR_FORCE_UPSTREAM_DOCKER_INSTALL:-false}" != "true" ]] && base_image_has_docker_engine; then
-  echo "EPAR Docker-DinD: using Docker Engine/CLI/Compose/Buildx from the base image."
+  echo "EPAR: using Docker Engine/CLI/Compose/Buildx from the base image."
   usermod -aG docker admin 2>/dev/null || true
   usermod -aG docker runner 2>/dev/null || true
   install -d /opt/epar/features
   touch /opt/epar/features/docker-engine
   bash /opt/epar/validate-docker-engine.sh
   exit 0
+fi
+
+if [[ "${EPAR_REQUIRE_BASE_DOCKER_ENGINE:-false}" == "true" ]]; then
+  echo "EPAR WSL Docker-image source did not provide Docker Engine, dockerd, Compose, Buildx, and iptables." >&2
+  echo "Use gitea/runner-images:ubuntu-latest-full, or choose image.sourceType=rootfs-tar with an install script that adds Docker." >&2
+  exit 1
 fi
 
 bash /opt/epar/wait-apt-ready.sh

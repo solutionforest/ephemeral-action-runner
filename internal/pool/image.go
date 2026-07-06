@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +30,12 @@ const (
 type wslExporter interface {
 	Export(ctx context.Context, name, outputPath string) error
 }
+
+var (
+	runHostLoggedCommand = runHostLogged
+	runHostOutputCommand = runHostOutput
+	runHostQuietCommand  = runHostQuiet
+)
 
 func (m *Manager) UpdateUpstream(ctx context.Context) error {
 	dir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
@@ -202,12 +209,18 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if !ok {
 		return fmt.Errorf("provider.type=wsl requires provider export support")
 	}
-	sourcePath := config.ProjectPath(m.ProjectRoot, m.Config.Image.SourceImage)
 	outputPath := config.ProjectPath(m.ProjectRoot, m.Config.Image.OutputImage)
+	sourceType := m.Config.Image.SourceType
+	if sourceType == "" {
+		sourceType = config.ImageSourceRootFSTar
+	}
+	buildName := RunnerName(m.Config.Pool.NamePrefix+"-image", 1, time.Now())
+	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".wsl-build.log")
+	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), buildName+".guest.log")
+	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
+		return err
+	}
 	if !m.DryRun {
-		if _, err := os.Stat(sourcePath); err != nil {
-			return fmt.Errorf("wsl source image %s: %w", sourcePath, err)
-		}
 		if _, err := os.Stat(outputPath); err == nil && !opts.Replace {
 			return fmt.Errorf("wsl output image %s already exists; rerun with --replace", outputPath)
 		} else if err != nil && !os.IsNotExist(err) {
@@ -219,12 +232,29 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 			}
 		}
 	}
-	buildName := RunnerName(m.Config.Pool.NamePrefix+"-image", 1, time.Now())
-	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".wsl-build.log")
-	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), buildName+".guest.log")
-	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
-		return err
+
+	sourceForClone := m.Config.Image.SourceImage
+	sourcePath := config.ProjectPath(m.ProjectRoot, sourceForClone)
+	sourceEnv := ""
+	switch sourceType {
+	case config.ImageSourceDockerImage:
+		rootfsPath, env, err := m.prepareWSLDockerSourceRootfs(ctx, outputPath, buildLogPath)
+		if err != nil {
+			return err
+		}
+		sourceForClone = rootfsPath
+		sourcePath = rootfsPath
+		sourceEnv = env
+	case config.ImageSourceRootFSTar:
+		if !m.DryRun {
+			if _, err := os.Stat(sourcePath); err != nil {
+				return fmt.Errorf("wsl source image %s: %w", sourcePath, err)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported WSL image.sourceType %q", sourceType)
 	}
+
 	fmt.Printf("building WSL image %s from %s using temporary distro %s\n", outputPath, sourcePath, buildName)
 	fmt.Printf("logs: %s, %s\n", buildLogPath, guestLogPath)
 	defer func() {
@@ -234,8 +264,14 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 		_ = m.Provider.Delete(cleanupCtx, buildName)
 	}()
 	fmt.Printf("importing source rootfs\n")
-	if err := m.Provider.Clone(ctx, m.Config.Image.SourceImage, buildName); err != nil {
+	if err := m.Provider.Clone(ctx, sourceForClone, buildName); err != nil {
 		return err
+	}
+	if sourceType == config.ImageSourceDockerImage {
+		fmt.Printf("preparing Docker image rootfs for WSL systemd\n")
+		if err := m.prepareWSLDockerSourceGuest(ctx, buildName); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("enabling WSL systemd\n")
 	if err := m.enableWSLSystemd(ctx, buildName); err != nil {
@@ -260,6 +296,12 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if err := m.installGuestScripts(ctx, buildName); err != nil {
 		return err
 	}
+	if sourceEnv != "" {
+		fmt.Printf("installing source image environment metadata\n")
+		if err := m.installSourceImageEnv(ctx, buildName, sourceEnv); err != nil {
+			return err
+		}
+	}
 	switch m.runnerImagesCopyMode() {
 	case runnerImagesCopySubset:
 		fmt.Printf("copying runner-images script subset\n")
@@ -275,6 +317,9 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	}
 	fmt.Printf("installing GitHub Actions runner\n")
 	if _, err := m.execGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
+		return err
+	}
+	if err := m.installWSLDockerEngine(ctx, buildName); err != nil {
 		return err
 	}
 	if err := m.installCustomInstallScripts(ctx, buildName); err != nil {
@@ -297,6 +342,213 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	}
 	fmt.Printf("image build complete: %s is available for WSL imports\n", outputPath)
 	return nil
+}
+
+func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, buildLogPath string) (string, string, error) {
+	image := strings.TrimSpace(m.Config.Image.SourceImage)
+	if image == "" {
+		return "", "", fmt.Errorf("image.sourceImage is required when image.sourceType=docker-image")
+	}
+	rootfsPath := wslDockerSourceRootfsPath(outputPath)
+	envCachePath := rootfsPath + ".env"
+	tmpPath := rootfsPath + ".tmp"
+	platform := strings.TrimSpace(m.Config.Image.SourcePlatform)
+	containerName := wslDockerSourceContainerName()
+	pullArgs := []string{"pull"}
+	createArgs := []string{"create"}
+	if platform != "" {
+		pullArgs = append(pullArgs, "--platform", platform)
+		createArgs = append(createArgs, "--platform", platform)
+	}
+	pullArgs = append(pullArgs, image)
+	createArgs = append(createArgs, "--name", containerName, image)
+	exportArgs := []string{"export", "-o", tmpPath, containerName}
+
+	if m.DryRun {
+		fmt.Printf("[dry-run] docker %s\n", strings.Join(pullArgs, " "))
+		fmt.Printf("[dry-run] docker %s\n", strings.Join(createArgs, " "))
+		fmt.Printf("[dry-run] docker container inspect --format {{json .Config.Env}} %s\n", containerName)
+		fmt.Printf("[dry-run] docker %s\n", strings.Join(exportArgs, " "))
+		fmt.Printf("[dry-run] docker rm -f %s\n", containerName)
+		return rootfsPath, "", nil
+	}
+
+	if info, err := os.Stat(rootfsPath); err == nil && info.Size() > 0 {
+		envContent, err := os.ReadFile(envCachePath)
+		if err != nil {
+			fmt.Printf("using cached WSL source rootfs at %s; source image env cache missing, refreshing metadata from Docker image\n", rootfsPath)
+			refreshedEnv, refreshErr := m.dockerImageEnvContent(ctx, image)
+			if refreshErr != nil {
+				fmt.Printf("warning: could not refresh WSL source image env metadata: %v\n", refreshErr)
+				return rootfsPath, "", nil
+			}
+			if writeErr := os.WriteFile(envCachePath, []byte(refreshedEnv), 0644); writeErr != nil {
+				return "", "", writeErr
+			}
+			return rootfsPath, refreshedEnv, nil
+		}
+		fmt.Printf("using cached WSL source rootfs at %s\n", rootfsPath)
+		return rootfsPath, string(envContent), nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0755); err != nil {
+		return "", "", err
+	}
+	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+	fmt.Printf("preparing WSL source rootfs from Docker image %s\n", image)
+	if err := runHostLoggedCommand(ctx, buildLogPath, "docker", pullArgs...); err != nil {
+		return "", "", fmt.Errorf("wsl image.sourceType=docker-image requires Docker Desktop, Docker Engine, or another reachable Docker daemon; alternatively set image.sourceType=rootfs-tar and provide a prepared rootfs tar: %w", err)
+	}
+	if err := runHostLoggedCommand(ctx, buildLogPath, "docker", createArgs...); err != nil {
+		return "", "", err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_ = runHostQuietCommand(cleanupCtx, "docker", "rm", "-f", containerName)
+	}()
+	envJSON, err := runHostOutputCommand(ctx, "docker", "container", "inspect", "--format", "{{json .Config.Env}}", containerName)
+	if err != nil {
+		return "", "", err
+	}
+	var sourceEnv []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(envJSON)), &sourceEnv); err != nil {
+		return "", "", fmt.Errorf("parse Docker source image environment: %w", err)
+	}
+	envContent := sourceImageEnvContent(sourceEnv)
+	if err := runHostLoggedCommand(ctx, buildLogPath, "docker", exportArgs...); err != nil {
+		return "", "", err
+	}
+	if err := os.Remove(rootfsPath); err != nil && !os.IsNotExist(err) {
+		return "", "", err
+	}
+	if err := os.Rename(tmpPath, rootfsPath); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(envCachePath, []byte(envContent), 0644); err != nil {
+		return "", "", err
+	}
+	fmt.Printf("WSL source rootfs exported to %s\n", rootfsPath)
+	return rootfsPath, envContent, nil
+}
+
+func (m *Manager) dockerImageEnvContent(ctx context.Context, image string) (string, error) {
+	envJSON, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{json .Config.Env}}", image)
+	if err != nil {
+		return "", err
+	}
+	var sourceEnv []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(envJSON)), &sourceEnv); err != nil {
+		return "", fmt.Errorf("parse Docker source image environment: %w", err)
+	}
+	return sourceImageEnvContent(sourceEnv), nil
+}
+
+func wslDockerSourceRootfsPath(outputPath string) string {
+	switch {
+	case strings.HasSuffix(outputPath, ".tar.gz"):
+		return strings.TrimSuffix(outputPath, ".tar.gz") + ".source.rootfs.tar"
+	case strings.HasSuffix(outputPath, ".tgz"):
+		return strings.TrimSuffix(outputPath, ".tgz") + ".source.rootfs.tar"
+	case strings.HasSuffix(outputPath, ".tar"):
+		return strings.TrimSuffix(outputPath, ".tar") + ".source.rootfs.tar"
+	default:
+		return outputPath + ".source.rootfs.tar"
+	}
+}
+
+func wslDockerSourceContainerName() string {
+	return fmt.Sprintf("epar-wsl-source-%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func (m *Manager) installSourceImageEnv(ctx context.Context, vmName, content string) error {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	return provider.CopyText(ctx, m.Provider, vmName, "/opt/epar/source-image.env", "0644", content)
+}
+
+func (m *Manager) prepareWSLDockerSourceGuest(ctx context.Context, vmName string) error {
+	script := `set -euo pipefail
+cat >/etc/fstab <<'FSTAB'
+# EPAR: Docker image rootfs prepared for WSL imports.
+FSTAB
+
+install -d /etc/skel/.cargo
+if [[ ! -e /etc/skel/.cargo/env ]]; then
+  if [[ -r /home/runner/.cargo/env ]]; then
+    cp /home/runner/.cargo/env /etc/skel/.cargo/env
+  else
+    : >/etc/skel/.cargo/env
+  fi
+fi
+chmod 0644 /etc/skel/.cargo/env
+
+if [[ -d /etc/cloud ]]; then
+  touch /etc/cloud/cloud-init.disabled
+fi
+
+install -d /etc/systemd/system
+for unit in \
+  cloud-config.service \
+  cloud-final.service \
+  cloud-init-local.service \
+  cloud-init.service \
+  hv-kvp-daemon.service \
+  walinuxagent-network-setup.service \
+  walinuxagent.service; do
+  ln -sf /dev/null "/etc/systemd/system/${unit}"
+done
+`
+	_, err := m.Provider.Exec(ctx, vmName, []string{"bash", "-c", script}, provider.ExecOptions{})
+	return err
+}
+
+func (m *Manager) installWSLDockerEngine(ctx context.Context, vmName string) error {
+	if m.Config.Provider.Type != "wsl" || m.Config.Image.SourceType != config.ImageSourceDockerImage {
+		return nil
+	}
+	fmt.Printf("validating Docker Engine from WSL Docker source image\n")
+	_, err := m.execGuest(ctx, vmName, []string{"sudo", "-E", "bash", "/opt/epar/install-docker-engine.sh", "/opt/epar/upstream/runner-images"}, provider.ExecOptions{
+		Env: map[string]string{"EPAR_REQUIRE_BASE_DOCKER_ENGINE": "true"},
+	})
+	return err
+}
+
+func sourceImageEnvContent(env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# Generated by EPAR from Docker source image metadata.\n")
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || !validShellEnvName(key) {
+			continue
+		}
+		fmt.Fprintf(&b, "export %s=%s\n", key, shellQuote(value))
+	}
+	return b.String()
+}
+
+func validShellEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || (i > 0 && r >= '0' && r <= '9')
+		if !ok {
+			return false
+		}
+		if i == 0 && r >= '0' && r <= '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) RefreshScripts(ctx context.Context) error {
@@ -761,6 +1013,20 @@ func runHost(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runHostOutput(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s %s failed: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return string(output), nil
+}
+
+func runHostQuiet(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
 	return cmd.Run()
 }
 

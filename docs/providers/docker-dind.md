@@ -18,6 +18,7 @@ Use `configs/docker-dind.example.yml` for a base runner image:
 
 ```yaml
 image:
+  sourceType: docker-image
   sourceImage: gitea/runner-images:ubuntu-latest-full
   outputImage: epar-docker-dind-gitea-ubuntu
 
@@ -31,6 +32,7 @@ Use `configs/docker-dind.web-e2e.example.yml` as a smaller customized-image exam
 
 ```yaml
 image:
+  sourceType: docker-image
   sourceImage: gitea/runner-images:ubuntu-latest
   outputImage: epar-docker-dind-gitea-ubuntu-web-e2e
   customInstallScripts:

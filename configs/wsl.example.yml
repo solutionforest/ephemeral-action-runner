@@ -6,8 +6,10 @@ github:
   webBaseUrl: https://github.com
 
 image:
-  sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
-  outputImage: work/images/epar-ubuntu-24-wsl.tar
+  sourceType: docker-image
+  sourceImage: gitea/runner-images:ubuntu-latest-full
+  sourcePlatform: linux/amd64
+  outputImage: work/images/epar-wsl-gitea-ubuntu.tar
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -21,12 +23,12 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, X64, epar-wsl-ubuntu-24.04-base]
+  labels: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
   ephemeral: true
 
 provider:
   type: wsl
-  sourceImage: work/images/epar-ubuntu-24-wsl.tar
+  sourceImage: work/images/epar-wsl-gitea-ubuntu.tar
   network: default
   installRoot: work/wsl
 

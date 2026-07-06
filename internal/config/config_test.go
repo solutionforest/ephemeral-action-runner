@@ -130,6 +130,146 @@ runner:
 	}
 }
 
+func TestProviderDefaultsForMinimalWSLConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: wsl
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceType, ImageSourceDockerImage; got != want {
+		t.Fatalf("image.sourceType = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.SourcePlatform, "linux/amd64"; got != want {
+		t.Fatalf("image.sourcePlatform = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "work/images/epar-wsl-gitea-ubuntu.tar"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
+		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.NamePrefix, "epar-wsl"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels[2], "X64"; got != want {
+		t.Fatalf("runner.labels[2] = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderDefaultsInferExistingWSLRootFSTar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+image:
+  sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
+provider:
+  type: wsl
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceType, ImageSourceRootFSTar; got != want {
+		t.Fatalf("image.sourceType = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "work/images/epar-ubuntu-24-wsl.tar"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got := cfg.Image.SourcePlatform; got != "" {
+		t.Fatalf("image.sourcePlatform = %q, want empty", got)
+	}
+}
+
+func TestProviderDefaultsRespectExplicitWSLOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+image:
+  sourceImage: example/rootfs.tar
+  sourceType: rootfs-tar
+  outputImage: work/images/custom-wsl.tar
+pool:
+  namePrefix: custom-wsl
+runner:
+  labels: [self-hosted, linux, custom]
+provider:
+  type: wsl
+  sourceImage: work/images/custom-provider.tar
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceImage, "example/rootfs.tar"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "work/images/custom-wsl.tar"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.SourceImage, "work/images/custom-provider.tar"; got != want {
+		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.NamePrefix, "custom-wsl"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels[2], "custom"; got != want {
+		t.Fatalf("runner label = %q, want %q", got, want)
+	}
+}
+
+func TestProviderDefaultsForMinimalDockerDindConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceType, ImageSourceDockerImage; got != want {
+		t.Fatalf("image.sourceType = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "epar-docker-dind-gitea-ubuntu"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
+		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.NamePrefix, "epar-dind"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-gitea-ubuntu"; got != want {
+		t.Fatalf("runner label = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateRosettaTag(t *testing.T) {
 	cfg := Default()
 	cfg.Provider.RosettaTag = "rosetta"

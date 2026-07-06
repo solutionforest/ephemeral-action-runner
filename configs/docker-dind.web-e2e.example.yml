@@ -6,6 +6,7 @@ github:
   webBaseUrl: https://github.com
 
 image:
+  sourceType: docker-image
   sourceImage: gitea/runner-images:ubuntu-latest
   outputImage: epar-docker-dind-gitea-ubuntu-web-e2e
   upstreamDir: third_party/runner-images

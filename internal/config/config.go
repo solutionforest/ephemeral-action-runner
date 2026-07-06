@@ -30,6 +30,8 @@ type GitHubConfig struct {
 
 type ImageConfig struct {
 	SourceImage          string
+	SourceType           string
+	SourcePlatform       string
 	OutputImage          string
 	UpstreamDir          string
 	UpstreamLock         string
@@ -67,6 +69,11 @@ type TimeoutConfig struct {
 	GitHubOnlineSeconds int
 	CommandSeconds      int
 }
+
+const (
+	ImageSourceDockerImage = "docker-image"
+	ImageSourceRootFSTar   = "rootfs-tar"
+)
 
 func Default() Config {
 	return Config{
@@ -120,6 +127,7 @@ func Load(path string) (Config, error) {
 	scanner := bufio.NewScanner(file)
 	lineNo := 0
 	var pendingList *pendingListKey
+	explicit := map[string]bool{}
 	for scanner.Scan() {
 		lineNo++
 		raw := strings.TrimRight(scanner.Text(), " \t")
@@ -158,16 +166,19 @@ func Load(path string) (Config, error) {
 			if err := setListValue(&cfg, section, key, nil); err != nil {
 				return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 			}
+			explicit[section+"."+key] = true
 			pendingList = &pendingListKey{section: section, key: key, indent: indent}
 			continue
 		}
 		if err := apply(&cfg, section, key, value); err != nil {
 			return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 		}
+		explicit[section+"."+key] = true
 	}
 	if err := scanner.Err(); err != nil {
 		return cfg, err
 	}
+	applyProviderDefaults(&cfg, explicit)
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
 	return cfg, nil
 }
@@ -202,6 +213,10 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "sourceImage":
 			cfg.Image.SourceImage = value
+		case "sourceType":
+			cfg.Image.SourceType = value
+		case "sourcePlatform":
+			cfg.Image.SourcePlatform = value
 		case "outputImage":
 			cfg.Image.OutputImage = value
 		case "upstreamDir":
@@ -282,6 +297,76 @@ func apply(cfg *Config, section, key, value string) error {
 		return fmt.Errorf("unknown section %q", section)
 	}
 	return nil
+}
+
+func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
+	switch cfg.Provider.Type {
+	case "wsl":
+		sourceType := cfg.Image.SourceType
+		if !explicit["image.sourceType"] {
+			sourceType = ImageSourceDockerImage
+			if explicit["image.sourceImage"] && looksLikeRootFSTar(cfg.Image.SourceImage) {
+				sourceType = ImageSourceRootFSTar
+			}
+			cfg.Image.SourceType = sourceType
+		}
+		if !explicit["image.sourceImage"] {
+			if sourceType == ImageSourceRootFSTar {
+				cfg.Image.SourceImage = "work/images/ubuntu-24.04-clean.rootfs.tar"
+			} else {
+				cfg.Image.SourceImage = "gitea/runner-images:ubuntu-latest-full"
+			}
+		}
+		if !explicit["image.outputImage"] {
+			if sourceType == ImageSourceRootFSTar {
+				cfg.Image.OutputImage = "work/images/epar-ubuntu-24-wsl.tar"
+			} else {
+				cfg.Image.OutputImage = "work/images/epar-wsl-gitea-ubuntu.tar"
+			}
+		}
+		if sourceType == ImageSourceDockerImage && !explicit["image.sourcePlatform"] {
+			cfg.Image.SourcePlatform = "linux/amd64"
+		}
+		if !explicit["provider.sourceImage"] {
+			cfg.Provider.SourceImage = cfg.Image.OutputImage
+		}
+		if !explicit["runner.labels"] {
+			if sourceType == ImageSourceRootFSTar {
+				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-ubuntu-24.04-base"}
+			} else {
+				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-gitea-ubuntu"}
+			}
+		}
+		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
+			cfg.Pool.NamePrefix = "epar-wsl"
+		}
+	case "docker-dind":
+		if !explicit["image.sourceType"] {
+			cfg.Image.SourceType = ImageSourceDockerImage
+		}
+		if !explicit["image.sourceImage"] {
+			cfg.Image.SourceImage = "gitea/runner-images:ubuntu-latest-full"
+		}
+		if !explicit["image.outputImage"] {
+			cfg.Image.OutputImage = "epar-docker-dind-gitea-ubuntu"
+		}
+		if !explicit["provider.sourceImage"] {
+			cfg.Provider.SourceImage = cfg.Image.OutputImage
+		}
+		if !explicit["runner.labels"] {
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-gitea-ubuntu"}
+		}
+		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
+			cfg.Pool.NamePrefix = "epar-dind"
+		}
+	}
+}
+
+func looksLikeRootFSTar(path string) bool {
+	path = strings.ToLower(strings.TrimSpace(path))
+	return strings.HasSuffix(path, ".tar") ||
+		strings.HasSuffix(path, ".tar.gz") ||
+		strings.HasSuffix(path, ".tgz")
 }
 
 func isListKey(section, key string) bool {
@@ -376,6 +461,19 @@ func Validate(cfg Config) error {
 	for _, script := range cfg.Image.CustomInstallScripts {
 		if strings.TrimSpace(script) == "" {
 			return fmt.Errorf("image.customInstallScripts must not contain empty paths")
+		}
+	}
+	switch cfg.Image.SourceType {
+	case "", ImageSourceDockerImage, ImageSourceRootFSTar:
+	default:
+		return fmt.Errorf("unsupported image.sourceType %q", cfg.Image.SourceType)
+	}
+	if cfg.Image.SourcePlatform != "" {
+		if err := ValidateDockerPlatform(cfg.Image.SourcePlatform); err != nil {
+			return fmt.Errorf("invalid image.sourcePlatform: %w", err)
+		}
+		if cfg.Image.SourceType == ImageSourceRootFSTar {
+			return fmt.Errorf("image.sourcePlatform is only supported with image.sourceType=docker-image")
 		}
 	}
 	if cfg.Pool.MinIdle < 0 || cfg.Pool.MaxInstances < 1 || cfg.Pool.MinIdle > cfg.Pool.MaxInstances {

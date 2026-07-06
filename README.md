@@ -20,7 +20,7 @@ flowchart LR
 - **Disposable runners:** every runner is expected to handle one job and then disappear.
 - **Warm pool:** `pool up` keeps ready runners online so jobs do not wait for a full image build.
 - **Use spare hosts:** turn a supported Mac, Windows, Linux, or Docker-capable machine into a pool of disposable Linux GitHub runners.
-- **Image control:** Tart and WSL start lean, while Docker-DinD defaults to Gitea's full runner image for broad out-of-the-box tooling.
+- **Image control:** WSL and Docker-DinD default to Gitea's full runner image for broad out-of-the-box tooling, while lean image paths stay available for smaller custom builds.
 - **Optional pull caching:** point runner Docker daemons at a registry mirror service to reduce repeated Docker Hub image pull time when that is a meaningful part of the job.
 - **GitHub App auth:** the host uses a GitHub App to request short-lived runner registration tokens.
 
@@ -52,12 +52,13 @@ Future providers can fit the same model: if EPAR supports the machine, that mach
 
 ## Image Choice
 
-EPAR keeps Tart and WSL base images lean. Docker-DinD defaults to Gitea's full Ubuntu runner image because it is the most convenient public path for Docker-heavy Linux workflows.
+EPAR defaults WSL and Docker-DinD to Gitea's full Ubuntu runner image because it is the most convenient public path for Docker-heavy Linux workflows. Tart stays lean by default, and WSL can still use an exported Ubuntu rootfs tar when you want a smaller image.
 
 | Image style | Config | Includes |
 | --- | --- | --- |
+| WSL default | `configs/wsl.example.yml` | WSL rootfs converted from Gitea's larger `ubuntu-latest-full` runner image, plus the GitHub Actions runner and EPAR lifecycle helpers. |
 | Docker-DinD default | `configs/docker-dind.example.yml` | Docker-DinD wrapper over Gitea's larger `ubuntu-latest-full` runner image, plus the GitHub Actions runner and EPAR lifecycle helpers. |
-| Runner-only base | `configs/tart.example.yml` or `configs/wsl.example.yml` | GitHub Actions runner and minimal runtime dependencies. |
+| Runner-only base | `configs/tart.example.yml` or `configs/wsl.lean.example.yml` | GitHub Actions runner and minimal runtime dependencies. |
 | Docker/browser | add `scripts/guest/ubuntu/install-docker-browser.sh` to `image.customInstallScripts` | Docker Engine, Docker CLI, Compose v2, Buildx, and a Chromium-compatible browser |
 | Web/E2E custom | `configs/tart.web-e2e.example.yml`, `configs/wsl.web-e2e.example.yml`, or `configs/docker-dind.web-e2e.example.yml` | Docker/browser plus Node.js/npm, zip, rsync, and mysql-client. The Docker-DinD example demonstrates a smaller custom image starting from `gitea/runner-images:ubuntu-latest`. |
 | Custom | add your own script path to `image.customInstallScripts` | Whatever your script installs inside Ubuntu |
@@ -104,7 +105,9 @@ image:
    Copy-Item configs/wsl.example.yml .local/config.yml
    ```
 
-4. If you chose WSL2 on Windows, export a clean Ubuntu 24.04 rootfs once:
+4. If you chose WSL2 on Windows, make sure WSL2 is enabled. The default WSL image build uses Docker once to pull and export `gitea/runner-images:ubuntu-latest-full` into a WSL rootfs tar, so Docker Desktop, Docker Engine, or another working Docker daemon must be available for this preparation step.
+
+   If you intentionally use `configs/wsl.lean.example.yml` or another `image.sourceType: rootfs-tar` config, export a clean Ubuntu 24.04 rootfs once instead:
 
    ```powershell
    New-Item -ItemType Directory -Force work/images
@@ -172,7 +175,7 @@ Start with:
 Provider details:
 
 - [Tart Provider](docs/providers/tart.md): Apple Silicon macOS and Ubuntu ARM64.
-- [WSL Provider](docs/providers/wsl.md): Windows WSL2, rootfs tar images, and WSL caveats.
+- [WSL Provider](docs/providers/wsl.md): Windows WSL2, Docker-image-to-rootfs builds, and WSL caveats.
 - [Docker-DinD Provider](docs/providers/docker-dind.md): privileged runner containers with private Docker daemons.
 
 Operational context:

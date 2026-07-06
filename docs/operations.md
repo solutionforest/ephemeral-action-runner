@@ -50,7 +50,8 @@ For Docker-DinD, cleanup removes the outer runner container with `docker rm -f -
 - If GitHub registration fails, confirm the app has permission to manage organization self-hosted runners and that the private key path is readable by the host user.
 - If stale runners remain, run `ephemeral-action-runner cleanup`.
 - If using Tart `softnet`, verify the host has the privileges Tart requires.
-- If WSL image build fails before systemd is ready, confirm WSL2 is enabled and that the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.
+- If default WSL image build fails before import, confirm Docker Desktop, Docker Engine, or another Docker daemon is reachable so EPAR can export `gitea/runner-images:ubuntu-latest-full` into a rootfs tar. For lean WSL configs, confirm the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.
+- If WSL image build fails before systemd is ready, confirm WSL2 is enabled and inspect `work/logs/<image>.guest.log`.
 - If Docker-DinD startup fails, confirm the host Docker runtime supports privileged containers and inspect `/var/log/epar-dockerd.log` inside the runner container.
 - If Docker-DinD `docker run` fails with nested overlay mount errors, keep the default `EPAR_DOCKERD_STORAGE_DRIVER=vfs`. Only switch to `overlay2` or `auto` in a derived image after proving that storage driver works on the exact host runtime.
-- If the default Docker-DinD build cannot validate Docker, confirm the source image still provides `docker`, `dockerd`, Compose, Buildx, and `iptables`. If you intentionally use a clean Ubuntu source image instead of Gitea's runner image, run `image update-upstream` first so EPAR can use its pinned `actions/runner-images` Docker install harness.
+- If the default WSL or Docker-DinD build cannot validate Docker, confirm the source image still provides `docker`, `dockerd`, Compose, Buildx, and `iptables`. If you intentionally use a clean Ubuntu source image instead of Gitea's runner image, run `image update-upstream` first and use a config that installs Docker from EPAR's pinned `actions/runner-images` Docker install harness.

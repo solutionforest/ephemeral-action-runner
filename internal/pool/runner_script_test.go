@@ -4,30 +4,41 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestCheckRunnerPIDFilePath(t *testing.T) {
-	script := filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh")
-	sleep := exec.Command("sleep", "30")
-	if err := sleep.Start(); err != nil {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX process signaling")
+	}
+	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "actions-runner.pid")
+	fakeBin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(fakeBin, 0755); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = sleep.Process.Kill()
-		_, _ = sleep.Process.Wait()
-	}()
-
-	pidFile := filepath.Join(t.TempDir(), "actions-runner.pid")
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(sleep.Process.Pid)), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(fakeBin, "kill"), []byte(`#!/usr/bin/env bash
+if [[ "${1:-}" == "-0" && "${2:-}" == "12345" ]]; then
+  exit 0
+fi
+exit 1
+`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidFile, []byte("12345"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	cmd := exec.Command("bash", script)
-	cmd.Env = append(os.Environ(), "EPAR_DISABLE_SYSTEMD=1", "EPAR_RUNNER_PID_FILE="+pidFile)
+	cmd.Env = append(os.Environ(),
+		"EPAR_DISABLE_SYSTEMD=1",
+		"EPAR_RUNNER_PID_FILE="+bashPath(pidFile),
+		"PATH="+bashPath(fakeBin)+":"+os.Getenv("PATH"),
+	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("check-runner PID path failed: %v\n%s", err, out)
 	}
@@ -36,14 +47,21 @@ func TestCheckRunnerPIDFilePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd = exec.Command("bash", script)
-	cmd.Env = append(os.Environ(), "EPAR_DISABLE_SYSTEMD=1", "EPAR_RUNNER_PID_FILE="+pidFile)
+	cmd.Env = append(os.Environ(),
+		"EPAR_DISABLE_SYSTEMD=1",
+		"EPAR_RUNNER_PID_FILE="+bashPath(pidFile),
+		"PATH="+bashPath(fakeBin)+":"+os.Getenv("PATH"),
+	)
 	if err := cmd.Run(); err == nil {
 		t.Fatal("check-runner accepted stale PID")
 	}
 }
 
 func TestCheckRunnerSystemdPath(t *testing.T) {
-	script := filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh")
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX systemd command simulation")
+	}
+	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "systemctl.args")
 	systemctl := filepath.Join(dir, "systemctl")
@@ -57,8 +75,8 @@ exit 0
 	cmd := exec.Command("bash", script)
 	cmd.Env = append(os.Environ(),
 		"EPAR_FORCE_SYSTEMD=1",
-		"EPAR_SYSTEMCTL_ARGS_FILE="+argsFile,
-		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"EPAR_SYSTEMCTL_ARGS_FILE="+bashPath(argsFile),
+		"PATH="+bashPath(dir)+":"+os.Getenv("PATH"),
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("check-runner systemd path failed: %v\n%s", err, out)
@@ -76,5 +94,35 @@ exit 0
 	}
 	if args != "is-active --quiet actions-runner.service" {
 		t.Fatalf("systemctl args = %q", args)
+	}
+}
+
+func bashPath(path string) string {
+	path = filepath.ToSlash(path)
+	if len(path) >= 2 && path[1] == ':' {
+		return "/" + strings.ToLower(path[:1]) + path[2:]
+	}
+	return path
+}
+
+func TestRunRunnerUsesSourceImageEnvWrapper(t *testing.T) {
+	runRunnerPath := filepath.Join("..", "..", "scripts", "guest", "ubuntu", "run-runner.sh")
+	runRunner, err := os.ReadFile(runRunnerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(runRunner), "/opt/epar/start-runner-with-env.sh"); got != 2 {
+		t.Fatalf("run-runner wrapper references = %d, want 2\n%s", got, runRunner)
+	}
+
+	wrapperPath := filepath.Join("..", "..", "scripts", "guest", "ubuntu", "start-runner-with-env.sh")
+	wrapper, err := os.ReadFile(wrapperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/opt/epar/source-image.env", "set -a", "exec ./run.sh"} {
+		if !strings.Contains(string(wrapper), want) {
+			t.Fatalf("wrapper missing %q:\n%s", want, wrapper)
+		}
 	}
 }

@@ -18,7 +18,7 @@ if command -v systemctl >/dev/null 2>&1 && [[ "$(ps -p 1 -o comm= 2>/dev/null ||
     --property=WorkingDirectory=/opt/actions-runner \
     --property=StandardOutput=append:/var/log/actions-runner/run.log \
     --property=StandardError=append:/var/log/actions-runner/run.log \
-    /opt/actions-runner/run.sh
+    /opt/epar/start-runner-with-env.sh
   sleep 1
   systemctl show "${unit}" --property=MainPID --value >"${pid_file}"
 else
@@ -26,6 +26,6 @@ else
   if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" >/dev/null 2>&1; then
     kill "${old_pid}" >/dev/null 2>&1 || true
   fi
-  sudo -u runner -H bash -lc 'cd /opt/actions-runner && nohup ./run.sh >>/var/log/actions-runner/run.log 2>&1 & echo $!' >"${pid_file}"
+  sudo -u runner -H bash -lc 'nohup /opt/epar/start-runner-with-env.sh >>/var/log/actions-runner/run.log 2>&1 & echo $!' >"${pid_file}"
 fi
 cat "${pid_file}"

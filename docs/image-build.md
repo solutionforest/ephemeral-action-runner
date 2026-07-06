@@ -9,15 +9,18 @@ For Tart, the image build has two image names:
 
 These are Tart VM image names. They are stored in Tart's local VM registry and are visible with `tart list`; they are not emitted as repository-local files.
 
-For WSL, the image build uses tar files:
+For WSL, the image build produces a rootfs tar. It can start from either a Docker image or an existing rootfs tar:
 
-- `image.sourceImage`: clean Ubuntu 24.04 rootfs tar, default `work/images/ubuntu-24.04-clean.rootfs.tar`.
-- `image.outputImage`: reusable EPAR runner rootfs tar, default `work/images/epar-ubuntu-24-wsl.tar`.
+- `image.sourceType`: `docker-image` or `rootfs-tar`, default `docker-image` for WSL.
+- `image.sourceImage`: source Docker image or rootfs tar, default `gitea/runner-images:ubuntu-latest-full`.
+- `image.sourcePlatform`: Docker platform used when `sourceType` is `docker-image`, default `linux/amd64`.
+- `image.outputImage`: reusable EPAR runner rootfs tar, default `work/images/epar-wsl-gitea-ubuntu.tar`.
 
-The WSL build imports the clean tar into a temporary distro, enables systemd, installs the runner runtime, runs any configured install scripts, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
+For `docker-image` sources, EPAR pulls the source image, creates a temporary container, exports that container filesystem to an intermediate rootfs tar, and captures the image environment metadata. Later builds reuse the intermediate rootfs and env cache unless you delete them. The WSL build then imports the rootfs into a temporary distro, enables systemd, installs the runner runtime, writes the captured image env under `/opt/epar`, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
 
 For Docker-DinD, the image build uses Docker images:
 
+- `image.sourceType`: `docker-image`.
 - `image.sourceImage`: maintained Gitea Ubuntu runner image, default `gitea/runner-images:ubuntu-latest-full`.
 - `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-gitea-ubuntu`.
 
@@ -25,10 +28,11 @@ Docker-DinD builds a thin wrapper over the source image, installs the GitHub Act
 
 ```mermaid
 flowchart TD
-  Source["Clean Ubuntu source<br/>Tart image, WSL rootfs tar, or Docker image"] --> Build["Temporary build instance or Docker build"]
+  Source["Clean Ubuntu source<br/>Tart image, WSL source, or Docker image"] --> Build["Temporary build instance or Docker build"]
   Build --> Scripts["EPAR guest scripts"]
   Scripts --> Runner["GitHub Actions runner"]
-  Runner --> DockerDind["Docker-DinD-only private daemon layer"]
+  Runner --> WSLFull["WSL Docker-source env and Docker validation"]
+  WSLFull --> DockerDind["Docker-DinD-only private daemon layer"]
   DockerDind --> Rosetta["Optional Tart Rosetta layer"]
   Rosetta --> Custom["Optional custom install scripts"]
   Custom --> Validate["Runtime validation"]
@@ -38,18 +42,20 @@ flowchart TD
 
 ## Image Install Scripts
 
-Four layers control what is pre-installed in the Ubuntu image:
+Several layers control what is pre-installed in the Ubuntu image:
 
 1. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
 2. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
-3. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
-4. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
-5. `image.customInstallScripts` adds optional tool layers.
+3. WSL builds from Docker-image sources validate Docker Engine from the base image and preserve source image environment metadata for runner jobs.
+4. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
+5. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
+6. `image.customInstallScripts` adds optional tool layers.
 
 ```mermaid
 flowchart LR
   Base["Runner-only base"] --> Runner["GitHub Actions runner"]
-  Runner --> DinD["Docker-DinD-only daemon layer"]
+  Runner --> WSLFull["WSL Docker-source env and Docker validation"]
+  WSLFull --> DinD["Docker-DinD-only daemon layer"]
   DinD --> Rosetta["Optional Tart Rosetta layer"]
   Rosetta --> Optional["customInstallScripts"]
   Optional --> Docker["Docker/browser layer"]
@@ -57,7 +63,7 @@ flowchart LR
   Optional --> Yours["your scripts"]
 ```
 
-The public Tart and WSL default examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always needs Docker Engine because the provider depends on a private inner Docker daemon; the default Gitea full source image already provides Docker plus a broad runner tool stack, so the EPAR build usually only adds the GitHub runner and EPAR lifecycle helpers.
+The public WSL and Docker-DinD default examples start from `gitea/runner-images:ubuntu-latest-full`, so they inherit Docker plus the broader Gitea runner tool stack. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always needs Docker Engine because the provider depends on a private inner Docker daemon.
 
 EPAR ships reusable install scripts for common cases:
 
@@ -132,7 +138,7 @@ Docker registry mirrors are runtime configuration, not image content. Keep them 
 
 ## Upstream Runner Images
 
-Runner-only Tart and WSL base images do not require `actions/runner-images`. The default Docker-DinD image also does not require it because it starts from `gitea/runner-images:ubuntu-latest-full`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Gitea runner tool stack.
+Runner-only Tart images and the default WSL and Docker-DinD images do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker-DinD images start from `gitea/runner-images:ubuntu-latest-full`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Gitea runner tool stack.
 
 The built-in Docker/browser and web/E2E scripts require a pinned checkout of `actions/runner-images`:
 
@@ -169,9 +175,39 @@ docker image ls epar-docker-dind-gitea-ubuntu
 
 The provider creates each runner instance with `docker create --privileged` and no host socket mount. The image entrypoint starts a private `dockerd`, waits for `docker info`, and keeps the container alive while EPAR configures and monitors the GitHub runner process. Workflow Docker resources live inside that inner daemon. The inner daemon defaults to the `vfs` storage driver because it is reliable for nested Docker across Docker Desktop, OrbStack, and Linux Docker hosts; users can bake a different `EPAR_DOCKERD_STORAGE_DRIVER` into a derived image after validating the host.
 
+## WSL Images
+
+Use `configs/wsl.example.yml` for the default full Gitea runner image converted into WSL:
+
+```powershell
+Copy-Item configs/wsl.example.yml .local/config.yml
+./bin/ephemeral-action-runner image build --replace
+```
+
+The default WSL build uses Docker on the Windows host only to prepare the source rootfs. It runs `docker pull`, `docker create`, `docker export`, and cleanup for `gitea/runner-images:ubuntu-latest-full`, then imports the exported rootfs into WSL and applies EPAR's normal lifecycle layer. If Docker is unavailable, use Docker Desktop, Docker Engine, or switch to `image.sourceType: rootfs-tar` with a prepared rootfs tar.
+
+The output image is a WSL-importable rootfs tar:
+
+```text
+work/images/epar-wsl-gitea-ubuntu.tar
+```
+
+EPAR also writes an intermediate source tar and env cache beside the output, for example:
+
+```text
+work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar
+work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar.env
+```
+
+Later builds reuse that source cache. Delete those files when you intentionally want to reconvert the Docker image.
+
+WSL runner startup sources `/opt/epar/source-image.env` before launching the GitHub Actions runner. That preserves image metadata such as `ImageOS`, `ImageVersion`, runner tool cache paths, browser paths, and Java paths from the Docker image source. WSL does not use Docker-DinD's container entrypoint; it keeps the systemd and keepalive model used by other WSL images.
+
+Use `configs/wsl.lean.example.yml` when you want the old smaller rootfs-tar path. That config expects you to export a clean Ubuntu 24.04 WSL distro to `work/images/ubuntu-24.04-clean.rootfs.tar`.
+
 ## Installed Runtime
 
-The default Docker-DinD build uses `gitea/runner-images:ubuntu-latest-full` as the source image. It is larger than the lightweight Gitea image, but it is the recommended default for public users because common tools such as Node/npm are already present. The web/E2E Docker-DinD example uses `gitea/runner-images:ubuntu-latest` to demonstrate a smaller custom image that layers only selected dependencies.
+The default WSL and Docker-DinD builds use `gitea/runner-images:ubuntu-latest-full` as the source image. It is larger than the lightweight Gitea image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
 
 The default build installs:
 
@@ -185,7 +221,7 @@ The optional `install-docker-browser.sh` layer installs:
 - upstream Google Chrome on x64
 - Playwright-managed Chromium on ARM64, exposed as `epar-browser`, `chromium`, and `chromium-browser`
 
-The Docker-DinD provider validates or installs Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`, then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside the image build only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
+The WSL default and Docker-DinD provider validate Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`. Docker-DinD then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`; WSL starts Docker through systemd inside the distro. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside non-WSL-default image builds only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
 
 The ARM64 Docker harness prefers upstream `toolset-2404-arm64.json`. If an older upstream checkout does not contain that file, EPAR falls back to a minimal ARM-aware Docker toolset.
 
@@ -227,7 +263,9 @@ The bundled `scripts/guest/ubuntu/install-web-e2e.sh` script creates a feature m
 
 ## WSL Bootstrap
 
-On Windows, create the clean Ubuntu tar once before `image build`. The supported path is to install an Ubuntu 24.04 WSL distro, export it, then use that tar as `image.sourceImage`:
+The default WSL config does not require a manually exported Ubuntu tar. It uses Docker to convert `gitea/runner-images:ubuntu-latest-full` into a rootfs tar during `image build`.
+
+For lean `image.sourceType: rootfs-tar` configs, create the clean Ubuntu tar once before `image build`. The supported path is to install an Ubuntu 24.04 WSL distro, export it, then use that tar as `image.sourceImage`:
 
 ```powershell
 New-Item -ItemType Directory -Force work/images

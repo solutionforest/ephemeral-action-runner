@@ -15,6 +15,7 @@ Install the host tools you need:
 | All hosts | Go 1.22 or newer, Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |
+| Windows WSL2 default image build | Docker Desktop, Docker Engine, or another working Docker daemon for the one-time Docker image export |
 | Docker-DinD provider | Docker Engine, OrbStack, or Docker Desktop with privileged container support |
 | Optional Docker registry mirrors | A running mirror service on the host, LAN, intranet, or cloud registry cache |
 | Runner registration | GitHub App with organization self-hosted runner read/write permission |
@@ -31,8 +32,9 @@ Copy one example config into `.local/config.yml`, then edit the GitHub App field
 | --- | --- |
 | macOS Tart, runner-only | `configs/tart.example.yml` |
 | macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
-| Windows WSL2, runner-only | `configs/wsl.example.yml` |
-| Windows WSL2, web/E2E | `configs/wsl.web-e2e.example.yml` |
+| Windows WSL2, default full Gitea runner image | `configs/wsl.example.yml` |
+| Windows WSL2, lean runner-only tar | `configs/wsl.lean.example.yml` |
+| Windows WSL2, lean web/E2E tar | `configs/wsl.web-e2e.example.yml` |
 | Docker-DinD, default full Gitea runner image | `configs/docker-dind.example.yml` |
 | Docker-DinD, smaller web/E2E custom image | `configs/docker-dind.web-e2e.example.yml` |
 
@@ -88,11 +90,13 @@ go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
 
 Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on `PATH`.
 
-## Prepare A WSL Source Tar
+## Prepare A WSL Source
 
 Skip this section for Tart and Docker-DinD.
 
-The WSL provider builds reusable rootfs tar images. Create the clean Ubuntu 24.04 source tar once:
+The default WSL config starts from `gitea/runner-images:ubuntu-latest-full`. During `image build`, EPAR runs Docker on the Windows host to pull that image, create a temporary container, export its filesystem into a rootfs tar, and then import that tar into WSL for EPAR's normal runner bootstrap. Docker is needed for this preparation step. Running WSL runner instances afterward does not require Docker Desktop unless your jobs need it.
+
+If you use `configs/wsl.lean.example.yml`, `configs/wsl.web-e2e.example.yml`, or another `image.sourceType: rootfs-tar` config, create the clean Ubuntu 24.04 source tar once:
 
 ```powershell
 New-Item -ItemType Directory -Force work/images
@@ -104,7 +108,7 @@ After that, EPAR imports disposable temporary distros for image builds and pool 
 
 ## Build The Runner Image
 
-Runner-only Tart and WSL images do not need the upstream `actions/runner-images` checkout:
+Default WSL and Docker-DinD builds and runner-only Tart builds do not need the upstream `actions/runner-images` checkout:
 
 ```bash
 ./bin/ephemeral-action-runner image build --replace
@@ -125,11 +129,13 @@ Tart output is a local Tart image name, such as `epar-ubuntu-24-arm64`. Confirm 
 tart list
 ```
 
-WSL output is a rootfs tar path, such as:
+The default WSL output is a rootfs tar path:
 
 ```text
-work/images/epar-ubuntu-24-wsl.tar
+work/images/epar-wsl-gitea-ubuntu.tar
 ```
+
+When the WSL source is a Docker image, EPAR also writes an intermediate source rootfs tar and env cache next to the output image, for example `work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar` and `.env`. Later builds reuse that source cache; delete those files when you intentionally want to reconvert the Docker image.
 
 Docker-DinD output is a Docker image tag, such as `epar-docker-dind-gitea-ubuntu`. Confirm it with:
 
@@ -141,7 +147,7 @@ Build logs are written under `work/logs`.
 
 ## Customize The Image
 
-Tart and WSL default images are runner-only. Docker-DinD uses the full Gitea runner image by default; use `image.customInstallScripts` when you want a different image shape, such as the smaller Docker-DinD web/E2E example:
+WSL and Docker-DinD use the full Gitea runner image by default. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker-DinD web/E2E examples:
 
 ```yaml
 image:
@@ -177,6 +183,7 @@ Healthy output should show each generated instance name moving through:
 Runtime validation always checks the base runner files and runner user. Images with optional feature markers also validate those features:
 
 - Docker/browser images validate Docker, Compose v2, Buildx, `hello-world`, and a headless browser.
+- Default WSL full images validate Docker, Compose v2, Buildx, and `hello-world`.
 - Docker-DinD images validate the private inner Docker daemon inside each runner container.
 - Tart Rosetta images validate `docker run --platform linux/amd64 alpine:3.20` and expect `uname -m` to return `x86_64`.
 - Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
@@ -223,6 +230,12 @@ Use provider-specific labels in workflows. For the Tart web/E2E Rosetta image, t
 
 ```yaml
 runs-on: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-rosetta-amd64]
+```
+
+For the default WSL image, target the default WSL label:
+
+```yaml
+runs-on: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
 ```
 
 For the default Docker-DinD image, target the default Docker-DinD label:

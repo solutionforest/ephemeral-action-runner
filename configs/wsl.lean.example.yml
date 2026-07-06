@@ -6,32 +6,34 @@ github:
   webBaseUrl: https://github.com
 
 image:
-  sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest-full
-  outputImage: epar-docker-dind-gitea-ubuntu
+  sourceType: rootfs-tar
+  sourceImage: work/images/ubuntu-24.04-clean.rootfs.tar
+  outputImage: work/images/epar-ubuntu-24-wsl.tar
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
   customInstallScripts:
+    # - examples/custom-install/install-extra-apt-tools.sh
 
 pool:
   minIdle: 2
   maxInstances: 2
-  namePrefix: epar-dind
+  namePrefix: epar-wsl
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
+  labels: [self-hosted, linux, X64, epar-wsl-ubuntu-24.04-base]
   ephemeral: true
 
 provider:
-  type: docker-dind
-  sourceImage: epar-docker-dind-gitea-ubuntu
+  type: wsl
+  sourceImage: work/images/epar-ubuntu-24-wsl.tar
   network: default
+  installRoot: work/wsl
 
 docker:
   registryMirrors:
-    # - http://host.docker.internal:5050
+    # - https://mirror.example.test
 
 timeouts:
   bootSeconds: 180

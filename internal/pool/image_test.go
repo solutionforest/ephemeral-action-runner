@@ -150,6 +150,29 @@ func TestEnableWSLSystemdDisablesWindowsPathInjection(t *testing.T) {
 	}
 }
 
+func TestPrepareWSLDockerSourceGuestNeutralizesCloudImageState(t *testing.T) {
+	provider := &recordingProvider{}
+	manager := Manager{Provider: provider}
+	if err := manager.prepareWSLDockerSourceGuest(context.Background(), "image-test"); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.commands) != 1 {
+		t.Fatalf("command count = %d, want 1", len(provider.commands))
+	}
+	command := strings.Join(provider.commands[0], "\n")
+	for _, want := range []string{
+		"cat >/etc/fstab",
+		"EPAR: Docker image rootfs prepared for WSL imports",
+		"/etc/skel/.cargo/env",
+		"cloud-init.disabled",
+		"walinuxagent.service",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("prepare command missing %q:\n%s", want, command)
+		}
+	}
+}
+
 func TestConfigureDockerRegistryMirrors(t *testing.T) {
 	root := t.TempDir()
 	scriptDir := filepath.Join(root, "scripts", "guest", "ubuntu")
@@ -181,6 +204,157 @@ func TestConfigureDockerRegistryMirrors(t *testing.T) {
 	wantEnv := "http://host.docker.internal:5000\nhttps://mirror.example.test"
 	if gotEnv != wantEnv {
 		t.Fatalf("mirror env = %q, want %q", gotEnv, wantEnv)
+	}
+}
+
+func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
+	root := t.TempDir()
+	oldLogged := runHostLoggedCommand
+	oldOutput := runHostOutputCommand
+	oldQuiet := runHostQuietCommand
+	defer func() {
+		runHostLoggedCommand = oldLogged
+		runHostOutputCommand = oldOutput
+		runHostQuietCommand = oldQuiet
+	}()
+
+	var calls []string
+	runHostLoggedCommand = func(_ context.Context, _ string, name string, args ...string) error {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		if len(args) > 0 && args[0] == "export" {
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == "-o" {
+					if err := os.MkdirAll(filepath.Dir(args[i+1]), 0755); err != nil {
+						return err
+					}
+					return os.WriteFile(args[i+1], []byte("rootfs"), 0644)
+				}
+			}
+		}
+		return nil
+	}
+	runHostOutputCommand = func(_ context.Context, name string, args ...string) (string, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return `["PATH=/opt/bin:/usr/bin","ImageVersion=20260615.205.1","QUOTED=a'b"]`, nil
+	}
+	runHostQuietCommand = func(_ context.Context, name string, args ...string) error {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+
+	manager := Manager{
+		Config: config.Config{
+			Image: config.ImageConfig{
+				SourceImage:    "gitea/runner-images:ubuntu-latest-full",
+				SourcePlatform: "linux/amd64",
+			},
+		},
+		ProjectRoot: root,
+	}
+	outputPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.tar")
+	rootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rootfsPath, filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.source.rootfs.tar"); got != want {
+		t.Fatalf("rootfsPath = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(rootfsPath); err != nil {
+		t.Fatalf("exported rootfs missing: %v", err)
+	}
+	if _, err := os.Stat(rootfsPath + ".env"); err != nil {
+		t.Fatalf("exported env cache missing: %v", err)
+	}
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"docker pull --platform linux/amd64 gitea/runner-images:ubuntu-latest-full",
+		"docker create --platform linux/amd64 --name epar-wsl-source-",
+		"docker container inspect --format {{json .Config.Env}} epar-wsl-source-",
+		"docker export -o " + rootfsPath + ".tmp epar-wsl-source-",
+		"docker rm -f epar-wsl-source-",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("calls missing %q:\n%s", want, joined)
+		}
+	}
+	if !strings.Contains(env, "export ImageVersion='20260615.205.1'") {
+		t.Fatalf("env missing ImageVersion export:\n%s", env)
+	}
+	if !strings.Contains(env, "export QUOTED='a'\"'\"'b'") {
+		t.Fatalf("env did not shell-quote single quote:\n%s", env)
+	}
+}
+
+func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
+	origLogged := runHostLoggedCommand
+	origOutput := runHostOutputCommand
+	origQuiet := runHostQuietCommand
+	defer func() {
+		runHostLoggedCommand = origLogged
+		runHostOutputCommand = origOutput
+		runHostQuietCommand = origQuiet
+	}()
+	runHostLoggedCommand = func(context.Context, string, string, ...string) error {
+		t.Fatal("docker command should not run when cached rootfs and env metadata exist")
+		return nil
+	}
+	runHostOutputCommand = func(context.Context, string, ...string) (string, error) {
+		t.Fatal("docker inspect should not run when cached env metadata exists")
+		return "", nil
+	}
+	runHostQuietCommand = func(context.Context, string, ...string) error {
+		t.Fatal("docker cleanup should not run when cached rootfs is reused")
+		return nil
+	}
+
+	root := t.TempDir()
+	outputPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.tar")
+	rootfsPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.source.rootfs.tar")
+	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rootfsPath, []byte("cached-rootfs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rootfsPath+".env", []byte("export ImageOS='ubuntu24'\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := Manager{
+		Config: config.Config{
+			Image: config.ImageConfig{SourceImage: "gitea/runner-images:ubuntu-latest-full"},
+		},
+		ProjectRoot: root,
+	}
+	gotRootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRootfsPath != rootfsPath {
+		t.Fatalf("rootfsPath = %q, want %q", gotRootfsPath, rootfsPath)
+	}
+	if env != "export ImageOS='ubuntu24'\n" {
+		t.Fatalf("env = %q", env)
+	}
+}
+
+func TestSourceImageEnvContentSkipsUnsafeNames(t *testing.T) {
+	content := sourceImageEnvContent([]string{
+		"PATH=/usr/local/bin:/usr/bin",
+		"GOOD_1=value",
+		"BAD-NAME=value",
+		"1BAD=value",
+		"NO_EQUALS",
+	})
+	for _, want := range []string{"export PATH=", "export GOOD_1='value'"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("env content missing %q:\n%s", want, content)
+		}
+	}
+	for _, bad := range []string{"BAD-NAME", "1BAD", "NO_EQUALS"} {
+		if strings.Contains(content, bad) {
+			t.Fatalf("env content included unsafe entry %q:\n%s", bad, content)
+		}
 	}
 }
 

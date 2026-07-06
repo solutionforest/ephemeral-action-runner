@@ -74,7 +74,7 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 	if err != nil {
 		return nil, err
 	}
-	_, err = p.Exec(ctx, name, []string{"/bin/sh", "-lc", "true"}, provider.ExecOptions{LogPath: opts.LogPath})
+	_, err = p.Exec(ctx, name, []string{"/bin/sh", "-c", "true"}, provider.ExecOptions{LogPath: opts.LogPath})
 	if err != nil {
 		if keeper != nil && keeper.Process != nil {
 			_ = keeper.Process.Kill()
@@ -98,7 +98,7 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
 	if p.DryRun && p.runCommand == nil {
-		fmt.Printf("[dry-run] %s -d %s --user root --exec /bin/sh -lc hostname -I 2>/dev/null || hostname -i 2>/dev/null || echo 127.0.0.1\n", p.Binary, name)
+		fmt.Printf("[dry-run] %s -d %s --user root --exec /bin/sh -c hostname -I 2>/dev/null || hostname -i 2>/dev/null || echo 127.0.0.1\n", p.Binary, name)
 		return "127.0.0.1", nil
 	}
 	if waitSeconds <= 0 {
@@ -107,7 +107,7 @@ func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string
 	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
 	var lastErr error
 	for {
-		result, err := p.Exec(ctx, name, []string{"/bin/sh", "-lc", "hostname -I 2>/dev/null || hostname -i 2>/dev/null || echo 127.0.0.1"}, provider.ExecOptions{})
+		result, err := p.Exec(ctx, name, []string{"/bin/sh", "-c", "hostname -I 2>/dev/null || hostname -i 2>/dev/null || echo 127.0.0.1"}, provider.ExecOptions{})
 		if err == nil {
 			fields := strings.Fields(result.Stdout)
 			if len(fields) > 0 {
@@ -212,7 +212,7 @@ func (p *Provider) cloneArgs(sourcePath, name, installDir string) []string {
 }
 
 func (p *Provider) keepAliveArgs(name string) []string {
-	return []string{"-d", name, "--user", "root", "--exec", "/bin/sh", "-lc", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"}
+	return []string{"-d", name, "--user", "root", "--exec", "/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done"}
 }
 
 func (p *Provider) execArgs(name string, command []string, env map[string]string) []string {
