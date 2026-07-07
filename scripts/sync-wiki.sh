@@ -21,6 +21,13 @@ fi
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
 
+copy_assets() {
+  if [ -d "$repo_root/docs/assets" ]; then
+    mkdir -p "$out_dir/assets"
+    cp -R "$repo_root/docs/assets/." "$out_dir/assets/"
+  fi
+}
+
 copy_page() {
   local source="$1"
   local target="$2"
@@ -80,11 +87,19 @@ rewrite_links() {
         $anchor //= "";
         $path =~ s{^\./}{};
         while ($path =~ s{^\.\./}{}) {}
-        exists $map{$path} ? "]($map{$path}$anchor)" : "]($raw)";
+        if ($path =~ s{^docs/assets/}{assets/}) {
+          "]($path$anchor)";
+        } elsif (exists $map{$path}) {
+          "]($map{$path}$anchor)";
+        } else {
+          "]($raw)";
+        }
       }
     }eg;
   ' "$file"
 }
+
+copy_assets
 
 copy_page "README.md" "Home"
 copy_page "docs/usage.md" "Usage"
