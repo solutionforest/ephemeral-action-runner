@@ -12,8 +12,8 @@ Install the host tools you need:
 
 | Required for | Tool |
 | --- | --- |
-| Release archive install | No Go toolchain required |
-| Source build | Go 1.22 or newer, Git |
+| Source ZIP quick start | Go 1.22 or newer |
+| Local binary build | Go 1.22 or newer |
 | Updating the pinned `actions/runner-images` checkout | Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |
@@ -26,68 +26,51 @@ Packer, GitHub CLI, and sshpass are not required.
 
 Set up the GitHub App before registering runners. The image build command can run without GitHub credentials, but `pool verify --register-only`, `pool up`, `status`, and GitHub cleanup need the app settings. See [GitHub App Setup](github-app.md).
 
-## Install The CLI
+## Get The Source
 
-For normal use, download the archive for your host from the GitHub Releases page and extract it:
-
-| Host | Release asset |
-| --- | --- |
-| Windows x64 | `ephemeral-action-runner_<version>_windows_amd64.zip` |
-| Linux x64 | `ephemeral-action-runner_<version>_linux_amd64.tar.gz` |
-| Linux ARM64 | `ephemeral-action-runner_<version>_linux_arm64.tar.gz` |
-| macOS Apple Silicon | `ephemeral-action-runner_<version>_macos_arm64.tar.gz` |
-| macOS Intel | `ephemeral-action-runner_<version>_macos_amd64.tar.gz` |
-
-Each release bundle includes the binary, a `run-epar` helper wrapper, `configs/`, `scripts/`, `docs/`, `examples/`, `README.md`, `LICENSE`, and `third_party/runner-images.lock`. Generated runner images, WSL tar files, local configs, and private keys are not included.
-
-Verify the downloaded archive against `checksums.txt` from the same release, then confirm the binary:
+For normal beta use, download the source ZIP from the [EPAR GitHub repo](https://github.com/solutionforest/ephemeral-action-runner), extract it, and open a terminal in the extracted folder:
 
 ```bash
-./ephemeral-action-runner version
+cd path/to/ephemeral-action-runner-main
+go run ./cmd/ephemeral-action-runner version
 ```
 
-On Windows PowerShell:
+If you want a local binary for automation or scheduled startup, build it from the source folder:
 
 ```powershell
-.\ephemeral-action-runner.exe version
+go build -o .\bin\ephemeral-action-runner.exe .\cmd\ephemeral-action-runner
+.\bin\ephemeral-action-runner.exe version
 ```
 
-If you are developing EPAR from source, build the CLI instead:
+macOS/Linux:
 
 ```bash
 go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
+./bin/ephemeral-action-runner version
 ```
 
-The examples below use `./bin/ephemeral-action-runner` for source checkouts. In an extracted release bundle, use `./run-epar` on macOS/Linux or `.\run-epar.cmd` on Windows for normal interactive use. Use `./ephemeral-action-runner` or `.\ephemeral-action-runner.exe` directly for automation.
+The examples below use `go run ./cmd/ephemeral-action-runner` for the public source-first path. If you built a local binary, use `./bin/ephemeral-action-runner` or `.\bin\ephemeral-action-runner.exe` instead.
 
 ## One-Command Start
 
-For the default Docker-DinD setup, run EPAR from the extracted release directory or source checkout:
+For the default Docker-DinD setup, run EPAR from the source folder:
 
 ```bash
-./run-epar
-```
-
-On Windows PowerShell:
-
-```powershell
-.\run-epar.cmd
+go run ./cmd/ephemeral-action-runner
 ```
 
 If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. It then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
-The wrapper passes every argument to the real executable and writes `work/logs/epar-last-run.log`. On failure it prints the log path and opens the log for desktop users when possible. Set `EPAR_NO_OPEN_LOG=1` to disable opening the log.
-
 Use `start` when you want to choose a config or runner count:
 
 ```bash
-./run-epar start --config .local/config.yml --instances 2
+go run ./cmd/ephemeral-action-runner start --config .local/config.yml --instances 2
 ```
 
 On Windows PowerShell:
 
 ```powershell
-.\run-epar.cmd start --config .local\wsl.yml --instances 2
+go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
 ```
 
 Stop the foreground process with Ctrl-C. Cleanup is enabled by default.
@@ -99,13 +82,13 @@ If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.ins
 Use `init` when you only want to create the default Docker-DinD config without building an image or starting runners:
 
 ```bash
-./ephemeral-action-runner init
+go run ./cmd/ephemeral-action-runner init
 ```
 
 On Windows PowerShell:
 
 ```powershell
-.\ephemeral-action-runner.exe init
+go run ./cmd/ephemeral-action-runner init
 ```
 
 For WSL, Tart, or custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
@@ -187,14 +170,14 @@ The `start` command builds or replaces the configured image automatically. Use t
 Default WSL and Docker-DinD builds and runner-only Tart builds do not need the upstream `actions/runner-images` checkout:
 
 ```bash
-./bin/ephemeral-action-runner image build --replace
+go run ./cmd/ephemeral-action-runner image build --replace
 ```
 
 If `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
 
 ```bash
-./bin/ephemeral-action-runner image update-upstream
-./bin/ephemeral-action-runner image build --replace
+go run ./cmd/ephemeral-action-runner image update-upstream
+go run ./cmd/ephemeral-action-runner image build --replace
 ```
 
 The Tart web/E2E example sets `provider.rosettaTag: rosetta`. Tart builds with that option start with `tart run --rosetta rosetta`, install Rosetta guest support, and validate that Docker can run a `linux/amd64` Alpine container returning `x86_64`.
@@ -241,13 +224,13 @@ Scripts run as root during image build, after the GitHub Actions runner is insta
 For a local runtime check without GitHub registration:
 
 ```bash
-./bin/ephemeral-action-runner pool verify --instances 1 --cleanup
+go run ./cmd/ephemeral-action-runner pool verify --instances 1 --cleanup
 ```
 
 For a full registration check:
 
 ```bash
-./bin/ephemeral-action-runner pool verify --instances 2 --register-only --cleanup
+go run ./cmd/ephemeral-action-runner pool verify --instances 2 --register-only --cleanup
 ```
 
 Healthy output should show each generated instance name moving through:
@@ -279,7 +262,7 @@ The expected output is `x86_64`.
 ## Run A Foreground Pool Manually
 
 ```bash
-./bin/ephemeral-action-runner pool up --instances 2
+go run ./cmd/ephemeral-action-runner pool up --instances 2
 ```
 
 `start` is the recommended public command because it also checks the image before starting runners. `pool up` is the lower-level supervisor command for users who already prepared the image.
@@ -298,8 +281,8 @@ Use these flags only for debugging:
 ## Status And Cleanup
 
 ```bash
-./bin/ephemeral-action-runner status
-./bin/ephemeral-action-runner cleanup
+go run ./cmd/ephemeral-action-runner status
+go run ./cmd/ephemeral-action-runner cleanup
 ```
 
 Cleanup only touches local instances and GitHub runners whose names match `pool.namePrefix`.
@@ -341,20 +324,19 @@ Do not use `ubuntu-latest` for these self-hosted runners.
 Use `--dry-run` to inspect provider command construction without mutating local instances:
 
 ```bash
-./bin/ephemeral-action-runner pool verify --dry-run --instances 2
+go run ./cmd/ephemeral-action-runner pool verify --dry-run --instances 2
 ```
 
-## Release Publishing
+## Maintainer Packaging
 
-Maintainers publish release bundles by pushing a version tag. Beta releases can be cut from `develop`; GitHub Releases are tag-based and are not tied to the repository default branch.
+Unsigned binary releases are not the normal public beta path. Maintainers can still package archives manually for testing, but the release workflow no longer runs on pushed tags.
 
 ```bash
-git push origin develop
 git tag -a v0.1.0-beta.1 -m "v0.1.0-beta.1"
 git push origin v0.1.0-beta.1
 ```
 
-The release workflow builds five archives, uploads `checksums.txt`, and marks tags with a prerelease suffix such as `-beta.1` as GitHub prereleases. It does not upload generated Docker images, WSL rootfs tars, local configs, or private keys.
+To run the disabled release workflow, start it manually from GitHub Actions and provide the tag plus the confirmation phrase. The workflow builds five unsigned archives and `checksums.txt`. It does not upload generated Docker images, WSL rootfs tars, local configs, or private keys.
 
 To test release packaging locally, run the same script used by the workflow:
 

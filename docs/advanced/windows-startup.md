@@ -6,6 +6,12 @@ Use the Startup folder for a personal machine where a visible foreground window 
 
 Run EPAR manually once first so `.local\config.yml` exists. The first run can take a while because `start` may build or refresh the configured image before starting runners.
 
+For startup automation, build a local binary from the source folder once:
+
+```powershell
+go build -o .\bin\ephemeral-action-runner.exe .\cmd\ephemeral-action-runner
+```
+
 ## Startup Folder Shortcut
 
 Open the current user's Startup folder:
@@ -14,14 +20,7 @@ Open the current user's Startup folder:
 Start-Process shell:startup
 ```
 
-Create a shortcut to the release binary:
-
-```text
-Target:   D:\path\to\ephemeral-action-runner\ephemeral-action-runner.exe
-Start in: D:\path\to\ephemeral-action-runner
-```
-
-For a source checkout, point the target at the source-built binary instead:
+Create a shortcut to the local binary:
 
 ```text
 Target:   D:\path\to\ephemeral-action-runner\bin\ephemeral-action-runner.exe
@@ -36,7 +35,7 @@ You can also create the shortcut from PowerShell:
 $root = "D:\path\to\ephemeral-action-runner"
 $startup = [Environment]::GetFolderPath("Startup")
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("$startup\EPAR.lnk")
-$shortcut.TargetPath = Join-Path $root "ephemeral-action-runner.exe"
+$shortcut.TargetPath = Join-Path $root "bin\ephemeral-action-runner.exe"
 $shortcut.WorkingDirectory = $root
 $shortcut.Arguments = "start --config .local\config.yml"
 $shortcut.Save()
@@ -50,7 +49,7 @@ Create a user logon task:
 2. Choose **Create Task**.
 3. On **Triggers**, add **At log on**. Add a short delay if Docker Desktop or another Docker daemon needs time to start.
 4. On **Actions**, choose **Start a program**.
-5. Set **Program/script** to `D:\path\to\ephemeral-action-runner\ephemeral-action-runner.exe`.
+5. Set **Program/script** to `D:\path\to\ephemeral-action-runner\bin\ephemeral-action-runner.exe`.
 6. Set **Add arguments** to `start --config .local\config.yml`.
 7. Set **Start in** to `D:\path\to\ephemeral-action-runner`.
 
@@ -61,7 +60,7 @@ PowerShell equivalent:
 ```powershell
 $root = "D:\path\to\ephemeral-action-runner"
 $action = New-ScheduledTaskAction `
-  -Execute (Join-Path $root "ephemeral-action-runner.exe") `
+  -Execute (Join-Path $root "bin\ephemeral-action-runner.exe") `
   -Argument "start --config .local\config.yml" `
   -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtLogOn

@@ -15,8 +15,7 @@ find_repo_root() {
 
   local dir="${script_dir}"
   for _ in $(seq 1 8); do
-    if [[ -d "${dir}/configs" && -d "${dir}/scripts" ]] &&
-      [[ -f "${dir}/go.mod" || -x "${dir}/ephemeral-action-runner" || -x "${dir}/bin/ephemeral-action-runner" ]]; then
+    if [[ -d "${dir}/configs" && -d "${dir}/scripts" && -f "${dir}/go.mod" ]]; then
       printf '%s\n' "${dir}"
       return
     fi
@@ -30,11 +29,7 @@ find_repo_root() {
 EPAR_ROOT="$(find_repo_root)"
 CONFIG_PATH="${EPAR_CONFIG:-${EPAR_ROOT}/.local/config.yml}"
 if [[ -z "${EPAR_BIN:-}" ]]; then
-  if [[ -x "${EPAR_ROOT}/ephemeral-action-runner" ]]; then
-    EPAR_BIN="${EPAR_ROOT}/ephemeral-action-runner"
-  else
-    EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
-  fi
+  EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
 fi
 MIRROR_CONTAINER="${EPAR_MIRROR_CONTAINER:-epar-dockerhub-cache}"
 WAIT_FOR_DOCKER="${EPAR_WAIT_FOR_DOCKER:-1}"
@@ -45,7 +40,7 @@ mkdir -p work/logs
 
 if [[ ! -x "${EPAR_BIN}" ]]; then
   echo "EPAR binary not found or not executable: ${EPAR_BIN}" >&2
-  echo "Use a release bundle, or build it first: go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner" >&2
+  echo "Build it first: go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner" >&2
   exit 1
 fi
 

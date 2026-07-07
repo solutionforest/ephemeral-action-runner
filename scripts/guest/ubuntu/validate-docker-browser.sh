@@ -36,7 +36,7 @@ else
   sudo -u runner -H docker version
   sudo -u runner -H docker compose version
   sudo -u runner -H docker buildx version
-  sudo -u runner -H docker run --rm hello-world
+  bash /opt/epar/validate-docker-hello-world.sh
 fi
 
 BROWSER=""

@@ -1,15 +1,22 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to package"
+        required: true
+        type: string
+      confirmation:
+        description: 'Type "package unsigned release assets"'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -22,7 +29,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
+
+      - name: Confirm manual unsigned packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirmation }}" != "package unsigned release assets" ]]; then
+            echo 'confirmation must be exactly: package unsigned release assets' >&2
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -39,7 +56,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ inputs.tag }}"
+          commit="$(git rev-parse HEAD)"
           build_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           prerelease=false
           if [[ "$tag" == *-* ]]; then
@@ -48,7 +66,7 @@ jobs:
 
           {
             echo "tag=$tag"
-            echo "commit=$GITHUB_SHA"
+            echo "commit=$commit"
             echo "build_date=$build_date"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
@@ -72,26 +90,15 @@ jobs:
 
           assets=(dist/*.tar.gz dist/*.zip dist/checksums.txt)
           release_notes="$(cat <<NOTES
-          ## Download
+          ## Source-first beta
 
-          Choose the archive for your host:
+          The recommended public beta path is to download the source ZIP from GitHub and run:
 
-          | Host | File |
-          | --- | --- |
-          | Windows x64 | \`ephemeral-action-runner_${TAG}_windows_amd64.zip\` |
-          | Linux x64 | \`ephemeral-action-runner_${TAG}_linux_amd64.tar.gz\` |
-          | Linux ARM64 | \`ephemeral-action-runner_${TAG}_linux_arm64.tar.gz\` |
-          | macOS Apple Silicon | \`ephemeral-action-runner_${TAG}_macos_arm64.tar.gz\` |
-          | macOS Intel | \`ephemeral-action-runner_${TAG}_macos_amd64.tar.gz\` |
+          \`\`\`bash
+          go run ./cmd/ephemeral-action-runner
+          \`\`\`
 
-          ## Run
-
-          After extracting:
-
-          - Windows: \`.\run-epar.cmd\`
-          - macOS/Linux: \`./run-epar\`
-
-          For setup details, read the README quick start.
+          These unsigned archives are maintainer testing artifacts and may be blocked by operating-system or antivirus checks.
           NOTES
           )"
           release_args=(gh release create "$TAG" --verify-tag --title "$TAG" --notes "$release_notes" --generate-notes)

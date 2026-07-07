@@ -6,7 +6,7 @@ The `.command` approach is the simplest option. It opens a Terminal window, and 
 
 ## Open At Login With A .command File
 
-From an extracted release bundle or source checkout, copy the example startup script into ignored local state:
+From the source folder, copy the example startup script into ignored local state:
 
 ```bash
 cd /path/to/ephemeral-action-runner
@@ -15,7 +15,7 @@ cp examples/macos/start-epar.command .local/start-epar.command
 chmod +x .local/start-epar.command
 ```
 
-If you are using a release bundle, no build step is needed. If you are running from source, build the binary once first:
+Build the local binary once:
 
 ```bash
 go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
@@ -29,8 +29,8 @@ Double-click `.local/start-epar.command` in Finder or run it from Terminal:
 
 The script:
 
-- finds the EPAR root when it lives under the extracted release or repo, such as `.local/start-epar.command`;
-- uses the release binary at `./ephemeral-action-runner` or the source-built binary at `./bin/ephemeral-action-runner`;
+- finds the EPAR source folder, such as when the script lives at `.local/start-epar.command`;
+- uses the local binary at `./bin/ephemeral-action-runner`;
 - uses `.local/config.yml` by default;
 - waits for Docker to become ready before starting EPAR;
 - starts an existing `epar-dockerhub-cache` mirror container if one exists;
@@ -49,7 +49,7 @@ You can edit the copied `.local/start-epar.command` file or set environment vari
 ```bash
 export EPAR_ROOT="/path/to/ephemeral-action-runner"
 export EPAR_CONFIG="${EPAR_ROOT}/.local/config.yml"
-export EPAR_BIN="${EPAR_ROOT}/ephemeral-action-runner"
+export EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
 export EPAR_MIRROR_CONTAINER="epar-dockerhub-cache"
 export EPAR_WAIT_FOR_DOCKER=1
 export EPAR_DOCKER_WAIT_ATTEMPTS=120

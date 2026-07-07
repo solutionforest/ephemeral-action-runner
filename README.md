@@ -33,31 +33,27 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
 
-### 1. Download EPAR
+### 1. Install Tools
 
-Download the archive for your host from GitHub Releases:
+Install:
 
-| Host | Asset |
-| --- | --- |
-| Windows x64 | `ephemeral-action-runner_<version>_windows_amd64.zip` |
-| Linux x64 | `ephemeral-action-runner_<version>_linux_amd64.tar.gz` |
-| Linux ARM64 | `ephemeral-action-runner_<version>_linux_arm64.tar.gz` |
-| macOS Apple Silicon | `ephemeral-action-runner_<version>_macos_arm64.tar.gz` |
-| macOS Intel | `ephemeral-action-runner_<version>_macos_amd64.tar.gz` |
-
-Extract it and open a terminal in the extracted folder.
-
-### 2. Install Docker
-
-The default setup needs a Docker-compatible daemon on the host.
-
-Common choices:
-
-- Windows: Docker Desktop, or another Docker daemon reachable from PowerShell.
-- macOS: Docker Desktop or OrbStack.
-- Linux: Docker Engine.
+- Go 1.22 or newer
+- a Docker-compatible daemon:
+  - Windows: Docker Desktop, or another Docker daemon reachable from PowerShell
+  - macOS: Docker Desktop or OrbStack
+  - Linux: Docker Engine
 
 The default Docker-DinD mode uses `docker run --privileged`, so the daemon must support privileged Linux containers.
+
+### 2. Download EPAR Source
+
+Open the [EPAR GitHub repo](https://github.com/solutionforest/ephemeral-action-runner), choose **Code**, then **Download ZIP**.
+
+Extract the ZIP and open a terminal in the extracted folder. The folder is usually named `ephemeral-action-runner-main`.
+
+```bash
+cd path/to/ephemeral-action-runner-main
+```
 
 ### 3. Create A GitHub App
 
@@ -71,18 +67,10 @@ Follow [GitHub App Setup](docs/github-app.md), then keep these three values read
 
 ### 4. Run EPAR
 
-Run EPAR with no command. The release includes a small `run-epar` wrapper that passes all arguments through to the real executable and writes `work/logs/epar-last-run.log` if something fails.
-
-Windows:
-
-```powershell
-.\run-epar.cmd
-```
-
-macOS/Linux:
+Run EPAR with no command:
 
 ```bash
-./run-epar
+go run ./cmd/ephemeral-action-runner
 ```
 
 If `.local/config.yml` does not exist, EPAR starts a short setup prompt and creates the default Docker-DinD config. Then it checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
@@ -94,16 +82,10 @@ Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans
 To choose a config or runner count:
 
 ```powershell
-.\run-epar.cmd start --config .local\wsl.yml --instances 2
+go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
 ```
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
-
-For automation, scripts, or agents, call the executable directly:
-
-```powershell
-.\ephemeral-action-runner.exe start --config .local\config.yml
-```
 
 Use this label in GitHub Actions:
 
