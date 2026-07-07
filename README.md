@@ -23,7 +23,7 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 ## Why Use EPAR
 
-- **Fast startup:** keep ready self-hosted runners online with `start`.
+- **Warm pool:** keep ready self-hosted runners online after setup.
 - **Disposable jobs:** each runner is cleaned up after one job.
 - **Great default image:** Docker-DinD and WSL use Gitea's full Ubuntu runner image by default.
 - **Docker-friendly isolation:** Docker-DinD gives each runner its own private Docker daemon.
@@ -33,17 +33,17 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
 
-### 1. Install Tools
+### 1. Prerequisites
 
-Install:
+Make sure these are installed:
 
-- Go 1.22 or newer
+- [Go](https://go.dev/) 1.22 or newer
 - a Docker-compatible daemon:
-  - Windows: Docker Desktop, or another Docker daemon reachable from PowerShell
-  - macOS: Docker Desktop or OrbStack
-  - Linux: Docker Engine
+  - Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
+  - macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
+  - Linux: [Docker Engine](https://docs.docker.com/engine/)
 
-The default Docker-DinD mode uses `docker run --privileged`, so the daemon must support privileged Linux containers.
+The default [Docker-DinD](https://www.docker.com/resources/docker-in-docker-containerized-ci-workflows-dockercon-2023/) mode uses `docker run --privileged`, so the daemon must support privileged Linux containers.
 
 ### 2. Download EPAR Source
 
@@ -67,17 +67,25 @@ Follow [GitHub App Setup](docs/github-app.md), then keep these three values read
 
 ### 4. Run EPAR
 
-Run EPAR with no command:
+Run EPAR with the default flow:
 
 ```bash
 go run ./cmd/ephemeral-action-runner
 ```
 
-If `.local/config.yml` does not exist, EPAR starts a short setup prompt and creates the default Docker-DinD config. Then it checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+That's it.
+
+#### What Happens
+
+EPAR initializes `.local/config.yml` for you if it does not exist. You can customize the config afterward; see [Configuration](docs/configuration.md).
+
+Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
 The first run can take a while because EPAR may need to build the runner image before it starts the pool. Later runs reuse the aligned image unless the config, EPAR scripts, or source image changed.
 
 Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans up matching local instances and GitHub runner records by default.
+
+#### Optional: Config Or Runner Count
 
 To choose a config or runner count:
 
@@ -86,6 +94,8 @@ go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
 ```
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
+
+#### GitHub Actions Label
 
 Use this label in GitHub Actions:
 
@@ -101,13 +111,31 @@ Docker-DinD is the default first choice. Other providers are available when they
 
 | Provider | Use when |
 | --- | --- |
-| Docker-DinD | You have Docker and want a private Docker daemon per runner. |
+| Docker-DinD | You have a Docker-compatible daemon on Windows, macOS, or Linux, and want a private Docker daemon per runner. |
 | WSL2 | You are on Windows and want runners as disposable WSL distros. |
-| Tart | You are on Apple Silicon macOS and want Linux VM runners. |
+| Tart | You are on Apple Silicon macOS and want Linux VM runners; consider Docker-DinD first for Docker-heavy jobs because virtualization limits can affect compatibility. |
 
 WSL2 also defaults to Gitea's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
 
 See [Usage](docs/usage.md) for WSL, Tart, source builds, custom configs, and advanced options.
+
+## FAQ
+
+### Can EPAR run multiple runners at once?
+
+Yes. Set `pool.instances` in `.local/config.yml`, or pass `--instances N` for one run.
+
+### Can one machine run runners for multiple GitHub organizations?
+
+Yes. Use one config per organization, then start EPAR once per config. Each config should use its own GitHub App values and a distinct `pool.namePrefix`.
+
+### Does each job get a clean runner?
+
+Yes. EPAR registers disposable ephemeral runners. After a job finishes, EPAR deletes that runner and creates a replacement.
+
+### Can jobs use Docker, Docker Compose, and Buildx?
+
+Yes, with the default Docker-DinD mode. Each runner gets its own private Docker daemon, so job-created containers, networks, and volumes stay inside that disposable runner.
 
 ## Safety
 
@@ -118,6 +146,7 @@ GitHub also warns against using self-hosted runners with public repositories tha
 ## More Docs
 
 - [Usage](docs/usage.md): setup, image builds, verification, and pool commands.
+- [Configuration](docs/configuration.md): config file sections and common edits.
 - [GitHub App Setup](docs/github-app.md): required GitHub App permissions and fields.
 - [Docker-DinD Provider](docs/providers/docker-dind.md): default Docker runner mode.
 - [WSL Provider](docs/providers/wsl.md): Windows WSL2 runners.
