@@ -2,9 +2,9 @@
 
 This page is the operational walkthrough. Start with the supported host you already have:
 
-- Tart on Apple Silicon macOS
-- WSL2 on Windows
 - Docker-DinD on a Docker-capable host
+- WSL2 on Windows
+- Tart on Apple Silicon macOS
 
 ## Prerequisites
 
@@ -12,7 +12,9 @@ Install the host tools you need:
 
 | Required for | Tool |
 | --- | --- |
-| All hosts | Go 1.22 or newer, Git |
+| Release archive install | No Go toolchain required |
+| Source build | Go 1.22 or newer, Git |
+| Updating the pinned `actions/runner-images` checkout | Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |
 | Windows WSL2 default image build | Docker Desktop, Docker Engine, or another working Docker daemon for the one-time Docker image export |
@@ -24,9 +26,89 @@ Packer, GitHub CLI, and sshpass are not required.
 
 Set up the GitHub App before registering runners. The image build command can run without GitHub credentials, but `pool verify --register-only`, `pool up`, `status`, and GitHub cleanup need the app settings. See [GitHub App Setup](github-app.md).
 
-## Configure
+## Install The CLI
 
-Copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
+For normal use, download the archive for your host from the GitHub Releases page and extract it:
+
+| Host | Release asset |
+| --- | --- |
+| Windows x64 | `ephemeral-action-runner_<version>_windows_amd64.zip` |
+| Linux x64 | `ephemeral-action-runner_<version>_linux_amd64.tar.gz` |
+| Linux ARM64 | `ephemeral-action-runner_<version>_linux_arm64.tar.gz` |
+| macOS Apple Silicon | `ephemeral-action-runner_<version>_macos_arm64.tar.gz` |
+| macOS Intel | `ephemeral-action-runner_<version>_macos_amd64.tar.gz` |
+
+Each release bundle includes the binary, a `run-epar` helper wrapper, `configs/`, `scripts/`, `docs/`, `examples/`, `README.md`, `LICENSE`, and `third_party/runner-images.lock`. Generated runner images, WSL tar files, local configs, and private keys are not included.
+
+Verify the downloaded archive against `checksums.txt` from the same release, then confirm the binary:
+
+```bash
+./ephemeral-action-runner version
+```
+
+On Windows PowerShell:
+
+```powershell
+.\ephemeral-action-runner.exe version
+```
+
+If you are developing EPAR from source, build the CLI instead:
+
+```bash
+go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
+```
+
+The examples below use `./bin/ephemeral-action-runner` for source checkouts. In an extracted release bundle, use `./run-epar` on macOS/Linux or `.\run-epar.cmd` on Windows for normal interactive use. Use `./ephemeral-action-runner` or `.\ephemeral-action-runner.exe` directly for automation.
+
+## One-Command Start
+
+For the default Docker-DinD setup, run EPAR from the extracted release directory or source checkout:
+
+```bash
+./run-epar
+```
+
+On Windows PowerShell:
+
+```powershell
+.\run-epar.cmd
+```
+
+If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. It then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+
+The wrapper passes every argument to the real executable and writes `work/logs/epar-last-run.log`. On failure it prints the log path and opens the log for desktop users when possible. Set `EPAR_NO_OPEN_LOG=1` to disable opening the log.
+
+Use `start` when you want to choose a config or runner count:
+
+```bash
+./run-epar start --config .local/config.yml --instances 2
+```
+
+On Windows PowerShell:
+
+```powershell
+.\run-epar.cmd start --config .local\wsl.yml --instances 2
+```
+
+Stop the foreground process with Ctrl-C. Cleanup is enabled by default.
+
+If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.instances` from the config. Passing `--instances N` overrides the config for that run.
+
+## Configure Only
+
+Use `init` when you only want to create the default Docker-DinD config without building an image or starting runners:
+
+```bash
+./ephemeral-action-runner init
+```
+
+On Windows PowerShell:
+
+```powershell
+.\ephemeral-action-runner.exe init
+```
+
+For WSL, Tart, or custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
 
 | Host and image | Example config |
 | --- | --- |
@@ -52,7 +134,7 @@ New-Item -ItemType Directory -Force .local
 Copy-Item configs/wsl.example.yml .local/config.yml
 ```
 
-Docker-DinD:
+Default Docker-DinD manually:
 
 ```bash
 mkdir -p .local
@@ -82,14 +164,6 @@ This is optional. Without it, EPAR behaves normally and pulls directly from regi
 
 EPAR only configures runner-side Docker daemons; it does not run or secure the mirror service. Docker Engine, Docker Desktop, or OrbStack can run a local `registry:2` pull-through cache on the EPAR host, or you can use a mirror reachable on the LAN/intranet. For private images, keep using `docker login` inside the workflow unless your mirror is deliberately configured and secured with upstream credentials. See [Docker Registry Mirrors](advanced/docker-registry-mirrors.md).
 
-## Build The CLI
-
-```bash
-go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
-```
-
-Use `./bin/ephemeral-action-runner` in the examples below, or put `bin` on `PATH`.
-
 ## Prepare A WSL Source
 
 Skip this section for Tart and Docker-DinD.
@@ -106,7 +180,9 @@ wsl --export Ubuntu-24.04 work/images/ubuntu-24.04-clean.rootfs.tar
 
 After that, EPAR imports disposable temporary distros for image builds and pool instances.
 
-## Build The Runner Image
+## Build The Runner Image Manually
+
+The `start` command builds or replaces the configured image automatically. Use this section when developing from source, debugging image builds, or intentionally separating image preparation from runner startup.
 
 Default WSL and Docker-DinD builds and runner-only Tart builds do not need the upstream `actions/runner-images` checkout:
 
@@ -136,6 +212,8 @@ work/images/epar-wsl-gitea-ubuntu.tar
 ```
 
 When the WSL source is a Docker image, EPAR also writes an intermediate source rootfs tar and env cache next to the output image, for example `work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar` and `.env`. Later builds reuse that source cache; delete those files when you intentionally want to reconvert the Docker image.
+
+EPAR also writes image manifests so `start` can tell whether the local image still matches the config. Docker-DinD stores the manifest hash as a Docker image label and stores the manifest at `/opt/epar/image-manifest.json`. WSL stores `/opt/epar/image-manifest.json` inside the exported image and writes a sidecar next to the tar.
 
 Docker-DinD output is a Docker image tag, such as `epar-docker-dind-gitea-ubuntu`. Confirm it with:
 
@@ -198,17 +276,19 @@ docker exec <epar-instance> docker run --rm --platform linux/amd64 alpine:3.20 u
 
 The expected output is `x86_64`.
 
-## Run A Foreground Pool
+## Run A Foreground Pool Manually
 
 ```bash
 ./bin/ephemeral-action-runner pool up --instances 2
 ```
 
+`start` is the recommended public command because it also checks the image before starting runners. `pool up` is the lower-level supervisor command for users who already prepared the image.
+
 `pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement.
 
 Stop the supervisor with Ctrl-C. By default, EPAR cleans up active instances and matching GitHub runner records before it exits.
 
-On macOS, see [macOS Startup](advanced/macos-startup.md) for an example `.command` file that waits for Docker and starts `pool up` after login.
+For startup after login, see [Windows Startup](advanced/windows-startup.md) or [macOS Startup](advanced/macos-startup.md).
 
 Use these flags only for debugging:
 
@@ -225,6 +305,8 @@ Use these flags only for debugging:
 Cleanup only touches local instances and GitHub runners whose names match `pool.namePrefix`.
 
 ## Runner Labels
+
+By default, EPAR appends an `epar-host-<machine>` label to the configured labels. The machine name is lowercased, unsafe characters are replaced with `-`, and the final label is kept within GitHub's 256-character label limit. Set `runner.includeHostLabel: false` to disable it.
 
 Use provider-specific labels in workflows. For the Tart web/E2E Rosetta image, target the existing web/E2E label plus the Rosetta label when the job needs amd64 Docker images:
 
@@ -261,3 +343,28 @@ Use `--dry-run` to inspect provider command construction without mutating local 
 ```bash
 ./bin/ephemeral-action-runner pool verify --dry-run --instances 2
 ```
+
+## Release Publishing
+
+Maintainers publish release bundles by pushing a version tag. Beta releases can be cut from `develop`; GitHub Releases are tag-based and are not tied to the repository default branch.
+
+```bash
+git push origin develop
+git tag -a v0.1.0-beta.1 -m "v0.1.0-beta.1"
+git push origin v0.1.0-beta.1
+```
+
+The release workflow builds five archives, uploads `checksums.txt`, and marks tags with a prerelease suffix such as `-beta.1` as GitHub prereleases. It does not upload generated Docker images, WSL rootfs tars, local configs, or private keys.
+
+To test release packaging locally, run the same script used by the workflow:
+
+```bash
+VERSION=v0.0.0-local \
+COMMIT="$(git rev-parse HEAD)" \
+BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+bash scripts/build-release-archives.sh
+```
+
+The default output is `dist/`, which is ignored by Git.
+
+On Windows, run that command from Git Bash when using the Windows Go toolchain. WSL Bash can accidentally call `go.exe` through WSL interop, which does not handle the `GOOS` and `GOARCH` assignments correctly.

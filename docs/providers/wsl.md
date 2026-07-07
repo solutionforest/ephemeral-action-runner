@@ -28,6 +28,7 @@ image:
 
 runner:
   labels: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
+  includeHostLabel: true
 
 provider:
   type: wsl

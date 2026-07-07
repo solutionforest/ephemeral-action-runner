@@ -54,13 +54,10 @@ type ProvisionedInstance struct {
 	RunnerID     int64
 }
 
+var runtimeValidationRetryDelay = 5 * time.Second
+
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
-	if opts.Instances <= 0 {
-		opts.Instances = m.Config.Pool.MinIdle
-	}
-	if opts.Instances > m.Config.Pool.MaxInstances {
-		return fmt.Errorf("instances %d exceeds pool.maxInstances %d", opts.Instances, m.Config.Pool.MaxInstances)
-	}
+	opts.Instances = m.requestedInstances(opts.Instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, opts.Instances, time.Now())
 	fmt.Printf("verifying %d instance(s): %s\n", opts.Instances, strings.Join(names, ", "))
 	fmt.Printf("source image: %s\n", m.Config.Provider.SourceImage)
@@ -119,12 +116,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
-	if opts.Instances <= 0 {
-		opts.Instances = m.Config.Pool.MinIdle
-	}
-	if opts.Instances > m.Config.Pool.MaxInstances {
-		return fmt.Errorf("instances %d exceeds pool.maxInstances %d", opts.Instances, m.Config.Pool.MaxInstances)
-	}
+	opts.Instances = m.requestedInstances(opts.Instances)
 	if opts.MonitorInterval <= 0 {
 		opts.MonitorInterval = 15 * time.Second
 	}
@@ -199,9 +191,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 }
 
 func (m *Manager) ProvisionPool(ctx context.Context, instances int, register bool) ([]ProvisionedInstance, error) {
-	if instances <= 0 {
-		instances = m.Config.Pool.MinIdle
-	}
+	instances = m.requestedInstances(instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, instances, time.Now())
 	out := make([]ProvisionedInstance, 0, len(names))
 	for _, name := range names {
@@ -212,6 +202,16 @@ func (m *Manager) ProvisionPool(ctx context.Context, instances int, register boo
 		out = append(out, vm)
 	}
 	return out, nil
+}
+
+func (m *Manager) requestedInstances(override int) int {
+	if override > 0 {
+		return override
+	}
+	if m.Config.Pool.Instances > 0 {
+		return m.Config.Pool.Instances
+	}
+	return 1
 }
 
 func (m *Manager) Cleanup(ctx context.Context) error {
@@ -301,7 +301,7 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 		return vm, err
 	}
 	fmt.Printf("[%s] validating runner runtime\n", name)
-	if err := m.validateRuntime(ctx, name); err != nil {
+	if err := m.validateRuntimeWithRetry(ctx, name, guestLogPath); err != nil {
 		return vm, err
 	}
 	fmt.Printf("[%s] runtime validation passed\n", name)
@@ -393,6 +393,32 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 func (m *Manager) validateRuntime(ctx context.Context, name string) error {
 	_, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/validate-runtime.sh"}, provider.ExecOptions{})
 	return err
+}
+
+func (m *Manager) validateRuntimeWithRetry(ctx context.Context, name, guestLogPath string) error {
+	const attempts = 2
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := m.validateRuntime(ctx, name)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		fmt.Printf("[%s] runtime validation attempt %d/%d failed: %v\n", name, attempt, attempts, err)
+		fmt.Printf("[%s] retrying runtime validation in %s; guest log: %s\n", name, runtimeValidationRetryDelay, guestLogPath)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(runtimeValidationRetryDelay):
+		}
+	}
+	return fmt.Errorf("runtime validation failed after %d attempts; guest log: %s: %w", attempts, guestLogPath, lastErr)
 }
 
 func (m *Manager) configureDockerRegistryMirrors(ctx context.Context, name string) error {

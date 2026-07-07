@@ -16,13 +16,13 @@ image:
     - scripts/guest/ubuntu/install-web-e2e.sh
 
 pool:
-  minIdle: 2
-  maxInstances: 2
+  instances: 1
   namePrefix: epar-wsl-web
   logDir: work/logs
 
 runner:
   labels: [self-hosted, linux, X64, epar-wsl-ubuntu-24.04-web-e2e]
+  includeHostLabel: true
   ephemeral: true
 
 provider:

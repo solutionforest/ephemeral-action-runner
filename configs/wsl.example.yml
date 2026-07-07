@@ -17,13 +17,13 @@ image:
     # - examples/custom-install/install-extra-apt-tools.sh
 
 pool:
-  minIdle: 2
-  maxInstances: 2
+  instances: 1
   namePrefix: epar-wsl
   logDir: work/logs
 
 runner:
   labels: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
+  includeHostLabel: true
   ephemeral: true
 
 provider:

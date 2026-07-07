@@ -24,16 +24,50 @@ const binaryName = "ephemeral-action-runner"
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, binaryName+":", err)
+		if reportPath := writeLastErrorReport(err); reportPath != "" {
+			fmt.Fprintln(os.Stderr, "error report:", reportPath)
+		}
 		os.Exit(1)
 	}
 }
 
+func writeLastErrorReport(runErr error) string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	logDir := filepath.Join(cwd, "work", "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return ""
+	}
+	now := time.Now().UTC()
+	content := fmt.Sprintf(`EPAR failed
+time: %s
+workingDirectory: %s
+command: %q
+
+%s
+error: %v
+`, now.Format(time.RFC3339), cwd, os.Args, versionString(), runErr)
+
+	lastPath := filepath.Join(logDir, "epar-last-error.log")
+	if err := os.WriteFile(lastPath, []byte(content), 0644); err != nil {
+		return ""
+	}
+	stampedPath := filepath.Join(logDir, fmt.Sprintf("epar-%s-error.log", now.Format("20060102-150405")))
+	_ = os.WriteFile(stampedPath, []byte(content), 0644)
+	return lastPath
+}
+
 func run(args []string) error {
 	if len(args) == 0 {
-		usage()
-		return nil
+		return runStart(nil)
 	}
 	switch args[0] {
+	case "start":
+		return runStart(args[1:])
+	case "init":
+		return runInit(args[1:])
 	case "image":
 		return runImage(args[1:])
 	case "pool":
@@ -42,6 +76,9 @@ func run(args []string) error {
 		return runCleanup(args[1:])
 	case "status":
 		return runStatus(args[1:])
+	case "version":
+		printVersion(os.Stdout)
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -110,11 +147,14 @@ func runPool(args []string) error {
 	case "verify":
 		fs := flag.NewFlagSet("pool verify", flag.ExitOnError)
 		common := addCommonFlags(fs)
-		instances := fs.Int("instances", 2, "number of concurrent instances to verify")
+		instances := fs.Int("instances", 0, "number of concurrent instances to verify; overrides pool.instances")
 		registerOnly := fs.Bool("register-only", false, "register runners and verify online/idle without dispatching a job")
 		cleanup := fs.Bool("cleanup", false, "clean up prefixed instances and GitHub runners after verification")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		if flagPassed(fs, "instances") && *instances <= 0 {
+			return fmt.Errorf("--instances must be 1 or greater")
 		}
 		m, err := newManager(*common.configPath, *common.projectRoot, *common.dryRun, *registerOnly)
 		if err != nil {
@@ -124,13 +164,16 @@ func runPool(args []string) error {
 	case "up":
 		fs := flag.NewFlagSet("pool up", flag.ExitOnError)
 		common := addCommonFlags(fs)
-		instances := fs.Int("instances", 2, "number of instances to create")
+		instances := fs.Int("instances", 0, "number of instances to create; overrides pool.instances")
 		register := fs.Bool("register", true, "register the instances as GitHub ephemeral runners")
 		keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 		replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 		monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		if flagPassed(fs, "instances") && *instances <= 0 {
+			return fmt.Errorf("--instances must be 1 or greater")
 		}
 		m, err := newManager(*common.configPath, *common.projectRoot, *common.dryRun, *register)
 		if err != nil {
@@ -198,6 +241,16 @@ func addCommonFlags(fs *flag.FlagSet) commonFlags {
 	}
 }
 
+func flagPassed(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(flag *flag.Flag) {
+		if flag.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool) (*pool.Manager, error) {
 	projectRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
@@ -206,6 +259,9 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	resolvedConfigPath, err := resolveConfigPath(projectRoot, configPath)
 	if err != nil {
 		return nil, err
+	}
+	if resolvedConfigPath == "" {
+		return nil, fmt.Errorf("no config found; run %s init from the EPAR directory to create .local/config.yml", binaryName)
 	}
 	cfg, err := config.Load(resolvedConfigPath)
 	if err != nil {
@@ -285,6 +341,9 @@ func usage() {
 	fmt.Print(`ephemeral-action-runner (EPAR) manages ephemeral GitHub Actions runners on local providers.
 
 Commands:
+  ephemeral-action-runner
+  ephemeral-action-runner start [--instances N] [--config .local/config.yml]
+  ephemeral-action-runner init
   ephemeral-action-runner image update-upstream [--config .local/config.yml]
   ephemeral-action-runner image build [--replace] [--update-upstream]
   ephemeral-action-runner image refresh-scripts
@@ -293,5 +352,6 @@ Commands:
   ephemeral-action-runner pool down
   ephemeral-action-runner cleanup
   ephemeral-action-runner status
+  ephemeral-action-runner version
 `)
 }

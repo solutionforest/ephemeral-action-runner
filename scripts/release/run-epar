@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -u
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exe="$root/ephemeral-action-runner"
+log_dir="$root/work/logs"
+log_file="$log_dir/epar-last-run.log"
+error_file="$log_dir/epar-last-error.log"
+
+cd "$root" || exit 1
+mkdir -p "$log_dir"
+
+{
+  echo "EPAR run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  echo "Working directory: $root"
+  printf "Command:"
+  printf " %q" "$exe" "$@"
+  echo
+  echo
+} >"$log_file"
+
+if [[ ! -x "$exe" ]]; then
+  echo "EPAR executable not found or not executable: $exe" | tee -a "$log_file"
+  exit 1
+fi
+
+"$exe" "$@" 2>&1 | tee -a "$log_file"
+code="${PIPESTATUS[0]}"
+
+if [[ "$code" -ne 0 ]]; then
+  {
+    echo
+    echo "EPAR failed with exit code $code."
+    if [[ -f "$error_file" ]]; then
+      echo "Error report: $error_file"
+    fi
+    echo "Run log: $log_file"
+  } | tee -a "$log_file"
+
+  if [[ "${EPAR_NO_OPEN_LOG:-}" != "1" ]]; then
+    open_file="$log_file"
+    if [[ -f "$error_file" ]]; then
+      open_file="$error_file"
+    fi
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v open >/dev/null 2>&1; then
+      open -t "$open_file" >/dev/null 2>&1 || true
+    elif [[ -n "${DISPLAY:-}" ]] && command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$open_file" >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+exit "$code"

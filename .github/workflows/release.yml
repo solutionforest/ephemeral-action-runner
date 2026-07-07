@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Prepare release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          build_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          prerelease=false
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "commit=$GITHUB_SHA"
+            echo "build_date=$build_date"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build archives
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          BUILD_DATE: ${{ steps.meta.outputs.build_date }}
+        run: bash scripts/build-release-archives.sh
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          assets=(dist/*.tar.gz dist/*.zip dist/checksums.txt)
+          release_args=(gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease --latest=false)
+          fi
+          release_args+=("${assets[@]}")
+
+          "${release_args[@]}"

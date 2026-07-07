@@ -15,13 +15,13 @@ image:
   customInstallScripts:
 
 pool:
-  minIdle: 2
-  maxInstances: 2
+  instances: 1
   namePrefix: epar-dind
   logDir: work/logs
 
 runner:
   labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
+  includeHostLabel: true
   ephemeral: true
 
 provider:

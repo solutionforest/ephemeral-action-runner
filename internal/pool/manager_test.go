@@ -83,7 +83,7 @@ func TestRunPoolDoesNotReplaceWhenRetirementIsDeferred(t *testing.T) {
 	manager := Manager{
 		Config: config.Config{
 			Provider: config.ProviderConfig{SourceImage: "image"},
-			Pool:     config.PoolConfig{NamePrefix: "epar-test", MaxInstances: 2, LogDir: t.TempDir()},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}},
 		},
 		Provider:    provider,
@@ -107,9 +107,63 @@ func TestRunPoolDoesNotReplaceWhenRetirementIsDeferred(t *testing.T) {
 	}
 }
 
+func TestRunPoolUsesConfiguredInstancesWhenNoOverride(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image"},
+			Pool:     config.PoolConfig{Instances: 2, NamePrefix: "epar-test", LogDir: t.TempDir()},
+		},
+		Provider:    provider,
+		ProjectRoot: t.TempDir(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	if err := manager.RunPool(ctx, RunOptions{
+		Instances:        0,
+		Register:         false,
+		KeepOnExit:       true,
+		ReplaceCompleted: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&provider.cloneCalls); got != 2 {
+		t.Fatalf("Clone called %d time(s), want configured instances 2", got)
+	}
+}
+
+func TestProvisionOneRetriesTransientRuntimeValidationFailure(t *testing.T) {
+	oldDelay := runtimeValidationRetryDelay
+	runtimeValidationRetryDelay = 0
+	t.Cleanup(func() { runtimeValidationRetryDelay = oldDelay })
+
+	provider := &fakeProvider{
+		ip:       "127.0.0.1",
+		execErrs: []error{errors.New("transient validation failure"), nil},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
+			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
+		},
+		Provider:    provider,
+		ProjectRoot: t.TempDir(),
+	}
+
+	if _, err := manager.provisionOne(context.Background(), "epar-test-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&provider.execCalls); got != 2 {
+		t.Fatalf("runtime validation attempts = %d, want 2", got)
+	}
+}
+
 type fakeProvider struct {
-	execErr error
-	ip      string
+	execErr  error
+	execErrs []error
+	ip       string
 
 	cloneCalls  int32
 	execCalls   int32
@@ -127,7 +181,10 @@ func (p *fakeProvider) Start(context.Context, string, provider.StartOptions) (*p
 }
 
 func (p *fakeProvider) Exec(context.Context, string, []string, provider.ExecOptions) (provider.ExecResult, error) {
-	atomic.AddInt32(&p.execCalls, 1)
+	call := atomic.AddInt32(&p.execCalls, 1)
+	if int(call) <= len(p.execErrs) {
+		return provider.ExecResult{}, p.execErrs[call-1]
+	}
 	return provider.ExecResult{}, p.execErr
 }
 

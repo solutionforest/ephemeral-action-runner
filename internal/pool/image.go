@@ -18,6 +18,7 @@ import (
 type ImageBuildOptions struct {
 	Replace           bool
 	SkipUpstreamCheck bool
+	Manifest          *ImageManifest
 }
 
 type runnerImagesCopyMode int
@@ -104,12 +105,23 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 			return fmt.Errorf("docker image %s already exists; rerun with --replace", m.Config.Image.OutputImage)
 		}
 	}
+	if opts.Manifest == nil {
+		manifest, err := m.desiredImageManifest(ctx)
+		if err != nil {
+			return err
+		}
+		opts.Manifest = &manifest
+	}
+	manifestContent, manifestHash, err := storedImageManifestContent(*opts.Manifest)
+	if err != nil {
+		return err
+	}
 	buildCtx, err := os.MkdirTemp("", "epar-docker-dind-build-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(buildCtx)
-	if err := m.prepareDockerDindBuildContext(buildCtx, upstreamDir); err != nil {
+	if err := m.prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestContent); err != nil {
 		return err
 	}
 	fmt.Printf("building Docker-DinD image %s from %s\n", m.Config.Image.OutputImage, m.Config.Image.SourceImage)
@@ -121,6 +133,7 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 	args = append(args,
 		"--build-arg", "BASE_IMAGE="+m.Config.Image.SourceImage,
 		"--build-arg", "RUNNER_VERSION="+m.Config.Image.RunnerVersion,
+		"--build-arg", "EPAR_IMAGE_MANIFEST_SHA256="+manifestHash,
 		buildCtx,
 	)
 	if m.DryRun {
@@ -136,6 +149,13 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 }
 
 func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	if opts.Manifest == nil {
+		manifest, err := m.desiredImageManifest(ctx)
+		if err != nil {
+			return err
+		}
+		opts.Manifest = &manifest
+	}
 	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".build.log")
 	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".guest.log")
 	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
@@ -163,6 +183,9 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	fmt.Printf("guest reachable at %s\n", ip)
 	fmt.Printf("copying guest scripts\n")
 	if err := m.installGuestScripts(ctx, m.Config.Image.OutputImage); err != nil {
+		return err
+	}
+	if err := m.installImageManifest(ctx, m.Config.Image.OutputImage, *opts.Manifest); err != nil {
 		return err
 	}
 	switch m.runnerImagesCopyMode() {
@@ -230,7 +253,17 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+			if err := os.Remove(wslImageManifestSidecarPath(outputPath)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
+	}
+	if opts.Manifest == nil {
+		manifest, err := m.desiredImageManifest(ctx)
+		if err != nil {
+			return err
+		}
+		opts.Manifest = &manifest
 	}
 
 	sourceForClone := m.Config.Image.SourceImage
@@ -238,7 +271,7 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	sourceEnv := ""
 	switch sourceType {
 	case config.ImageSourceDockerImage:
-		rootfsPath, env, err := m.prepareWSLDockerSourceRootfs(ctx, outputPath, buildLogPath)
+		rootfsPath, env, err := m.prepareWSLDockerSourceRootfs(ctx, outputPath, buildLogPath, *opts.Manifest)
 		if err != nil {
 			return err
 		}
@@ -296,6 +329,9 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if err := m.installGuestScripts(ctx, buildName); err != nil {
 		return err
 	}
+	if err := m.installImageManifest(ctx, buildName, *opts.Manifest); err != nil {
+		return err
+	}
 	if sourceEnv != "" {
 		fmt.Printf("installing source image environment metadata\n")
 		if err := m.installSourceImageEnv(ctx, buildName, sourceEnv); err != nil {
@@ -340,19 +376,26 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	if err := exporter.Export(ctx, buildName, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
+	if !m.DryRun {
+		if err := writeStoredImageManifest(wslImageManifestSidecarPath(outputPath), *opts.Manifest); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("image build complete: %s is available for WSL imports\n", outputPath)
 	return nil
 }
 
-func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, buildLogPath string) (string, string, error) {
+func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, buildLogPath string, manifest ImageManifest) (string, string, error) {
 	image := strings.TrimSpace(m.Config.Image.SourceImage)
 	if image == "" {
 		return "", "", fmt.Errorf("image.sourceImage is required when image.sourceType=docker-image")
 	}
 	rootfsPath := wslDockerSourceRootfsPath(outputPath)
 	envCachePath := rootfsPath + ".env"
+	sourceCachePath := sourceCacheManifestPath(rootfsPath)
 	tmpPath := rootfsPath + ".tmp"
 	platform := strings.TrimSpace(m.Config.Image.SourcePlatform)
+	sourceCache := sourceCacheManifest{SourceImage: image, SourcePlatform: platform, SourceDigest: manifest.SourceDigest}
 	containerName := wslDockerSourceContainerName()
 	pullArgs := []string{"pull"}
 	createArgs := []string{"create"}
@@ -373,7 +416,7 @@ func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, 
 		return rootfsPath, "", nil
 	}
 
-	if info, err := os.Stat(rootfsPath); err == nil && info.Size() > 0 {
+	if info, err := os.Stat(rootfsPath); err == nil && info.Size() > 0 && sourceCacheMatches(sourceCachePath, sourceCache) {
 		envContent, err := os.ReadFile(envCachePath)
 		if err != nil {
 			fmt.Printf("using cached WSL source rootfs at %s; source image env cache missing, refreshing metadata from Docker image\n", rootfsPath)
@@ -391,6 +434,17 @@ func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, 
 		return rootfsPath, string(envContent), nil
 	} else if err != nil && !os.IsNotExist(err) {
 		return "", "", err
+	} else if err == nil {
+		fmt.Printf("cached WSL source rootfs is missing source metadata or no longer matches; reconverting %s\n", image)
+		if err := os.Remove(rootfsPath); err != nil && !os.IsNotExist(err) {
+			return "", "", err
+		}
+		if err := os.Remove(envCachePath); err != nil && !os.IsNotExist(err) {
+			return "", "", err
+		}
+		if err := os.Remove(sourceCachePath); err != nil && !os.IsNotExist(err) {
+			return "", "", err
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0755); err != nil {
@@ -430,6 +484,9 @@ func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, 
 		return "", "", err
 	}
 	if err := os.WriteFile(envCachePath, []byte(envContent), 0644); err != nil {
+		return "", "", err
+	}
+	if err := writeSourceCacheManifest(sourceCachePath, sourceCache); err != nil {
 		return "", "", err
 	}
 	fmt.Printf("WSL source rootfs exported to %s\n", rootfsPath)
@@ -796,7 +853,7 @@ func (m *Manager) runnerImagesCopyMode() runnerImagesCopyMode {
 	return runnerImagesCopyNone
 }
 
-func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) error {
+func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestContent string) error {
 	if err := copyDir(filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu"), filepath.Join(buildCtx, "scripts", "guest", "ubuntu")); err != nil {
 		return err
 	}
@@ -823,6 +880,9 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) er
 	if err := os.MkdirAll(customDir, 0755); err != nil {
 		return err
 	}
+	if err := os.WriteFile(filepath.Join(buildCtx, "image-manifest.json"), []byte(manifestContent), 0644); err != nil {
+		return err
+	}
 	var customRuns strings.Builder
 	for i, script := range m.Config.Image.CustomInstallScripts {
 		hostPath, err := m.customInstallScriptHostPath(script)
@@ -839,12 +899,14 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir string) er
 FROM ${BASE_IMAGE}
 USER root
 ARG RUNNER_VERSION=latest
+ARG EPAR_IMAGE_MANIFEST_SHA256
 ARG OCI_SOURCE=https://github.com/solutionforest/ephemeral-action-runner
 ARG OCI_DESCRIPTION="EPAR Docker-DinD runner image"
 ARG OCI_LICENSES=MIT
 LABEL org.opencontainers.image.source="${OCI_SOURCE}"
 LABEL org.opencontainers.image.description="${OCI_DESCRIPTION}"
 LABEL org.opencontainers.image.licenses="${OCI_LICENSES}"
+LABEL `+imageManifestLabel+`="${EPAR_IMAGE_MANIFEST_SHA256}"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NEEDRESTART_MODE=l
 ENV NEEDRESTART_SUSPEND=1
@@ -852,6 +914,7 @@ COPY scripts/guest/ubuntu/ /opt/epar/
 COPY scripts/container/ubuntu/entrypoint.sh /opt/epar/container-entrypoint.sh
 COPY upstream/runner-images/ /opt/epar/upstream/runner-images/
 COPY custom-install/ /opt/epar/custom-install/
+COPY image-manifest.json /opt/epar/image-manifest.json
 RUN chmod +x /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
 RUN bash /opt/epar/install-base.sh /opt/epar/upstream/runner-images
 RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}"

@@ -3,10 +3,15 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestLoadYAMLSubset(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "CI Box 01", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
@@ -15,8 +20,7 @@ github:
   organization: example
   privateKeyPath: /tmp/key.pem
 pool:
-  minIdle: 2
-  maxInstances: 3
+  instances: 3
   namePrefix: epar-test
 runner:
   labels:
@@ -24,6 +28,7 @@ runner:
     - linux
     - ARM64
     - custom
+  includeHostLabel: true
   ephemeral: true
 provider:
   type: tart
@@ -48,11 +53,17 @@ image:
 	if got, want := cfg.Runner.Labels[3], "custom"; got != want {
 		t.Fatalf("label = %q, want %q", got, want)
 	}
+	if got, want := cfg.Runner.Labels[4], "epar-host-ci-box-01"; got != want {
+		t.Fatalf("host label = %q, want %q", got, want)
+	}
 	if got, want := cfg.Provider.InstallRoot, "work/custom-wsl"; got != want {
 		t.Fatalf("provider.installRoot = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.RosettaTag, "rosetta"; got != want {
 		t.Fatalf("provider.rosettaTag = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.Instances, 3; got != want {
+		t.Fatalf("pool.instances = %d, want %d", got, want)
 	}
 	if got, want := len(cfg.Image.CustomInstallScripts), 2; got != want {
 		t.Fatalf("custom install scripts = %d, want %d", got, want)
@@ -62,13 +73,106 @@ image:
 	}
 }
 
+func TestRunnerHostLabelDefaultsToEnabled(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "Build Box_01.example", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Runner.Labels[len(cfg.Runner.Labels)-1], "epar-host-build-box_01.example"; got != want {
+		t.Fatalf("host label = %q, want %q", got, want)
+	}
+}
+
+func TestRunnerHostLabelCanBeDisabled(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "build-box", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+runner:
+  includeHostLabel: false
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range cfg.Runner.Labels {
+		if strings.HasPrefix(label, "epar-host-") {
+			t.Fatalf("host label should be disabled, got labels %v", cfg.Runner.Labels)
+		}
+	}
+}
+
+func TestRunnerHostLabelDoesNotDuplicateExistingLabel(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "Build Box", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+runner:
+  labels: [self-hosted, linux, epar-host-build-box]
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, label := range cfg.Runner.Labels {
+		if label == "epar-host-build-box" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("host label count = %d, want 1 in labels %v", count, cfg.Runner.Labels)
+	}
+}
+
+func TestHostLabelSanitizesMachineName(t *testing.T) {
+	if got, want := HostLabel("JJ ORION/Dev@Box"), "epar-host-jj-orion-dev-box"; got != want {
+		t.Fatalf("HostLabel = %q, want %q", got, want)
+	}
+}
+
+func TestHostLabelDoesNotExceedGitHubLimit(t *testing.T) {
+	got := HostLabel(strings.Repeat("a", MaxRunnerLabelLength+100))
+	if len(got) != MaxRunnerLabelLength {
+		t.Fatalf("host label length = %d, want %d", len(got), MaxRunnerLabelLength)
+	}
+	if !strings.HasPrefix(got, "epar-host-") {
+		t.Fatalf("host label = %q, want epar-host prefix", got)
+	}
+}
+
 func TestLoadDockerDindPlatform(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 pool:
-  minIdle: 1
-  maxInstances: 1
+  instances: 1
   namePrefix: epar-dind
 runner:
   labels: [self-hosted, linux, ARM64, epar-docker-dind]
@@ -107,8 +211,7 @@ func TestLoadAllowsEmptyBlockList(t *testing.T) {
 image:
   customInstallScripts:
 pool:
-  minIdle: 0
-  maxInstances: 1
+  instances: 1
 provider:
   type: wsl
   sourceImage: image.tar
@@ -365,6 +468,23 @@ func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
 	}
 	if err := ValidateGitHub(cfg); err == nil {
 		t.Fatal("ValidateGitHub accepted empty GitHub settings")
+	}
+}
+
+func TestValidateRejectsInvalidPoolInstances(t *testing.T) {
+	cfg := Default()
+	cfg.Pool.Instances = 0
+	if err := Validate(cfg); err == nil {
+		t.Fatal("pool.instances=0 accepted")
+	}
+}
+
+func TestValidateRejectsOverlongRunnerLabel(t *testing.T) {
+	cfg := Default()
+	cfg.Runner.IncludeHostLabel = false
+	cfg.Runner.Labels = []string{"self-hosted", strings.Repeat("a", MaxRunnerLabelLength+1)}
+	if err := Validate(cfg); err == nil {
+		t.Fatal("overlong runner label accepted")
 	}
 }
 

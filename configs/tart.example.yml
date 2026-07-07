@@ -15,13 +15,13 @@ image:
     # - examples/custom-install/install-extra-apt-tools.sh
 
 pool:
-  minIdle: 2
-  maxInstances: 2
+  instances: 1
   namePrefix: epar-tart
   logDir: work/logs
 
 runner:
   labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-base]
+  includeHostLabel: true
   ephemeral: true
 
 provider:

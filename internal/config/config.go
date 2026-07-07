@@ -40,15 +40,15 @@ type ImageConfig struct {
 }
 
 type PoolConfig struct {
-	MinIdle      int
-	MaxInstances int
-	NamePrefix   string
-	LogDir       string
+	Instances  int
+	NamePrefix string
+	LogDir     string
 }
 
 type RunnerConfig struct {
-	Labels    []string
-	Ephemeral bool
+	Labels           []string
+	IncludeHostLabel bool
+	Ephemeral        bool
 }
 
 type ProviderConfig struct {
@@ -73,6 +73,7 @@ type TimeoutConfig struct {
 const (
 	ImageSourceDockerImage = "docker-image"
 	ImageSourceRootFSTar   = "rootfs-tar"
+	MaxRunnerLabelLength   = 256
 )
 
 func Default() Config {
@@ -89,14 +90,14 @@ func Default() Config {
 			RunnerVersion: "latest",
 		},
 		Pool: PoolConfig{
-			MinIdle:      2,
-			MaxInstances: 2,
-			NamePrefix:   "epar",
-			LogDir:       "work/logs",
+			Instances:  1,
+			NamePrefix: "epar",
+			LogDir:     "work/logs",
 		},
 		Runner: RunnerConfig{
-			Labels:    []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
-			Ephemeral: true,
+			Labels:           []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
+			IncludeHostLabel: true,
+			Ephemeral:        true,
 		},
 		Provider: ProviderConfig{
 			Type:        "tart",
@@ -115,6 +116,7 @@ func Default() Config {
 func Load(path string) (Config, error) {
 	cfg := Default()
 	if path == "" {
+		applyRunnerHostLabel(&cfg)
 		return cfg, nil
 	}
 	file, err := os.Open(expandHome(path))
@@ -179,6 +181,7 @@ func Load(path string) (Config, error) {
 		return cfg, err
 	}
 	applyProviderDefaults(&cfg, explicit)
+	applyRunnerHostLabel(&cfg)
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
 	return cfg, nil
 }
@@ -232,18 +235,12 @@ func apply(cfg *Config, section, key, value string) error {
 		}
 	case "pool":
 		switch key {
-		case "minIdle":
+		case "instances":
 			v, err := strconv.Atoi(value)
 			if err != nil {
-				return fmt.Errorf("invalid pool.minIdle: %w", err)
+				return fmt.Errorf("invalid pool.instances: %w", err)
 			}
-			cfg.Pool.MinIdle = v
-		case "maxInstances":
-			v, err := strconv.Atoi(value)
-			if err != nil {
-				return fmt.Errorf("invalid pool.maxInstances: %w", err)
-			}
-			cfg.Pool.MaxInstances = v
+			cfg.Pool.Instances = v
 		case "namePrefix", "vmPrefix":
 			cfg.Pool.NamePrefix = value
 		case "logDir":
@@ -253,6 +250,12 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "labels":
 			return setListValue(cfg, section, key, parseList(value))
+		case "includeHostLabel":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid runner.includeHostLabel: %w", err)
+			}
+			cfg.Runner.IncludeHostLabel = v
 		case "ephemeral":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -360,6 +363,67 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			cfg.Pool.NamePrefix = "epar-dind"
 		}
 	}
+}
+
+var osHostname = os.Hostname
+
+func applyRunnerHostLabel(cfg *Config) {
+	if !cfg.Runner.IncludeHostLabel {
+		return
+	}
+	hostname, err := osHostname()
+	if err != nil {
+		return
+	}
+	hostLabel := HostLabel(hostname)
+	if hostLabel == "" {
+		return
+	}
+	for _, label := range cfg.Runner.Labels {
+		if strings.EqualFold(label, hostLabel) {
+			return
+		}
+	}
+	cfg.Runner.Labels = append(cfg.Runner.Labels, hostLabel)
+}
+
+func HostLabel(hostname string) string {
+	const prefix = "epar-host-"
+	sanitized := sanitizeLabelPart(hostname)
+	if sanitized == "" {
+		return ""
+	}
+	maxPartLength := MaxRunnerLabelLength - len(prefix)
+	if len(sanitized) > maxPartLength {
+		sanitized = strings.Trim(sanitized[:maxPartLength], "-")
+	}
+	if sanitized == "" {
+		return ""
+	}
+	return prefix + sanitized
+}
+
+func sanitizeLabelPart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		valid := (r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' ||
+			r == '_' ||
+			r == '-'
+		if valid {
+			b.WriteRune(r)
+			lastDash = r == '-'
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func looksLikeRootFSTar(path string) bool {
@@ -476,8 +540,8 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("image.sourcePlatform is only supported with image.sourceType=docker-image")
 		}
 	}
-	if cfg.Pool.MinIdle < 0 || cfg.Pool.MaxInstances < 1 || cfg.Pool.MinIdle > cfg.Pool.MaxInstances {
-		return fmt.Errorf("pool sizing must satisfy 0 <= minIdle <= maxInstances")
+	if cfg.Pool.Instances < 1 {
+		return fmt.Errorf("pool.instances must be 1 or greater")
 	}
 	if err := ValidatePrefix(cfg.Pool.NamePrefix); err != nil {
 		return err
@@ -485,10 +549,25 @@ func Validate(cfg Config) error {
 	if len(cfg.Runner.Labels) == 0 {
 		return fmt.Errorf("runner.labels must not be empty")
 	}
+	for _, label := range cfg.Runner.Labels {
+		if err := ValidateRunnerLabel(label); err != nil {
+			return err
+		}
+	}
 	for _, mirror := range cfg.Docker.RegistryMirrors {
 		if err := ValidateDockerRegistryMirror(mirror); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func ValidateRunnerLabel(label string) error {
+	if strings.TrimSpace(label) == "" {
+		return fmt.Errorf("runner.labels must not contain empty labels")
+	}
+	if len(label) > MaxRunnerLabelLength {
+		return fmt.Errorf("runner label %q exceeds %d characters", label, MaxRunnerLabelLength)
 	}
 	return nil
 }

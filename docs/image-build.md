@@ -16,7 +16,7 @@ For WSL, the image build produces a rootfs tar. It can start from either a Docke
 - `image.sourcePlatform`: Docker platform used when `sourceType` is `docker-image`, default `linux/amd64`.
 - `image.outputImage`: reusable EPAR runner rootfs tar, default `work/images/epar-wsl-gitea-ubuntu.tar`.
 
-For `docker-image` sources, EPAR pulls the source image, creates a temporary container, exports that container filesystem to an intermediate rootfs tar, and captures the image environment metadata. Later builds reuse the intermediate rootfs and env cache unless you delete them. The WSL build then imports the rootfs into a temporary distro, enables systemd, installs the runner runtime, writes the captured image env under `/opt/epar`, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
+For `docker-image` sources, EPAR pulls the source image, creates a temporary container, exports that container filesystem to an intermediate rootfs tar, and captures the image environment metadata. Later builds reuse the intermediate rootfs only when the cached source manifest still matches the source image, platform, and digest. The WSL build then imports the rootfs into a temporary distro, enables systemd, installs the runner runtime, writes the captured image env under `/opt/epar`, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
 
 For Docker-DinD, the image build uses Docker images:
 
@@ -25,6 +25,8 @@ For Docker-DinD, the image build uses Docker images:
 - `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-gitea-ubuntu`.
 
 Docker-DinD builds a thin wrapper over the source image, installs the GitHub Actions runner, reuses Docker Engine/CLI/Compose/Buildx from the base image when they are already present, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
+
+Every build writes an EPAR image manifest. The `start` command compares that manifest with the current config and source image identity before creating runners. If the image is missing, has no manifest, or no longer matches, `start` rebuilds it with replace enabled. The lower-level `image build` command keeps its explicit safety behavior and still requires `--replace` when the output already exists.
 
 ```mermaid
 flowchart TD
@@ -197,9 +199,11 @@ EPAR also writes an intermediate source tar and env cache beside the output, for
 ```text
 work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar
 work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar.env
+work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar.source.json
+work/images/epar-wsl-gitea-ubuntu.tar.epar-manifest.json
 ```
 
-Later builds reuse that source cache. Delete those files when you intentionally want to reconvert the Docker image.
+Later builds reuse that source cache when its source manifest still matches. Delete those files when you intentionally want to reconvert the Docker image.
 
 WSL runner startup sources `/opt/epar/source-image.env` before launching the GitHub Actions runner. That preserves image metadata such as `ImageOS`, `ImageVersion`, runner tool cache paths, browser paths, and Java paths from the Docker image source. WSL does not use Docker-DinD's container entrypoint; it keeps the systemd and keepalive model used by other WSL images.
 

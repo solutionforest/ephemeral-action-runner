@@ -40,6 +40,7 @@ image:
 
 runner:
   labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu-web-e2e]
+  includeHostLabel: true
 
 provider:
   sourceImage: epar-docker-dind-gitea-ubuntu-web-e2e

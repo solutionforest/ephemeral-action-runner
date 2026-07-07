@@ -15,20 +15,27 @@ find_repo_root() {
 
   local dir="${script_dir}"
   for _ in $(seq 1 8); do
-    if [[ -f "${dir}/go.mod" && -d "${dir}/configs" ]]; then
+    if [[ -d "${dir}/configs" && -d "${dir}/scripts" ]] &&
+      [[ -f "${dir}/go.mod" || -x "${dir}/ephemeral-action-runner" || -x "${dir}/bin/ephemeral-action-runner" ]]; then
       printf '%s\n' "${dir}"
       return
     fi
     dir="$(dirname -- "${dir}")"
   done
 
-  echo "Unable to find EPAR repo root. Set EPAR_ROOT in this script." >&2
+  echo "Unable to find EPAR root. Set EPAR_ROOT in this script." >&2
   return 1
 }
 
 EPAR_ROOT="$(find_repo_root)"
 CONFIG_PATH="${EPAR_CONFIG:-${EPAR_ROOT}/.local/config.yml}"
-EPAR_BIN="${EPAR_BIN:-${EPAR_ROOT}/bin/ephemeral-action-runner}"
+if [[ -z "${EPAR_BIN:-}" ]]; then
+  if [[ -x "${EPAR_ROOT}/ephemeral-action-runner" ]]; then
+    EPAR_BIN="${EPAR_ROOT}/ephemeral-action-runner"
+  else
+    EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
+  fi
+fi
 MIRROR_CONTAINER="${EPAR_MIRROR_CONTAINER:-epar-dockerhub-cache}"
 WAIT_FOR_DOCKER="${EPAR_WAIT_FOR_DOCKER:-1}"
 DOCKER_WAIT_ATTEMPTS="${EPAR_DOCKER_WAIT_ATTEMPTS:-120}"
@@ -38,12 +45,7 @@ mkdir -p work/logs
 
 if [[ ! -x "${EPAR_BIN}" ]]; then
   echo "EPAR binary not found or not executable: ${EPAR_BIN}" >&2
-  echo "Build it first: go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner" >&2
-  exit 1
-fi
-
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  echo "EPAR config not found: ${CONFIG_PATH}" >&2
+  echo "Use a release bundle, or build it first: go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner" >&2
   exit 1
 fi
 
@@ -67,5 +69,5 @@ if [[ "${WAIT_FOR_DOCKER}" != "0" ]]; then
   fi
 fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting EPAR pool..."
-exec "${EPAR_BIN}" pool up --config "${CONFIG_PATH}" "$@"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting EPAR..."
+exec "${EPAR_BIN}" start --config "${CONFIG_PATH}" "$@"

@@ -1,12 +1,12 @@
 # macOS Startup
 
-EPAR's `pool up` command is a foreground supervisor. On a personal Mac, you can start it after login with either a `.command` file in macOS Open at Login or a user `launchd` LaunchAgent.
+EPAR's `start` command is a foreground supervisor. On a personal Mac, you can start it after login with either a `.command` file in macOS Open at Login or a user `launchd` LaunchAgent.
 
-The `.command` approach is easy to test and easy to remove. It opens a Terminal window, and closing that window stops EPAR. Use `launchd` when you want a quieter background service.
+The `.command` approach is the simplest option. It opens a Terminal window, and closing that window stops EPAR. Use `launchd` only when you want a quieter background service.
 
 ## Open At Login With A .command File
 
-Copy the example startup script into ignored local state:
+From an extracted release bundle or source checkout, copy the example startup script into ignored local state:
 
 ```bash
 cd /path/to/ephemeral-action-runner
@@ -15,11 +15,10 @@ cp examples/macos/start-epar.command .local/start-epar.command
 chmod +x .local/start-epar.command
 ```
 
-Build the EPAR binary and create `.local/config.yml` before starting the script:
+If you are using a release bundle, no build step is needed. If you are running from source, build the binary once first:
 
 ```bash
 go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
-test -f .local/config.yml
 ```
 
 Double-click `.local/start-epar.command` in Finder or run it from Terminal:
@@ -30,11 +29,14 @@ Double-click `.local/start-epar.command` in Finder or run it from Terminal:
 
 The script:
 
-- finds the EPAR repo root when it lives under the repo, such as `.local/start-epar.command`;
+- finds the EPAR root when it lives under the extracted release or repo, such as `.local/start-epar.command`;
+- uses the release binary at `./ephemeral-action-runner` or the source-built binary at `./bin/ephemeral-action-runner`;
 - uses `.local/config.yml` by default;
 - waits for Docker to become ready before starting EPAR;
 - starts an existing `epar-dockerhub-cache` mirror container if one exists;
-- runs `ephemeral-action-runner pool up`.
+- runs `ephemeral-action-runner start`.
+
+If `.local/config.yml` does not exist and the script is running in a Terminal window, EPAR's normal first-run setup can create it. For `launchd`, create the config first by running EPAR manually once.
 
 To start it automatically after login, open macOS System Settings, go to **General**, then **Login Items & Extensions**, then add `.local/start-epar.command` under **Open at Login**.
 
@@ -47,7 +49,7 @@ You can edit the copied `.local/start-epar.command` file or set environment vari
 ```bash
 export EPAR_ROOT="/path/to/ephemeral-action-runner"
 export EPAR_CONFIG="${EPAR_ROOT}/.local/config.yml"
-export EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
+export EPAR_BIN="${EPAR_ROOT}/ephemeral-action-runner"
 export EPAR_MIRROR_CONTAINER="epar-dockerhub-cache"
 export EPAR_WAIT_FOR_DOCKER=1
 export EPAR_DOCKER_WAIT_ATTEMPTS=120
@@ -59,7 +61,7 @@ If you use the optional Docker registry mirror, create the mirror container sepa
 
 ## launchd Alternative
 
-For a background service without a Terminal window, create a user LaunchAgent that runs the same `.local/start-epar.command` script.
+For a background service without a Terminal window, create `.local/config.yml` first, then create a user LaunchAgent that runs the same `.local/start-epar.command` script.
 
 Example `~/Library/LaunchAgents/com.example.epar.plist`:
 
@@ -111,7 +113,8 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.example.epar.plist
 
 ## Operational Notes
 
-- `pool up` cleans up prefixed instances when it exits. Use `--keep-on-exit` only for debugging.
+- `start` cleans up prefixed instances when it exits. Use `--keep-on-exit` only for debugging.
+- The first run can take a while because `start` may build or refresh the configured image before starting runners.
 - If Docker Desktop, OrbStack, or Docker Engine cannot start, the script exits before EPAR starts.
 - For Docker-DinD, the host Docker runtime must support privileged containers.
 - For Tart-only pools that do not use host Docker or a local registry mirror, disable the Docker wait in your local copy.

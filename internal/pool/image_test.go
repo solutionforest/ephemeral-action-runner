@@ -73,7 +73,7 @@ func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 		},
 		ProjectRoot: root,
 	}
-	if err := manager.prepareDockerDindBuildContext(buildCtx, t.TempDir()); err != nil {
+	if err := manager.prepareDockerDindBuildContext(buildCtx, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
 	content, err := os.ReadFile(filepath.Join(buildCtx, "Dockerfile"))
@@ -82,6 +82,12 @@ func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "FROM ${BASE_IMAGE}\nUSER root\n") {
 		t.Fatalf("Dockerfile does not force root user after FROM:\n%s", content)
+	}
+	if !strings.Contains(string(content), imageManifestLabel) {
+		t.Fatalf("Dockerfile missing EPAR manifest label:\n%s", content)
+	}
+	if _, err := os.Stat(filepath.Join(buildCtx, "image-manifest.json")); err != nil {
+		t.Fatalf("build context missing image manifest: %v", err)
 	}
 }
 
@@ -252,7 +258,7 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 		ProjectRoot: root,
 	}
 	outputPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.tar")
-	rootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"))
+	rootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"), ImageManifest{SourceDigest: "digest-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,6 +270,9 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	}
 	if _, err := os.Stat(rootfsPath + ".env"); err != nil {
 		t.Fatalf("exported env cache missing: %v", err)
+	}
+	if _, err := os.Stat(sourceCacheManifestPath(rootfsPath)); err != nil {
+		t.Fatalf("exported source cache manifest missing: %v", err)
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
@@ -319,6 +328,12 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 	if err := os.WriteFile(rootfsPath+".env", []byte("export ImageOS='ubuntu24'\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	if err := writeSourceCacheManifest(sourceCacheManifestPath(rootfsPath), sourceCacheManifest{
+		SourceImage:  "gitea/runner-images:ubuntu-latest-full",
+		SourceDigest: "digest-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	manager := Manager{
 		Config: config.Config{
@@ -326,7 +341,7 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 		},
 		ProjectRoot: root,
 	}
-	gotRootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"))
+	gotRootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"), ImageManifest{SourceDigest: "digest-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
