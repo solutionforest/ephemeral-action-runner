@@ -71,7 +71,30 @@ jobs:
           set -euo pipefail
 
           assets=(dist/*.tar.gz dist/*.zip dist/checksums.txt)
-          release_args=(gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes)
+          release_notes="$(cat <<NOTES
+          ## Download
+
+          Choose the archive for your host:
+
+          | Host | File |
+          | --- | --- |
+          | Windows x64 | \`ephemeral-action-runner_${TAG}_windows_amd64.zip\` |
+          | Linux x64 | \`ephemeral-action-runner_${TAG}_linux_amd64.tar.gz\` |
+          | Linux ARM64 | \`ephemeral-action-runner_${TAG}_linux_arm64.tar.gz\` |
+          | macOS Apple Silicon | \`ephemeral-action-runner_${TAG}_macos_arm64.tar.gz\` |
+          | macOS Intel | \`ephemeral-action-runner_${TAG}_macos_amd64.tar.gz\` |
+
+          ## Run
+
+          After extracting:
+
+          - Windows: \`.\run-epar.cmd\`
+          - macOS/Linux: \`./run-epar\`
+
+          For setup details, read the README quick start.
+          NOTES
+          )"
+          release_args=(gh release create "$TAG" --verify-tag --title "$TAG" --notes "$release_notes" --generate-notes)
           if [[ "$PRERELEASE" == "true" ]]; then
             release_args+=(--prerelease --latest=false)
           fi
