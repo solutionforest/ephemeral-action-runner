@@ -2,7 +2,9 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -347,18 +349,25 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 	if m.GitHub != nil {
 		runner, found, err := m.GitHub.RunnerByName(ctx, vm.Name)
 		if err != nil {
-			return true, "", err
-		}
-		if !found {
-			return false, "GitHub runner record is gone", nil
-		}
-		if runner.Busy {
-			return true, "", nil
-		}
-		if runner.Status != "online" {
-			return false, fmt.Sprintf("GitHub runner status is %q", runner.Status), nil
+			if !isTransientGitHubLivenessError(err) {
+				return true, "", err
+			}
+		} else {
+			if !found {
+				return false, "GitHub runner record is gone", nil
+			}
+			if runner.Busy {
+				return true, "", nil
+			}
+			if runner.Status != "online" {
+				return false, fmt.Sprintf("GitHub runner status is %q", runner.Status), nil
+			}
 		}
 	}
+	return m.runnerProcessAlive(ctx, vm)
+}
+
+func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	_, serviceErr := m.Provider.Exec(checkCtx, vm.Name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
@@ -366,6 +375,11 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 		return false, "actions runner process is no longer active", nil
 	}
 	return true, "", nil
+}
+
+func isTransientGitHubLivenessError(err error) bool {
+	var httpErr *gh.HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode >= http.StatusInternalServerError
 }
 
 func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, reason string) error {

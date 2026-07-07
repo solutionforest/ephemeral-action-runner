@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +22,10 @@ import (
 var dockerAvailable = func(ctx context.Context) error {
 	return exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}").Run()
 }
+
+var initHostname = os.Hostname
+
+var initRandomRead = rand.Read
 
 type initOptions struct {
 	ProjectRoot     string
@@ -105,8 +111,19 @@ func runInitWithOptions(opts initOptions) error {
 	if err != nil {
 		return err
 	}
+	defaultPrefix, err := generatedPoolNamePrefix()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "Pool name prefix must be unique for this machine/config within the GitHub organization.")
+	fmt.Fprintln(opts.Out, "EPAR cleanup deletes GitHub runner records matching this prefix.")
+	poolNamePrefix, err := promptPoolNamePrefix(opts.Out, reader, defaultPrefix)
+	if err != nil {
+		return err
+	}
 
-	content := defaultDockerDindConfig(appID, organization, privateKeyPath)
+	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix)
 	if err := os.MkdirAll(filepath.Dir(opts.ConfigPath), 0755); err != nil {
 		return err
 	}
@@ -163,7 +180,81 @@ func promptRequiredInt64(out io.Writer, reader *bufio.Reader, label string) (int
 	}
 }
 
-func defaultDockerDindConfig(appID int64, organization, privateKeyPath string) string {
+func promptPoolNamePrefix(out io.Writer, reader *bufio.Reader, defaultValue string) (string, error) {
+	for {
+		value, hitEOF, err := promptDefault(out, reader, "Pool name prefix", defaultValue)
+		if err != nil {
+			return "", err
+		}
+		if err := config.ValidatePrefix(value); err != nil {
+			fmt.Fprintf(out, "Pool name prefix is invalid: %v\n", err)
+			if hitEOF {
+				return "", err
+			}
+			continue
+		}
+		return value, nil
+	}
+}
+
+func promptDefault(out io.Writer, reader *bufio.Reader, label string, defaultValue string) (string, bool, error) {
+	fmt.Fprintf(out, "%s (press Enter to use %s): ", label, defaultValue)
+	value, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", false, err
+	}
+	hitEOF := errors.Is(err, io.EOF)
+	value = strings.TrimSpace(value)
+	if strings.ContainsAny(value, "\r\n") {
+		return "", hitEOF, fmt.Errorf("%s must be one line", label)
+	}
+	if value == "" {
+		return defaultValue, hitEOF, nil
+	}
+	return value, hitEOF, nil
+}
+
+func generatedPoolNamePrefix() (string, error) {
+	const (
+		maxPrefixLength = 40
+		randomHexLength = 6
+		fallbackHost    = "runner"
+	)
+	randomPart, err := randomHex(randomHexLength)
+	if err != nil {
+		return "", fmt.Errorf("generate pool name prefix: %w", err)
+	}
+	hostPart := ""
+	if hostname, err := initHostname(); err == nil {
+		hostPart = config.SanitizeNamePart(hostname)
+	}
+	if hostPart == "" {
+		hostPart = fallbackHost
+	}
+	maxHostPartLength := maxPrefixLength - 1 - randomHexLength
+	if len(hostPart) > maxHostPartLength {
+		hostPart = strings.TrimRight(hostPart[:maxHostPartLength], ".-_")
+	}
+	if hostPart == "" {
+		hostPart = fallbackHost
+	}
+	return hostPart + "-" + randomPart, nil
+}
+
+func randomHex(length int) (string, error) {
+	if length <= 0 || length%2 != 0 {
+		return "", fmt.Errorf("random hex length must be a positive even number")
+	}
+	data := make([]byte, length/2)
+	if n, err := initRandomRead(data); err != nil {
+		return "", err
+	} else if n != len(data) {
+		return "", io.ErrUnexpectedEOF
+	}
+	return hex.EncodeToString(data), nil
+}
+
+func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -182,7 +273,7 @@ image:
 
 pool:
   instances: 1
-  namePrefix: epar-dind
+  namePrefix: %s
   logDir: work/logs
 
 runner:
@@ -203,7 +294,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath)
+`, appID, organization, privateKeyPath, poolNamePrefix)
 }
 
 var stdinIsInteractive = func() bool {

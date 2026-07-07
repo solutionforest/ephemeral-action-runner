@@ -15,7 +15,7 @@ func RunnerNames(prefix string, count int, now time.Time) []string {
 }
 
 func RunnerName(prefix string, sequence int, now time.Time) string {
-	return fmt.Sprintf("%s-%s-%03d", prefix, now.Format("20060102-150405"), sequence)
+	return fmt.Sprintf("%s-%s-%03d", prefix, now.Format("20060102-150405"), sequence%1000)
 }
 
 func HasPrefix(name, prefix string) bool {

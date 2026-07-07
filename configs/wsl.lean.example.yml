@@ -17,7 +17,8 @@ image:
 
 pool:
   instances: 1
-  namePrefix: epar-wsl
+  # Must be unique for this machine/config within the GitHub organization.
+  namePrefix: CHANGE-ME-unique-machine-prefix
   logDir: work/logs
 
 runner:

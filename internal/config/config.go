@@ -403,6 +403,13 @@ func HostLabel(hostname string) string {
 	return prefix + sanitized
 }
 
+func SanitizeNamePart(value string) string {
+	value = sanitizeLabelPart(value)
+	return strings.TrimFunc(value, func(r rune) bool {
+		return !isASCIILetterOrDigit(r)
+	})
+}
+
 func sanitizeLabelPart(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var b strings.Builder
@@ -424,6 +431,12 @@ func sanitizeLabelPart(value string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+func isASCIILetterOrDigit(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z') ||
+		(r >= '0' && r <= '9')
 }
 
 func looksLikeRootFSTar(path string) bool {

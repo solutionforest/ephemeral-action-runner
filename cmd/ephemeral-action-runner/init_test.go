@@ -13,6 +13,8 @@ import (
 )
 
 func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
 	var out bytes.Buffer
@@ -21,7 +23,7 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 		ProjectRoot:     dir,
 		ConfigPath:      path,
 		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n"),
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\n"),
 		Out:             &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -46,11 +48,114 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Pool.Instances, 1; got != want {
 		t.Fatalf("pool.instances = %d, want %d", got, want)
 	}
+	if got, want := cfg.Pool.NamePrefix, "build-box-01-a4f9c2"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-gitea-ubuntu") {
 		t.Fatalf("runner labels = %q", got)
 	}
 	if !strings.Contains(out.String(), "start") || !strings.Contains(out.String(), "pool up --instances 2") {
 		t.Fatalf("init output did not include next steps:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Pool name prefix (press Enter to use build-box-01-a4f9c2):") {
+		t.Fatalf("init output did not explain default prefix acceptance:\n%s", out.String())
+	}
+}
+
+func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:     dir,
+		ConfigPath:      path,
+		SkipDockerCheck: true,
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ncustom-prefix\n"),
+		Out:             &bytes.Buffer{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Pool.NamePrefix, "custom-prefix"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+}
+
+func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:     dir,
+		ConfigPath:      path,
+		SkipDockerCheck: true,
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n-bad\nfixed-prefix\n"),
+		Out:             &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Pool.NamePrefix, "fixed-prefix"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+	if !strings.Contains(out.String(), "Pool name prefix is invalid") {
+		t.Fatalf("init output did not include validation warning:\n%s", out.String())
+	}
+}
+
+func TestGeneratedPoolNamePrefixTruncatesLongHostname(t *testing.T) {
+	stubInitHostAndRandom(t, strings.Repeat("a", 80), []byte{0xa4, 0xf9, 0xc2})
+
+	prefix, err := generatedPoolNamePrefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Repeat("a", 33) + "-a4f9c2"
+	if prefix != want {
+		t.Fatalf("generatedPoolNamePrefix() = %q, want %q", prefix, want)
+	}
+	if len(prefix) != 40 {
+		t.Fatalf("prefix length = %d, want 40", len(prefix))
+	}
+}
+
+func TestGeneratedPoolNamePrefixFallsBackWhenHostnameIsUnavailable(t *testing.T) {
+	oldHostname := initHostname
+	oldRandomRead := initRandomRead
+	initHostname = func() (string, error) { return "", errors.New("hostname unavailable") }
+	initRandomRead = fixedRandomRead([]byte{0xa4, 0xf9, 0xc2})
+	t.Cleanup(func() {
+		initHostname = oldHostname
+		initRandomRead = oldRandomRead
+	})
+
+	prefix, err := generatedPoolNamePrefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prefix, "runner-a4f9c2"; got != want {
+		t.Fatalf("generatedPoolNamePrefix() = %q, want %q", got, want)
+	}
+}
+
+func TestGeneratedPoolNamePrefixFallsBackWhenHostnameSanitizesEmpty(t *testing.T) {
+	stubInitHostAndRandom(t, "!!!", []byte{0xa4, 0xf9, 0xc2})
+
+	prefix, err := generatedPoolNamePrefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prefix, "runner-a4f9c2"; got != want {
+		t.Fatalf("generatedPoolNamePrefix() = %q, want %q", got, want)
 	}
 }
 
@@ -93,5 +198,24 @@ func TestInitChecksDockerByDefault(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "Docker is required") {
 		t.Fatalf("error = %v, want Docker requirement", err)
+	}
+}
+
+func stubInitHostAndRandom(t *testing.T, hostname string, random []byte) {
+	t.Helper()
+	oldHostname := initHostname
+	oldRandomRead := initRandomRead
+	initHostname = func() (string, error) { return hostname, nil }
+	initRandomRead = fixedRandomRead(random)
+	t.Cleanup(func() {
+		initHostname = oldHostname
+		initRandomRead = oldRandomRead
+	})
+}
+
+func fixedRandomRead(random []byte) func([]byte) (int, error) {
+	return func(data []byte) (int, error) {
+		copy(data, random)
+		return len(data), nil
 	}
 }

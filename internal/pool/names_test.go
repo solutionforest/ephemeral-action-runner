@@ -23,6 +23,21 @@ func TestRunnerName(t *testing.T) {
 	}
 }
 
+func TestRunnerNameWrapsSequenceSuffixAtOneThousand(t *testing.T) {
+	now := time.Date(2026, 7, 3, 1, 2, 3, 0, time.UTC)
+	tests := map[int]string{
+		998:  "epar-20260703-010203-998",
+		999:  "epar-20260703-010203-999",
+		1000: "epar-20260703-010203-000",
+		1001: "epar-20260703-010203-001",
+	}
+	for sequence, want := range tests {
+		if got := RunnerName("epar", sequence, now); got != want {
+			t.Fatalf("RunnerName(%d) = %q, want %q", sequence, got, want)
+		}
+	}
+}
+
 func TestHasPrefix(t *testing.T) {
 	if !HasPrefix("epar-test-1", "epar-test") {
 		t.Fatal("expected prefix match")

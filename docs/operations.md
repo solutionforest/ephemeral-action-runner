@@ -34,7 +34,8 @@ Generated names look like:
 epar-tart-20260703-010500-001
 ```
 
-Do not set `namePrefix` to a broad value such as `ubuntu` or `runner`.
+Do not set `namePrefix` to a broad value such as `ubuntu` or `runner`. Keep it within 40 characters so EPAR can append its generated runner-name suffix.
+Also do not reuse the same `namePrefix` on different machines or for separate EPAR supervisors in the same GitHub organization. GitHub cleanup is prefix-based, so a shared prefix lets one machine delete another machine's runner records.
 
 For Docker-DinD, cleanup removes the outer runner container with `docker rm -f -v`. That also removes the private inner Docker daemon's containers, networks, volumes, and image cache for that EPAR instance.
 

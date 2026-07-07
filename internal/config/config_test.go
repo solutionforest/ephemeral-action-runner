@@ -167,6 +167,21 @@ func TestHostLabelDoesNotExceedGitHubLimit(t *testing.T) {
 	}
 }
 
+func TestSanitizeNamePart(t *testing.T) {
+	tests := map[string]string{
+		"JJ ORION/Dev@Box":      "jj-orion-dev-box",
+		"...Build_Box--":        "build_box",
+		"---name---":            "name",
+		"!!!":                   "",
+		strings.Repeat("A", 60): strings.Repeat("a", 60),
+	}
+	for input, want := range tests {
+		if got := SanitizeNamePart(input); got != want {
+			t.Fatalf("SanitizeNamePart(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestLoadDockerDindPlatform(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -370,6 +385,31 @@ provider:
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExampleConfigsLoadAndValidate(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "Example Host", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+
+	entries, err := os.ReadDir(filepath.Join("..", "..", "configs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yml" {
+			continue
+		}
+		t.Run(entry.Name(), func(t *testing.T) {
+			cfg, err := Load(filepath.Join("..", "..", "configs", entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Validate(cfg); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

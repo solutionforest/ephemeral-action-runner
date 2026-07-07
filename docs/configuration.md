@@ -34,6 +34,15 @@ pool:
   instances: 2
 ```
 
+Set a unique instance name prefix for each machine/config in the same GitHub organization:
+
+```yaml
+pool:
+  namePrefix: buildbox01-a4f9c2
+```
+
+`pool.namePrefix` is both the prefix for generated GitHub runner names and the cleanup boundary for GitHub runner records. It must be 2-40 characters and should leave room for EPAR's generated `-YYYYMMDD-HHMMSS-###` suffix. Do not reuse the same prefix on different machines or for separate EPAR supervisors in the same organization. If two machines share a prefix, one machine's cleanup can delete the other machine's GitHub runner record, causing the other supervisor to report that the runner record is gone and replace a healthy runner.
+
 Add or change workflow labels:
 
 ```yaml

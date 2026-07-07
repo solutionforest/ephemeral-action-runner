@@ -55,6 +55,44 @@ func TestRunnerAliveRetiresIdleRunnerWhenServiceIsInactive(t *testing.T) {
 	}
 }
 
+func TestRunnerAliveFallsBackToServiceCheckWhenGitHubLivenessHasServerError(t *testing.T) {
+	provider := &fakeProvider{}
+	github := &fakeGitHub{
+		runnerErr: &gh.HTTPError{StatusCode: 500},
+	}
+	manager := Manager{Provider: provider, GitHub: github}
+
+	alive, reason, err := manager.runnerAlive(context.Background(), ProvisionedInstance{Name: "epar-test-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !alive {
+		t.Fatalf("runnerAlive() alive = false, reason = %q", reason)
+	}
+	if got := atomic.LoadInt32(&provider.execCalls); got != 1 {
+		t.Fatalf("service check ran %d time(s), want 1", got)
+	}
+}
+
+func TestRunnerAliveReturnsNonTransientGitHubLivenessError(t *testing.T) {
+	provider := &fakeProvider{}
+	github := &fakeGitHub{
+		runnerErr: &gh.HTTPError{StatusCode: 403},
+	}
+	manager := Manager{Provider: provider, GitHub: github}
+
+	alive, reason, err := manager.runnerAlive(context.Background(), ProvisionedInstance{Name: "epar-test-1"})
+	if err == nil {
+		t.Fatal("runnerAlive() error = nil, want GitHub error")
+	}
+	if !alive {
+		t.Fatalf("runnerAlive() alive = false, reason = %q", reason)
+	}
+	if got := atomic.LoadInt32(&provider.execCalls); got != 0 {
+		t.Fatalf("service check ran %d time(s), want 0", got)
+	}
+}
+
 func TestRetireInstanceDefersLocalDeleteWhenGitHubDeleteFails(t *testing.T) {
 	provider := &fakeProvider{}
 	github := &fakeGitHub{deleteErr: errors.New("github runner is currently running a job")}
