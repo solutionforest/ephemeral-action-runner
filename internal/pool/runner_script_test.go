@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,19 +18,17 @@ func TestCheckRunnerPIDFilePath(t *testing.T) {
 	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "actions-runner.pid")
-	fakeBin := filepath.Join(dir, "bin")
-	if err := os.MkdirAll(fakeBin, 0755); err != nil {
+
+	sleeper := exec.Command("sleep", "60")
+	if err := sleeper.Start(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "kill"), []byte(`#!/usr/bin/env bash
-if [[ "${1:-}" == "-0" && "${2:-}" == "12345" ]]; then
-  exit 0
-fi
-exit 1
-`), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(pidFile, []byte("12345"), 0644); err != nil {
+	t.Cleanup(func() {
+		_ = sleeper.Process.Kill()
+		_, _ = sleeper.Process.Wait()
+	})
+
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprint(sleeper.Process.Pid)), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -37,20 +36,23 @@ exit 1
 	cmd.Env = append(os.Environ(),
 		"EPAR_DISABLE_SYSTEMD=1",
 		"EPAR_RUNNER_PID_FILE="+bashPath(pidFile),
-		"PATH="+bashPath(fakeBin)+":"+os.Getenv("PATH"),
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("check-runner PID path failed: %v\n%s", err, out)
 	}
 
-	if err := os.WriteFile(pidFile, []byte("999999"), 0644); err != nil {
+	if err := sleeper.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = sleeper.Process.Wait()
+
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprint(sleeper.Process.Pid)), 0644); err != nil {
 		t.Fatal(err)
 	}
 	cmd = exec.Command("bash", script)
 	cmd.Env = append(os.Environ(),
 		"EPAR_DISABLE_SYSTEMD=1",
 		"EPAR_RUNNER_PID_FILE="+bashPath(pidFile),
-		"PATH="+bashPath(fakeBin)+":"+os.Getenv("PATH"),
 	)
 	if err := cmd.Run(); err == nil {
 		t.Fatal("check-runner accepted stale PID")
