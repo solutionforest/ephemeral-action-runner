@@ -15,6 +15,12 @@ flowchart TB
   Delete --> Create
 ```
 
+## Use Case
+
+Private repositories often have limited [GitHub-hosted Actions minutes](https://docs.github.com/en/billing/concepts/product-billing/github-actions#free-use-of-github-actions). If you already have a spare Windows, macOS, Linux, or Docker-capable machine, you can use it for feature-branch CI instead of spending those hosted-runner minutes.
+
+A normal long-lived self-hosted runner can leave dependencies, files, containers, caches, or other job state behind on that machine. EPAR lowers that risk by running each job in a disposable container, WSL distro, or VM, then deleting it and creating a clean replacement.
+
 ## Why Use EPAR
 
 - **Fast startup:** keep ready self-hosted runners online with `start`.
