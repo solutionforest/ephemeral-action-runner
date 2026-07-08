@@ -15,12 +15,6 @@ cp examples/macos/start-epar.command .local/start-epar.command
 chmod +x .local/start-epar.command
 ```
 
-Build the local binary once:
-
-```bash
-go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
-```
-
 Double-click `.local/start-epar.command` in Finder or run it from Terminal:
 
 ```bash
@@ -30,11 +24,11 @@ Double-click `.local/start-epar.command` in Finder or run it from Terminal:
 The script:
 
 - finds the EPAR source folder, such as when the script lives at `.local/start-epar.command`;
-- uses the local binary at `./bin/ephemeral-action-runner`;
+- runs EPAR with `go run ./cmd/ephemeral-action-runner`;
 - uses `.local/config.yml` by default;
 - waits for Docker to become ready before starting EPAR;
 - starts an existing `epar-dockerhub-cache` mirror container if one exists;
-- runs `ephemeral-action-runner start`.
+- runs the `start` flow.
 
 If `.local/config.yml` does not exist and the script is running in a Terminal window, EPAR's normal first-run setup can create it. For `launchd`, create the config first by running EPAR manually once.
 
@@ -49,7 +43,7 @@ You can edit the copied `.local/start-epar.command` file or set environment vari
 ```bash
 export EPAR_ROOT="/path/to/ephemeral-action-runner"
 export EPAR_CONFIG="${EPAR_ROOT}/.local/config.yml"
-export EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
+export EPAR_GO_BIN="/usr/local/go/bin/go"
 export EPAR_MIRROR_CONTAINER="epar-dockerhub-cache"
 export EPAR_WAIT_FOR_DOCKER=1
 export EPAR_DOCKER_WAIT_ATTEMPTS=120

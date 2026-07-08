@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Finder/Open at Login launches .command files with a minimal environment.
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+export PATH="/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 script_path="${BASH_SOURCE[0]:-$0}"
 script_dir="$(cd -- "$(dirname -- "${script_path}")" && pwd -P)"
@@ -28,9 +28,7 @@ find_repo_root() {
 
 EPAR_ROOT="$(find_repo_root)"
 CONFIG_PATH="${EPAR_CONFIG:-${EPAR_ROOT}/.local/config.yml}"
-if [[ -z "${EPAR_BIN:-}" ]]; then
-  EPAR_BIN="${EPAR_ROOT}/bin/ephemeral-action-runner"
-fi
+GO_BIN="${EPAR_GO_BIN:-go}"
 MIRROR_CONTAINER="${EPAR_MIRROR_CONTAINER:-epar-dockerhub-cache}"
 WAIT_FOR_DOCKER="${EPAR_WAIT_FOR_DOCKER:-1}"
 DOCKER_WAIT_ATTEMPTS="${EPAR_DOCKER_WAIT_ATTEMPTS:-120}"
@@ -38,9 +36,9 @@ DOCKER_WAIT_ATTEMPTS="${EPAR_DOCKER_WAIT_ATTEMPTS:-120}"
 cd "${EPAR_ROOT}"
 mkdir -p work/logs
 
-if [[ ! -x "${EPAR_BIN}" ]]; then
-  echo "EPAR binary not found or not executable: ${EPAR_BIN}" >&2
-  echo "Build it first: go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner" >&2
+if ! command -v "${GO_BIN}" >/dev/null 2>&1; then
+  echo "Go not found: ${GO_BIN}" >&2
+  echo "Install Go, or set EPAR_GO_BIN to the full path of the go executable." >&2
   exit 1
 fi
 
@@ -65,4 +63,4 @@ if [[ "${WAIT_FOR_DOCKER}" != "0" ]]; then
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting EPAR..."
-exec "${EPAR_BIN}" start --config "${CONFIG_PATH}" "$@"
+exec "${GO_BIN}" run ./cmd/ephemeral-action-runner start --config "${CONFIG_PATH}" "$@"
