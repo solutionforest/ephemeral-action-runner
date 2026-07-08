@@ -95,12 +95,18 @@ go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
 
-#### GitHub Actions Label
+#### GitHub Actions Labels
 
-Use this label in GitHub Actions:
+GitHub Actions picks a runner by matching the job's `runs-on` list with the labels registered on each runner. Every self-hosted runner gets the `self-hosted` label, so the simplest workflow can use:
 
 ```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
+runs-on: [self-hosted]
+```
+
+If you have multiple self-hosted runners and want this job to run on a specific kind of EPAR runner, add one of its extra labels to the list, e.g.:
+
+```yaml
+runs-on: [self-hosted, epar-docker-dind-gitea-ubuntu]
 ```
 
 EPAR also adds an `epar-host-<machine>` label by default, so you can see which host registered each runner. You only need to include that label in `runs-on` when you intentionally want a job to target one machine.
