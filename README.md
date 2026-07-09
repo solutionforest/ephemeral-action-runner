@@ -165,6 +165,7 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Tart Provider](docs/providers/tart.md): Apple Silicon Linux VM runners.
 - [Image Build](docs/image-build.md): image internals and customization.
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
+- [Troubleshooting](docs/troubleshooting.md): symptom-first diagnostics by host and provider.
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
 - [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
