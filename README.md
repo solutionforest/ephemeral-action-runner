@@ -33,17 +33,13 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
 
-### 1. Prerequisites
+### 1. Install Docker
 
-Make sure these are installed:
+The default quick start needs a Docker-compatible daemon:
 
-- [Go](https://go.dev/) 1.22 or newer — optional; skip it if you'd rather not install Go at all (see [Running EPAR Without Installing Go](docs/advanced/no-go-install.md))
-- a Docker-compatible daemon:
-  - Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
-  - macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
-  - Linux: [Docker Engine](https://docs.docker.com/engine/)
-
-The default [Docker-DinD](https://www.docker.com/resources/docker-in-docker-containerized-ci-workflows-dockercon-2023/) mode uses `docker run --privileged`, so the daemon must support privileged Linux containers.
+- Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
+- macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
+- Linux: [Docker Engine](https://docs.docker.com/engine/)
 
 ### 2. Download EPAR Source
 
@@ -73,11 +69,7 @@ Run EPAR with the default flow:
 ./start
 ```
 
-On native Windows PowerShell or cmd, use `.\start.ps1` or `start.cmd` instead. Either wrapper uses Go if it's installed, and otherwise runs EPAR from source in a container with no local Go install and no binary written to disk — see [Running EPAR Without Installing Go](docs/advanced/no-go-install.md). If you'd rather call Go directly:
-
-```bash
-go run ./cmd/ephemeral-action-runner
-```
+On Windows, `./start` also works in modern PowerShell. If your shell does not run it, use `.\start.ps1` or `start.cmd`.
 
 That's it.
 
@@ -95,8 +87,8 @@ Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans
 
 To choose a config or runner count:
 
-```powershell
-.\start.ps1 --config .local\wsl.yml --instances 2
+```bash
+./start --config .local/custom-config.yml --instances 2
 ```
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
