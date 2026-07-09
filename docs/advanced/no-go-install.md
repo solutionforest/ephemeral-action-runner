@@ -41,6 +41,8 @@ scripts/run-with-docker.sh start --config .local/config.yml
 
 Set `EPAR_USE_DOCKER_RUN=1` to force `./start` down this path even when Go is installed, or `=0` to force `go run` locally and error out instead of falling back. A Docker volume caches Go modules and build output across runs, so repeat starts are fast.
 
+The Docker wrapper passes the real host name into the toolchain container as `EPAR_HOST_NAME` so first-run defaults and generated host labels describe the machine running EPAR, not the temporary Go container. Set `EPAR_HOST_NAME` yourself before launching EPAR if you want to override that identity.
+
 ### Linux: File Ownership
 
 The container runs as root (the Go toolchain image only lets root write to its module/build cache directories). On Docker Desktop for macOS, bind-mounted files still come out owned by your normal user. On native Linux hosts, that isn't true — root-owned files would otherwise land in `.local/` and `work/`. `scripts/run-with-docker.sh` handles this by `chown`-ing those two directories back to the invoking user after each run; no action needed, but don't rely on other directories under the repo getting the same treatment.

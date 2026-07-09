@@ -20,6 +20,21 @@ $DevImage = if ($env:EPAR_DEV_IMAGE) { $env:EPAR_DEV_IMAGE } else { "epar-dev-to
 $GomodVolume = if ($env:EPAR_GOMOD_VOLUME) { $env:EPAR_GOMOD_VOLUME } else { "epar-gomod" }
 $GocacheVolume = if ($env:EPAR_GOCACHE_VOLUME) { $env:EPAR_GOCACHE_VOLUME } else { "epar-gocache" }
 $DockerSock = if ($env:EPAR_DOCKER_SOCK) { $env:EPAR_DOCKER_SOCK } else { "/var/run/docker.sock" }
+$HostName = $env:EPAR_HOST_NAME
+if (-not $HostName) {
+    $HostName = $env:COMPUTERNAME
+}
+if (-not $HostName) {
+    try {
+        $HostName = [System.Net.Dns]::GetHostName()
+    } catch {
+        $HostName = ""
+    }
+}
+$DockerEnvFlags = @()
+if ($HostName) {
+    $DockerEnvFlags += @("-e", "EPAR_HOST_NAME=$HostName")
+}
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Write-Error "docker command not found. Install Docker Desktop or another working Docker host."
@@ -27,6 +42,14 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$DockerRunFlags = @("--rm", "-i")
+try {
+    if (-not [Console]::IsInputRedirected) {
+        $DockerRunFlags += "-t"
+    }
+} catch {
+    # Non-console PowerShell hosts can throw here; keep stdin attached without a TTY.
+}
 
 docker build --quiet `
     --build-arg "GO_IMAGE=$Image" `
@@ -35,7 +58,8 @@ docker build --quiet `
     (Join-Path $RepoRoot "scripts\docker") | Out-Null
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-docker run --rm -i `
+docker run @DockerRunFlags `
+    @DockerEnvFlags `
     -v "${RepoRoot}:/app" -w /app `
     -v "${GomodVolume}:/go/pkg/mod" `
     -v "${GocacheVolume}:/root/.cache/go-build" `

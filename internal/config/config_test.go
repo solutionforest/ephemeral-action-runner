@@ -11,6 +11,7 @@ func TestLoadYAMLSubset(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "CI Box 01", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -77,6 +78,7 @@ func TestRunnerHostLabelDefaultsToEnabled(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Build Box_01.example", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -95,10 +97,34 @@ provider:
 	}
 }
 
+func TestRunnerHostLabelPrefersHostNameEnv(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "container-id", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "Real Windows Host")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Runner.Labels[len(cfg.Runner.Labels)-1], "epar-host-real-windows-host"; got != want {
+		t.Fatalf("host label = %q, want %q", got, want)
+	}
+}
+
 func TestRunnerHostLabelCanBeDisabled(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "build-box", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -125,6 +151,7 @@ func TestRunnerHostLabelDoesNotDuplicateExistingLabel(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Build Box", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -392,6 +419,7 @@ func TestExampleConfigsLoadAndValidate(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Example Host", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	entries, err := os.ReadDir(filepath.Join("..", "..", "configs"))
 	if err != nil {

@@ -16,6 +16,10 @@ Set-Location -LiteralPath $Root
 
 $GoBin = if ($env:EPAR_GO_BIN) { $env:EPAR_GO_BIN } else { "go" }
 $UseDockerRun = if ($env:EPAR_USE_DOCKER_RUN) { $env:EPAR_USE_DOCKER_RUN } else { "auto" }
+$StartArgs = @("start")
+if ($null -ne $EparArgs -and $EparArgs.Count -gt 0) {
+    $StartArgs += $EparArgs
+}
 
 function Test-GoUsable {
     param([string]$GoBin)
@@ -32,7 +36,7 @@ $goUsable = Test-GoUsable -GoBin $GoBin
 
 if ($UseDockerRun -eq "1" -or ($UseDockerRun -eq "auto" -and -not $goUsable)) {
     Write-Warning "Go not found or not runnable (or EPAR_USE_DOCKER_RUN=1); running with a containerized Go toolchain instead..."
-    & (Join-Path $Root "scripts\run-with-docker.ps1") "start" @EparArgs
+    & (Join-Path $Root "scripts\run-with-docker.ps1") @StartArgs
     exit $LASTEXITCODE
 }
 
@@ -41,5 +45,5 @@ if (-not $goUsable) {
     exit 1
 }
 
-& $GoBin run ./cmd/ephemeral-action-runner start @EparArgs
+& $GoBin run ./cmd/ephemeral-action-runner @StartArgs
 exit $LASTEXITCODE

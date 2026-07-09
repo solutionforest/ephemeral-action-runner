@@ -16,6 +16,14 @@ dev_image="${EPAR_DEV_IMAGE:-epar-dev-toolchain}"
 gomod_volume="${EPAR_GOMOD_VOLUME:-epar-gomod}"
 gocache_volume="${EPAR_GOCACHE_VOLUME:-epar-gocache}"
 docker_sock="${EPAR_DOCKER_SOCK:-/var/run/docker.sock}"
+host_name="${EPAR_HOST_NAME:-}"
+if [[ -z "${host_name}" ]]; then
+  host_name="$(hostname 2>/dev/null || true)"
+fi
+docker_env_flags=()
+if [[ -n "${host_name}" ]]; then
+  docker_env_flags=(-e "EPAR_HOST_NAME=${host_name}")
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker command not found. Install Docker Desktop, Docker Engine, or a compatible Docker host." >&2
@@ -31,7 +39,7 @@ docker build --quiet \
   "${repo_root}/scripts/docker" >/dev/null
 
 tty_flags=(--rm -i)
-if [[ -t 0 && -t 1 ]]; then
+if [[ -t 0 ]]; then
   tty_flags=(--rm -it)
 fi
 
@@ -43,6 +51,7 @@ fi
 # bind-mounted .local/ and work/ dirs, so hand them back to the invoking user
 # afterward.
 docker run "${tty_flags[@]}" \
+  "${docker_env_flags[@]}" \
   -v "${repo_root}:/app" -w /app \
   -v "${gomod_volume}:/go/pkg/mod" \
   -v "${gocache_volume}:/root/.cache/go-build" \
