@@ -12,8 +12,8 @@ Install the host tools you need:
 
 | Required for | Tool |
 | --- | --- |
-| Source ZIP quick start | Go 1.22 or newer |
-| Local binary build | Go 1.22 or newer |
+| Source ZIP quick start | Go 1.22 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
+| Local binary build | Go 1.22 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
 | Updating the pinned `actions/runner-images` checkout | Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |
@@ -51,9 +51,17 @@ go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
 
 The examples below use `go run ./cmd/ephemeral-action-runner` for the public source-first path. If you built a local binary, use `./bin/ephemeral-action-runner` or `.\bin\ephemeral-action-runner.exe` instead.
 
+Don't want to install Go at all? See [Running EPAR Without Installing Go](advanced/no-go-install.md) for running from source in a container, or downloading a prebuilt release binary.
+
 ## One-Command Start
 
-For the default Docker-DinD setup, run EPAR from the source folder:
+For the default Docker-DinD setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, with no binary written to disk (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
+
+```bash
+./start
+```
+
+Equivalent without the wrapper:
 
 ```bash
 go run ./cmd/ephemeral-action-runner
@@ -61,13 +69,25 @@ go run ./cmd/ephemeral-action-runner
 
 If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. It then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
-Use `start` when you want to choose a config or runner count:
+Pass flags through `./start` to choose a config or runner count:
+
+```bash
+./start --config .local/config.yml --instances 2
+```
+
+Equivalent without the wrapper:
 
 ```bash
 go run ./cmd/ephemeral-action-runner start --config .local/config.yml --instances 2
 ```
 
 On Windows PowerShell:
+
+```powershell
+.\start.ps1 --config .local\wsl.yml --instances 2
+```
+
+Equivalent without the wrapper:
 
 ```powershell
 go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2

@@ -37,7 +37,7 @@ The easiest path is the default **Docker-DinD** mode. It works well for most Lin
 
 Make sure these are installed:
 
-- [Go](https://go.dev/) 1.22 or newer
+- [Go](https://go.dev/) 1.22 or newer — optional; skip it if you'd rather not install Go at all (see [Running EPAR Without Installing Go](docs/advanced/no-go-install.md))
 - a Docker-compatible daemon:
   - Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
   - macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
@@ -70,6 +70,12 @@ Follow [GitHub App Setup](docs/github-app.md), then keep these three values read
 Run EPAR with the default flow:
 
 ```bash
+./start
+```
+
+On native Windows PowerShell or cmd, use `.\start.ps1` or `start.cmd` instead. Either wrapper uses Go if it's installed, and otherwise runs EPAR from source in a container with no local Go install and no binary written to disk — see [Running EPAR Without Installing Go](docs/advanced/no-go-install.md). If you'd rather call Go directly:
+
+```bash
 go run ./cmd/ephemeral-action-runner
 ```
 
@@ -90,7 +96,7 @@ Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans
 To choose a config or runner count:
 
 ```powershell
-go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
+.\start.ps1 --config .local\wsl.yml --instances 2
 ```
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
@@ -161,4 +167,5 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
+- [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
 - [Security](docs/security.md): trust boundaries and secret handling.

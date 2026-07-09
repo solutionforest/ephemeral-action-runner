@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One-command start: ./start or ./start --config .local/config.yml --instances 2
+#
+# Uses local Go if present. Otherwise runs EPAR from source inside a
+# containerized Go toolchain via `go run` (no local Go install needed, and
+# no binary is built or left on disk). Docker is required either way.
+# See docs/advanced/no-go-install.md.
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+cd "${script_dir}"
+
+GO_BIN="${EPAR_GO_BIN:-go}"
+USE_DOCKER_RUN="${EPAR_USE_DOCKER_RUN:-auto}"
+
+# A present-but-broken `go` (wrong architecture, ancient pre-modules install
+# left over on PATH, etc.) must not look "usable" just because it exists.
+go_usable() {
+  command -v "$1" >/dev/null 2>&1 && "$1" version >/dev/null 2>&1
+}
+
+if [[ "${USE_DOCKER_RUN}" == "1" ]] || { [[ "${USE_DOCKER_RUN}" == "auto" ]] && ! go_usable "${GO_BIN}"; }; then
+  echo "Go not found or not runnable (or EPAR_USE_DOCKER_RUN=1); running with a containerized Go toolchain instead..." >&2
+  exec "${script_dir}/scripts/run-with-docker.sh" start "$@"
+fi
+
+if ! go_usable "${GO_BIN}"; then
+  echo "Go not found or not runnable: ${GO_BIN}" >&2
+  echo "Install Go, set EPAR_GO_BIN, or set EPAR_USE_DOCKER_RUN=1 to run with a containerized Go toolchain instead." >&2
+  echo "See docs/advanced/no-go-install.md." >&2
+  exit 1
+fi
+
+exec "${GO_BIN}" run ./cmd/ephemeral-action-runner start "$@"
