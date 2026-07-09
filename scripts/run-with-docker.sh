@@ -16,13 +16,14 @@ dev_image="${EPAR_DEV_IMAGE:-epar-dev-toolchain}"
 gomod_volume="${EPAR_GOMOD_VOLUME:-epar-gomod}"
 gocache_volume="${EPAR_GOCACHE_VOLUME:-epar-gocache}"
 docker_sock="${EPAR_DOCKER_SOCK:-/var/run/docker.sock}"
+export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"
 host_name="${EPAR_HOST_NAME:-}"
 if [[ -z "${host_name}" ]]; then
   host_name="$(hostname 2>/dev/null || true)"
 fi
-docker_env_flags=()
+docker_env_flags=(-e "DOCKER_CLI_HINTS=${DOCKER_CLI_HINTS}")
 if [[ -n "${host_name}" ]]; then
-  docker_env_flags=(-e "EPAR_HOST_NAME=${host_name}")
+  docker_env_flags+=(-e "EPAR_HOST_NAME=${host_name}")
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
