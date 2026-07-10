@@ -14,8 +14,8 @@ request.
 
 The workflow has three jobs:
 
-1. `Core runner controller` runs on a persistent, trusted self-hosted runner.
-   It builds EPAR and the pinned lightweight core image, pre-cleans the
+1. `Core runner controller` runs on a fresh, trusted GitHub-hosted runner. It
+   builds EPAR and the pinned lightweight core image, pre-cleans the
    `epar-ci-core` boundary, and supervises one ephemeral runner.
 2. `Core canary 1` runs on that ephemeral runner, validates its basic runtime,
    and uploads its runner name and a nonce.
@@ -30,27 +30,12 @@ because every run intentionally shares the fixed cleanup prefix.
 
 ## Required GitHub Setup
 
-### Trusted controller runner
+### GitHub-hosted controller
 
-Provide trusted Linux X64 self-hosted runners with all of the following:
-
-- the standard `self-hosted` label
-- Docker access and support for privileged Linux containers
-- Bash, curl, jq, and GNU `timeout`
-- enough disk space to build and retain the core Docker image
-- a current GitHub Actions runner compatible with actions implemented on
-  Node.js 24
-
-The repository must be allowed to use these runners. The controller uses
-`runs-on: self-hosted`, so every eligible runner that may accept the job must
-meet these requirements and be trusted with the GitHub App key and privileged
-Docker access.
-
-Because the controller is not pinned to one machine, a forced cancellation or
-host outage can leave a local DinD container on the machine that accepted that
-run. A later run on another self-hosted machine can remove the organization
-runner registration, but it cannot remove that host-local container. Inspect
-all eligible controller hosts after an unclean interruption.
+The controller uses the standard GitHub-hosted `ubuntu-latest` runner. No
+pre-existing self-hosted controller is required. Each run receives a fresh
+Linux VM with Docker, Bash, curl, jq, and GNU `timeout`; the workflow installs
+the Go version declared by `go.mod` before building EPAR.
 
 ### Restricted ephemeral-runner group
 
@@ -85,26 +70,12 @@ For the initial feature-branch test, allow
 trigger. Requiring an environment reviewer is possible, but every matching
 push will wait for that approval.
 
-### Optional network variables
-
-Add these only when the controller's network requires them:
-
-| Environment variable | Purpose |
-| --- | --- |
-| `EPAR_TRUSTED_CA_CERTIFICATE_PATH` | Absolute path on the controller host to a readable PEM CA certificate for private TLS inspection. The certificate is installed into the generated runner image; TLS verification remains enabled. |
-| `EPAR_DOCKER_PROXY` | One unauthenticated HTTP(S) proxy URL inherited by the outer DinD daemon. URLs containing user information are rejected. |
-| `EPAR_DOCKER_REGISTRY_MIRROR` | One HTTP(S) Docker registry mirror URL reachable from the nested Docker daemon. |
-
-The CA variable is a host path, not the certificate contents. Ensure the same
-path exists for the operating-system account running the controller service.
-Do not put proxy credentials in these variables.
-
 ## Trust Boundaries and Triggers
 
 The controller job is privileged and secret-bearing. It receives the GitHub
 App key and a workflow token with Actions write permission, and it can start
-privileged containers on the host. It must run only on a controlled machine and
-only for trusted repository changes.
+privileged containers in its disposable GitHub-hosted VM. It runs only for
+trusted repository changes and never for pull-request events.
 
 The two canary jobs do not receive the GitHub App key. They receive only the
 minimum workflow permissions needed for checkout and artifact operations, and
@@ -133,29 +104,30 @@ the artifact, Buildx, Compose, container health, and HTTP checks.
 The controller performs cleanup before and after the canaries. It stops the
 pool supervisor, deletes GitHub runner registrations within the exact
 `epar-ci-core` prefix boundary, removes matching outer Docker-DinD containers,
-and deletes its temporary key, generated config, and logs. A controller failure
-attempts cleanup before canceling the workflow so queued canary jobs do not
-remain indefinitely. The next run also pre-cleans the same boundary.
+and deletes its temporary key, generated config, and logs. Before failed-run
+cleanup deletes those logs, the controller prints a sanitized final 200 lines
+from the pool-supervisor log and each available runner log. A controller
+failure then attempts cleanup before canceling the workflow so queued canary
+jobs do not remain indefinitely. The next run also pre-cleans the same
+boundary.
 
-A sudden controller-host outage or forced process termination can bypass that
-cleanup. Always inspect both the organization runner list and the controller's
-Docker containers after such an event.
+A sudden controller failure can bypass application cleanup. GitHub discards the
+hosted VM and its Docker containers, while the next run pre-cleans stale GitHub
+runner registrations within the same prefix boundary.
 
 ## Troubleshooting
 
 ### Controller job remains queued
 
-- Confirm a compatible Linux X64 runner labeled `self-hosted` is online and
-  accessible to this repository.
-- Confirm its runner service is current enough for the workflow's Node.js
-  24-based actions.
-- Confirm the runner account can execute `docker info` and the Docker runtime
-  permits privileged containers.
+- Confirm the organization and repository allow standard GitHub-hosted
+  runners.
+- Check GitHub Actions service status and the account's hosted-runner
+  concurrency.
 
 ### Controller starts, but canaries remain queued
 
-- Open the controller log and check image-build, registration, and pool
-  supervisor errors.
+- Open the controller log and check image-build errors plus the grouped,
+  sanitized pool-supervisor and runner-log tails printed before cleanup.
 - Confirm `epar-ci-canary` exists with that exact spelling and permits this
   repository.
 - Confirm the GitHub App is installed in the organization and can administer
@@ -170,14 +142,8 @@ Docker containers after such an event.
 
 - Check controller disk space and Docker health.
 - Confirm outbound access to the pinned Gitea and BusyBox images.
-- If TLS inspection is used, verify that
-  `EPAR_TRUSTED_CA_CERTIFICATE_PATH` is readable by the controller service
-  account and contains a CA certificate in PEM format.
-- Verify the proxy or registry mirror is reachable from Docker, not merely from
-  the interactive host shell. The optional proxy and mirror accept only one
-  HTTP(S) URL and intentionally reject embedded credentials.
-- For nested-Docker startup failures, confirm the host supports privileged
-  containers and inspect the outer container before cleanup removes it.
+- For nested-Docker startup failures, inspect the grouped Docker-DinD runner-log
+  tail in the controller output.
 
 ### Workflow is canceled after a controller error
 
@@ -187,12 +153,6 @@ not stay queued. Diagnose the first controller error rather than treating the
 cancellation itself as the root cause.
 
 ## Manual Cleanup
-
-First verify the exact cleanup boundary. On the trusted controller host:
-
-```bash
-docker ps --all --format '{{.Names}}' | grep -E '^epar-ci-core(-|$)'
-```
 
 Use a local, untracked config based on
 `configs/docker-dind.core.example.yml`, with the same organization, GitHub App
@@ -204,19 +164,8 @@ go run ./cmd/ephemeral-action-runner cleanup \
   --project-root .
 ```
 
-This removes both matching organization runner records and local Docker-DinD
-containers. If GitHub credentials are temporarily unavailable, local-only
-cleanup is possible:
-
-```bash
-go run ./cmd/ephemeral-action-runner cleanup \
-  --config .local/core-cleanup.yml \
-  --project-root . \
-  --no-github
-```
-
-Then remove remaining `epar-ci-core-*` runner records from the organization's
-Actions runner settings. For direct Docker cleanup, review the names produced
-by the listing command and run `docker rm --force --volumes <exact-name>` for
-each confirmed match. Do not use a broader prefix: EPAR cleanup is deliberately
-bounded to `epar-ci-core` and `epar-ci-core-*`.
+This removes matching organization runner records. Docker containers from the
+controller run existed only on its disposable GitHub-hosted VM. If cleanup
+still reports an error, remove remaining `epar-ci-core-*` records from the
+organization's Actions runner settings. Do not use a broader prefix: EPAR
+cleanup is deliberately bounded to `epar-ci-core` and `epar-ci-core-*`.

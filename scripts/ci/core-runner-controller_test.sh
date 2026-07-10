@@ -11,6 +11,7 @@ workflow_path="${repo_root}/.github/workflows/core-runner-verification.yml"
 grep -F -q 'if: ${{ failure() && !cancelled() }}' "${workflow_path}"
 grep -F -q 'Cancel workflow after controller setup failure' "${workflow_path}"
 grep -F -q '"${api_url}/force-cancel"' "${workflow_path}"
+grep -F -q 'runs-on: ubuntu-latest' "${workflow_path}"
 
 cat >"${test_root}/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -20,12 +21,21 @@ EOF
 cat >"${test_root}/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 if [[ " $* " == *" --request GET "* ]]; then
-  cat <<'JSON'
+  if [[ "${MOCK_POOL_FAILURE:-}" == "1" ]]; then
+    cat <<'JSON'
+{"jobs":[
+  {"name":"Core canary 1","status":"queued","conclusion":null,"runner_name":null,"runner_group_name":null,"labels":["epar-core-123-1"]},
+  {"name":"Core canary 2","status":"queued","conclusion":null,"runner_name":null,"runner_group_name":null,"labels":["epar-core-123-1"]}
+]}
+JSON
+  else
+    cat <<'JSON'
 {"jobs":[
   {"name":"Core canary 1","status":"completed","conclusion":"success","runner_name":"epar-ci-core-20260710-100000-001","runner_group_name":"epar-ci-canary","labels":["epar-core-123-1"]},
   {"name":"Core canary 2","status":"completed","conclusion":"success","runner_name":"epar-ci-core-20260710-100010-002","runner_group_name":"epar-ci-canary","labels":["epar-core-123-1"]}
 ]}
 JSON
+  fi
 else
   : >"${MOCK_CANCEL_MARKER}"
 fi
@@ -55,10 +65,18 @@ input="$(cat)"
 
 case "${expr}" in
   *'Core canary 1'*)
-    printf '%s\n' '{"name":"Core canary 1","status":"completed","conclusion":"success","runner_name":"epar-ci-core-20260710-100000-001","runner_group_name":"epar-ci-canary","labels":["epar-core-123-1"]}'
+    if [[ "${input}" == *'"status":"queued"'* ]]; then
+      printf '%s\n' '{"name":"Core canary 1","status":"queued","conclusion":null,"runner_name":null,"runner_group_name":null,"labels":["epar-core-123-1"]}'
+    else
+      printf '%s\n' '{"name":"Core canary 1","status":"completed","conclusion":"success","runner_name":"epar-ci-core-20260710-100000-001","runner_group_name":"epar-ci-canary","labels":["epar-core-123-1"]}'
+    fi
     ;;
   *'Core canary 2'*)
-    printf '%s\n' '{"name":"Core canary 2","status":"completed","conclusion":"success","runner_name":"epar-ci-core-20260710-100010-002","runner_group_name":"epar-ci-canary","labels":["epar-core-123-1"]}'
+    if [[ "${input}" == *'"status":"queued"'* ]]; then
+      printf '%s\n' '{"name":"Core canary 2","status":"queued","conclusion":null,"runner_name":null,"runner_group_name":null,"labels":["epar-core-123-1"]}'
+    else
+      printf '%s\n' '{"name":"Core canary 2","status":"completed","conclusion":"success","runner_name":"epar-ci-core-20260710-100010-002","runner_group_name":"epar-ci-canary","labels":["epar-core-123-1"]}'
+    fi
     ;;
   '.status // "missing"')
     sed -n 's/.*"status":"\([^"]*\)".*/\1/p' <<<"${input}"
@@ -108,6 +126,37 @@ if [[ " $* " == *" image build "* ]]; then
   grep -F -q 'noProxy: localhost,127.0.0.1,::1' "${config_path}"
 fi
 if [[ " $* " == *" pool up "* ]]; then
+  if [[ "${MOCK_POOL_FAILURE:-}" == "1" ]]; then
+    config_path=""
+    while (( $# > 0 )); do
+      if [[ "$1" == "--config" ]]; then
+        config_path="$2"
+        break
+      fi
+      shift
+    done
+    log_dir="$(sed -n 's/^  logDir: //p' "${config_path}")"
+    mkdir -p "${log_dir}"
+    {
+      echo 'guest safe diagnostic'
+      printf 'RUNNER_TOKEN=%s\n' "${MOCK_GUEST_TOKEN}"
+      printf 'Authorization: token %s\n' "${MOCK_GUEST_AUTH_TOKEN}"
+    } >"${log_dir}/mock.guest.log"
+    {
+      echo 'Docker-DinD safe diagnostic'
+      printf 'EPAR_APP_PRIVATE_KEY=%s\n' "${MOCK_PRIVATE_KEY_ENV}"
+    } >"${log_dir}/mock.docker-dind.log"
+    echo 'pool safe diagnostic'
+    printf 'RUNNER_TOKEN=%s\n' "${MOCK_POOL_TOKEN}"
+    printf -- '--token %s\n' "${MOCK_CLI_TOKEN}"
+    printf '{"token":"%s"}\n' "${MOCK_JSON_TOKEN}"
+    printf 'Authorization: Bearer %s\n' "${MOCK_BEARER_TOKEN}"
+    echo '::warning::mock workflow-command injection'
+    echo '-----BEGIN PRIVATE KEY-----'
+    printf '%s\n' "${MOCK_KEY_BODY}"
+    echo '-----END PRIVATE KEY-----'
+    exit 7
+  fi
   trap 'exit 0' TERM INT
   while true; do sleep 1; done
 fi
@@ -151,6 +200,71 @@ if grep -R -q 'test-private-key-material\|test-workflow-token' "${test_root}"; t
 fi
 if find "${test_root}/runner-temp" -mindepth 1 -print -quit | grep -q .; then
   echo "controller test found run files after cleanup" >&2
+  exit 1
+fi
+
+failure_output="${test_root}/failure-output.log"
+rm -f "${test_root}/cancelled"
+if EPAR_BINARY="${test_root}/bin/epar" \
+  EPAR_PROJECT_ROOT="${repo_root}" \
+  EPAR_APP_ID=12345 \
+  EPAR_ORGANIZATION=solutionforest \
+  EPAR_APP_PRIVATE_KEY='test-private-key-material' \
+  EPAR_TRUSTED_CA_CERTIFICATE_PATH="${test_root}/inspection-ca.pem" \
+  EPAR_DOCKER_REGISTRY_MIRROR=http://hubproxy.docker.internal:5555 \
+  EPAR_DOCKER_PROXY=http://host.docker.internal:3128 \
+  CORE_CANARY_LABEL=epar-core-123-1 \
+  CORE_POLL_SECONDS=1 \
+  GITHUB_TOKEN=test-workflow-token \
+  GITHUB_REPOSITORY=solutionforest/ephemeral-action-runner \
+  GITHUB_RUN_ID=124 \
+  GITHUB_RUN_ATTEMPT=1 \
+  GITHUB_API_URL=https://api.github.test \
+  GITHUB_STEP_SUMMARY="${test_root}/failure-summary.md" \
+  RUNNER_TEMP="${test_root}/runner-temp" \
+  MOCK_EPAR_LOG="${test_root}/epar.log" \
+  MOCK_CA_PATH="${test_root}/inspection-ca.pem" \
+  MOCK_REGISTRY_MIRROR=http://hubproxy.docker.internal:5555 \
+  MOCK_DOCKER_PROXY=http://host.docker.internal:3128 \
+  MOCK_CANCEL_MARKER="${test_root}/cancelled" \
+  MOCK_POOL_FAILURE=1 \
+  MOCK_POOL_TOKEN=pool-secret-value \
+  MOCK_CLI_TOKEN=cli-secret-value \
+  MOCK_JSON_TOKEN=json-secret-value \
+  MOCK_BEARER_TOKEN=bearer-secret-value \
+  MOCK_GUEST_TOKEN=guest-secret-value \
+  MOCK_GUEST_AUTH_TOKEN=guest-auth-secret-value \
+  MOCK_PRIVATE_KEY_ENV=private-key-env-secret-value \
+  MOCK_KEY_BODY=VGhpcy1pcy1mYWtlLXByaXZhdGUta2V5LW1hdGVyaWFs \
+  PATH="${test_root}/bin:${PATH}" \
+  bash "${repo_root}/scripts/ci/core-runner-controller.sh" >"${failure_output}" 2>&1; then
+  echo "controller test expected the pool supervisor failure to fail" >&2
+  exit 1
+fi
+
+grep -q 'EPAR pool supervisor exited unexpectedly with status 7' "${failure_output}"
+grep -q 'EPAR pool supervisor log (last 200 lines, sanitized)' "${failure_output}"
+grep -q 'EPAR runner log: mock.guest.log (last 200 lines, sanitized)' "${failure_output}"
+grep -q 'EPAR runner log: mock.docker-dind.log (last 200 lines, sanitized)' "${failure_output}"
+grep -q '| pool safe diagnostic' "${failure_output}"
+grep -q '| guest safe diagnostic' "${failure_output}"
+grep -q '| Docker-DinD safe diagnostic' "${failure_output}"
+grep -q '| RUNNER_TOKEN=\*\*\*' "${failure_output}"
+grep -q '| Authorization: Bearer \*\*\*' "${failure_output}"
+grep -q '| {"token":"\*\*\*"}' "${failure_output}"
+grep -q '| \[REDACTED PRIVATE KEY\]' "${failure_output}"
+grep -q '| ::warning::mock workflow-command injection' "${failure_output}"
+if grep -q '^::warning::mock workflow-command injection' "${failure_output}"; then
+  echo "controller test found an unescaped workflow command in diagnostics" >&2
+  exit 1
+fi
+if grep -E -q 'pool-secret-value|cli-secret-value|json-secret-value|bearer-secret-value|guest-secret-value|guest-auth-secret-value|private-key-env-secret-value|VGhpcy1pcy1mYWtlLXByaXZhdGUta2V5LW1hdGVyaWFs' "${failure_output}"; then
+  echo "controller test found secret material in failure diagnostics" >&2
+  exit 1
+fi
+test -f "${test_root}/cancelled"
+if find "${test_root}/runner-temp" -mindepth 1 -print -quit | grep -q .; then
+  echo "controller test found run files after failed-run cleanup" >&2
   exit 1
 fi
 

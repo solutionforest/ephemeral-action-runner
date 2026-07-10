@@ -17,7 +17,7 @@ concurrency:
 jobs:
   controller:
     name: Core runner controller
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: epar-live-ci
     # Leaves time for a cold image build and bounded cleanup around the
     # controller's 40-minute canary deadline.
@@ -48,17 +48,6 @@ jobs:
           EPAR_APP_ID: ${{ vars.EPAR_GITHUB_APP_ID }}
           EPAR_ORGANIZATION: ${{ vars.EPAR_GITHUB_ORGANIZATION }}
           EPAR_APP_PRIVATE_KEY: ${{ secrets.EPAR_GITHUB_APP_PRIVATE_KEY }}
-          # Optional host path for organizations whose outbound TLS is signed
-          # by a private inspection CA. EPAR installs this CA into the image;
-          # TLS verification remains enabled.
-          EPAR_TRUSTED_CA_CERTIFICATE_PATH: ${{ vars.EPAR_TRUSTED_CA_CERTIFICATE_PATH }}
-          # Optional HTTP(S) registry mirror reachable by the nested dockerd.
-          # This does not disable certificate verification.
-          EPAR_DOCKER_REGISTRY_MIRROR: ${{ vars.EPAR_DOCKER_REGISTRY_MIRROR }}
-          # Optional HTTP(S) proxy inherited by the inner dockerd when the
-          # outer DinD container first starts. Userinfo is rejected and TLS
-          # verification stays on.
-          EPAR_DOCKER_PROXY: ${{ vars.EPAR_DOCKER_PROXY }}
           CORE_POOL_PREFIX: epar-ci-core
           CORE_RUNNER_GROUP: epar-ci-canary
           CORE_CANARY_LABEL: epar-core-${{ github.run_id }}-${{ github.run_attempt }}

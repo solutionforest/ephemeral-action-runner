@@ -202,6 +202,7 @@ pool_log="${run_dir}/pool-supervisor.log"
 pool_pid=""
 cleanup_started=false
 cleanup_result=0
+failure_diagnostics_emitted=false
 
 umask 077
 mkdir -p "${log_dir}"
@@ -297,6 +298,60 @@ stop_pool() {
   pool_pid=""
 }
 
+sanitize_diagnostic_stream() {
+  awk '
+    BEGIN { in_private_key = 0 }
+    in_private_key {
+      if ($0 ~ /-----END .*PRIVATE KEY-----/) {
+        in_private_key = 0
+      }
+      next
+    }
+    /-----BEGIN .*PRIVATE KEY-----/ {
+      print "[REDACTED PRIVATE KEY]"
+      in_private_key = 1
+      next
+    }
+    { print }
+  ' | sed -E \
+    -e 's/(Authorization:[[:space:]]*(Bearer|token)[[:space:]]+)[^[:space:]]+/\1***/Ig' \
+    -e 's/(--token(=|[[:space:]]+))[^[:space:]]+/\1***/Ig' \
+    -e 's/("token"[[:space:]]*:[[:space:]]*")[^"]+/\1***/Ig' \
+    -e 's/(([[:alnum:]_]*(TOKEN|SECRET|PASSWORD|PRIVATE_KEY)[[:alnum:]_]*)=)[^[:space:]]+/\1***/Ig' \
+    -e 's/^[A-Za-z0-9+\/=]{40,}$/[REDACTED POSSIBLE KEY MATERIAL]/' \
+    -e 's/^/| /'
+}
+
+print_sanitized_log_file() {
+  local path="$1"
+  local title="$2"
+  if [[ ! -s "${path}" ]]; then
+    return
+  fi
+
+  printf '::group::%s (last 200 lines, sanitized)\n' "${title}"
+  tail -n 200 "${path}" | sanitize_diagnostic_stream || true
+  echo '::endgroup::'
+}
+
+emit_failure_diagnostics() {
+  if [[ "${failure_diagnostics_emitted}" == "true" ]]; then
+    return
+  fi
+  failure_diagnostics_emitted=true
+
+  print_sanitized_log_file "${pool_log}" 'EPAR pool supervisor log'
+
+  local log_path
+  local -a runner_logs=()
+  shopt -s nullglob
+  runner_logs=("${log_dir}"/*.log)
+  shopt -u nullglob
+  for log_path in "${runner_logs[@]}"; do
+    print_sanitized_log_file "${log_path}" "EPAR runner log: $(basename "${log_path}")"
+  done
+}
+
 cleanup() {
   if [[ "${cleanup_started}" == "true" ]]; then
     return "${cleanup_result}"
@@ -363,6 +418,9 @@ workflow_cancel_requested=false
 finalize() {
   local status=$?
   trap - EXIT
+  if (( status != 0 )); then
+    emit_failure_diagnostics || true
+  fi
   if ! cleanup && (( status == 0 )); then
     status=1
   fi
@@ -376,6 +434,7 @@ trap finalize EXIT
 fail_run() {
   local message="$1"
   echo "::error::${message}" >&2
+  emit_failure_diagnostics || true
   cleanup || true
   cancel_workflow
   exit 1
