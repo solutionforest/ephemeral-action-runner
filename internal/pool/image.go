@@ -928,7 +928,7 @@ COPY upstream/runner-images/ /opt/epar/upstream/runner-images/
 COPY custom-install/ /opt/epar/custom-install/
 COPY trusted-ca-certificates/ `+trustedCAGuestDir+`/
 COPY image-manifest.json /opt/epar/image-manifest.json
-RUN chmod +x /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
+RUN chmod 0755 /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
 RUN bash /opt/epar/install-trusted-ca-certificates.sh
 RUN bash /opt/epar/install-base.sh /opt/epar/upstream/runner-images
 RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}"
@@ -1212,7 +1212,14 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(dst, content, mode)
+	if err := os.WriteFile(dst, content, mode); err != nil {
+		return err
+	}
+	// os.WriteFile applies the process umask when it creates a file. Image
+	// builds can run beneath a restrictive controller umask because the same
+	// process also handles GitHub App credentials, so enforce the requested
+	// build-context mode explicitly after writing.
+	return os.Chmod(dst, mode)
 }
 
 func resetLogs(paths ...string) error {
