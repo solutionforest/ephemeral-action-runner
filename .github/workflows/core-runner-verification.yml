@@ -17,7 +17,7 @@ concurrency:
 jobs:
   controller:
     name: Core runner controller
-    runs-on: [self-hosted, epar-ci-controller]
+    runs-on: self-hosted
     environment: epar-live-ci
     # Leaves time for a cold image build and bounded cleanup around the
     # controller's 40-minute canary deadline.

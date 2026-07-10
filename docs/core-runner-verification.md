@@ -32,18 +32,25 @@ because every run intentionally shares the fixed cleanup prefix.
 
 ### Trusted controller runner
 
-Provide a trusted Linux X64 self-hosted runner with all of the following:
+Provide trusted Linux X64 self-hosted runners with all of the following:
 
-- label `epar-ci-controller`
+- the standard `self-hosted` label
 - Docker access and support for privileged Linux containers
 - Bash, curl, jq, and GNU `timeout`
 - enough disk space to build and retain the core Docker image
 - a current GitHub Actions runner compatible with actions implemented on
   Node.js 24
 
-The repository must be allowed to use this controller runner. Assign
-`epar-ci-controller` only to the intended trusted machine; the workflow uses
-`runs-on: [self-hosted, epar-ci-controller]`.
+The repository must be allowed to use these runners. The controller uses
+`runs-on: self-hosted`, so every eligible runner that may accept the job must
+meet these requirements and be trusted with the GitHub App key and privileged
+Docker access.
+
+Because the controller is not pinned to one machine, a forced cancellation or
+host outage can leave a local DinD container on the machine that accepted that
+run. A later run on another self-hosted machine can remove the organization
+runner registration, but it cannot remove that host-local container. Inspect
+all eligible controller hosts after an unclean interruption.
 
 ### Restricted ephemeral-runner group
 
@@ -138,8 +145,8 @@ Docker containers after such an event.
 
 ### Controller job remains queued
 
-- Confirm a Linux X64 runner labeled `self-hosted` and `epar-ci-controller` is
-  online and accessible to this repository.
+- Confirm a compatible Linux X64 runner labeled `self-hosted` is online and
+  accessible to this repository.
 - Confirm its runner service is current enough for the workflow's Node.js
   24-based actions.
 - Confirm the runner account can execute `docker info` and the Docker runtime
