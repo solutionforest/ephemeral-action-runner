@@ -106,10 +106,12 @@ pool supervisor, deletes GitHub runner registrations within the exact
 `epar-ci-core` prefix boundary, removes matching outer Docker-DinD containers,
 and deletes its temporary key, generated config, and logs. Before failed-run
 cleanup deletes those logs, the controller prints a sanitized final 200 lines
-from the pool-supervisor log and each available runner log. A controller
+from the pool-supervisor log and each available runner log. Runner launch or
+online/idle readiness failures first append bounded process state, `run.log`,
+latest `Runner_*.log`, and Docker-DinD daemon tails to the host guest log, so
+those diagnostics pass through the same sanitizer before cleanup. A controller
 failure then attempts cleanup before canceling the workflow so queued canary
-jobs do not remain indefinitely. The next run also pre-cleans the same
-boundary.
+jobs do not remain indefinitely. The next run also pre-cleans the same boundary.
 
 A sudden controller failure can bypass application cleanup. GitHub discards the
 hosted VM and its Docker containers, while the next run pre-cleans stale GitHub

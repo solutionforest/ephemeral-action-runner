@@ -151,6 +151,21 @@ if [[ " $* " == *" pool up "* ]]; then
     printf -- '--token %s\n' "${MOCK_CLI_TOKEN}"
     printf '{"token":"%s"}\n' "${MOCK_JSON_TOKEN}"
     printf 'Authorization: Bearer %s\n' "${MOCK_BEARER_TOKEN}"
+    printf 'Authorization: Basic %s\n' "${MOCK_BASIC_AUTH}"
+    printf '{"AcCeSsToKeN":"%s","client_secret":"%s","Password":"%s","private-key":"%s"}\n' \
+      "${MOCK_JSON_ACCESS_TOKEN}" \
+      "${MOCK_JSON_CLIENT_SECRET}" \
+      "${MOCK_JSON_PASSWORD}" \
+      "${MOCK_JSON_PRIVATE_KEY}"
+    printf 'privateKey=%s\n' "${MOCK_PRIVATE_KEY_CAMEL}"
+    printf 'GitHub tokens: %s %s %s %s %s %s\n' \
+      "${MOCK_GHP_TOKEN}" \
+      "${MOCK_GHO_TOKEN}" \
+      "${MOCK_GHU_TOKEN}" \
+      "${MOCK_GHS_TOKEN}" \
+      "${MOCK_GHR_TOKEN}" \
+      "${MOCK_GITHUB_PAT}"
+    printf 'JWT: %s\n' "${MOCK_JWT}"
     echo '::warning::mock workflow-command injection'
     echo '-----BEGIN PRIVATE KEY-----'
     printf '%s\n' "${MOCK_KEY_BODY}"
@@ -232,6 +247,19 @@ if EPAR_BINARY="${test_root}/bin/epar" \
   MOCK_CLI_TOKEN=cli-secret-value \
   MOCK_JSON_TOKEN=json-secret-value \
   MOCK_BEARER_TOKEN=bearer-secret-value \
+  MOCK_BASIC_AUTH=basic-auth-secret-value \
+  MOCK_JSON_ACCESS_TOKEN=json-access-token-secret-value \
+  MOCK_JSON_CLIENT_SECRET=json-client-secret-value \
+  MOCK_JSON_PASSWORD='json-password-before-\"after-secret-value' \
+  MOCK_JSON_PRIVATE_KEY=json-private-key-secret-value \
+  MOCK_PRIVATE_KEY_CAMEL=camel-private-key-secret-value \
+  MOCK_GHP_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+  MOCK_GHO_TOKEN=gho_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB \
+  MOCK_GHU_TOKEN=ghu_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC \
+  MOCK_GHS_TOKEN=ghs_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD \
+  MOCK_GHR_TOKEN=ghr_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE \
+  MOCK_GITHUB_PAT=github_pat_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF \
+  MOCK_JWT=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJlcGFyLXRlc3QifQ.c2lnbmF0dXJlLXNlY3JldA \
   MOCK_GUEST_TOKEN=guest-secret-value \
   MOCK_GUEST_AUTH_TOKEN=guest-auth-secret-value \
   MOCK_PRIVATE_KEY_ENV=private-key-env-secret-value \
@@ -251,14 +279,19 @@ grep -q '| guest safe diagnostic' "${failure_output}"
 grep -q '| Docker-DinD safe diagnostic' "${failure_output}"
 grep -q '| RUNNER_TOKEN=\*\*\*' "${failure_output}"
 grep -q '| Authorization: Bearer \*\*\*' "${failure_output}"
+grep -q '| Authorization: Basic \*\*\*' "${failure_output}"
 grep -q '| {"token":"\*\*\*"}' "${failure_output}"
+grep -q '| {"AcCeSsToKeN":"\*\*\*","client_secret":"\*\*\*","Password":"\*\*\*","private-key":"\*\*\*"}' "${failure_output}"
+grep -q '| privateKey=\*\*\*' "${failure_output}"
+grep -q '| GitHub tokens: \*\*\* \*\*\* \*\*\* \*\*\* \*\*\* \*\*\*' "${failure_output}"
+grep -q '| JWT: \*\*\*' "${failure_output}"
 grep -q '| \[REDACTED PRIVATE KEY\]' "${failure_output}"
 grep -q '| ::warning::mock workflow-command injection' "${failure_output}"
 if grep -q '^::warning::mock workflow-command injection' "${failure_output}"; then
   echo "controller test found an unescaped workflow command in diagnostics" >&2
   exit 1
 fi
-if grep -E -q 'pool-secret-value|cli-secret-value|json-secret-value|bearer-secret-value|guest-secret-value|guest-auth-secret-value|private-key-env-secret-value|VGhpcy1pcy1mYWtlLXByaXZhdGUta2V5LW1hdGVyaWFs' "${failure_output}"; then
+if grep -E -q 'pool-secret-value|cli-secret-value|json-secret-value|bearer-secret-value|basic-auth-secret-value|json-access-token-secret-value|json-client-secret-value|json-password-before|after-secret-value|json-private-key-secret-value|camel-private-key-secret-value|ghp_A+|gho_B+|ghu_C+|ghs_D+|ghr_E+|github_pat_F+|eyJhbGciOiJIUzI1NiJ9|guest-secret-value|guest-auth-secret-value|private-key-env-secret-value|VGhpcy1pcy1mYWtlLXByaXZhdGUta2V5LW1hdGVyaWFs' "${failure_output}"; then
   echo "controller test found secret material in failure diagnostics" >&2
   exit 1
 fi

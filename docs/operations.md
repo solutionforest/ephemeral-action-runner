@@ -7,7 +7,12 @@ Host-side provider logs go under `work/logs` by default. Runner logs inside the 
 - `/var/log/actions-runner/run.log`
 - `/opt/actions-runner/_diag`
 
-Guest provisioning command output is streamed to `work/logs/<instance-name>.guest.log`.
+Guest provisioning command output is streamed to
+`work/logs/<instance-name>.guest.log`. If runner launch or GitHub online/idle
+readiness fails, EPAR first appends bounded diagnostics to that host guest log:
+runner PID/process state, tails from `run.log` and the latest `Runner_*.log`,
+and the Docker-DinD daemon log when present. Diagnostic collection is
+best-effort and does not replace the original readiness error.
 
 On systemd instances, the runner process is launched with `systemd-run` as `actions-runner.service` so provider `exec` calls return immediately after the service starts. On non-systemd instances such as Docker-DinD containers, EPAR starts `run.sh` in the background, writes `/var/run/actions-runner.pid`, and appends output to `/var/log/actions-runner/run.log`.
 

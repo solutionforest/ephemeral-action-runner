@@ -314,10 +314,12 @@ sanitize_diagnostic_stream() {
     }
     { print }
   ' | sed -E \
-    -e 's/(Authorization:[[:space:]]*(Bearer|token)[[:space:]]+)[^[:space:]]+/\1***/Ig' \
+    -e 's/(Authorization:[[:space:]]*(Basic|Bearer|token)[[:space:]]+)[^[:space:]]+/\1***/Ig' \
     -e 's/(--token(=|[[:space:]]+))[^[:space:]]+/\1***/Ig' \
-    -e 's/("token"[[:space:]]*:[[:space:]]*")[^"]+/\1***/Ig' \
-    -e 's/(([[:alnum:]_]*(TOKEN|SECRET|PASSWORD|PRIVATE_KEY)[[:alnum:]_]*)=)[^[:space:]]+/\1***/Ig' \
+    -e 's/("[^"]*(TOKEN|SECRET|PASSWORD|PRIVATE[ _-]*KEY)[^"]*"[[:space:]]*:[[:space:]]*")([^"\\]|\\.)*/\1***/Ig' \
+    -e 's/(([[:alnum:]_-]*(TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY)[[:alnum:]_-]*)=)[^[:space:]]+/\1***/Ig' \
+    -e 's/(^|[^[:alnum:]_])(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})/\1***/Ig' \
+    -e 's/(^|[^[:alnum:]_-])(eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,})/\1***/g' \
     -e 's/^[A-Za-z0-9+\/=]{40,}$/[REDACTED POSSIBLE KEY MATERIAL]/' \
     -e 's/^/| /'
 }

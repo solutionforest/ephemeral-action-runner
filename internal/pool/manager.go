@@ -57,8 +57,13 @@ type ProvisionedInstance struct {
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
+var runnerReadinessHealthCheckInterval = 2 * time.Second
 
-const cleanupTimeout = 5 * time.Minute
+const (
+	cleanupTimeout                    = 5 * time.Minute
+	runnerReadinessDiagnosticsTimeout = 30 * time.Second
+	runnerReadinessProbeFailureLimit  = 3
+)
 
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	opts.Instances = m.requestedInstances(opts.Instances)
@@ -340,17 +345,87 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 		}
 		fmt.Printf("[%s] starting runner service\n", name)
 		if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
+			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
 		fmt.Printf("[%s] waiting for GitHub online/idle\n", name)
-		runner, err := m.GitHub.WaitRunnerOnlineIdle(ctx, name, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second)
+		runner, err := m.waitRunnerOnlineIdleAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second)
 		if err != nil {
+			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
 		fmt.Printf("[%s] GitHub runner online/idle id=%d\n", name, runner.ID)
 	}
 	return vm, nil
+}
+
+type runnerReadinessResult struct {
+	runner gh.Runner
+	err    error
+}
+
+func (m *Manager) waitRunnerOnlineIdleAndHealthy(ctx context.Context, vm ProvisionedInstance, timeout time.Duration) (gh.Runner, error) {
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resultCh := make(chan runnerReadinessResult, 1)
+	go func() {
+		runner, err := m.GitHub.WaitRunnerOnlineIdle(waitCtx, vm.Name, timeout)
+		resultCh <- runnerReadinessResult{runner: runner, err: err}
+	}()
+
+	interval := runnerReadinessHealthCheckInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	consecutiveProbeFailures := 0
+	var lastProbeErr error
+
+	for {
+		select {
+		case result := <-resultCh:
+			return result.runner, result.err
+		case <-ticker.C:
+			err := m.checkRunnerProcess(waitCtx, vm.Name)
+			if err == nil {
+				consecutiveProbeFailures = 0
+				lastProbeErr = nil
+				continue
+			}
+			if ctx.Err() != nil {
+				cancel()
+				return gh.Runner{}, ctx.Err()
+			}
+			consecutiveProbeFailures++
+			lastProbeErr = err
+			if consecutiveProbeFailures < runnerReadinessProbeFailureLimit {
+				fmt.Printf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
+				continue
+			}
+			cancel()
+			return gh.Runner{}, fmt.Errorf("actions runner process failed %d consecutive checks while waiting for GitHub online/idle: %w", runnerReadinessProbeFailureLimit, lastProbeErr)
+		case <-ctx.Done():
+			cancel()
+			return gh.Runner{}, ctx.Err()
+		}
+	}
+}
+
+func (m *Manager) captureRunnerReadinessDiagnostics(name, guestLogPath string) {
+	diagnosticCtx, cancel := context.WithTimeout(context.Background(), runnerReadinessDiagnosticsTimeout)
+	defer cancel()
+	_, err := m.Provider.Exec(
+		diagnosticCtx,
+		name,
+		[]string{"sudo", "bash", "/opt/epar/collect-runner-diagnostics.sh"},
+		provider.ExecOptions{LogPath: guestLogPath},
+	)
+	if err != nil {
+		fmt.Printf("[%s] runner readiness diagnostic collection warning: %v\n", name, err)
+	}
 }
 
 func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
@@ -376,13 +451,17 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 }
 
 func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
-	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	_, serviceErr := m.Provider.Exec(checkCtx, vm.Name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
-	if serviceErr != nil {
+	if err := m.checkRunnerProcess(ctx, vm.Name); err != nil {
 		return false, "actions runner process is no longer active", nil
 	}
 	return true, "", nil
+}
+
+func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, err := m.Provider.Exec(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
+	return err
 }
 
 func isTransientGitHubLivenessError(err error) bool {
