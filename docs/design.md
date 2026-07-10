@@ -29,7 +29,7 @@ For each runner instance:
 6. Fetch a short-lived GitHub registration token on the host.
 7. Run `config.sh --ephemeral --unattended` inside the instance.
 8. Start the runner process. VM and WSL images use systemd; Docker-DinD falls back to a PID-file managed background process.
-9. Poll GitHub until the runner is online and idle.
+9. Poll GitHub until the runner is ready. Verification-only flows require online/idle; supervised replacement pools also accept an online runner that is already busy with a queued job.
 10. Monitor the runner service and GitHub runner record.
 11. Delete the instance after the ephemeral runner exits, then create a replacement to maintain pool size.
 
@@ -55,7 +55,7 @@ sequenceDiagram
 
 ## Multi-Instance Behavior
 
-`pool verify --instances 2 --register-only --cleanup` creates two instances concurrently, registers two ephemeral runners, verifies both are online/idle, and removes them.
+`pool verify --instances 2 --register-only --cleanup` creates two instances concurrently, registers two ephemeral runners, verifies both are online/idle, and removes them. A supervised `pool up --replace-completed` accepts an online runner that is already busy, because requiring an idle observation would race immediate job assignment; the supervisor observes its completion and creates the replacement.
 
 `pool up --instances 2` keeps two runners available in the foreground. Replacement names use `pool.namePrefix` plus a timestamp and sequence suffix, for example `epar-20260703-010530-003`.
 

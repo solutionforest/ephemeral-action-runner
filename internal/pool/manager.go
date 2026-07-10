@@ -29,6 +29,7 @@ type GitHubClient interface {
 	RegistrationToken(ctx context.Context) (gh.RegistrationToken, error)
 	ListRunners(ctx context.Context) ([]gh.Runner, error)
 	RunnerByName(ctx context.Context, name string) (gh.Runner, bool, error)
+	WaitRunnerOnline(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error)
 	WaitRunnerOnlineIdle(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error)
 	DeleteRunnerIfExists(ctx context.Context, id int64) error
 	DeleteRunnersByPrefix(ctx context.Context, prefix string) ([]gh.Runner, error)
@@ -86,7 +87,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			vm, err := m.provisionOne(ctx, name, opts.RegisterOnly)
+			vm, err := m.provisionOne(ctx, name, opts.RegisterOnly, false)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil && errOnce == nil {
@@ -138,7 +139,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		return m.cleanupWithFreshContext()
 	}
 	for len(active) < opts.Instances {
-		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register)
+		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
 		sequence++
 		if err != nil {
 			_ = cleanup()
@@ -185,7 +186,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
 				fmt.Printf("[%s] creating replacement runner\n", name)
-				vm, err := m.provisionOne(ctx, name, opts.Register)
+				vm, err := m.provisionOne(ctx, name, opts.Register, true)
 				if err != nil {
 					fmt.Printf("[%s] replacement failed: %v\n", name, err)
 					break
@@ -208,7 +209,7 @@ func (m *Manager) ProvisionPool(ctx context.Context, instances int, register boo
 	names := RunnerNames(m.Config.Pool.NamePrefix, instances, time.Now())
 	out := make([]ProvisionedInstance, 0, len(names))
 	for _, name := range names {
-		vm, err := m.provisionOne(ctx, name, register)
+		vm, err := m.provisionOne(ctx, name, register, false)
 		if err != nil {
 			return out, err
 		}
@@ -288,7 +289,7 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 	return b.String(), nil
 }
 
-func (m *Manager) provisionOne(ctx context.Context, name string, register bool) (ProvisionedInstance, error) {
+func (m *Manager) provisionOne(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
 	logPath := config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir)
 	logPath = filepath.Join(logPath, name+"."+m.Config.Provider.Type+".log")
 	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
@@ -348,14 +349,18 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
-		fmt.Printf("[%s] waiting for GitHub online/idle\n", name)
-		runner, err := m.waitRunnerOnlineIdleAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second)
+		readiness := "online/idle"
+		if allowBusy {
+			readiness = "online"
+		}
+		fmt.Printf("[%s] waiting for GitHub %s\n", name, readiness)
+		runner, err := m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
 		if err != nil {
 			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
-		fmt.Printf("[%s] GitHub runner online/idle id=%d\n", name, runner.ID)
+		fmt.Printf("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
 	}
 	return vm, nil
 }
@@ -365,13 +370,19 @@ type runnerReadinessResult struct {
 	err    error
 }
 
-func (m *Manager) waitRunnerOnlineIdleAndHealthy(ctx context.Context, vm ProvisionedInstance, timeout time.Duration) (gh.Runner, error) {
+func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedInstance, timeout time.Duration, allowBusy bool) (gh.Runner, error) {
 	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	resultCh := make(chan runnerReadinessResult, 1)
 	go func() {
-		runner, err := m.GitHub.WaitRunnerOnlineIdle(waitCtx, vm.Name, timeout)
+		var runner gh.Runner
+		var err error
+		if allowBusy {
+			runner, err = m.GitHub.WaitRunnerOnline(waitCtx, vm.Name, timeout)
+		} else {
+			runner, err = m.GitHub.WaitRunnerOnlineIdle(waitCtx, vm.Name, timeout)
+		}
 		resultCh <- runnerReadinessResult{runner: runner, err: err}
 	}()
 
@@ -406,7 +417,11 @@ func (m *Manager) waitRunnerOnlineIdleAndHealthy(ctx context.Context, vm Provisi
 				continue
 			}
 			cancel()
-			return gh.Runner{}, fmt.Errorf("actions runner process failed %d consecutive checks while waiting for GitHub online/idle: %w", runnerReadinessProbeFailureLimit, lastProbeErr)
+			readiness := "online/idle"
+			if allowBusy {
+				readiness = "online"
+			}
+			return gh.Runner{}, fmt.Errorf("actions runner process failed %d consecutive checks while waiting for GitHub %s: %w", runnerReadinessProbeFailureLimit, readiness, lastProbeErr)
 		case <-ctx.Done():
 			cancel()
 			return gh.Runner{}, ctx.Err()

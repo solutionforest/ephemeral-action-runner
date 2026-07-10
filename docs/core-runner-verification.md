@@ -107,7 +107,7 @@ pool supervisor, deletes GitHub runner registrations within the exact
 and deletes its temporary key, generated config, and logs. Before failed-run
 cleanup deletes those logs, the controller prints a sanitized final 200 lines
 from the pool-supervisor log and each available runner log. Runner launch or
-online/idle readiness failures first append bounded process state, `run.log`,
+online readiness failures first append bounded process state, `run.log`,
 latest `Runner_*.log`, and Docker-DinD daemon tails to the host guest log, so
 those diagnostics pass through the same sanitizer before cleanup. A controller
 failure then attempts cleanup before canceling the workflow so queued canary

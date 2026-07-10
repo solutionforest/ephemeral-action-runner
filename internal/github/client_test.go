@@ -68,6 +68,77 @@ func TestListRunnersUsesInstallationToken(t *testing.T) {
 	}
 }
 
+func TestWaitRunnerOnlineAcceptsBusyRunner(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{
+		AppID:          123,
+		Organization:   "example",
+		PrivateKeyPath: keyPath,
+		APIBaseURL:     "https://api.github.test",
+		WebBaseURL:     "https://github.test",
+	})
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body string
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			body = `{"id":42}`
+		case "/app/installations/42/access_tokens":
+			body = `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`
+		case "/orgs/example/actions/runners":
+			body = `{"total_count":1,"runners":[{"id":1,"name":"epar-test-1","os":"linux","status":"online","busy":true}]}`
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+
+	runner, err := client.WaitRunnerOnline(context.Background(), "epar-test-1", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.ID != 1 || !runner.Busy {
+		t.Fatalf("runner = %+v, want online busy runner id 1", runner)
+	}
+}
+
+func TestWaitRunnerOnlineIdleRejectsBusyRunner(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{
+		AppID:          123,
+		Organization:   "example",
+		PrivateKeyPath: keyPath,
+		APIBaseURL:     "https://api.github.test",
+		WebBaseURL:     "https://github.test",
+	})
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body string
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			body = `{"id":42}`
+		case "/app/installations/42/access_tokens":
+			body = `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`
+		case "/orgs/example/actions/runners":
+			body = `{"total_count":1,"runners":[{"id":1,"name":"epar-test-1","os":"linux","status":"online","busy":true}]}`
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+
+	_, err := client.WaitRunnerOnlineIdle(context.Background(), "epar-test-1", 0)
+	if err == nil || !strings.Contains(err.Error(), "did not become online and idle") {
+		t.Fatalf("WaitRunnerOnlineIdle() error = %v, want busy runner rejected", err)
+	}
+}
+
 func TestDeleteRunnerIfExistsIgnoresNotFound(t *testing.T) {
 	keyPath := writeKey(t)
 	client := New(config.GitHubConfig{

@@ -8,7 +8,7 @@ Host-side provider logs go under `work/logs` by default. Runner logs inside the 
 - `/opt/actions-runner/_diag`
 
 Guest provisioning command output is streamed to
-`work/logs/<instance-name>.guest.log`. If runner launch or GitHub online/idle
+`work/logs/<instance-name>.guest.log`. If runner launch or GitHub online
 readiness fails, EPAR first appends bounded diagnostics to that host guest log:
 runner PID/process state, tails from `run.log` and the latest `Runner_*.log`,
 and the Docker-DinD daemon log when present. Diagnostic collection is

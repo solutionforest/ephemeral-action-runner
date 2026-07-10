@@ -147,6 +147,74 @@ func TestRunPoolDoesNotReplaceWhenRetirementIsDeferred(t *testing.T) {
 	}
 }
 
+func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image"},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
+			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+		},
+		Provider:    provider,
+		GitHub:      github,
+		ProjectRoot: t.TempDir(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	if err := manager.RunPool(ctx, RunOptions{
+		Instances:        1,
+		Register:         true,
+		KeepOnExit:       true,
+		ReplaceCompleted: true,
+		MonitorInterval:  5 * time.Millisecond,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&provider.cloneCalls); got < 2 {
+		t.Fatalf("Clone called %d time(s), want a replacement after the initially busy ephemeral runner disappeared", got)
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got < 1 {
+		t.Fatalf("Delete called %d time(s), want completed runner instance retired", got)
+	}
+	if got := atomic.LoadInt32(&github.waitOnlineCalls); got < 2 {
+		t.Fatalf("WaitRunnerOnline called %d time(s), want initial busy runner and replacement", got)
+	}
+	if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 0 {
+		t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want supervised pool to accept busy runners", got)
+	}
+}
+
+func TestVerifyUsesIdleReadiness(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image"},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
+			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+		},
+		Provider:    provider,
+		GitHub:      github,
+		ProjectRoot: t.TempDir(),
+	}
+
+	if err := manager.Verify(context.Background(), VerifyOptions{Instances: 1, RegisterOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 1 {
+		t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want verification to require an idle runner", got)
+	}
+	if got := atomic.LoadInt32(&github.waitOnlineCalls); got != 0 {
+		t.Fatalf("WaitRunnerOnline called %d time(s), verification must not accept a busy runner", got)
+	}
+}
+
 func TestRunPoolUsesConfiguredInstancesWhenNoOverride(t *testing.T) {
 	provider := &fakeProvider{ip: "127.0.0.1"}
 	manager := Manager{
@@ -192,7 +260,7 @@ func TestProvisionOneRetriesTransientRuntimeValidationFailure(t *testing.T) {
 		ProjectRoot: t.TempDir(),
 	}
 
-	if _, err := manager.provisionOne(context.Background(), "epar-test-1", false); err != nil {
+	if _, err := manager.provisionOne(context.Background(), "epar-test-1", false, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := atomic.LoadInt32(&provider.execCalls); got != 2 {
@@ -297,7 +365,7 @@ func TestProvisionOnePassesRunnerRegistrationControlsWithoutPrivateKey(t *testin
 		ProjectRoot: t.TempDir(),
 	}
 
-	if _, err := manager.provisionOne(context.Background(), "epar-test-1", true); err != nil {
+	if _, err := manager.provisionOne(context.Background(), "epar-test-1", true, false); err != nil {
 		t.Fatal(err)
 	}
 	provider.mu.Lock()
@@ -322,6 +390,12 @@ func TestProvisionOnePassesRunnerRegistrationControlsWithoutPrivateKey(t *testin
 			t.Fatalf("guest registration environment exposes private key through %s", key)
 		}
 	}
+	if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 1 {
+		t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want strict verification readiness", got)
+	}
+	if got := atomic.LoadInt32(&github.waitOnlineCalls); got != 0 {
+		t.Fatalf("WaitRunnerOnline called %d time(s), verification must not accept a busy runner", got)
+	}
 }
 
 func TestProvisionOneFailsPromptlyAfterConsecutiveRunnerProbeFailures(t *testing.T) {
@@ -344,7 +418,7 @@ func TestProvisionOneFailsPromptlyAfterConsecutiveRunnerProbeFailures(t *testing
 	}
 	manager := newRegisteredTestManager(t, fake, github)
 
-	_, err := manager.provisionOne(context.Background(), "epar-test-1", true)
+	_, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
 	if err == nil || !strings.Contains(err.Error(), "actions runner process failed 3 consecutive checks while waiting for GitHub online/idle") {
 		t.Fatalf("provisionOne() error = %v, want prompt listener process failure", err)
 	}
@@ -381,7 +455,7 @@ func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
 	}
 	manager := newRegisteredTestManager(t, fake, github)
 
-	vm, err := manager.provisionOne(context.Background(), "epar-test-1", true)
+	vm, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +482,7 @@ func TestProvisionOneCapturesReadinessTimeoutAndPreservesCause(t *testing.T) {
 	github := &fakeGitHub{waitErr: timeoutErr}
 	manager := newRegisteredTestManager(t, fake, github)
 
-	_, err := manager.provisionOne(context.Background(), "epar-test-1", true)
+	_, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
 	if !errors.Is(err, timeoutErr) {
 		t.Fatalf("provisionOne() error = %v, want original timeout error", err)
 	}
@@ -438,7 +512,7 @@ func TestProvisionOneReadinessSucceedsWhileRunnerProcessStaysHealthy(t *testing.
 	}
 	manager := newRegisteredTestManager(t, provider, github)
 
-	vm, err := manager.provisionOne(context.Background(), "epar-test-1", true)
+	vm, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,13 +643,15 @@ func (p *fakeProvider) List(ctx context.Context) ([]provider.Instance, error) {
 }
 
 type fakeGitHub struct {
-	runner     gh.Runner
-	waitRunner gh.Runner
-	waitErr    error
-	waitFunc   func(context.Context, string, time.Duration) (gh.Runner, error)
-	found      bool
-	runnerErr  error
-	deleteErr  error
+	runner              gh.Runner
+	waitRunner          gh.Runner
+	waitErr             error
+	waitFunc            func(context.Context, string, time.Duration) (gh.Runner, error)
+	found               bool
+	runnerErr           error
+	deleteErr           error
+	waitOnlineCalls     int32
+	waitOnlineIdleCalls int32
 }
 
 func (g *fakeGitHub) OrganizationURL() string {
@@ -597,7 +673,17 @@ func (g *fakeGitHub) RunnerByName(context.Context, string) (gh.Runner, bool, err
 	return g.runner, g.found, g.runnerErr
 }
 
+func (g *fakeGitHub) WaitRunnerOnline(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error) {
+	atomic.AddInt32(&g.waitOnlineCalls, 1)
+	return g.waitReady(ctx, name, timeout)
+}
+
 func (g *fakeGitHub) WaitRunnerOnlineIdle(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error) {
+	atomic.AddInt32(&g.waitOnlineIdleCalls, 1)
+	return g.waitReady(ctx, name, timeout)
+}
+
+func (g *fakeGitHub) waitReady(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error) {
 	if g.waitFunc != nil {
 		return g.waitFunc(ctx, name, timeout)
 	}
