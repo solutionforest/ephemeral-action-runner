@@ -21,8 +21,8 @@ EPAR looks for config in this order:
 | `provider` | How EPAR creates disposable runners: `docker-dind`, `wsl`, or `tart`. |
 | `image` | Source image/rootfs, output image, runner version, and optional install scripts. |
 | `pool` | Runner count, instance name prefix, and log directory. |
-| `runner` | GitHub Actions labels and whether to add the host-machine label. |
-| `docker` | Optional Docker registry mirrors applied inside disposable runners. |
+| `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
+| `docker` | Optional Docker registry mirrors and Docker-DinD daemon proxy settings. |
 | `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
 
 ## Common Edits
@@ -60,11 +60,54 @@ runner:
   includeHostLabel: false
 ```
 
+Register runners in an organization runner group and omit GitHub's automatic
+`self-hosted`, operating-system, and architecture labels:
+
+```yaml
+runner:
+  group: epar-ci-canary
+  labels: [epar-core-unique-label]
+  includeHostLabel: false
+  noDefaultLabels: true
+```
+
+`runner.group` is optional. The group must already exist and allow the target
+repository to use it. `runner.noDefaultLabels` defaults to `false`; when it is
+`true`, workflows must target labels explicitly configured under
+`runner.labels` (and may also target the runner group).
+
 Use a different config file:
 
 ```bash
 go run ./cmd/ephemeral-action-runner start --config .local/wsl.yml
 ```
+
+Trust an enterprise TLS inspection or private package-registry CA during image builds:
+
+```yaml
+image:
+  trustedCaCertificatePaths:
+    - .local/enterprise-root.pem
+```
+
+Paths may be repository-relative, absolute, or under `~/`. EPAR validates PEM
+or DER X.509 CA certificates before building, normalizes them to deterministic
+`.crt` files, and installs them before any `apt` or `curl` step. This is opt-in:
+only configure a CA that your organization explicitly trusts.
+
+Route the private Docker-DinD daemon through an enterprise network proxy:
+
+```yaml
+docker:
+  httpProxy: http://proxy.example.test:3128
+  httpsProxy: http://proxy.example.test:3128
+  noProxy: localhost,127.0.0.1,.example.test
+```
+
+These optional values become `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` on the
+outer Docker-DinD container, so its inner `dockerd` inherits them at first
+startup. Proxy URLs must not contain credentials. Keep machine-specific proxy
+addresses in ignored `.local/config.yml`, not tracked example files.
 
 ## Provider Defaults
 

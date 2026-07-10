@@ -23,6 +23,7 @@ type Provider struct {
 	Binary      string
 	Platform    string
 	HostGateway bool
+	Environment map[string]string
 	DryRun      bool
 	runCommand  runCommandFunc
 }
@@ -30,14 +31,14 @@ type Provider struct {
 type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error)
 
 func New(binary, platform string, dryRun bool) *Provider {
-	return NewWithOptions(binary, platform, false, dryRun)
+	return NewWithOptions(binary, platform, false, nil, dryRun)
 }
 
-func NewWithOptions(binary, platform string, hostGateway bool, dryRun bool) *Provider {
+func NewWithOptions(binary, platform string, hostGateway bool, environment map[string]string, dryRun bool) *Provider {
 	if binary == "" {
 		binary = "docker"
 	}
-	return &Provider{Binary: binary, Platform: platform, HostGateway: hostGateway, DryRun: dryRun}
+	return &Provider{Binary: binary, Platform: platform, HostGateway: hostGateway, Environment: environment, DryRun: dryRun}
 }
 
 func (p *Provider) Clone(ctx context.Context, source, name string) error {
@@ -156,6 +157,11 @@ func (p *Provider) createArgs(source, name string) []string {
 	)
 	if p.HostGateway {
 		args = append(args, "--add-host", "host.docker.internal:host-gateway")
+	}
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
+		if value := p.Environment[key]; value != "" {
+			args = append(args, "--env", key+"="+value)
+		}
 	}
 	args = append(args,
 		"--label", labelManaged,

@@ -119,15 +119,17 @@ func (c *Client) DeleteRunnersByPrefix(ctx context.Context, prefix string) ([]Ru
 		return nil, err
 	}
 	var deleted []Runner
+	var deleteErrors []error
 	for _, runner := range runners {
 		if strings.HasPrefix(runner.Name, prefix+"-") || runner.Name == prefix {
-			if err := c.DeleteRunner(ctx, runner.ID); err != nil {
-				return deleted, err
+			if err := c.DeleteRunnerIfExists(ctx, runner.ID); err != nil {
+				deleteErrors = append(deleteErrors, fmt.Errorf("delete runner %q (id=%d): %w", runner.Name, runner.ID, err))
+				continue
 			}
 			deleted = append(deleted, runner)
 		}
 	}
-	return deleted, nil
+	return deleted, errors.Join(deleteErrors...)
 }
 
 func (c *Client) WaitRunnerOnlineIdle(ctx context.Context, name string, timeout time.Duration) (Runner, error) {

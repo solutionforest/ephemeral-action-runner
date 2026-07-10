@@ -58,6 +58,24 @@ docker:
 
 When a Docker-DinD mirror URL uses `host.docker.internal`, EPAR adds Docker's `host-gateway` alias to the outer runner container so the inner daemon can reach a host-published mirror on Linux Docker Engine. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
 
+If the inner daemon must use an enterprise HTTP proxy, configure its startup
+environment explicitly:
+
+```yaml
+docker:
+  httpProxy: http://proxy.example.test:3128
+  httpsProxy: http://proxy.example.test:3128
+  noProxy: localhost,127.0.0.1,.example.test
+```
+
+EPAR sets these values on the outer container before it starts, allowing
+`dockerd` to inherit them on its first launch. Empty values preserve direct
+networking. Proxy URLs are limited to credential-free HTTP(S) roots; use network
+controls rather than embedding proxy passwords. Put host-specific endpoints in
+ignored `.local/config.yml`. If the proxy performs TLS inspection, also configure
+the authorized root under `image.trustedCaCertificatePaths` so verified HTTPS
+continues to work.
+
 ## Image Build
 
 Docker-DinD images are Docker image tags, not Tart images or rootfs tar files:

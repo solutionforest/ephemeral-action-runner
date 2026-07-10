@@ -58,6 +58,8 @@ type ProvisionedInstance struct {
 
 var runtimeValidationRetryDelay = 5 * time.Second
 
+const cleanupTimeout = 5 * time.Minute
+
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	opts.Instances = m.requestedInstances(opts.Instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, opts.Instances, time.Now())
@@ -93,7 +95,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	wg.Wait()
 	if opts.Cleanup {
 		fmt.Printf("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
-		if err := m.Cleanup(ctx); err != nil && errOnce == nil {
+		if err := m.cleanupWithFreshContext(); err != nil && errOnce == nil {
 			errOnce = err
 		}
 	}
@@ -128,9 +130,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		if opts.KeepOnExit {
 			return nil
 		}
-		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		return m.Cleanup(cctx)
+		return m.cleanupWithFreshContext()
 	}
 	for len(active) < opts.Instances {
 		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register)
@@ -190,6 +190,12 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 		}
 	}
+}
+
+func (m *Manager) cleanupWithFreshContext() error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	return m.Cleanup(cleanupCtx)
 }
 
 func (m *Manager) ProvisionPool(ctx context.Context, instances int, register bool) ([]ProvisionedInstance, error) {
@@ -321,11 +327,13 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 			return vm, err
 		}
 		env := map[string]string{
-			"RUNNER_URL":       m.GitHub.OrganizationURL(),
-			"RUNNER_TOKEN":     token.Token,
-			"RUNNER_NAME":      name,
-			"RUNNER_LABELS":    strings.Join(m.Config.Runner.Labels, ","),
-			"RUNNER_EPHEMERAL": fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
+			"RUNNER_URL":               m.GitHub.OrganizationURL(),
+			"RUNNER_TOKEN":             token.Token,
+			"RUNNER_NAME":              name,
+			"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
+			"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
+			"RUNNER_GROUP":             m.Config.Runner.Group,
+			"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
 		}
 		if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
 			return vm, err

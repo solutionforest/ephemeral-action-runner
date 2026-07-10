@@ -128,3 +128,22 @@ func TestRunRunnerUsesSourceImageEnvWrapper(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigureRunnerSupportsGroupAndNoDefaultLabels(t *testing.T) {
+	path := filepath.Join("..", "..", "scripts", "guest", "ubuntu", "configure-runner.sh")
+	script, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(script)
+	for _, want := range []string{
+		`RUNNER_GROUP="${RUNNER_GROUP:-}"`,
+		`RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-false}"`,
+		`args+=(--runnergroup "${RUNNER_GROUP}")`,
+		`args+=(--no-default-labels)`,
+	} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("configure-runner.sh missing %q:\n%s", want, contents)
+		}
+	}
+}

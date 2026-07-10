@@ -74,6 +74,9 @@ func (m *Manager) UpdateUpstream(ctx context.Context) error {
 }
 
 func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error {
+	if _, err := m.trustedCACertificates(); err != nil {
+		return err
+	}
 	upstreamDir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
 	copyMode := m.runnerImagesCopyMode()
 	if !opts.SkipUpstreamCheck && copyMode != runnerImagesCopyNone {
@@ -183,6 +186,9 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	fmt.Printf("guest reachable at %s\n", ip)
 	fmt.Printf("copying guest scripts\n")
 	if err := m.installGuestScripts(ctx, m.Config.Image.OutputImage); err != nil {
+		return err
+	}
+	if err := m.installTrustedCACertificates(ctx, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
 	if err := m.installImageManifest(ctx, m.Config.Image.OutputImage, *opts.Manifest); err != nil {
@@ -327,6 +333,9 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	}
 	fmt.Printf("copying guest scripts\n")
 	if err := m.installGuestScripts(ctx, buildName); err != nil {
+		return err
+	}
+	if err := m.installTrustedCACertificates(ctx, buildName); err != nil {
 		return err
 	}
 	if err := m.installImageManifest(ctx, buildName, *opts.Manifest); err != nil {
@@ -880,6 +889,9 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestC
 	if err := os.MkdirAll(customDir, 0755); err != nil {
 		return err
 	}
+	if err := m.copyTrustedCACertificatesToDir(filepath.Join(buildCtx, "trusted-ca-certificates")); err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(buildCtx, "image-manifest.json"), []byte(manifestContent), 0644); err != nil {
 		return err
 	}
@@ -914,8 +926,10 @@ COPY scripts/guest/ubuntu/ /opt/epar/
 COPY scripts/container/ubuntu/entrypoint.sh /opt/epar/container-entrypoint.sh
 COPY upstream/runner-images/ /opt/epar/upstream/runner-images/
 COPY custom-install/ /opt/epar/custom-install/
+COPY trusted-ca-certificates/ `+trustedCAGuestDir+`/
 COPY image-manifest.json /opt/epar/image-manifest.json
 RUN chmod +x /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
+RUN bash /opt/epar/install-trusted-ca-certificates.sh
 RUN bash /opt/epar/install-base.sh /opt/epar/upstream/runner-images
 RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}"
 RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/install-docker-engine.sh /opt/epar/upstream/runner-images

@@ -102,6 +102,72 @@ func TestDeleteRunnerIfExistsIgnoresNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteRunnersByPrefixContinuesAfterFailureAndPreservesBoundary(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{
+		AppID:          123,
+		Organization:   "example",
+		PrivateKeyPath: keyPath,
+		APIBaseURL:     "https://api.github.test",
+		WebBaseURL:     "https://github.test",
+	})
+	var deletePaths []string
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		body := `{}`
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			body = `{"id":42}`
+		case "/app/installations/42/access_tokens":
+			body = `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`
+		case "/orgs/example/actions/runners":
+			body = `{"total_count":5,"runners":[` +
+				`{"id":1,"name":"epar-core"},` +
+				`{"id":2,"name":"epar-core-first"},` +
+				`{"id":3,"name":"epar-core-second"},` +
+				`{"id":4,"name":"epar-core-third"},` +
+				`{"id":5,"name":"epar-corex-unrelated"}]}`
+		case "/orgs/example/actions/runners/1", "/orgs/example/actions/runners/2", "/orgs/example/actions/runners/3", "/orgs/example/actions/runners/4":
+			deletePaths = append(deletePaths, r.URL.Path)
+			status = http.StatusNoContent
+			body = ""
+			if r.URL.Path == "/orgs/example/actions/runners/2" || r.URL.Path == "/orgs/example/actions/runners/3" {
+				status = http.StatusInternalServerError
+				body = `{"message":"temporary failure"}`
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+
+	deleted, err := client.DeleteRunnersByPrefix(context.Background(), "epar-core")
+	if err == nil {
+		t.Fatal("DeleteRunnersByPrefix() error = nil, want aggregate delete error")
+	}
+	if !strings.Contains(err.Error(), `delete runner "epar-core-first" (id=2)`) {
+		t.Fatalf("error %q does not identify the failed runner", err)
+	}
+	if !strings.Contains(err.Error(), `delete runner "epar-core-second" (id=3)`) {
+		t.Fatalf("aggregate error %q does not identify every failed runner", err)
+	}
+	if got, want := strings.Join(deletePaths, ","), strings.Join([]string{
+		"/orgs/example/actions/runners/1",
+		"/orgs/example/actions/runners/2",
+		"/orgs/example/actions/runners/3",
+		"/orgs/example/actions/runners/4",
+	}, ","); got != want {
+		t.Fatalf("delete paths = %q, want %q", got, want)
+	}
+	if len(deleted) != 2 || deleted[0].ID != 1 || deleted[1].ID != 4 {
+		t.Fatalf("deleted runners = %+v, want ids 1 and 4", deleted)
+	}
+}
+
 func writeKey(t *testing.T) string {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 1024)

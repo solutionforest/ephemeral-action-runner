@@ -3,6 +3,8 @@ package pool
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,15 +200,144 @@ func TestProvisionOneRetriesTransientRuntimeValidationFailure(t *testing.T) {
 	}
 }
 
+func TestVerifyCleanupUsesFreshContextAfterCancellation(t *testing.T) {
+	provider := &fakeProvider{
+		instances: []provider.Instance{
+			{Name: "epar-test-1"},
+			{Name: "epar-test-unrelated"},
+			{Name: "epar-testing-1"},
+		},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
+			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
+		},
+		Provider:    provider,
+		ProjectRoot: t.TempDir(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := manager.Verify(ctx, VerifyOptions{Instances: 1, Cleanup: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&provider.canceledListCalls); got != 0 {
+		t.Fatalf("cleanup List received a canceled context %d time(s)", got)
+	}
+	if got := atomic.LoadInt32(&provider.stopCalls); got != 2 {
+		t.Fatalf("Stop called %d time(s), want 2 matching prefix-boundary instances", got)
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got != 2 {
+		t.Fatalf("Delete called %d time(s), want 2 matching prefix-boundary instances", got)
+	}
+}
+
+func TestRunPoolCleanupUsesFreshContextAfterCancellation(t *testing.T) {
+	provider := &fakeProvider{
+		instances: []provider.Instance{{Name: "epar-test-1"}},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
+			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
+		},
+		Provider:    provider,
+		ProjectRoot: t.TempDir(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := manager.RunPool(ctx, RunOptions{Instances: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&provider.canceledListCalls); got != 0 {
+		t.Fatalf("cleanup List received a canceled context %d time(s)", got)
+	}
+	if got := atomic.LoadInt32(&provider.stopCalls); got != 1 {
+		t.Fatalf("Stop called %d time(s), want 1", got)
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got != 1 {
+		t.Fatalf("Delete called %d time(s), want 1", got)
+	}
+}
+
+func TestProvisionOnePassesRunnerRegistrationControlsWithoutPrivateKey(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+	}
+	manager := Manager{
+		Config: config.Config{
+			GitHub: config.GitHubConfig{PrivateKeyPath: "/secret/app.pem"},
+			Provider: config.ProviderConfig{
+				SourceImage: "image",
+				Type:        "docker-dind",
+			},
+			Pool: config.PoolConfig{
+				Instances:  1,
+				NamePrefix: "epar-test",
+				LogDir:     t.TempDir(),
+			},
+			Runner: config.RunnerConfig{
+				Labels:          []string{"epar-core-test"},
+				Ephemeral:       true,
+				Group:           "epar-ci-canary",
+				NoDefaultLabels: true,
+			},
+			Timeouts: config.TimeoutConfig{
+				CommandSeconds:      5,
+				GitHubOnlineSeconds: 5,
+			},
+		},
+		Provider:    provider,
+		GitHub:      github,
+		ProjectRoot: t.TempDir(),
+	}
+
+	if _, err := manager.provisionOne(context.Background(), "epar-test-1", true); err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	env := provider.configureEnv
+	provider.mu.Unlock()
+	if env == nil {
+		t.Fatal("configure-runner invocation was not captured")
+	}
+	for key, want := range map[string]string{
+		"RUNNER_GROUP":             "epar-ci-canary",
+		"RUNNER_NO_DEFAULT_LABELS": "true",
+		"RUNNER_LABELS":            "epar-core-test",
+		"RUNNER_EPHEMERAL":         "true",
+		"RUNNER_TOKEN":             "token",
+	} {
+		if got := env[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for key, value := range env {
+		if strings.Contains(strings.ToLower(key), "private") || value == "/secret/app.pem" {
+			t.Fatalf("guest registration environment exposes private key through %s", key)
+		}
+	}
+}
+
 type fakeProvider struct {
 	execErr  error
 	execErrs []error
 	ip       string
+	mu       sync.Mutex
 
-	cloneCalls  int32
-	execCalls   int32
-	stopCalls   int32
-	deleteCalls int32
+	configureEnv map[string]string
+	instances    []provider.Instance
+
+	cloneCalls        int32
+	execCalls         int32
+	stopCalls         int32
+	deleteCalls       int32
+	canceledListCalls int32
 }
 
 func (p *fakeProvider) Clone(context.Context, string, string) error {
@@ -218,7 +349,15 @@ func (p *fakeProvider) Start(context.Context, string, provider.StartOptions) (*p
 	return &provider.RunningProcess{}, nil
 }
 
-func (p *fakeProvider) Exec(context.Context, string, []string, provider.ExecOptions) (provider.ExecResult, error) {
+func (p *fakeProvider) Exec(_ context.Context, _ string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
+	if strings.Contains(strings.Join(command, " "), "configure-runner.sh") {
+		p.mu.Lock()
+		p.configureEnv = make(map[string]string, len(opts.Env))
+		for key, value := range opts.Env {
+			p.configureEnv[key] = value
+		}
+		p.mu.Unlock()
+	}
 	call := atomic.AddInt32(&p.execCalls, 1)
 	if int(call) <= len(p.execErrs) {
 		return provider.ExecResult{}, p.execErrs[call-1]
@@ -243,8 +382,12 @@ func (p *fakeProvider) Delete(context.Context, string) error {
 	return nil
 }
 
-func (p *fakeProvider) List(context.Context) ([]provider.Instance, error) {
-	return nil, nil
+func (p *fakeProvider) List(ctx context.Context) ([]provider.Instance, error) {
+	if ctx.Err() != nil {
+		atomic.AddInt32(&p.canceledListCalls, 1)
+		return nil, ctx.Err()
+	}
+	return append([]provider.Instance(nil), p.instances...), nil
 }
 
 type fakeGitHub struct {
