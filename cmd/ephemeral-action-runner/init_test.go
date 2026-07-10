@@ -128,6 +128,26 @@ func TestGeneratedPoolNamePrefixTruncatesLongHostname(t *testing.T) {
 	}
 }
 
+func TestGeneratedPoolNamePrefixPrefersHostNameEnv(t *testing.T) {
+	oldHostname := initHostname
+	oldRandomRead := initRandomRead
+	initHostname = config.HostName
+	initRandomRead = fixedRandomRead([]byte{0xa4, 0xf9, 0xc2})
+	t.Cleanup(func() {
+		initHostname = oldHostname
+		initRandomRead = oldRandomRead
+	})
+	t.Setenv(config.HostNameEnv, "Real Windows Host")
+
+	prefix, err := generatedPoolNamePrefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prefix, "real-windows-host-a4f9c2"; got != want {
+		t.Fatalf("generatedPoolNamePrefix() = %q, want %q", got, want)
+	}
+}
+
 func TestGeneratedPoolNamePrefixFallsBackWhenHostnameIsUnavailable(t *testing.T) {
 	oldHostname := initHostname
 	oldRandomRead := initRandomRead

@@ -24,7 +24,7 @@ Double-click `.local/start-epar.command` in Finder or run it from Terminal:
 The script:
 
 - finds the EPAR source folder, such as when the script lives at `.local/start-epar.command`;
-- runs EPAR with `go run ./cmd/ephemeral-action-runner`;
+- delegates to `./start`, which runs EPAR with `go run ./cmd/ephemeral-action-runner` if Go is installed and working, or a containerized `go run` if not (see [No Go Install](#no-go-install));
 - uses `.local/config.yml` by default;
 - waits for Docker to become ready before starting EPAR;
 - starts an existing `epar-dockerhub-cache` mirror container if one exists;
@@ -44,6 +44,7 @@ You can edit the copied `.local/start-epar.command` file or set environment vari
 export EPAR_ROOT="/path/to/ephemeral-action-runner"
 export EPAR_CONFIG="${EPAR_ROOT}/.local/config.yml"
 export EPAR_GO_BIN="/usr/local/go/bin/go"
+export EPAR_USE_DOCKER_RUN="auto"
 export EPAR_MIRROR_CONTAINER="epar-dockerhub-cache"
 export EPAR_WAIT_FOR_DOCKER=1
 export EPAR_DOCKER_WAIT_ATTEMPTS=120
@@ -52,6 +53,20 @@ export EPAR_DOCKER_WAIT_ATTEMPTS=120
 Set `EPAR_WAIT_FOR_DOCKER=0` only when the selected provider does not need Docker at startup.
 
 If you use the optional Docker registry mirror, create the mirror container separately. The startup script starts the container if it already exists, but it does not create or configure the mirror service.
+
+## No Go Install
+
+`start-epar.command` delegates to `./start` at the repo root. If `go` isn't on `PATH`, or the `go` found there doesn't actually run (stale/wrong-architecture installs happen — see below), `./start` runs EPAR straight from source with a containerized Go toolchain (`scripts/run-with-docker.sh`) instead of failing. No binary is built or left on disk either way. Docker is required in both cases.
+
+To force this path even when Go is installed (for example, to avoid rebuilding via `go run` on every start), set in your local copy:
+
+```bash
+export EPAR_USE_DOCKER_RUN=1
+```
+
+Set `EPAR_USE_DOCKER_RUN=0` to force `go run` locally and error out instead of falling back. See [Running EPAR Without Installing Go](no-go-install.md) for details.
+
+`./start` checks that `go version` actually runs, not just that a `go` binary exists on `PATH` — this catches a real failure mode: a stale Go install left over on `PATH` (e.g. an old Intel-only `/usr/local/go` from before an Apple Silicon migration) that segfaults instead of running. If you hit that, either remove the stale install or set `EPAR_GO_BIN`/`EPAR_USE_DOCKER_RUN` to bypass it.
 
 ## launchd Alternative
 

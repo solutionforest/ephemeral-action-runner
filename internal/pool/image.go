@@ -126,7 +126,7 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 	}
 	fmt.Printf("building Docker-DinD image %s from %s\n", m.Config.Image.OutputImage, m.Config.Image.SourceImage)
 	fmt.Printf("log: %s\n", buildLogPath)
-	args := []string{"build", "--progress=plain", "-t", m.Config.Image.OutputImage}
+	args := []string{"build", "-t", m.Config.Image.OutputImage}
 	if m.Config.Provider.Platform != "" {
 		args = append(args, "--platform", m.Config.Provider.Platform)
 	}

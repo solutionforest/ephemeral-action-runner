@@ -33,17 +33,13 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
 
-### 1. Prerequisites
+### 1. Install Docker
 
-Make sure these are installed:
+The default quick start needs a Docker-compatible daemon:
 
-- [Go](https://go.dev/) 1.22 or newer
-- a Docker-compatible daemon:
-  - Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
-  - macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
-  - Linux: [Docker Engine](https://docs.docker.com/engine/)
-
-The default [Docker-DinD](https://www.docker.com/resources/docker-in-docker-containerized-ci-workflows-dockercon-2023/) mode uses `docker run --privileged`, so the daemon must support privileged Linux containers.
+- Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
+- macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
+- Linux: [Docker Engine](https://docs.docker.com/engine/)
 
 ### 2. Download EPAR Source
 
@@ -70,8 +66,10 @@ Follow [GitHub App Setup](docs/github-app.md), then keep these three values read
 Run EPAR with the default flow:
 
 ```bash
-go run ./cmd/ephemeral-action-runner
+./start
 ```
+
+On Windows, `./start` also works in modern PowerShell. If your shell does not run it, use `.\start.ps1` or `start.cmd`.
 
 That's it.
 
@@ -89,8 +87,8 @@ Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans
 
 To choose a config or runner count:
 
-```powershell
-go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
+```bash
+./start --config .local/custom-config.yml --instances 2
 ```
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
@@ -159,6 +157,8 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Tart Provider](docs/providers/tart.md): Apple Silicon Linux VM runners.
 - [Image Build](docs/image-build.md): image internals and customization.
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
+- [Troubleshooting](docs/troubleshooting.md): symptom-first diagnostics by host and provider.
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
+- [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
 - [Security](docs/security.md): trust boundaries and secret handling.

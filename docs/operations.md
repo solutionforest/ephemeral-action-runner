@@ -41,7 +41,10 @@ For Docker-DinD, cleanup removes the outer runner container with `docker rm -f -
 
 ## Troubleshooting
 
+This section is a compact checklist. For symptom-first diagnostics with host/provider-specific commands, see [Troubleshooting](troubleshooting.md).
+
 - If a Docker/browser or web/E2E image build fails before package installation, run `image update-upstream`.
+- If an image build fails with `E: You don't have enough free space in /var/cache/apt/archives/.`, check the Docker daemon or VM storage with `docker system df` and `docker run --rm gitea/runner-images:ubuntu-latest-full df -h /`. On Windows Docker Desktop with WSL2, the container-visible disk can be much smaller than Windows Explorer free space; see [Windows Docker Desktop WSL2 Disk Is Smaller Than Expected](troubleshooting.md#windows-docker-desktop-wsl2-disk-is-smaller-than-expected).
 - If Docker validation fails for a Docker-enabled image, inspect `work/logs/<image>.guest.log`.
 - If browser validation fails on ARM64, confirm `epar-browser` exists inside the guest and inspect `/opt/epar/browser`.
 - If a Docker Compose job uses an amd64-only runtime image on an ARM64 Tart runner and fails with `exec format error` or repeated container exits such as status `139`, use a runner label that supports that image instead of changing application runtime settings only for runner compatibility. Suitable targets include Docker-DinD with verified `linux/amd64` emulation, WSL x64, an x64 Linux host, or a Tart image with Rosetta enabled and validated.

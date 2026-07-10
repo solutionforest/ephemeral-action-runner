@@ -1,0 +1,239 @@
+# Troubleshooting
+
+This page is organized by symptom, host OS, and EPAR provider. Start with the sections that match the machine and provider you are using.
+
+## Quick Diagnostics
+
+Start with the commands that match your host and provider.
+
+### All Hosts
+
+EPAR logs are written under `work/logs` by default. The latest top-level error report is usually:
+
+```text
+work/logs/epar-last-error.log
+```
+
+Image build logs use provider-specific names, for example:
+
+```text
+work/logs/epar-docker-dind-gitea-ubuntu.docker-build.log
+work/logs/epar-wsl-gitea-ubuntu.wsl-build.log
+```
+
+Check the EPAR version and selected config:
+
+```bash
+./start --help
+go run ./cmd/ephemeral-action-runner version
+```
+
+If you are running without local Go, use `./start --help`; the wrapper will run EPAR through the containerized Go toolchain.
+
+### Docker-Backed Workflows
+
+Use these on any host when the provider is Docker-DinD, when WSL image preparation starts from a Docker image, or when the no-Go wrapper is in use:
+
+```bash
+docker version
+docker info
+docker system df
+docker image ls
+```
+
+To see the free space available to containers on the active Docker daemon:
+
+```bash
+docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+```
+
+For a custom source image, replace `gitea/runner-images:ubuntu-latest-full` with the value from `image.sourceImage`.
+
+### Windows Hosts
+
+For Windows hosts that use WSL2, Docker Desktop's WSL2 backend, or the WSL provider:
+
+```powershell
+wsl --version
+wsl -l -v
+docker context ls
+docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+```
+
+`gitea/runner-images:ubuntu-latest-full` is the default source image for EPAR's default config. If your config uses a custom source image, replace it with your configured `image.sourceImage`.
+
+Docker Desktop's WSL2 backend stores Docker data in a WSL-backed virtual disk. Windows Explorer free space and container-visible free space are related, but they are not the same number.
+
+### Linux Docker Engine Hosts
+
+On native Linux, Docker data usually lives under Docker's root directory. Check it directly:
+
+```bash
+docker info --format '{{.DockerRootDir}}'
+df -h "$(docker info --format '{{.DockerRootDir}}')"
+```
+
+### macOS Docker Hosts
+
+Docker Desktop and OrbStack keep Linux container data inside their own VM/storage area. Use Docker's own view first:
+
+```bash
+docker system df
+docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+```
+
+If the container-visible disk is full, adjust or clean the Docker/OrbStack storage from that product's settings. Finder free space by itself may not reflect the Linux VM storage available to containers.
+
+## Docker Image Build Runs Out Of Space
+
+### Symptom
+
+During `start` or `image build`, the log contains:
+
+```text
+E: You don't have enough free space in /var/cache/apt/archives/.
+```
+
+or another package install fails with `No space left on device`.
+
+### What It Means
+
+This error is raised inside the temporary container or guest that is building the runner image. It usually means the Docker daemon or VM backing that build is out of writable layer space. It does not necessarily mean the host OS drive has no free space.
+
+Check the active Docker daemon:
+
+```bash
+docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+docker system df
+```
+
+If `/` inside the container is nearly full, clean up Docker data or increase the Docker VM/data-disk limit before retrying.
+
+### Cleanup Direction
+
+Review Docker's usage first:
+
+```bash
+docker system df
+docker system df -v
+```
+
+Docker prune commands remove resources that Docker considers unused. Depending on the command, that can include stopped containers, unused images, build cache, unused networks, or unused volumes. Review the Docker command help and the data on the machine before pruning, especially if you expect to restart stopped containers or keep data in Docker volumes.
+
+## Windows Docker Desktop WSL2 Disk Is Smaller Than Expected
+
+### Symptom
+
+On a Windows machine where WSL2 storage was set up before 2021, the Docker container filesystem may report about 251 GB total:
+
+```powershell
+docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+```
+
+Example:
+
+```text
+Filesystem      Size  Used Avail Use% Mounted on
+overlay         251G  211G   28G  89% /
+```
+
+On a Windows machine where WSL2 storage was set up after the 2022 WSL default-size change, the same command may report about 1007 GB total:
+
+```text
+Filesystem      Size  Used Avail Use% Mounted on
+overlay        1007G  127G  830G  14% /
+```
+
+### Why It Happens
+
+This is a Windows Docker Desktop / WSL2 storage detail, not an EPAR image-size issue. The command reports the size of Docker Desktop's Linux container storage, not the size of `gitea/runner-images:ubuntu-latest-full`.
+
+For Windows machines where WSL2 storage was set up before 2021, the default WSL2 virtual disk maximum may be about 256 GB. For WSL2 setups created after the WSL 0.58.0 change, released in 2022, Microsoft's documentation says the default maximum for each WSL2 VHD is 1 TB. This can explain why one Windows machine reports about 251 GB while another reports about 1007 GB for the container-visible filesystem.
+
+Windows Explorer free space by itself is not enough to confirm Docker has build space. The container-visible filesystem must have enough free space for the image pull, build layers, package manager cache, and final runner image.
+
+For more background, see:
+
+- <https://github.com/microsoft/WSL/issues/4373>
+- <https://learn.microsoft.com/windows/wsl/disk-space>
+- <https://docs.docker.com/desktop/features/wsl/>
+
+## Docker-DinD Build Fails With `unknown flag: --progress`
+
+### Symptom
+
+The Docker-DinD image build fails with:
+
+```text
+unknown flag: --progress
+```
+
+### What It Means
+
+This happens when the Docker client used for the build routes `docker build` through the legacy builder, or when the client does not have Buildx-style build support. It is most visible when EPAR is run through a containerized Go toolchain whose bundled Docker client differs from the host `docker.exe`.
+
+Current EPAR builds use legacy-builder-compatible Docker build arguments. If you still see this error, confirm you are running a revision that includes that fix and check which Docker client is actually executing the command:
+
+```bash
+docker version
+docker build --help
+docker buildx version
+```
+
+## Docker-DinD Startup Fails
+
+### Privileged Containers
+
+Docker-DinD requires the host Docker runtime to allow privileged Linux containers. Confirm the Docker host supports:
+
+```bash
+docker run --rm --privileged alpine:3.20 true
+```
+
+### Nested Docker Storage Driver
+
+If Docker-DinD starts but nested Docker operations fail with overlay mount errors, keep the default inner daemon storage driver:
+
+```text
+EPAR_DOCKERD_STORAGE_DRIVER=vfs
+```
+
+Use `overlay2` or `auto` in a derived image only after proving that storage driver works on the exact host runtime.
+
+## WSL Provider Image Build Fails Early
+
+This section applies to Windows hosts using `provider.type: wsl`.
+
+If the default WSL image build fails before importing or starting the temporary distro, confirm Docker is reachable because the default WSL full image converts a Docker image into a rootfs tar:
+
+```powershell
+docker version
+docker pull gitea/runner-images:ubuntu-latest-full
+wsl -l -v
+```
+
+If the WSL image build fails after import but before systemd is ready, inspect:
+
+```text
+work/logs/<image>.wsl-build.log
+work/logs/<temporary-distro>.guest.log
+```
+
+## GitHub Runner Registration Fails
+
+Confirm the GitHub App has organization self-hosted runner read/write permission and that the private key path in the config is readable from the EPAR process:
+
+```yaml
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: .local/github-app.pem
+```
+
+If stale runner records remain after an interrupted run:
+
+```bash
+go run ./cmd/ephemeral-action-runner cleanup
+```
+
+Cleanup only targets runner names matching `pool.namePrefix`, so keep that prefix unique per machine/config within the GitHub organization.

@@ -23,7 +23,7 @@ var dockerAvailable = func(ctx context.Context) error {
 	return exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}").Run()
 }
 
-var initHostname = os.Hostname
+var initHostname = config.HostName
 
 var initRandomRead = rand.Read
 

@@ -28,19 +28,12 @@ find_repo_root() {
 
 EPAR_ROOT="$(find_repo_root)"
 CONFIG_PATH="${EPAR_CONFIG:-${EPAR_ROOT}/.local/config.yml}"
-GO_BIN="${EPAR_GO_BIN:-go}"
 MIRROR_CONTAINER="${EPAR_MIRROR_CONTAINER:-epar-dockerhub-cache}"
 WAIT_FOR_DOCKER="${EPAR_WAIT_FOR_DOCKER:-1}"
 DOCKER_WAIT_ATTEMPTS="${EPAR_DOCKER_WAIT_ATTEMPTS:-120}"
 
 cd "${EPAR_ROOT}"
 mkdir -p work/logs
-
-if ! command -v "${GO_BIN}" >/dev/null 2>&1; then
-  echo "Go not found: ${GO_BIN}" >&2
-  echo "Install Go, or set EPAR_GO_BIN to the full path of the go executable." >&2
-  exit 1
-fi
 
 if [[ "${WAIT_FOR_DOCKER}" != "0" ]]; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] waiting for Docker to become ready..."
@@ -63,4 +56,6 @@ if [[ "${WAIT_FOR_DOCKER}" != "0" ]]; then
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting EPAR..."
-exec "${GO_BIN}" run ./cmd/ephemeral-action-runner start --config "${CONFIG_PATH}" "$@"
+# Go-detection and the containerized-Go fallback live in ./start (single
+# source of truth). Set EPAR_GO_BIN / EPAR_USE_DOCKER_RUN above to override.
+exec "${EPAR_ROOT}/start" --config "${CONFIG_PATH}" "$@"

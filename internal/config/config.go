@@ -74,6 +74,7 @@ const (
 	ImageSourceDockerImage = "docker-image"
 	ImageSourceRootFSTar   = "rootfs-tar"
 	MaxRunnerLabelLength   = 256
+	HostNameEnv            = "EPAR_HOST_NAME"
 )
 
 func Default() Config {
@@ -367,11 +368,18 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 
 var osHostname = os.Hostname
 
+func HostName() (string, error) {
+	if hostname := strings.TrimSpace(os.Getenv(HostNameEnv)); hostname != "" {
+		return hostname, nil
+	}
+	return osHostname()
+}
+
 func applyRunnerHostLabel(cfg *Config) {
 	if !cfg.Runner.IncludeHostLabel {
 		return
 	}
-	hostname, err := osHostname()
+	hostname, err := HostName()
 	if err != nil {
 		return
 	}
