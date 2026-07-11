@@ -3,7 +3,14 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 test_root="$(mktemp -d)"
-trap 'rm -rf "${test_root}"' EXIT
+cleanup_test_root() {
+  if [[ -f "${test_root}/pool.pid" ]]; then
+    pool_pid="$(<"${test_root}/pool.pid")"
+    [[ "${pool_pid}" =~ ^[0-9]+$ ]] && kill -KILL "${pool_pid}" 2>/dev/null || true
+  fi
+  rm -rf "${test_root}"
+}
+trap cleanup_test_root EXIT
 mkdir -p "${test_root}/bin" "${test_root}/runner-temp"
 printf '%s\n' 'test inspection CA' >"${test_root}/inspection-ca.pem"
 
@@ -15,6 +22,19 @@ grep -F -q 'runs-on: ubuntu-latest' "${workflow_path}"
 
 cat >"${test_root}/bin/docker" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "ps" ]]; then
+  scan_count=0
+  if [[ -f "${MOCK_DOCKER_PS_COUNT}" ]]; then
+    scan_count="$(<"${MOCK_DOCKER_PS_COUNT}")"
+  fi
+  scan_count=$((scan_count + 1))
+  printf '%s\n' "${scan_count}" >"${MOCK_DOCKER_PS_COUNT}"
+  if (( scan_count <= ${MOCK_DOCKER_LATE_RESOURCE_SCANS:-0} )); then
+    printf '%s\n' 'epar-ci-core-late-resource'
+  elif (( scan_count <= ${MOCK_DOCKER_LATE_RESOURCE_SCANS:-0} + ${MOCK_DOCKER_OUTSIDE_BOUNDARY_SCANS:-0} )); then
+    printf '%s\n' 'epar-ci-corex-outside-boundary'
+  fi
+fi
 exit 0
 EOF
 
@@ -108,6 +128,18 @@ EOF
 cat >"${test_root}/bin/epar" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${MOCK_EPAR_LOG}"
+if [[ "${1:-}" == "cleanup" && -n "${MOCK_CLEANUP_CALL_COUNT_FILE:-}" ]]; then
+  cleanup_calls=0
+  if [[ -f "${MOCK_CLEANUP_CALL_COUNT_FILE}" ]]; then
+    cleanup_calls="$(<"${MOCK_CLEANUP_CALL_COUNT_FILE}")"
+  fi
+  cleanup_calls=$((cleanup_calls + 1))
+  printf '%s\n' "${cleanup_calls}" >"${MOCK_CLEANUP_CALL_COUNT_FILE}"
+  if [[ "${MOCK_CLEANUP_FAIL_ON_CALL:-}" == "${cleanup_calls}" ]]; then
+    : >"${MOCK_CLEANUP_FAIL_MARKER}"
+    exit "${MOCK_CLEANUP_FAIL_STATUS:-7}"
+  fi
+fi
 if [[ " $* " == *" image build "* ]]; then
   config_path=""
   while (( $# > 0 )); do
@@ -172,7 +204,8 @@ if [[ " $* " == *" pool up "* ]]; then
     echo '-----END PRIVATE KEY-----'
     exit 7
   fi
-  trap 'exit 0' TERM INT
+  printf '%s\n' "$$" >"${MOCK_POOL_PID_FILE}"
+  trap ': >"${MOCK_POOL_TERM_MARKER}"; exit 0' TERM INT
   while true; do sleep 1; done
 fi
 EOF
@@ -201,6 +234,17 @@ MOCK_CA_PATH="${test_root}/inspection-ca.pem" \
 MOCK_REGISTRY_MIRROR=http://hubproxy.docker.internal:5555 \
 MOCK_DOCKER_PROXY=http://host.docker.internal:3128 \
 MOCK_CANCEL_MARKER="${test_root}/cancelled" \
+MOCK_POOL_PID_FILE="${test_root}/pool.pid" \
+MOCK_POOL_TERM_MARKER="${test_root}/pool-term" \
+MOCK_DOCKER_PS_COUNT="${test_root}/docker-ps-count" \
+MOCK_DOCKER_LATE_RESOURCE_SCANS=1 \
+MOCK_DOCKER_OUTSIDE_BOUNDARY_SCANS=1 \
+MOCK_CLEANUP_CALL_COUNT_FILE="${test_root}/cleanup-count" \
+MOCK_CLEANUP_FAIL_ON_CALL=2 \
+MOCK_CLEANUP_FAIL_MARKER="${test_root}/cleanup-failed-once" \
+CORE_CLEANUP_TOTAL_SECONDS=10 \
+CORE_CLEANUP_ATTEMPT_SECONDS=1 \
+CORE_CLEANUP_SETTLE_SECONDS=0 \
 PATH="${test_root}/bin:${PATH}" \
 bash "${repo_root}/scripts/ci/core-runner-controller.sh"
 
@@ -209,6 +253,16 @@ grep -q '^image build --replace ' "${test_root}/epar.log"
 grep -q '^pool up --instances 1 --monitor-interval 5s ' "${test_root}/epar.log"
 grep -q 'Canary 1 runner.*epar-ci-core-20260710-100000-001' "${summary}"
 grep -q 'Canary 2 runner.*epar-ci-core-20260710-100010-002' "${summary}"
+test -f "${test_root}/pool-term"
+test -f "${test_root}/cleanup-failed-once"
+pool_pid="$(<"${test_root}/pool.pid")"
+if kill -0 "${pool_pid}" 2>/dev/null; then
+  echo "controller test found the pool supervisor still running after cleanup" >&2
+  exit 1
+fi
+test "$(<"${test_root}/docker-ps-count")" -eq 3
+test "$(<"${test_root}/cleanup-count")" -eq 5
+test "$(grep -c '^cleanup ' "${test_root}/epar.log")" -eq 5
 if grep -R -q 'test-private-key-material\|test-workflow-token' "${test_root}"; then
   echo "controller test found credential material after cleanup" >&2
   exit 1
@@ -242,6 +296,12 @@ if EPAR_BINARY="${test_root}/bin/epar" \
   MOCK_REGISTRY_MIRROR=http://hubproxy.docker.internal:5555 \
   MOCK_DOCKER_PROXY=http://host.docker.internal:3128 \
   MOCK_CANCEL_MARKER="${test_root}/cancelled" \
+  MOCK_POOL_PID_FILE="${test_root}/failure-pool.pid" \
+  MOCK_POOL_TERM_MARKER="${test_root}/failure-pool-term" \
+  MOCK_DOCKER_PS_COUNT="${test_root}/failure-docker-ps-count" \
+  CORE_CLEANUP_TOTAL_SECONDS=10 \
+  CORE_CLEANUP_ATTEMPT_SECONDS=1 \
+  CORE_CLEANUP_SETTLE_SECONDS=0 \
   MOCK_POOL_FAILURE=1 \
   MOCK_POOL_TOKEN=pool-secret-value \
   MOCK_CLI_TOKEN=cli-secret-value \

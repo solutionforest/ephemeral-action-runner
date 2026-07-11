@@ -66,6 +66,10 @@ CORE_POOL_PREFIX="${CORE_POOL_PREFIX:-epar-ci-core}"
 CORE_RUNNER_GROUP="${CORE_RUNNER_GROUP:-epar-ci-canary}"
 CORE_MAX_WAIT_SECONDS="${CORE_MAX_WAIT_SECONDS:-2400}"
 CORE_POLL_SECONDS="${CORE_POLL_SECONDS:-10}"
+CORE_CLEANUP_MAX_ATTEMPTS="${CORE_CLEANUP_MAX_ATTEMPTS:-6}"
+CORE_CLEANUP_TOTAL_SECONDS="${CORE_CLEANUP_TOTAL_SECONDS:-300}"
+CORE_CLEANUP_ATTEMPT_SECONDS="${CORE_CLEANUP_ATTEMPT_SECONDS:-60}"
+CORE_CLEANUP_SETTLE_SECONDS="${CORE_CLEANUP_SETTLE_SECONDS:-2}"
 EPAR_SOURCE_IMAGE="${EPAR_SOURCE_IMAGE:-gitea/runner-images:ubuntu-latest@sha256:58ea92624c7c09582e05594d95488331045053d3a3f34cf09649f2a32313a614}"
 EPAR_OUTPUT_IMAGE="${EPAR_OUTPUT_IMAGE:-epar-ci-core-image}"
 
@@ -96,6 +100,22 @@ if [[ ! "${CORE_MAX_WAIT_SECONDS}" =~ ^[0-9]+$ ]] || (( CORE_MAX_WAIT_SECONDS < 
 fi
 if [[ ! "${CORE_POLL_SECONDS}" =~ ^[0-9]+$ ]] || (( CORE_POLL_SECONDS < 1 )); then
   echo "::error::CORE_POLL_SECONDS must be a positive integer" >&2
+  exit 1
+fi
+if [[ ! "${CORE_CLEANUP_MAX_ATTEMPTS}" =~ ^[0-9]+$ ]] || (( CORE_CLEANUP_MAX_ATTEMPTS < 2 )); then
+  echo "::error::CORE_CLEANUP_MAX_ATTEMPTS must be an integer of at least 2" >&2
+  exit 1
+fi
+if [[ ! "${CORE_CLEANUP_TOTAL_SECONDS}" =~ ^[0-9]+$ ]] || (( CORE_CLEANUP_TOTAL_SECONDS < 1 )); then
+  echo "::error::CORE_CLEANUP_TOTAL_SECONDS must be a positive integer" >&2
+  exit 1
+fi
+if [[ ! "${CORE_CLEANUP_ATTEMPT_SECONDS}" =~ ^[0-9]+$ ]] || (( CORE_CLEANUP_ATTEMPT_SECONDS < 1 )); then
+  echo "::error::CORE_CLEANUP_ATTEMPT_SECONDS must be a positive integer" >&2
+  exit 1
+fi
+if [[ ! "${CORE_CLEANUP_SETTLE_SECONDS}" =~ ^[0-9]+$ ]]; then
+  echo "::error::CORE_CLEANUP_SETTLE_SECONDS must be a non-negative integer" >&2
   exit 1
 fi
 if [[ -n "${EPAR_TRUSTED_CA_CERTIFICATE_PATH:-}" ]]; then
@@ -363,24 +383,66 @@ cleanup() {
   set +e
 
   stop_pool
-  timeout 300 "${EPAR_BINARY}" cleanup \
-    --config "${config_path}" \
-    --project-root "${EPAR_PROJECT_ROOT}"
-  local cleanup_status=$?
-  if (( cleanup_status != 0 )); then
-    echo "::warning::EPAR cleanup exited with status ${cleanup_status}" >&2
-    cleanup_result=1
-  fi
 
-  local container_name
+  local attempt cleanup_status container_name consecutive_empty=0
+  local cleanup_deadline remaining_seconds attempt_seconds sleep_seconds
+  local cleanup_converged=false
   local -a stale_containers=()
-  while IFS= read -r container_name; do
-    case "${container_name}" in
-      "${CORE_POOL_PREFIX}"|"${CORE_POOL_PREFIX}"-*) stale_containers+=("${container_name}") ;;
-    esac
-  done < <(docker ps --all --format '{{.Names}}')
-  if (( ${#stale_containers[@]} > 0 )); then
-    echo "::warning::Docker containers remain inside the ${CORE_POOL_PREFIX} cleanup boundary: ${stale_containers[*]}" >&2
+  cleanup_deadline=$((SECONDS + CORE_CLEANUP_TOTAL_SECONDS))
+  for (( attempt = 1; attempt <= CORE_CLEANUP_MAX_ATTEMPTS; attempt++ )); do
+    remaining_seconds=$((cleanup_deadline - SECONDS))
+    if (( remaining_seconds <= 0 )); then
+      echo "::warning::EPAR cleanup exhausted its ${CORE_CLEANUP_TOTAL_SECONDS}-second total budget before attempt ${attempt}" >&2
+      break
+    fi
+    attempt_seconds="${CORE_CLEANUP_ATTEMPT_SECONDS}"
+    if (( attempt_seconds > remaining_seconds )); then
+      attempt_seconds="${remaining_seconds}"
+    fi
+
+    timeout "${attempt_seconds}" "${EPAR_BINARY}" cleanup \
+      --config "${config_path}" \
+      --project-root "${EPAR_PROJECT_ROOT}"
+    cleanup_status=$?
+    if (( cleanup_status != 0 )); then
+      echo "::warning::EPAR cleanup attempt ${attempt}/${CORE_CLEANUP_MAX_ATTEMPTS} exited with status ${cleanup_status}" >&2
+      consecutive_empty=0
+    else
+      stale_containers=()
+      while IFS= read -r container_name; do
+        case "${container_name}" in
+          "${CORE_POOL_PREFIX}"|"${CORE_POOL_PREFIX}"-*) stale_containers+=("${container_name}") ;;
+        esac
+      done < <(docker ps --all --format '{{.Names}}')
+
+      if (( ${#stale_containers[@]} == 0 )); then
+        ((consecutive_empty++))
+        if (( consecutive_empty >= 2 )); then
+          cleanup_converged=true
+          break
+        fi
+        echo "EPAR cleanup attempt ${attempt}/${CORE_CLEANUP_MAX_ATTEMPTS} found no in-boundary containers; confirming cleanup convergence."
+      else
+        consecutive_empty=0
+        echo "::warning::Docker containers remain inside the ${CORE_POOL_PREFIX} cleanup boundary after attempt ${attempt}/${CORE_CLEANUP_MAX_ATTEMPTS}: ${stale_containers[*]}" >&2
+      fi
+    fi
+
+    if (( attempt < CORE_CLEANUP_MAX_ATTEMPTS )); then
+      remaining_seconds=$((cleanup_deadline - SECONDS))
+      if (( remaining_seconds <= 0 )); then
+        echo "::warning::EPAR cleanup exhausted its ${CORE_CLEANUP_TOTAL_SECONDS}-second total budget after attempt ${attempt}" >&2
+        break
+      fi
+      sleep_seconds="${CORE_CLEANUP_SETTLE_SECONDS}"
+      if (( sleep_seconds > remaining_seconds )); then
+        sleep_seconds="${remaining_seconds}"
+      fi
+      sleep "${sleep_seconds}"
+    fi
+  done
+  if [[ "${cleanup_converged}" != "true" ]]; then
+    echo "::warning::EPAR cleanup did not converge within ${CORE_CLEANUP_MAX_ATTEMPTS} attempts and ${CORE_CLEANUP_TOTAL_SECONDS} seconds; containers may remain inside the ${CORE_POOL_PREFIX} cleanup boundary" >&2
     cleanup_result=1
   fi
 
@@ -450,7 +512,14 @@ echo "Building the pinned Level 1 core image."
 epar image build --replace
 
 echo "Starting one supervised ephemeral runner for label ${CORE_CANARY_LABEL}."
-epar pool up --instances 1 --monitor-interval 5s >"${pool_log}" 2>&1 &
+# Do not background the epar() shell function: Bash would track the function's
+# wrapper process, while the EPAR supervisor it starts could outlive that
+# wrapper. exec makes pool_pid the real EPAR supervisor process.
+(
+  exec "${EPAR_BINARY}" pool up --instances 1 --monitor-interval 5s \
+    --config "${config_path}" \
+    --project-root "${EPAR_PROJECT_ROOT}"
+) >"${pool_log}" 2>&1 &
 pool_pid=$!
 
 deadline=$((SECONDS + CORE_MAX_WAIT_SECONDS))
