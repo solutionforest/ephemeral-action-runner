@@ -83,6 +83,7 @@ if [[ "${EPAR_DISABLE_SYSTEMD:-}" != "1" ]] && command -v systemctl >/dev/null 2
     --description="GitHub Actions ephemeral runner" \
     --property=User=runner \
     --property=Group=runner \
+    "--setenv=EPAR_RUNNER_WORK_DIR=${runner_work_dir}" \
     --property=WorkingDirectory="${runner_work_dir}" \
     --property=StandardOutput="append:${log_file}" \
     --property=StandardError="append:${log_file}" \
@@ -101,7 +102,8 @@ else
     kill "${old_pid}" >/dev/null 2>&1 || true
   fi
   rm -f "${pid_start_file}"
-  sudo -u runner -H bash -c 'nohup /opt/epar/start-runner-with-env.sh >>"$1" 2>&1 & echo $!' bash "${log_file}" >"${pid_file}"
+  sudo -u runner -H env "EPAR_RUNNER_WORK_DIR=${runner_work_dir}" \
+    bash -c 'nohup /opt/epar/start-runner-with-env.sh >>"$1" 2>&1 & echo $!' bash "${log_file}" >"${pid_file}"
   sleep "${startup_check_seconds}"
   pid="$(cat "${pid_file}" 2>/dev/null || true)"
   validate_pid "${pid}"

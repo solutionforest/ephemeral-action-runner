@@ -85,6 +85,7 @@ jobs:
       labels: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 15
     permissions:
+      actions: write
       contents: read
 
     steps:
@@ -129,6 +130,7 @@ jobs:
       labels: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: read
 
     steps:

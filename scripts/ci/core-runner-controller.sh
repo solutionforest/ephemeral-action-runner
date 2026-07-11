@@ -21,6 +21,7 @@ done
 github_token="${GITHUB_TOKEN}"
 unset GITHUB_TOKEN
 GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
+GITHUB_SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
 run_dir=""
 
 cancel_during_initialization() {
@@ -216,8 +217,8 @@ github:
   appId: ${EPAR_APP_ID}
   organization: ${EPAR_ORGANIZATION}
   privateKeyPath: ${key_path}
-  apiBaseUrl: https://api.github.com
-  webBaseUrl: https://github.com
+  apiBaseUrl: ${GITHUB_API_URL%/}
+  webBaseUrl: ${GITHUB_SERVER_URL%/}
 
 image:
   sourceType: docker-image
