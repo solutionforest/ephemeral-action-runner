@@ -1,11 +1,14 @@
 name: Core runner verification
 
 on:
+  pull_request:
+    branches:
+      - develop
+      - main
   push:
     branches:
-      - feature/level-1-core-runner-verification
       - develop
-  workflow_dispatch:
+      - main
 
 permissions:
   contents: read
