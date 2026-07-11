@@ -1,0 +1,42 @@
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  sourceType: docker-image
+  sourceImage: gitea/runner-images:ubuntu-latest@sha256:58ea92624c7c09582e05594d95488331045053d3a3f34cf09649f2a32313a614
+  sourcePlatform: linux/amd64
+  outputImage: epar-ci-core
+  upstreamDir: third_party/runner-images
+  upstreamLock: third_party/runner-images.lock
+  runnerVersion: latest
+  customInstallScripts:
+
+pool:
+  instances: 1
+  namePrefix: epar-ci-core
+  logDir: work/logs
+
+runner:
+  group: epar-ci-canary
+  labels: [epar-core-CHANGE-ME]
+  includeHostLabel: false
+  noDefaultLabels: true
+  ephemeral: true
+
+provider:
+  type: docker-dind
+  sourceImage: epar-ci-core
+  network: default
+  platform: linux/amd64
+
+docker:
+  registryMirrors:
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900

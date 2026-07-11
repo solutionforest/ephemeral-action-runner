@@ -30,6 +30,12 @@ WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provid
 
 `image.customInstallScripts` run as root during image build and their effects are captured in the reusable image. Use them only for non-secret tooling and configuration. Do not bake Docker credentials, GitHub tokens, private keys, or project secrets into runner images.
 
+Certificates configured through `image.trustedCaCertificatePaths` are embedded
+in the reusable image and become public trust anchors for every process in its
+runner instances. CA certificates are not treated as secrets. Add only CA roots
+or intermediates that your organization has explicitly authorized, and rebuild
+the image when they are rotated or revoked.
+
 The GitHub App private key remains on the host. Guest instances receive only short-lived registration tokens at runtime. Do not bake tokens or private keys into runner images.
 
 ## Registry Mirrors

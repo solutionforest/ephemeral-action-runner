@@ -119,18 +119,28 @@ func (c *Client) DeleteRunnersByPrefix(ctx context.Context, prefix string) ([]Ru
 		return nil, err
 	}
 	var deleted []Runner
+	var deleteErrors []error
 	for _, runner := range runners {
 		if strings.HasPrefix(runner.Name, prefix+"-") || runner.Name == prefix {
-			if err := c.DeleteRunner(ctx, runner.ID); err != nil {
-				return deleted, err
+			if err := c.DeleteRunnerIfExists(ctx, runner.ID); err != nil {
+				deleteErrors = append(deleteErrors, fmt.Errorf("delete runner %q (id=%d): %w", runner.Name, runner.ID, err))
+				continue
 			}
 			deleted = append(deleted, runner)
 		}
 	}
-	return deleted, nil
+	return deleted, errors.Join(deleteErrors...)
+}
+
+func (c *Client) WaitRunnerOnline(ctx context.Context, name string, timeout time.Duration) (Runner, error) {
+	return c.waitRunnerOnline(ctx, name, timeout, false)
 }
 
 func (c *Client) WaitRunnerOnlineIdle(ctx context.Context, name string, timeout time.Duration) (Runner, error) {
+	return c.waitRunnerOnline(ctx, name, timeout, true)
+}
+
+func (c *Client) waitRunnerOnline(ctx context.Context, name string, timeout time.Duration, requireIdle bool) (Runner, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		runners, err := c.ListRunners(ctx)
@@ -138,12 +148,15 @@ func (c *Client) WaitRunnerOnlineIdle(ctx context.Context, name string, timeout 
 			return Runner{}, err
 		}
 		for _, runner := range runners {
-			if runner.Name == name && runner.Status == "online" && !runner.Busy {
+			if runner.Name == name && runner.Status == "online" && (!requireIdle || !runner.Busy) {
 				return runner, nil
 			}
 		}
 		if time.Now().After(deadline) {
-			return Runner{}, fmt.Errorf("runner %q did not become online and idle within %s", name, timeout)
+			if requireIdle {
+				return Runner{}, fmt.Errorf("runner %q did not become online and idle within %s", name, timeout)
+			}
+			return Runner{}, fmt.Errorf("runner %q did not become online within %s", name, timeout)
 		}
 		select {
 		case <-ctx.Done():

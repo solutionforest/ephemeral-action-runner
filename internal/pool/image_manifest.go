@@ -23,19 +23,20 @@ const (
 )
 
 type ImageManifest struct {
-	SchemaVersion        int          `json:"schemaVersion"`
-	ProviderType         string       `json:"providerType"`
-	ProviderPlatform     string       `json:"providerPlatform,omitempty"`
-	ProviderRosettaTag   string       `json:"providerRosettaTag,omitempty"`
-	SourceType           string       `json:"sourceType,omitempty"`
-	SourceImage          string       `json:"sourceImage"`
-	SourcePlatform       string       `json:"sourcePlatform,omitempty"`
-	SourceDigest         string       `json:"sourceDigest,omitempty"`
-	OutputImage          string       `json:"outputImage"`
-	RunnerVersion        string       `json:"runnerVersion"`
-	UpstreamCommit       string       `json:"upstreamCommit,omitempty"`
-	EPARScripts          []fileDigest `json:"eparScripts,omitempty"`
-	CustomInstallScripts []fileDigest `json:"customInstallScripts,omitempty"`
+	SchemaVersion         int          `json:"schemaVersion"`
+	ProviderType          string       `json:"providerType"`
+	ProviderPlatform      string       `json:"providerPlatform,omitempty"`
+	ProviderRosettaTag    string       `json:"providerRosettaTag,omitempty"`
+	SourceType            string       `json:"sourceType,omitempty"`
+	SourceImage           string       `json:"sourceImage"`
+	SourcePlatform        string       `json:"sourcePlatform,omitempty"`
+	SourceDigest          string       `json:"sourceDigest,omitempty"`
+	OutputImage           string       `json:"outputImage"`
+	RunnerVersion         string       `json:"runnerVersion"`
+	UpstreamCommit        string       `json:"upstreamCommit,omitempty"`
+	EPARScripts           []fileDigest `json:"eparScripts,omitempty"`
+	CustomInstallScripts  []fileDigest `json:"customInstallScripts,omitempty"`
+	TrustedCACertificates []fileDigest `json:"trustedCaCertificates,omitempty"`
 }
 
 type fileDigest struct {
@@ -224,6 +225,11 @@ func (m *Manager) desiredImageManifest(ctx context.Context) (ImageManifest, erro
 		return manifest, err
 	}
 	manifest.CustomInstallScripts = customScripts
+	trustedCACertificates, err := m.trustedCACertificateDigests()
+	if err != nil {
+		return manifest, err
+	}
+	manifest.TrustedCACertificates = trustedCACertificates
 	if m.runnerImagesCopyMode() != runnerImagesCopyNone {
 		commit, err := m.runnerImagesCommit()
 		if err != nil {
@@ -304,6 +310,23 @@ func (m *Manager) customInstallScriptDigests() ([]fileDigest, error) {
 		if err != nil {
 			return nil, err
 		}
+		digest, err := m.fileDigest(path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, digest)
+	}
+	sortFileDigests(out)
+	return out, nil
+}
+
+func (m *Manager) trustedCACertificateDigests() ([]fileDigest, error) {
+	if _, err := m.trustedCACertificates(); err != nil {
+		return nil, err
+	}
+	var out []fileDigest
+	for _, configuredPath := range m.Config.Image.TrustedCACertificatePaths {
+		path := config.ProjectPath(m.ProjectRoot, strings.TrimSpace(configuredPath))
 		digest, err := m.fileDigest(path)
 		if err != nil {
 			return nil, err

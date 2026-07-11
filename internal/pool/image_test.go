@@ -84,6 +84,9 @@ func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 	if !strings.Contains(string(content), "FROM ${BASE_IMAGE}\nUSER root\n") {
 		t.Fatalf("Dockerfile does not force root user after FROM:\n%s", content)
 	}
+	if !strings.Contains(string(content), "RUN chmod 0755 /opt/epar/*.sh") {
+		t.Fatalf("Dockerfile does not normalize guest script permissions independently of umask:\n%s", content)
+	}
 	if !strings.Contains(string(content), imageManifestLabel) {
 		t.Fatalf("Dockerfile missing EPAR manifest label:\n%s", content)
 	}

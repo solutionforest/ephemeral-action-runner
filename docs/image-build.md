@@ -46,12 +46,13 @@ flowchart TD
 
 Several layers control what is pre-installed in the Ubuntu image:
 
-1. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
-2. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
-3. WSL builds from Docker-image sources validate Docker Engine from the base image and preserve source image environment metadata for runner jobs.
-4. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
-5. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
-6. `image.customInstallScripts` adds optional tool layers.
+1. `image.trustedCaCertificatePaths`, when configured, installs explicitly trusted enterprise CA certificates before guest install steps access the network.
+2. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
+3. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
+4. WSL builds from Docker-image sources validate Docker Engine from the base image and preserve source image environment metadata for runner jobs.
+5. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
+6. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
+7. `image.customInstallScripts` adds optional tool layers.
 
 ```mermaid
 flowchart LR
@@ -73,6 +74,29 @@ EPAR ships reusable install scripts for common cases:
 - `scripts/guest/ubuntu/install-web-e2e.sh` includes Docker/browser support and adds Node.js/npm, `zip`, `rsync`, and `mysql-client` for common web app and browser E2E workflows.
 
 Built-in install scripts call `scripts/guest/ubuntu/wait-apt-ready.sh` before package installs. It stops active `apt-daily` jobs for the current boot only, waits for dpkg locks to clear, and leaves Ubuntu's normal apt timer enablement unchanged in the finalized image.
+
+### Enterprise CA certificates
+
+If HTTPS traffic is inspected by an enterprise proxy, or install scripts use a
+private registry with an internal CA, provide the trusted CA explicitly:
+
+```yaml
+image:
+  trustedCaCertificatePaths:
+    - .local/enterprise-root.pem
+    - ~/company/intermediate.crt
+```
+
+Each path must be a readable PEM or DER X.509 CA certificate file, not a
+directory. Bundled PEM CA files are supported. EPAR rejects invalid or non-CA
+content before the build, normalizes certificate filenames from certificate
+fingerprints, and runs Ubuntu's `update-ca-certificates` before `apt`, `curl`,
+or runner downloads. Certificate paths and content digests are part of the EPAR
+image manifest, so certificate rotation invalidates image reuse.
+
+This keeps TLS verification enabled. Do not work around certificate errors with
+`curl -k`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, or package-manager verification
+disabling.
 
 ```yaml
 image:

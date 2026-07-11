@@ -8,5 +8,7 @@ if [[ -f /opt/epar/source-image.env ]]; then
   set +a
 fi
 
-cd /opt/actions-runner
+runner_work_dir="${EPAR_RUNNER_WORK_DIR:-/opt/actions-runner}"
+
+cd "${runner_work_dir}"
 exec ./run.sh

@@ -162,3 +162,4 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
 - [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
 - [Security](docs/security.md): trust boundaries and secret handling.
+- [Level 1 Core Runner Verification](docs/core-runner-verification.md): trusted live CI setup, canary behavior, and cleanup.
