@@ -117,10 +117,11 @@ For WSL, Tart, or custom labels, copy one example config into `.local/config.yml
 | --- | --- |
 | macOS Tart, runner-only | `configs/tart.example.yml` |
 | macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
-| Windows WSL2, default full Gitea runner image | `configs/wsl.example.yml` |
+| Windows WSL2, default full Catthehacker runner image | `configs/wsl.example.yml` |
 | Windows WSL2, lean runner-only tar | `configs/wsl.lean.example.yml` |
 | Windows WSL2, lean web/E2E tar | `configs/wsl.web-e2e.example.yml` |
-| Docker-DinD, default full Gitea runner image | `configs/docker-dind.example.yml` |
+| Docker-DinD, default full Catthehacker runner image | `configs/docker-dind.example.yml` |
+| Docker-DinD, Docker-focused Catthehacker Act image | `configs/docker-dind.act.example.yml` |
 | Docker-DinD, smaller web/E2E custom image | `configs/docker-dind.web-e2e.example.yml` |
 
 macOS:
@@ -171,7 +172,7 @@ EPAR only configures runner-side Docker daemons; it does not run or secure the m
 
 Skip this section for Tart and Docker-DinD.
 
-The default WSL config starts from `gitea/runner-images:ubuntu-latest-full`. During `image build`, EPAR runs Docker on the Windows host to pull that image, create a temporary container, export its filesystem into a rootfs tar, and then import that tar into WSL for EPAR's normal runner bootstrap. Docker is needed for this preparation step. Running WSL runner instances afterward does not require Docker Desktop unless your jobs need it.
+The default WSL config starts from `ghcr.io/catthehacker/ubuntu:full-latest`. During `image build`, EPAR runs Docker on the Windows host to pull that image, create a temporary container, export its filesystem into a rootfs tar, and then import that tar into WSL for EPAR's normal runner bootstrap. Docker is needed for this preparation step. Running WSL runner instances afterward does not require Docker Desktop unless your jobs need it.
 
 If you use `configs/wsl.lean.example.yml`, `configs/wsl.web-e2e.example.yml`, or another `image.sourceType: rootfs-tar` config, create the clean Ubuntu 24.04 source tar once:
 
@@ -211,24 +212,24 @@ tart list
 The default WSL output is a rootfs tar path:
 
 ```text
-work/images/epar-wsl-gitea-ubuntu.tar
+work/images/epar-wsl-catthehacker-ubuntu.tar
 ```
 
-When the WSL source is a Docker image, EPAR also writes an intermediate source rootfs tar and env cache next to the output image, for example `work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar` and `.env`. Later builds reuse that source cache; delete those files when you intentionally want to reconvert the Docker image.
+When the WSL source is a Docker image, EPAR also writes an intermediate source rootfs tar and env cache next to the output image, for example `work/images/epar-wsl-catthehacker-ubuntu.source.rootfs.tar` and `.env`. Later builds reuse that source cache; delete those files when you intentionally want to reconvert the Docker image.
 
 EPAR also writes image manifests so `start` can tell whether the local image still matches the config. Docker-DinD stores the manifest hash as a Docker image label and stores the manifest at `/opt/epar/image-manifest.json`. WSL stores `/opt/epar/image-manifest.json` inside the exported image and writes a sidecar next to the tar.
 
-Docker-DinD output is a Docker image tag, such as `epar-docker-dind-gitea-ubuntu`. Confirm it with:
+Docker-DinD output is a Docker image tag, such as `epar-docker-dind-catthehacker-ubuntu`. Confirm it with:
 
 ```bash
-docker image ls epar-docker-dind-gitea-ubuntu
+docker image ls epar-docker-dind-catthehacker-ubuntu
 ```
 
 Build logs are written under `work/logs`.
 
 ## Customize The Image
 
-WSL and Docker-DinD use the full Gitea runner image by default. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker-DinD web/E2E examples:
+WSL and Docker-DinD use the full Catthehacker runner image by default. For Docker-focused jobs, `configs/docker-dind.act.example.yml` uses the smaller Catthehacker Act image, which includes Node and the Docker Engine/CLI/Compose/Buildx stack EPAR needs. It does not guarantee browser dependencies; use `configs/docker-dind.web-e2e.example.yml` for Playwright or other browser tests. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker-DinD web/E2E examples:
 
 ```yaml
 image:
@@ -320,19 +321,25 @@ runs-on: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-r
 For the default WSL image, target the default WSL label:
 
 ```yaml
-runs-on: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
+runs-on: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
 ```
 
 For the default Docker-DinD image, target the default Docker-DinD label:
 
 ```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
+runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
+```
+
+For the Docker-focused Act image, target its dedicated label:
+
+```yaml
+runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-act]
 ```
 
 For Docker-DinD web/E2E images, target the custom web/E2E label:
 
 ```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-gitea-ubuntu-web-e2e]
+runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu-web-e2e]
 ```
 
 When that Docker-DinD runner is used for amd64-only runtime images, keep the workflow's Docker platform explicit, for example `DOCKER_PLATFORM=linux/amd64` or the equivalent variable used by your compose scripts, and verify the host runtime supports amd64 emulation as described above.

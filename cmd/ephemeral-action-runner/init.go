@@ -264,8 +264,8 @@ func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, p
 
 image:
   sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest-full
-  outputImage: epar-docker-dind-gitea-ubuntu
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  outputImage: epar-docker-dind-catthehacker-ubuntu
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -277,13 +277,13 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu]
+  labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
 
 provider:
   type: docker-dind
-  sourceImage: epar-docker-dind-gitea-ubuntu
+  sourceImage: epar-docker-dind-catthehacker-ubuntu
   network: default
 
 docker:

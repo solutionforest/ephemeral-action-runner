@@ -143,7 +143,7 @@ runner registrations within the same prefix boundary.
 ### Image build or Docker workload fails
 
 - Check controller disk space and Docker health.
-- Confirm outbound access to the pinned Gitea and BusyBox images.
+- Confirm outbound access to the pinned Catthehacker and BusyBox images.
 - For nested-Docker startup failures, inspect the grouped Docker-DinD runner-log
   tail in the controller output.
 

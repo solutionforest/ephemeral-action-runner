@@ -19,31 +19,46 @@ Use `configs/docker-dind.example.yml` for a base runner image:
 ```yaml
 image:
   sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest-full
-  outputImage: epar-docker-dind-gitea-ubuntu
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  outputImage: epar-docker-dind-catthehacker-ubuntu
 
 provider:
   type: docker-dind
-  sourceImage: epar-docker-dind-gitea-ubuntu
+  sourceImage: epar-docker-dind-catthehacker-ubuntu
   network: default
 ```
 
-Use `configs/docker-dind.web-e2e.example.yml` as a smaller customized-image example. It starts from `gitea/runner-images:ubuntu-latest` and layers only the web/E2E add-on:
+Use `configs/docker-dind.act.example.yml` for a smaller Docker-focused runner. Its Catthehacker Act base includes Node plus Docker Engine/CLI/Compose/Buildx, but does not guarantee a browser runtime:
 
 ```yaml
 image:
   sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest
-  outputImage: epar-docker-dind-gitea-ubuntu-web-e2e
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  outputImage: epar-docker-dind-catthehacker-act
+
+runner:
+  labels: [self-hosted, linux, epar-docker-dind-catthehacker-act]
+
+provider:
+  sourceImage: epar-docker-dind-catthehacker-act
+```
+
+Use `configs/docker-dind.web-e2e.example.yml` as a smaller customized-image example. It starts from `ghcr.io/catthehacker/ubuntu:act-latest` and layers only the web/E2E add-on:
+
+```yaml
+image:
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  outputImage: epar-docker-dind-catthehacker-ubuntu-web-e2e
   customInstallScripts:
     - scripts/guest/ubuntu/install-web-e2e.sh
 
 runner:
-  labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu-web-e2e]
+  labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu-web-e2e]
   includeHostLabel: true
 
 provider:
-  sourceImage: epar-docker-dind-gitea-ubuntu-web-e2e
+  sourceImage: epar-docker-dind-catthehacker-ubuntu-web-e2e
 ```
 
 `provider.platform` is optional and maps to Docker's `--platform` flag for image builds and runner containers. Use a label that reflects the actual platform your workflows should target.
@@ -82,10 +97,10 @@ Docker-DinD images are Docker image tags, not Tart images or rootfs tar files:
 
 ```bash
 ./bin/ephemeral-action-runner image build --replace
-docker image ls epar-docker-dind-gitea-ubuntu
+docker image ls epar-docker-dind-catthehacker-ubuntu
 ```
 
-The default build starts from `gitea/runner-images:ubuntu-latest-full`, installs the GitHub Actions runner and EPAR helper scripts, and reuses the base image's Docker Engine/CLI/Compose/Buildx. The generated image also includes `/opt/epar/container-entrypoint.sh`, which starts the private inner `dockerd` when the runner container starts.
+The default build starts from `ghcr.io/catthehacker/ubuntu:full-latest`, installs the GitHub Actions runner and EPAR helper scripts, and reuses the base image's Docker Engine/CLI/Compose/Buildx. The generated image also includes `/opt/epar/container-entrypoint.sh`, which starts the private inner `dockerd` when the runner container starts.
 
 Run `image update-upstream` only when selected install scripts need EPAR's pinned `actions/runner-images` checkout, such as the web/E2E script.
 

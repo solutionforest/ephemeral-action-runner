@@ -345,13 +345,13 @@ provider:
 	if got, want := cfg.Image.SourceType, ImageSourceDockerImage; got != want {
 		t.Fatalf("image.sourceType = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Image.SourcePlatform, "linux/amd64"; got != want {
 		t.Fatalf("image.sourcePlatform = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "work/images/epar-wsl-gitea-ubuntu.tar"; got != want {
+	if got, want := cfg.Image.OutputImage, "work/images/epar-wsl-catthehacker-ubuntu.tar"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
@@ -449,10 +449,10 @@ provider:
 	if got, want := cfg.Image.SourceType, ImageSourceDockerImage; got != want {
 		t.Fatalf("image.sourceType = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "epar-docker-dind-gitea-ubuntu"; got != want {
+	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
@@ -461,7 +461,7 @@ provider:
 	if got, want := cfg.Pool.NamePrefix, "epar-dind"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
-	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-gitea-ubuntu"; got != want {
+	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-catthehacker-ubuntu"; got != want {
 		t.Fatalf("runner label = %q, want %q", got, want)
 	}
 	if err := Validate(cfg); err != nil {

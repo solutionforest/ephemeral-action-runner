@@ -20,19 +20,19 @@ Use `configs/wsl.example.yml` as the starting point:
 ```yaml
 image:
   sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest-full
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64
-  outputImage: work/images/epar-wsl-gitea-ubuntu.tar
+  outputImage: work/images/epar-wsl-catthehacker-ubuntu.tar
   customInstallScripts:
     # - examples/custom-install/install-extra-apt-tools.sh
 
 runner:
-  labels: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
+  labels: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
   includeHostLabel: true
 
 provider:
   type: wsl
-  sourceImage: work/images/epar-wsl-gitea-ubuntu.tar
+  sourceImage: work/images/epar-wsl-catthehacker-ubuntu.tar
   installRoot: work/wsl
 ```
 
@@ -44,7 +44,7 @@ Use `configs/wsl.lean.example.yml` when you want the smaller tar-first path. Exi
 
 For the default full WSL image, EPAR uses Docker on the Windows host during `image build`:
 
-1. `docker pull --platform linux/amd64 gitea/runner-images:ubuntu-latest-full`
+1. `docker pull --platform linux/amd64 ghcr.io/catthehacker/ubuntu:full-latest`
 2. `docker create` a temporary stopped container
 3. `docker container inspect` to capture image environment metadata
 4. `docker export` the container filesystem into an intermediate rootfs tar
@@ -60,7 +60,7 @@ Docker is required only for the Docker-image conversion step. Running WSL pool i
 
 The WSL image build writes `/etc/wsl.conf` with systemd enabled and `appendWindowsPath=false`, restarts the temporary distro, then installs the GitHub Actions runner inside the distro. Disabling Windows PATH injection keeps validation and jobs from accidentally resolving host-installed tools such as Windows Docker or Node.
 
-The default WSL full image expects Docker Engine, dockerd, Compose v2, Buildx, and iptables to already exist in `gitea/runner-images:ubuntu-latest-full`. EPAR validates those tools and marks the image with `/opt/epar/features/docker-engine` so `pool verify` proves:
+The default WSL full image expects Docker Engine, dockerd, Compose v2, Buildx, and iptables to already exist in `ghcr.io/catthehacker/ubuntu:full-latest`. EPAR validates those tools and marks the image with `/opt/epar/features/docker-engine` so `pool verify` proves:
 
 ```bash
 sudo -u runner -H docker version
@@ -76,7 +76,8 @@ sudo -u runner -H docker version
 sudo -u runner -H docker compose version
 sudo -u runner -H docker buildx version
 sudo -u runner -H docker run --rm hello-world
-sudo -u runner -H chromium --headless --no-sandbox --dump-dom https://www.w3.org/
+printf '%s\n' '<p>EPAR browser validation marker</p>' >/tmp/epar-browser-validation.html
+sudo -u runner -H chromium --headless --no-sandbox --dump-dom file:///tmp/epar-browser-validation.html
 ```
 
 The provider does not mount the Windows Docker Desktop socket. Docker-enabled jobs run against Docker Engine inside the WSL distro.
@@ -93,7 +94,7 @@ If `docker.registryMirrors` is configured, EPAR applies it to Docker Engine insi
 - WSL distros share the WSL kernel and host integration surface.
 - Use this provider for trusted internal jobs unless your environment has reviewed and accepted the isolation model.
 - The default Docker-image source needs Docker Desktop, Docker Engine, or another reachable Docker daemon during `image build`.
-- The full Gitea runner image is large and needs enough disk for the pulled Docker image, the intermediate source rootfs tar, the temporary WSL import, and the final WSL tar.
+- The full Catthehacker runner image is large and needs enough disk for the pulled Docker image, the intermediate source rootfs tar, the temporary WSL import, and the final WSL tar.
 - Expect one long-lived host `wsl.exe` process per running disposable runner. This is intentional and keeps the WSL distro alive while it waits for jobs.
 - Cleanup only unregisters distros whose names match `pool.namePrefix`.
 

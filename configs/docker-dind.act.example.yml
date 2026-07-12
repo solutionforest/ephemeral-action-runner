@@ -7,9 +7,8 @@ github:
 
 image:
   sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest@sha256:2362bb12b0c61438d334b9ed3686809981796a864ab89d93b5ee657652774eb7
-  sourcePlatform: linux/amd64
-  outputImage: epar-ci-core
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  outputImage: epar-docker-dind-catthehacker-act
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -17,24 +16,23 @@ image:
 
 pool:
   instances: 1
-  namePrefix: epar-ci-core
+  # Must be unique for this machine/config within the GitHub organization.
+  namePrefix: CHANGE-ME-unique-machine-prefix
   logDir: work/logs
 
 runner:
-  group: epar-ci-canary
-  labels: [epar-core-CHANGE-ME]
-  includeHostLabel: false
-  noDefaultLabels: true
+  labels: [self-hosted, linux, epar-docker-dind-catthehacker-act]
+  includeHostLabel: true
   ephemeral: true
 
 provider:
   type: docker-dind
-  sourceImage: epar-ci-core
+  sourceImage: epar-docker-dind-catthehacker-act
   network: default
-  platform: linux/amd64
 
 docker:
   registryMirrors:
+    # - http://host.docker.internal:5050
 
 timeouts:
   bootSeconds: 180

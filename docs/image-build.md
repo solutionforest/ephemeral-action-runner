@@ -12,17 +12,17 @@ These are Tart VM image names. They are stored in Tart's local VM registry and a
 For WSL, the image build produces a rootfs tar. It can start from either a Docker image or an existing rootfs tar:
 
 - `image.sourceType`: `docker-image` or `rootfs-tar`, default `docker-image` for WSL.
-- `image.sourceImage`: source Docker image or rootfs tar, default `gitea/runner-images:ubuntu-latest-full`.
+- `image.sourceImage`: source Docker image or rootfs tar, default `ghcr.io/catthehacker/ubuntu:full-latest`.
 - `image.sourcePlatform`: Docker platform used when `sourceType` is `docker-image`, default `linux/amd64`.
-- `image.outputImage`: reusable EPAR runner rootfs tar, default `work/images/epar-wsl-gitea-ubuntu.tar`.
+- `image.outputImage`: reusable EPAR runner rootfs tar, default `work/images/epar-wsl-catthehacker-ubuntu.tar`.
 
 For `docker-image` sources, EPAR pulls the source image, creates a temporary container, exports that container filesystem to an intermediate rootfs tar, and captures the image environment metadata. Later builds reuse the intermediate rootfs only when the cached source manifest still matches the source image, platform, and digest. The WSL build then imports the rootfs into a temporary distro, enables systemd, installs the runner runtime, writes the captured image env under `/opt/epar`, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
 
 For Docker-DinD, the image build uses Docker images:
 
 - `image.sourceType`: `docker-image`.
-- `image.sourceImage`: maintained Gitea Ubuntu runner image, default `gitea/runner-images:ubuntu-latest-full`.
-- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-gitea-ubuntu`.
+- `image.sourceImage`: maintained Catthehacker Ubuntu runner image, default `ghcr.io/catthehacker/ubuntu:full-latest`.
+- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-catthehacker-ubuntu`.
 
 Docker-DinD builds a thin wrapper over the source image, installs the GitHub Actions runner, reuses Docker Engine/CLI/Compose/Buildx from the base image when they are already present, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
 
@@ -66,12 +66,12 @@ flowchart LR
   Optional --> Yours["your scripts"]
 ```
 
-The public WSL and Docker-DinD default examples start from `gitea/runner-images:ubuntu-latest-full`, so they inherit Docker plus the broader Gitea runner tool stack. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always needs Docker Engine because the provider depends on a private inner Docker daemon.
+The public WSL and Docker-DinD default examples start from `ghcr.io/catthehacker/ubuntu:full-latest`, so they inherit Docker plus the broader Catthehacker runner tool stack. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always needs Docker Engine because the provider depends on a private inner Docker daemon.
 
 EPAR ships reusable install scripts for common cases:
 
 - `scripts/guest/ubuntu/install-docker-browser.sh` installs Docker Engine, Docker CLI, Compose v2, Buildx, and a Chromium-compatible browser.
-- `scripts/guest/ubuntu/install-web-e2e.sh` includes Docker/browser support and adds Node.js/npm, `zip`, `rsync`, and `mysql-client` for common web app and browser E2E workflows.
+- `scripts/guest/ubuntu/install-web-e2e.sh` includes Docker/browser support and ensures Node.js/npm, `zip`, `rsync`, and `mysql-client` for common web app and browser E2E workflows.
 
 Built-in install scripts call `scripts/guest/ubuntu/wait-apt-ready.sh` before package installs. It stops active `apt-daily` jobs for the current boot only, waits for dpkg locks to clear, and leaves Ubuntu's normal apt timer enablement unchanged in the finalized image.
 
@@ -104,7 +104,7 @@ image:
     - scripts/guest/ubuntu/install-web-e2e.sh
 ```
 
-The built-in `install-web-e2e.sh` script adds Node.js/npm through the pinned GitHub runner-image `install-nodejs.sh` script, plus `zip`, `rsync`, and `mysql-client`. It does not install MySQL server, project dependencies, `node_modules`, Playwright test packages, Playwright browser cache, Docker credentials, or application runtime secrets.
+The built-in `install-web-e2e.sh` script reuses base-image Node.js/npm only when its numeric Node major version meets the pinned toolset's `.node.default`; otherwise, it installs Node.js/npm through the pinned GitHub runner-image `install-nodejs.sh` script. It also adds `zip`, `rsync`, and `mysql-client`. It does not install MySQL server, project dependencies, `node_modules`, Playwright test packages, Playwright browser cache, Docker credentials, or application runtime secrets.
 
 Use the web/E2E examples when workflows need this larger toolset:
 
@@ -164,7 +164,7 @@ Docker registry mirrors are runtime configuration, not image content. Keep them 
 
 ## Upstream Runner Images
 
-Runner-only Tart images and the default WSL and Docker-DinD images do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker-DinD images start from `gitea/runner-images:ubuntu-latest-full`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Gitea runner tool stack.
+Runner-only Tart images and the default WSL and Docker-DinD images do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker-DinD images start from `ghcr.io/catthehacker/ubuntu:full-latest`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Catthehacker runner tool stack.
 
 The built-in Docker/browser and web/E2E scripts require a pinned checkout of `actions/runner-images`:
 
@@ -184,7 +184,7 @@ When one of those built-in scripts is selected, the build copies only the requir
 
 ## Docker-DinD Images
 
-Use `configs/docker-dind.example.yml` for the default full Gitea runner container with a private Docker daemon. Use `configs/docker-dind.web-e2e.example.yml` as the smaller customized-image example when you want to start from `gitea/runner-images:ubuntu-latest` and add only the web/E2E layer.
+Use `configs/docker-dind.example.yml` for the default full Catthehacker runner container with a private Docker daemon. For smaller Docker-focused workloads, use `configs/docker-dind.act.example.yml`, which starts from `ghcr.io/catthehacker/ubuntu:act-latest` without custom install scripts. It includes Node plus Docker Engine/CLI/Compose/Buildx, but does not guarantee browser dependencies. Use `configs/docker-dind.web-e2e.example.yml` when workflows need Playwright or another browser workload; it starts from the same Act base and layers the web/E2E add-on.
 
 ```bash
 cp configs/docker-dind.example.yml .local/config.yml
@@ -196,35 +196,35 @@ Run `image update-upstream` first when using `configs/docker-dind.web-e2e.exampl
 The output image is a Docker image tag:
 
 ```bash
-docker image ls epar-docker-dind-gitea-ubuntu
+docker image ls epar-docker-dind-catthehacker-ubuntu
 ```
 
 The provider creates each runner instance with `docker create --privileged` and no host socket mount. The image entrypoint starts a private `dockerd`, waits for `docker info`, and keeps the container alive while EPAR configures and monitors the GitHub runner process. Workflow Docker resources live inside that inner daemon. The inner daemon defaults to the `vfs` storage driver because it is reliable for nested Docker across Docker Desktop, OrbStack, and Linux Docker hosts; users can bake a different `EPAR_DOCKERD_STORAGE_DRIVER` into a derived image after validating the host.
 
 ## WSL Images
 
-Use `configs/wsl.example.yml` for the default full Gitea runner image converted into WSL:
+Use `configs/wsl.example.yml` for the default full Catthehacker runner image converted into WSL:
 
 ```powershell
 Copy-Item configs/wsl.example.yml .local/config.yml
 ./bin/ephemeral-action-runner image build --replace
 ```
 
-The default WSL build uses Docker on the Windows host only to prepare the source rootfs. It runs `docker pull`, `docker create`, `docker export`, and cleanup for `gitea/runner-images:ubuntu-latest-full`, then imports the exported rootfs into WSL and applies EPAR's normal lifecycle layer. If Docker is unavailable, use Docker Desktop, Docker Engine, or switch to `image.sourceType: rootfs-tar` with a prepared rootfs tar.
+The default WSL build uses Docker on the Windows host only to prepare the source rootfs. It runs `docker pull`, `docker create`, `docker export`, and cleanup for `ghcr.io/catthehacker/ubuntu:full-latest`, then imports the exported rootfs into WSL and applies EPAR's normal lifecycle layer. If Docker is unavailable, use Docker Desktop, Docker Engine, or switch to `image.sourceType: rootfs-tar` with a prepared rootfs tar.
 
 The output image is a WSL-importable rootfs tar:
 
 ```text
-work/images/epar-wsl-gitea-ubuntu.tar
+work/images/epar-wsl-catthehacker-ubuntu.tar
 ```
 
 EPAR also writes an intermediate source tar and env cache beside the output, for example:
 
 ```text
-work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar
-work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar.env
-work/images/epar-wsl-gitea-ubuntu.source.rootfs.tar.source.json
-work/images/epar-wsl-gitea-ubuntu.tar.epar-manifest.json
+work/images/epar-wsl-catthehacker-ubuntu.source.rootfs.tar
+work/images/epar-wsl-catthehacker-ubuntu.source.rootfs.tar.env
+work/images/epar-wsl-catthehacker-ubuntu.source.rootfs.tar.source.json
+work/images/epar-wsl-catthehacker-ubuntu.tar.epar-manifest.json
 ```
 
 Later builds reuse that source cache when its source manifest still matches. Delete those files when you intentionally want to reconvert the Docker image.
@@ -235,7 +235,9 @@ Use `configs/wsl.lean.example.yml` when you want the old smaller rootfs-tar path
 
 ## Installed Runtime
 
-The default WSL and Docker-DinD builds use `gitea/runner-images:ubuntu-latest-full` as the source image. It is larger than the lightweight Gitea image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
+The default WSL and Docker-DinD builds use `ghcr.io/catthehacker/ubuntu:full-latest` as the source image. It is larger than the medium Catthehacker act image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
+
+Catthehacker's `full-latest` and `act-latest` tags are rolling references. EPAR records the resolved source digest in its image manifest so a built image remains auditable, but a later `image build --replace` can consume a newer upstream digest. Pin `image.sourceImage` to a tested digest when rebuild reproducibility is required.
 
 The default build installs:
 
@@ -276,7 +278,8 @@ sudo -u runner -H docker version
 sudo -u runner -H docker compose version
 sudo -u runner -H docker buildx version
 sudo -u runner -H docker run --rm hello-world
-sudo -u runner -H chromium --headless --no-sandbox --dump-dom https://www.w3.org/
+printf '%s\n' '<p>EPAR browser validation marker</p>' >/tmp/epar-browser-validation.html
+sudo -u runner -H chromium --headless --no-sandbox --dump-dom file:///tmp/epar-browser-validation.html
 ```
 
 If the Rosetta feature marker is present, validation also verifies a real amd64 Linux container:
@@ -291,7 +294,7 @@ The bundled `scripts/guest/ubuntu/install-web-e2e.sh` script creates a feature m
 
 ## WSL Bootstrap
 
-The default WSL config does not require a manually exported Ubuntu tar. It uses Docker to convert `gitea/runner-images:ubuntu-latest-full` into a rootfs tar during `image build`.
+The default WSL config does not require a manually exported Ubuntu tar. It uses Docker to convert `ghcr.io/catthehacker/ubuntu:full-latest` into a rootfs tar during `image build`.
 
 For lean `image.sourceType: rootfs-tar` configs, create the clean Ubuntu tar once before `image build`. The supported path is to install an Ubuntu 24.04 WSL distro, export it, then use that tar as `image.sourceImage`:
 

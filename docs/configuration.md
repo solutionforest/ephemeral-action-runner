@@ -50,7 +50,7 @@ runner:
   labels:
     - self-hosted
     - linux
-    - epar-docker-dind-gitea-ubuntu
+    - epar-docker-dind-catthehacker-ubuntu
 ```
 
 Disable the automatic host-machine label:
@@ -111,9 +111,9 @@ addresses in ignored `.local/config.yml`, not tracked example files.
 
 ## Provider Defaults
 
-For `provider.type: docker-dind`, EPAR defaults to Gitea's full Ubuntu runner image and creates a Docker-DinD image named `epar-docker-dind-gitea-ubuntu`.
+For `provider.type: docker-dind`, EPAR defaults to Catthehacker's full Ubuntu runner image and creates a Docker-DinD image named `epar-docker-dind-catthehacker-ubuntu`.
 
-For `provider.type: wsl`, EPAR defaults to Gitea's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
+For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
 
 For `provider.type: tart`, start from `configs/tart.example.yml` and adjust labels or image scripts as needed.
 

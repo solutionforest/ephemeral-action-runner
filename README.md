@@ -25,7 +25,7 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 - **Warm pool:** keep ready self-hosted runners online after setup.
 - **Disposable jobs:** each runner is cleaned up after one job.
-- **Great default image:** Docker-DinD and WSL use Gitea's full Ubuntu runner image by default.
+- **Great default image:** Docker-DinD and WSL use Catthehacker's full Ubuntu runner image by default.
 - **Docker-friendly isolation:** Docker-DinD gives each runner its own private Docker daemon.
 - **Simple host use:** run Linux GitHub Actions jobs from a Windows, macOS, Linux, or Docker-capable host.
 
@@ -104,7 +104,7 @@ runs-on: [self-hosted]
 If you have multiple self-hosted runners and want this job to run on a specific kind of EPAR runner, add one of its extra labels to the list, e.g.:
 
 ```yaml
-runs-on: [self-hosted, epar-docker-dind-gitea-ubuntu]
+runs-on: [self-hosted, epar-docker-dind-catthehacker-ubuntu]
 ```
 
 EPAR also adds an `epar-host-<machine>` label by default, so you can see which host registered each runner. You only need to include that label in `runs-on` when you intentionally want a job to target one machine.
@@ -119,7 +119,7 @@ Docker-DinD is the default first choice. Other providers are available when they
 | WSL2 | You are on Windows and want runners as disposable WSL distros. |
 | Tart | You are on Apple Silicon macOS and want Linux VM runners; consider Docker-DinD first for Docker-heavy jobs because virtualization limits can affect compatibility. |
 
-WSL2 also defaults to Gitea's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
+WSL2 also defaults to Catthehacker's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
 
 See [Usage](docs/usage.md) for WSL, Tart, source builds, custom configs, and advanced options.
 

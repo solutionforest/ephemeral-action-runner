@@ -17,8 +17,8 @@ work/logs/epar-last-error.log
 Image build logs use provider-specific names, for example:
 
 ```text
-work/logs/epar-docker-dind-gitea-ubuntu.docker-build.log
-work/logs/epar-wsl-gitea-ubuntu.wsl-build.log
+work/logs/epar-docker-dind-catthehacker-ubuntu.docker-build.log
+work/logs/epar-wsl-catthehacker-ubuntu.wsl-build.log
 ```
 
 Check the EPAR version and selected config:
@@ -44,10 +44,10 @@ docker image ls
 To see the free space available to containers on the active Docker daemon:
 
 ```bash
-docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
-For a custom source image, replace `gitea/runner-images:ubuntu-latest-full` with the value from `image.sourceImage`.
+For a custom source image, replace `ghcr.io/catthehacker/ubuntu:full-latest` with the value from `image.sourceImage`.
 
 ### Windows Hosts
 
@@ -57,10 +57,10 @@ For Windows hosts that use WSL2, Docker Desktop's WSL2 backend, or the WSL provi
 wsl --version
 wsl -l -v
 docker context ls
-docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
-`gitea/runner-images:ubuntu-latest-full` is the default source image for EPAR's default config. If your config uses a custom source image, replace it with your configured `image.sourceImage`.
+`ghcr.io/catthehacker/ubuntu:full-latest` is the default source image for EPAR's default config. If your config uses a custom source image, replace it with your configured `image.sourceImage`.
 
 Docker Desktop's WSL2 backend stores Docker data in a WSL-backed virtual disk. Windows Explorer free space and container-visible free space are related, but they are not the same number.
 
@@ -79,7 +79,7 @@ Docker Desktop and OrbStack keep Linux container data inside their own VM/storag
 
 ```bash
 docker system df
-docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
 If the container-visible disk is full, adjust or clean the Docker/OrbStack storage from that product's settings. Finder free space by itself may not reflect the Linux VM storage available to containers.
@@ -103,7 +103,7 @@ This error is raised inside the temporary container or guest that is building th
 Check the active Docker daemon:
 
 ```bash
-docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 docker system df
 ```
 
@@ -139,12 +139,12 @@ You may also see these errors for `packages.microsoft.com` or `dl.google.com` du
 
 ### What It Means
 
-The network between the container and the remote server is intercepting TLS connections. Antivirus, endpoint security, or corporate proxies re-sign HTTPS traffic with a local root CA that is not included in the Ubuntu CA bundle inside the runner image. The base image `gitea/runner-images:ubuntu-latest-full` trusts only standard public CAs, so the intercepted certificate chain fails verification.
+The network between the container and the remote server is intercepting TLS connections. Antivirus, endpoint security, or corporate proxies re-sign HTTPS traffic with a local root CA that is not included in the Ubuntu CA bundle inside the runner image. The base image `ghcr.io/catthehacker/ubuntu:full-latest` trusts only standard public CAs, so the intercepted certificate chain fails verification.
 
 You can confirm the intercept from inside a container:
 
 ```bash
-docker run --rm --user root gitea/runner-images:ubuntu-latest-full bash -c \
+docker run --rm --user root ghcr.io/catthehacker/ubuntu:full-latest bash -c \
   "openssl s_client -connect api.github.com:443 -servername api.github.com </dev/null 2>/dev/null | openssl x509 -noout -issuer"
 ```
 
@@ -185,7 +185,7 @@ This also applies to other TLS-inspecting proxies, firewalls, or endpoint-securi
 On a Windows machine where WSL2 storage was set up before 2021, the Docker container filesystem may report about 251 GB total:
 
 ```powershell
-docker run --rm gitea/runner-images:ubuntu-latest-full df -h /
+docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
 Example:
@@ -204,7 +204,7 @@ overlay        1007G  127G  830G  14% /
 
 ### Why It Happens
 
-This is a Windows Docker Desktop / WSL2 storage detail, not an EPAR image-size issue. The command reports the size of Docker Desktop's Linux container storage, not the size of `gitea/runner-images:ubuntu-latest-full`.
+This is a Windows Docker Desktop / WSL2 storage detail, not an EPAR image-size issue. The command reports the size of Docker Desktop's Linux container storage, not the size of `ghcr.io/catthehacker/ubuntu:full-latest`.
 
 For Windows machines where WSL2 storage was set up before 2021, the default WSL2 virtual disk maximum may be about 256 GB. For WSL2 setups created after the WSL 0.58.0 change, released in 2022, Microsoft's documentation says the default maximum for each WSL2 VHD is 1 TB. This can explain why one Windows machine reports about 251 GB while another reports about 1007 GB for the container-visible filesystem.
 
@@ -266,7 +266,7 @@ If the default WSL image build fails before importing or starting the temporary 
 
 ```powershell
 docker version
-docker pull gitea/runner-images:ubuntu-latest-full
+docker pull ghcr.io/catthehacker/ubuntu:full-latest
 wsl -l -v
 ```
 

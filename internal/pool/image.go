@@ -907,7 +907,7 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestC
 		}
 		fmt.Fprintf(&customRuns, "RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/custom-install/%s\n", name)
 	}
-	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=gitea/runner-images:ubuntu-latest-full
+	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=ghcr.io/catthehacker/ubuntu:full-latest
 FROM ${BASE_IMAGE}
 USER root
 ARG RUNNER_VERSION=latest

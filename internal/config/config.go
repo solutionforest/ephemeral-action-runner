@@ -344,14 +344,14 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			if sourceType == ImageSourceRootFSTar {
 				cfg.Image.SourceImage = "work/images/ubuntu-24.04-clean.rootfs.tar"
 			} else {
-				cfg.Image.SourceImage = "gitea/runner-images:ubuntu-latest-full"
+				cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
 			}
 		}
 		if !explicit["image.outputImage"] {
 			if sourceType == ImageSourceRootFSTar {
 				cfg.Image.OutputImage = "work/images/epar-ubuntu-24-wsl.tar"
 			} else {
-				cfg.Image.OutputImage = "work/images/epar-wsl-gitea-ubuntu.tar"
+				cfg.Image.OutputImage = "work/images/epar-wsl-catthehacker-ubuntu.tar"
 			}
 		}
 		if sourceType == ImageSourceDockerImage && !explicit["image.sourcePlatform"] {
@@ -364,7 +364,7 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			if sourceType == ImageSourceRootFSTar {
 				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-ubuntu-24.04-base"}
 			} else {
-				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-gitea-ubuntu"}
+				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-catthehacker-ubuntu"}
 			}
 		}
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
@@ -375,16 +375,16 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			cfg.Image.SourceType = ImageSourceDockerImage
 		}
 		if !explicit["image.sourceImage"] {
-			cfg.Image.SourceImage = "gitea/runner-images:ubuntu-latest-full"
+			cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
 		}
 		if !explicit["image.outputImage"] {
-			cfg.Image.OutputImage = "epar-docker-dind-gitea-ubuntu"
+			cfg.Image.OutputImage = "epar-docker-dind-catthehacker-ubuntu"
 		}
 		if !explicit["provider.sourceImage"] {
 			cfg.Provider.SourceImage = cfg.Image.OutputImage
 		}
 		if !explicit["runner.labels"] {
-			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-gitea-ubuntu"}
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-catthehacker-ubuntu"}
 		}
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
 			cfg.Pool.NamePrefix = "epar-dind"

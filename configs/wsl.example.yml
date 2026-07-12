@@ -7,9 +7,9 @@ github:
 
 image:
   sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest-full
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64
-  outputImage: work/images/epar-wsl-gitea-ubuntu.tar
+  outputImage: work/images/epar-wsl-catthehacker-ubuntu.tar
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -23,13 +23,13 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, X64, epar-wsl-gitea-ubuntu]
+  labels: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
 
 provider:
   type: wsl
-  sourceImage: work/images/epar-wsl-gitea-ubuntu.tar
+  sourceImage: work/images/epar-wsl-catthehacker-ubuntu.tar
   network: default
   installRoot: work/wsl
 
