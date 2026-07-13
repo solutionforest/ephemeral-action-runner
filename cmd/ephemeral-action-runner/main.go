@@ -321,8 +321,13 @@ func newProvider(cfg config.Config, projectRoot string, dryRun bool) (provider.P
 	case "wsl":
 		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.Provider.InstallRoot), projectRoot, dryRun), nil
 	case "docker-dind":
-		hostGateway := config.DockerRegistryMirrorsNeedHostGateway(cfg.Docker.RegistryMirrors)
-		return dockerdindprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, dryRun), nil
+		hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
+		environment := map[string]string{
+			"HTTP_PROXY":  cfg.Docker.HTTPProxy,
+			"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
+			"NO_PROXY":    cfg.Docker.NoProxy,
+		}
+		return dockerdindprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), nil
 	default:
 		return nil, provider.UnsupportedTypeError(cfg.Provider.Type)
 	}

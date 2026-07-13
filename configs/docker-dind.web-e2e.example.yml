@@ -7,8 +7,8 @@ github:
 
 image:
   sourceType: docker-image
-  sourceImage: gitea/runner-images:ubuntu-latest
-  outputImage: epar-docker-dind-gitea-ubuntu-web-e2e
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  outputImage: epar-docker-dind-catthehacker-ubuntu-web-e2e
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -22,13 +22,13 @@ pool:
   logDir: work/logs
 
 runner:
-  labels: [self-hosted, linux, epar-docker-dind-gitea-ubuntu-web-e2e]
+  labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu-web-e2e]
   includeHostLabel: true
   ephemeral: true
 
 provider:
   type: docker-dind
-  sourceImage: epar-docker-dind-gitea-ubuntu-web-e2e
+  sourceImage: epar-docker-dind-catthehacker-ubuntu-web-e2e
   network: default
 
 docker:

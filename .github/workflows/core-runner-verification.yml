@@ -1,0 +1,202 @@
+name: Core runner verification
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: epar-core-live
+  cancel-in-progress: false
+
+jobs:
+  controller:
+    name: Core runner controller
+    runs-on: ubuntu-latest
+    environment: epar-live-ci
+    # Leaves time for a cold image build and bounded cleanup around the
+    # controller's 40-minute canary deadline.
+    timeout-minutes: 70
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build EPAR
+        shell: bash
+        run: go build -trimpath -o "${RUNNER_TEMP}/ephemeral-action-runner" ./cmd/ephemeral-action-runner
+
+      - name: Orchestrate ephemeral canaries
+        shell: bash
+        env:
+          EPAR_BINARY: ${{ runner.temp }}/ephemeral-action-runner
+          EPAR_PROJECT_ROOT: ${{ github.workspace }}
+          EPAR_APP_ID: ${{ vars.EPAR_GITHUB_APP_ID }}
+          EPAR_ORGANIZATION: ${{ vars.EPAR_GITHUB_ORGANIZATION }}
+          EPAR_APP_PRIVATE_KEY: ${{ secrets.EPAR_GITHUB_APP_PRIVATE_KEY }}
+          CORE_POOL_PREFIX: epar-ci-core
+          CORE_RUNNER_GROUP: epar-ci-canary
+          CORE_CANARY_LABEL: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
+          CORE_MAX_WAIT_SECONDS: "2400"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci/core-runner-controller.sh
+
+      # This guard does not depend on checkout. If controller preparation fails
+      # before the helper starts, cancel the canaries that are waiting for a
+      # label which could never be provisioned.
+      - name: Cancel workflow after controller setup failure
+        if: ${{ failure() && !cancelled() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          api_url="${GITHUB_API_URL%/}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          headers=(
+            --header "Authorization: Bearer ${GITHUB_TOKEN}"
+            --header "Accept: application/vnd.github+json"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          if ! curl --fail --silent --show-error --output /dev/null \
+            --request POST "${headers[@]}" "${api_url}/cancel"; then
+            echo "Normal cancellation failed; attempting force cancellation." >&2
+            curl --fail --silent --show-error --output /dev/null \
+              --request POST "${headers[@]}" "${api_url}/force-cancel"
+          fi
+
+  canary-1:
+    name: Core canary 1
+    runs-on:
+      group: epar-ci-canary
+      labels: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Verify the core runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RUNNER_OS}" == "Linux" ]]
+          [[ "${RUNNER_ARCH}" == "X64" ]]
+          for command in bash curl docker git jq sudo; do
+            command -v "${command}" >/dev/null
+          done
+          docker info >/dev/null
+
+      - name: Record runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity_dir="${RUNNER_TEMP}/epar-core-identity"
+          mkdir -p "${identity_dir}"
+          printf '%s\n' "${RUNNER_NAME}" >"${identity_dir}/runner-name.txt"
+          printf '%s-%s-%s-%s\n' \
+            "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${GITHUB_JOB}" "${RANDOM}" \
+            >"${identity_dir}/nonce.txt"
+
+      - name: Upload runner identity
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epar-core-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/epar-core-identity
+          if-no-files-found: error
+          retention-days: 1
+
+  canary-2:
+    name: Core canary 2
+    needs: canary-1
+    runs-on:
+      group: epar-ci-canary
+      labels: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Download first runner identity
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: epar-core-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/epar-core-identity
+
+      - name: Prove ephemeral replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          first_runner="$(<"${RUNNER_TEMP}/epar-core-identity/runner-name.txt")"
+          nonce="$(<"${RUNNER_TEMP}/epar-core-identity/nonce.txt")"
+          [[ -n "${first_runner}" && -n "${nonce}" ]]
+          [[ "${first_runner}" == epar-ci-core-* ]]
+          [[ "${RUNNER_NAME}" == epar-ci-core-* ]]
+          if [[ "${first_runner}" == "${RUNNER_NAME}" ]]; then
+            echo "Expected a replacement runner, but both jobs ran on ${RUNNER_NAME}" >&2
+            exit 1
+          fi
+          echo "Runner ${first_runner} was replaced by ${RUNNER_NAME}."
+
+      - name: Exercise Buildx and Compose
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_dir="${RUNNER_TEMP}/epar-core-workload"
+          image="epar-core-workload:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export COMPOSE_PROJECT_NAME="eparcore${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${work_dir}"
+          cd "${work_dir}"
+
+          cleanup() {
+            docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+            docker image rm --force "${image}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          printf 'epar core runner healthy\n' >index.html
+          cat >Dockerfile <<'DOCKERFILE'
+          FROM busybox:1.37.0@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028
+          COPY index.html /www/index.html
+          HEALTHCHECK --interval=1s --timeout=2s --retries=30 CMD wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1
+          CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]
+          DOCKERFILE
+
+          docker buildx version
+          docker buildx build --load --tag "${image}" .
+
+          cat >compose.yml <<COMPOSE
+          services:
+            core:
+              image: ${image}
+              ports:
+                - "127.0.0.1:18080:8080"
+          COMPOSE
+
+          docker compose version
+          docker compose -f compose.yml up --detach --wait --wait-timeout 60
+          response="$(curl --fail --silent --show-error --retry 10 --retry-delay 1 http://127.0.0.1:18080/)"
+          [[ "${response}" == "epar core runner healthy" ]]

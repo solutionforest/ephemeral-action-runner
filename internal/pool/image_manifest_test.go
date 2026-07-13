@@ -193,7 +193,7 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 		runHostQuietCommand = oldQuiet
 	})
 	root := t.TempDir()
-	outputPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.tar")
+	outputPath := filepath.Join(root, "work", "images", "epar-wsl-catthehacker-ubuntu.tar")
 	rootfsPath := wslDockerSourceRootfsPath(outputPath)
 	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0755); err != nil {
 		t.Fatal(err)
@@ -205,7 +205,7 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := writeSourceCacheManifest(sourceCacheManifestPath(rootfsPath), sourceCacheManifest{
-		SourceImage:  "gitea/runner-images:ubuntu-latest-full",
+		SourceImage:  "ghcr.io/catthehacker/ubuntu:full-latest",
 		SourceDigest: "old",
 	}); err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 
 	manager := Manager{
 		Config: config.Config{
-			Image: config.ImageConfig{SourceImage: "gitea/runner-images:ubuntu-latest-full"},
+			Image: config.ImageConfig{SourceImage: "ghcr.io/catthehacker/ubuntu:full-latest"},
 		},
 		ProjectRoot: root,
 	}

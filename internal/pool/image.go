@@ -74,6 +74,9 @@ func (m *Manager) UpdateUpstream(ctx context.Context) error {
 }
 
 func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error {
+	if _, err := m.trustedCACertificates(); err != nil {
+		return err
+	}
 	upstreamDir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
 	copyMode := m.runnerImagesCopyMode()
 	if !opts.SkipUpstreamCheck && copyMode != runnerImagesCopyNone {
@@ -126,7 +129,7 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 	}
 	fmt.Printf("building Docker-DinD image %s from %s\n", m.Config.Image.OutputImage, m.Config.Image.SourceImage)
 	fmt.Printf("log: %s\n", buildLogPath)
-	args := []string{"build", "--progress=plain", "-t", m.Config.Image.OutputImage}
+	args := []string{"build", "-t", m.Config.Image.OutputImage}
 	if m.Config.Provider.Platform != "" {
 		args = append(args, "--platform", m.Config.Provider.Platform)
 	}
@@ -183,6 +186,9 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 	fmt.Printf("guest reachable at %s\n", ip)
 	fmt.Printf("copying guest scripts\n")
 	if err := m.installGuestScripts(ctx, m.Config.Image.OutputImage); err != nil {
+		return err
+	}
+	if err := m.installTrustedCACertificates(ctx, m.Config.Image.OutputImage); err != nil {
 		return err
 	}
 	if err := m.installImageManifest(ctx, m.Config.Image.OutputImage, *opts.Manifest); err != nil {
@@ -327,6 +333,9 @@ func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, ups
 	}
 	fmt.Printf("copying guest scripts\n")
 	if err := m.installGuestScripts(ctx, buildName); err != nil {
+		return err
+	}
+	if err := m.installTrustedCACertificates(ctx, buildName); err != nil {
 		return err
 	}
 	if err := m.installImageManifest(ctx, buildName, *opts.Manifest); err != nil {
@@ -880,6 +889,9 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestC
 	if err := os.MkdirAll(customDir, 0755); err != nil {
 		return err
 	}
+	if err := m.copyTrustedCACertificatesToDir(filepath.Join(buildCtx, "trusted-ca-certificates")); err != nil {
+		return err
+	}
 	if err := os.WriteFile(filepath.Join(buildCtx, "image-manifest.json"), []byte(manifestContent), 0644); err != nil {
 		return err
 	}
@@ -895,7 +907,7 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestC
 		}
 		fmt.Fprintf(&customRuns, "RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/custom-install/%s\n", name)
 	}
-	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=gitea/runner-images:ubuntu-latest-full
+	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=ghcr.io/catthehacker/ubuntu:full-latest
 FROM ${BASE_IMAGE}
 USER root
 ARG RUNNER_VERSION=latest
@@ -914,8 +926,10 @@ COPY scripts/guest/ubuntu/ /opt/epar/
 COPY scripts/container/ubuntu/entrypoint.sh /opt/epar/container-entrypoint.sh
 COPY upstream/runner-images/ /opt/epar/upstream/runner-images/
 COPY custom-install/ /opt/epar/custom-install/
+COPY trusted-ca-certificates/ `+trustedCAGuestDir+`/
 COPY image-manifest.json /opt/epar/image-manifest.json
-RUN chmod +x /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
+RUN chmod 0755 /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
+RUN bash /opt/epar/install-trusted-ca-certificates.sh
 RUN bash /opt/epar/install-base.sh /opt/epar/upstream/runner-images
 RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}"
 RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/install-docker-engine.sh /opt/epar/upstream/runner-images
@@ -1198,7 +1212,14 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(dst, content, mode)
+	if err := os.WriteFile(dst, content, mode); err != nil {
+		return err
+	}
+	// os.WriteFile applies the process umask when it creates a file. Image
+	// builds can run beneath a restrictive controller umask because the same
+	// process also handles GitHub App credentials, so enforce the requested
+	// build-context mode explicitly after writing.
+	return os.Chmod(dst, mode)
 }
 
 func resetLogs(paths ...string) error {

@@ -6,6 +6,8 @@ set -euo pipefail
 : "${RUNNER_NAME:?RUNNER_NAME is required}"
 : "${RUNNER_LABELS:?RUNNER_LABELS is required}"
 RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-true}"
+RUNNER_GROUP="${RUNNER_GROUP:-}"
+RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-false}"
 
 cd /opt/actions-runner
 if [[ -f .runner ]]; then
@@ -23,6 +25,12 @@ args=(
 )
 if [[ "${RUNNER_EPHEMERAL}" == "true" ]]; then
   args+=(--ephemeral)
+fi
+if [[ -n "${RUNNER_GROUP}" ]]; then
+  args+=(--runnergroup "${RUNNER_GROUP}")
+fi
+if [[ "${RUNNER_NO_DEFAULT_LABELS}" == "true" ]]; then
+  args+=(--no-default-labels)
 fi
 
 sudo -u runner ./config.sh "${args[@]}"

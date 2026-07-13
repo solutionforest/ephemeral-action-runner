@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -83,11 +84,61 @@ func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 	if !strings.Contains(string(content), "FROM ${BASE_IMAGE}\nUSER root\n") {
 		t.Fatalf("Dockerfile does not force root user after FROM:\n%s", content)
 	}
+	if !strings.Contains(string(content), "RUN chmod 0755 /opt/epar/*.sh") {
+		t.Fatalf("Dockerfile does not normalize guest script permissions independently of umask:\n%s", content)
+	}
 	if !strings.Contains(string(content), imageManifestLabel) {
 		t.Fatalf("Dockerfile missing EPAR manifest label:\n%s", content)
 	}
 	if _, err := os.Stat(filepath.Join(buildCtx, "image-manifest.json")); err != nil {
 		t.Fatalf("build context missing image manifest: %v", err)
+	}
+}
+
+func TestDockerDindBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{
+		filepath.Join(root, "scripts", "guest", "ubuntu"),
+		filepath.Join(root, "scripts", "container", "ubuntu"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager := Manager{
+		Config: config.Config{
+			Image: config.ImageConfig{
+				SourceImage:   "ghcr.io/catthehacker/ubuntu:full-latest",
+				OutputImage:   "epar-docker-dind-catthehacker-ubuntu",
+				RunnerVersion: "latest",
+			},
+			Pool:     config.PoolConfig{LogDir: "logs"},
+			Provider: config.ProviderConfig{Type: "docker-dind", Platform: "linux/amd64"},
+		},
+		ProjectRoot: root,
+		DryRun:      true,
+	}
+	manifest := ImageManifest{
+		SchemaVersion: imageManifestSchemaVersion,
+		ProviderType:  "docker-dind",
+		SourceType:    config.ImageSourceDockerImage,
+		SourceImage:   "ghcr.io/catthehacker/ubuntu:full-latest",
+		OutputImage:   "epar-docker-dind-catthehacker-ubuntu",
+		RunnerVersion: "latest",
+	}
+
+	out, err := capturePoolStdout(t, func() error {
+		return manager.buildDockerDindImage(context.Background(), ImageBuildOptions{Replace: true, Manifest: &manifest}, filepath.Join(root, "third_party", "runner-images"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "--progress") {
+		t.Fatalf("docker build command should not require BuildKit progress support:\n%s", out)
+	}
+	if !strings.Contains(out, "docker build -t epar-docker-dind-catthehacker-ubuntu --platform linux/amd64") {
+		t.Fatalf("docker build command missing expected base args:\n%s", out)
 	}
 }
 
@@ -129,6 +180,30 @@ func TestInstallCustomScriptsRunsInOrder(t *testing.T) {
 	if !reflect.DeepEqual(runCommands, want) {
 		t.Fatalf("custom script run commands = %#v, want %#v", runCommands, want)
 	}
+}
+
+func capturePoolStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() {
+		os.Stdout = oldStdout
+	}()
+
+	fnErr := fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out), fnErr
 }
 
 func TestRelativeCustomInstallScriptCannotEscapeProjectRoot(t *testing.T) {
@@ -251,18 +326,18 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	manager := Manager{
 		Config: config.Config{
 			Image: config.ImageConfig{
-				SourceImage:    "gitea/runner-images:ubuntu-latest-full",
+				SourceImage:    "ghcr.io/catthehacker/ubuntu:full-latest",
 				SourcePlatform: "linux/amd64",
 			},
 		},
 		ProjectRoot: root,
 	}
-	outputPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.tar")
+	outputPath := filepath.Join(root, "work", "images", "epar-wsl-catthehacker-ubuntu.tar")
 	rootfsPath, env, err := manager.prepareWSLDockerSourceRootfs(context.Background(), outputPath, filepath.Join(root, "build.log"), ImageManifest{SourceDigest: "digest-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := rootfsPath, filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.source.rootfs.tar"); got != want {
+	if got, want := rootfsPath, filepath.Join(root, "work", "images", "epar-wsl-catthehacker-ubuntu.source.rootfs.tar"); got != want {
 		t.Fatalf("rootfsPath = %q, want %q", got, want)
 	}
 	if _, err := os.Stat(rootfsPath); err != nil {
@@ -276,7 +351,7 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	}
 	joined := strings.Join(calls, "\n")
 	for _, want := range []string{
-		"docker pull --platform linux/amd64 gitea/runner-images:ubuntu-latest-full",
+		"docker pull --platform linux/amd64 ghcr.io/catthehacker/ubuntu:full-latest",
 		"docker create --platform linux/amd64 --name epar-wsl-source-",
 		"docker container inspect --format {{json .Config.Env}} epar-wsl-source-",
 		"docker export -o " + rootfsPath + ".tmp epar-wsl-source-",
@@ -317,8 +392,8 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	outputPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.tar")
-	rootfsPath := filepath.Join(root, "work", "images", "epar-wsl-gitea-ubuntu.source.rootfs.tar")
+	outputPath := filepath.Join(root, "work", "images", "epar-wsl-catthehacker-ubuntu.tar")
+	rootfsPath := filepath.Join(root, "work", "images", "epar-wsl-catthehacker-ubuntu.source.rootfs.tar")
 	if err := os.MkdirAll(filepath.Dir(rootfsPath), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +404,7 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := writeSourceCacheManifest(sourceCacheManifestPath(rootfsPath), sourceCacheManifest{
-		SourceImage:  "gitea/runner-images:ubuntu-latest-full",
+		SourceImage:  "ghcr.io/catthehacker/ubuntu:full-latest",
 		SourceDigest: "digest-1",
 	}); err != nil {
 		t.Fatal(err)
@@ -337,7 +412,7 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 
 	manager := Manager{
 		Config: config.Config{
-			Image: config.ImageConfig{SourceImage: "gitea/runner-images:ubuntu-latest-full"},
+			Image: config.ImageConfig{SourceImage: "ghcr.io/catthehacker/ubuntu:full-latest"},
 		},
 		ProjectRoot: root,
 	}

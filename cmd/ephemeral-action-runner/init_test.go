@@ -39,10 +39,10 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Provider.Type, "docker-dind"; got != want {
 		t.Fatalf("provider.type = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "epar-docker-dind-gitea-ubuntu"; got != want {
+	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Pool.Instances, 1; got != want {
@@ -51,7 +51,7 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Pool.NamePrefix, "build-box-01-a4f9c2"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
-	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-gitea-ubuntu") {
+	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-catthehacker-ubuntu") {
 		t.Fatalf("runner labels = %q", got)
 	}
 	if !strings.Contains(out.String(), "start") || !strings.Contains(out.String(), "pool up --instances 2") {
@@ -125,6 +125,26 @@ func TestGeneratedPoolNamePrefixTruncatesLongHostname(t *testing.T) {
 	}
 	if len(prefix) != 40 {
 		t.Fatalf("prefix length = %d, want 40", len(prefix))
+	}
+}
+
+func TestGeneratedPoolNamePrefixPrefersHostNameEnv(t *testing.T) {
+	oldHostname := initHostname
+	oldRandomRead := initRandomRead
+	initHostname = config.HostName
+	initRandomRead = fixedRandomRead([]byte{0xa4, 0xf9, 0xc2})
+	t.Cleanup(func() {
+		initHostname = oldHostname
+		initRandomRead = oldRandomRead
+	})
+	t.Setenv(config.HostNameEnv, "Real Windows Host")
+
+	prefix, err := generatedPoolNamePrefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prefix, "real-windows-host-a4f9c2"; got != want {
+		t.Fatalf("generatedPoolNamePrefix() = %q, want %q", got, want)
 	}
 }
 

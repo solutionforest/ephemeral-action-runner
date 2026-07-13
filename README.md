@@ -25,7 +25,7 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 - **Warm pool:** keep ready self-hosted runners online after setup.
 - **Disposable jobs:** each runner is cleaned up after one job.
-- **Great default image:** Docker-DinD and WSL use Gitea's full Ubuntu runner image by default.
+- **Great default image:** Docker-DinD and WSL use Catthehacker's full Ubuntu runner image by default.
 - **Docker-friendly isolation:** Docker-DinD gives each runner its own private Docker daemon.
 - **Simple host use:** run Linux GitHub Actions jobs from a Windows, macOS, Linux, or Docker-capable host.
 
@@ -33,17 +33,13 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
 
-### 1. Prerequisites
+### 1. Install Docker
 
-Make sure these are installed:
+The default quick start needs a Docker-compatible daemon:
 
-- [Go](https://go.dev/) 1.22 or newer
-- a Docker-compatible daemon:
-  - Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
-  - macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
-  - Linux: [Docker Engine](https://docs.docker.com/engine/)
-
-The default [Docker-DinD](https://www.docker.com/resources/docker-in-docker-containerized-ci-workflows-dockercon-2023/) mode uses `docker run --privileged`, so the daemon must support privileged Linux containers.
+- Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
+- macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
+- Linux: [Docker Engine](https://docs.docker.com/engine/)
 
 ### 2. Download EPAR Source
 
@@ -70,8 +66,10 @@ Follow [GitHub App Setup](docs/github-app.md), then keep these three values read
 Run EPAR with the default flow:
 
 ```bash
-go run ./cmd/ephemeral-action-runner
+./start
 ```
+
+On Windows, `./start` also works in modern PowerShell. If your shell does not run it, use `.\start.ps1` or `start.cmd`.
 
 That's it.
 
@@ -89,8 +87,8 @@ Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans
 
 To choose a config or runner count:
 
-```powershell
-go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
+```bash
+./start --config .local/custom-config.yml --instances 2
 ```
 
 If `--instances` is omitted, EPAR uses `pool.instances` from the config.
@@ -106,7 +104,7 @@ runs-on: [self-hosted]
 If you have multiple self-hosted runners and want this job to run on a specific kind of EPAR runner, add one of its extra labels to the list, e.g.:
 
 ```yaml
-runs-on: [self-hosted, epar-docker-dind-gitea-ubuntu]
+runs-on: [self-hosted, epar-docker-dind-catthehacker-ubuntu]
 ```
 
 EPAR also adds an `epar-host-<machine>` label by default, so you can see which host registered each runner. You only need to include that label in `runs-on` when you intentionally want a job to target one machine.
@@ -121,7 +119,7 @@ Docker-DinD is the default first choice. Other providers are available when they
 | WSL2 | You are on Windows and want runners as disposable WSL distros. |
 | Tart | You are on Apple Silicon macOS and want Linux VM runners; consider Docker-DinD first for Docker-heavy jobs because virtualization limits can affect compatibility. |
 
-WSL2 also defaults to Gitea's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
+WSL2 also defaults to Catthehacker's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
 
 See [Usage](docs/usage.md) for WSL, Tart, source builds, custom configs, and advanced options.
 
@@ -159,6 +157,9 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Tart Provider](docs/providers/tart.md): Apple Silicon Linux VM runners.
 - [Image Build](docs/image-build.md): image internals and customization.
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
+- [Troubleshooting](docs/troubleshooting.md): symptom-first diagnostics by host and provider.
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
+- [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
 - [Security](docs/security.md): trust boundaries and secret handling.
+- [Level 1 Core Runner Verification](docs/core-runner-verification.md): trusted live CI setup, canary behavior, and cleanup.

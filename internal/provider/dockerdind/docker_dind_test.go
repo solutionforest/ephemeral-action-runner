@@ -2,6 +2,7 @@ package dockerdind
 
 import (
 	"context"
+	"errors"
 	"io"
 	"reflect"
 	"strings"
@@ -11,7 +12,11 @@ import (
 )
 
 func TestCreateArgsUsePrivilegedWithoutHostSocketOrPorts(t *testing.T) {
-	p := NewWithOptions("docker", "linux/arm64", true, true)
+	p := NewWithOptions("docker", "linux/arm64", true, map[string]string{
+		"NO_PROXY":    "localhost,127.0.0.1",
+		"HTTPS_PROXY": "http://proxy.example.test:3128",
+		"HTTP_PROXY":  "http://proxy.example.test:3128",
+	}, true)
 	args := p.createArgs("runner-image", "epar-dind-1")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
@@ -20,12 +25,18 @@ func TestCreateArgsUsePrivilegedWithoutHostSocketOrPorts(t *testing.T) {
 		"--name epar-dind-1",
 		"--privileged",
 		"--add-host host.docker.internal:host-gateway",
+		"--env HTTP_PROXY=http://proxy.example.test:3128",
+		"--env HTTPS_PROXY=http://proxy.example.test:3128",
+		"--env NO_PROXY=localhost,127.0.0.1",
 		"--label epar.provider=docker-dind",
 		"runner-image",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("create args %q missing %q", joined, want)
 		}
+	}
+	if strings.Index(joined, "HTTP_PROXY=") > strings.Index(joined, "HTTPS_PROXY=") || strings.Index(joined, "HTTPS_PROXY=") > strings.Index(joined, "NO_PROXY=") {
+		t.Fatalf("create args proxy environment is not deterministic: %q", joined)
 	}
 	for _, forbidden := range []string{"/var/run/docker.sock", ".orbstack", "-p ", "--publish", "--network host"} {
 		if strings.Contains(joined, forbidden) {
@@ -85,5 +96,25 @@ func TestDryRunIPReturnsPlaceholder(t *testing.T) {
 	}
 	if ip != "127.0.0.1" {
 		t.Fatalf("ip = %q, want placeholder", ip)
+	}
+}
+
+func TestStopAndDeleteIgnoreMissingContainer(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(*Provider) error
+	}{
+		{name: "stop", call: func(p *Provider) error { return p.Stop(context.Background(), "epar-core-1") }},
+		{name: "delete", call: func(p *Provider) error { return p.Delete(context.Background(), "epar-core-1") }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := New("docker", "", false)
+			p.runCommand = func(_ context.Context, _ io.Reader, _ string, _ ...string) (provider.ExecResult, error) {
+				return provider.ExecResult{Stderr: "Error response from daemon: No such container: epar-core-1"}, errors.New("exit status 1")
+			}
+			if err := test.call(p); err != nil {
+				t.Fatalf("missing container should be idempotent, got %v", err)
+			}
+		})
 	}
 }

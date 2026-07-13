@@ -31,7 +31,7 @@ fi
 
 if [[ "${EPAR_REQUIRE_BASE_DOCKER_ENGINE:-false}" == "true" ]]; then
   echo "EPAR WSL Docker-image source did not provide Docker Engine, dockerd, Compose, Buildx, and iptables." >&2
-  echo "Use gitea/runner-images:ubuntu-latest-full, or choose image.sourceType=rootfs-tar with an install script that adds Docker." >&2
+  echo "Use ghcr.io/catthehacker/ubuntu:full-latest, or choose image.sourceType=rootfs-tar with an install script that adds Docker." >&2
   exit 1
 fi
 

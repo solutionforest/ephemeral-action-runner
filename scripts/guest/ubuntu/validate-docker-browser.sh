@@ -55,14 +55,20 @@ if [[ -z "${BROWSER}" ]]; then
   exit 1
 fi
 
+BROWSER_VALIDATION_HTML="$(mktemp /tmp/epar-browser-validation.XXXXXX.html)"
+trap 'rm -f "${BROWSER_VALIDATION_HTML}"' EXIT
+printf '%s\n' '<!doctype html><html><body>EPAR browser validation marker</body></html>' >"${BROWSER_VALIDATION_HTML}"
+chmod 0644 "${BROWSER_VALIDATION_HTML}"
+BROWSER_VALIDATION_URL="file://${BROWSER_VALIDATION_HTML}"
+
 for attempt in 1 2 3; do
-  if sudo -u runner -H "${BROWSER}" --headless --no-sandbox --disable-gpu --dump-dom https://www.w3.org/ >/tmp/w3-dom.html 2>/tmp/w3-browser.err &&
-    grep -Eiq 'W3C|World Wide Web Consortium' /tmp/w3-dom.html; then
+  if sudo -u runner -H "${BROWSER}" --headless --no-sandbox --disable-gpu --dump-dom "${BROWSER_VALIDATION_URL}" >/tmp/epar-browser-dom.html 2>/tmp/epar-browser.err &&
+    grep -Fq 'EPAR browser validation marker' /tmp/epar-browser-dom.html; then
     echo "Browser validation passed with ${BROWSER}"
     exit 0
   fi
   echo "Browser validation attempt ${attempt} failed" >&2
-  cat /tmp/w3-browser.err >&2 || true
+  cat /tmp/epar-browser.err >&2 || true
   sleep $((attempt * 5))
 done
 

@@ -11,6 +11,7 @@ func TestLoadYAMLSubset(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "CI Box 01", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -30,6 +31,8 @@ runner:
     - custom
   includeHostLabel: true
   ephemeral: true
+  group: epar-ci-canary
+  noDefaultLabels: true
 provider:
   type: tart
   sourceImage: runner-base
@@ -40,6 +43,9 @@ image:
   customInstallScripts:
     - .local/web-e2e.sh
     - /opt/epar/install-extra.sh
+  trustedCaCertificatePaths:
+    - .local/corporate-root.pem
+    - /opt/epar/enterprise-root.crt
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +62,12 @@ image:
 	if got, want := cfg.Runner.Labels[4], "epar-host-ci-box-01"; got != want {
 		t.Fatalf("host label = %q, want %q", got, want)
 	}
+	if got, want := cfg.Runner.Group, "epar-ci-canary"; got != want {
+		t.Fatalf("runner.group = %q, want %q", got, want)
+	}
+	if !cfg.Runner.NoDefaultLabels {
+		t.Fatal("runner.noDefaultLabels = false, want true")
+	}
 	if got, want := cfg.Provider.InstallRoot, "work/custom-wsl"; got != want {
 		t.Fatalf("provider.installRoot = %q, want %q", got, want)
 	}
@@ -68,8 +80,36 @@ image:
 	if got, want := len(cfg.Image.CustomInstallScripts), 2; got != want {
 		t.Fatalf("custom install scripts = %d, want %d", got, want)
 	}
+	if got, want := len(cfg.Image.TrustedCACertificatePaths), 2; got != want {
+		t.Fatalf("trusted CA certificate paths = %d, want %d", got, want)
+	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
+	cfg := Default()
+	if cfg.Runner.Group != "" {
+		t.Fatalf("runner.group = %q, want empty", cfg.Runner.Group)
+	}
+	if cfg.Runner.NoDefaultLabels {
+		t.Fatal("runner.noDefaultLabels = true, want false")
+	}
+}
+
+func TestTrustedCACertificatePathsDefaultToEmpty(t *testing.T) {
+	cfg := Default()
+	if len(cfg.Image.TrustedCACertificatePaths) != 0 {
+		t.Fatalf("image.trustedCaCertificatePaths = %#v, want empty", cfg.Image.TrustedCACertificatePaths)
+	}
+}
+
+func TestValidateRejectsEmptyTrustedCACertificatePath(t *testing.T) {
+	cfg := Default()
+	cfg.Image.TrustedCACertificatePaths = []string{" "}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "image.trustedCaCertificatePaths") {
+		t.Fatalf("Validate() error = %v, want trusted CA path error", err)
 	}
 }
 
@@ -77,6 +117,7 @@ func TestRunnerHostLabelDefaultsToEnabled(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Build Box_01.example", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -95,10 +136,34 @@ provider:
 	}
 }
 
+func TestRunnerHostLabelPrefersHostNameEnv(t *testing.T) {
+	oldHostname := osHostname
+	osHostname = func() (string, error) { return "container-id", nil }
+	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "Real Windows Host")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Runner.Labels[len(cfg.Runner.Labels)-1], "epar-host-real-windows-host"; got != want {
+		t.Fatalf("host label = %q, want %q", got, want)
+	}
+}
+
 func TestRunnerHostLabelCanBeDisabled(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "build-box", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -125,6 +190,7 @@ func TestRunnerHostLabelDoesNotDuplicateExistingLabel(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Build Box", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -198,6 +264,9 @@ provider:
 docker:
   registryMirrors:
     - http://host.docker.internal:5000
+  httpProxy: http://host.docker.internal:3128
+  httpsProxy: http://host.docker.internal:3128
+  noProxy: localhost,127.0.0.1,.example.test
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -211,11 +280,23 @@ docker:
 	if got, want := cfg.Docker.RegistryMirrors[0], "http://host.docker.internal:5000"; got != want {
 		t.Fatalf("docker.registryMirrors[0] = %q, want %q", got, want)
 	}
+	if got, want := cfg.Docker.HTTPProxy, "http://host.docker.internal:3128"; got != want {
+		t.Fatalf("docker.httpProxy = %q, want %q", got, want)
+	}
+	if got, want := cfg.Docker.HTTPSProxy, "http://host.docker.internal:3128"; got != want {
+		t.Fatalf("docker.httpsProxy = %q, want %q", got, want)
+	}
+	if got, want := cfg.Docker.NoProxy, "localhost,127.0.0.1,.example.test"; got != want {
+		t.Fatalf("docker.noProxy = %q, want %q", got, want)
+	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
 	}
 	if !DockerRegistryMirrorsNeedHostGateway(cfg.Docker.RegistryMirrors) {
 		t.Fatal("host.docker.internal mirror should request docker-dind host gateway")
+	}
+	if !DockerConfigNeedsHostGateway(cfg.Docker) {
+		t.Fatal("host.docker.internal Docker config should request docker-dind host gateway")
 	}
 }
 
@@ -264,13 +345,13 @@ provider:
 	if got, want := cfg.Image.SourceType, ImageSourceDockerImage; got != want {
 		t.Fatalf("image.sourceType = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Image.SourcePlatform, "linux/amd64"; got != want {
 		t.Fatalf("image.sourcePlatform = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "work/images/epar-wsl-gitea-ubuntu.tar"; got != want {
+	if got, want := cfg.Image.OutputImage, "work/images/epar-wsl-catthehacker-ubuntu.tar"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
@@ -368,10 +449,10 @@ provider:
 	if got, want := cfg.Image.SourceType, ImageSourceDockerImage; got != want {
 		t.Fatalf("image.sourceType = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.SourceImage, "gitea/runner-images:ubuntu-latest-full"; got != want {
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "epar-docker-dind-gitea-ubuntu"; got != want {
+	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
@@ -380,7 +461,7 @@ provider:
 	if got, want := cfg.Pool.NamePrefix, "epar-dind"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
-	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-gitea-ubuntu"; got != want {
+	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-catthehacker-ubuntu"; got != want {
 		t.Fatalf("runner label = %q, want %q", got, want)
 	}
 	if err := Validate(cfg); err != nil {
@@ -392,6 +473,7 @@ func TestExampleConfigsLoadAndValidate(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Example Host", nil }
 	t.Cleanup(func() { osHostname = oldHostname })
+	t.Setenv(HostNameEnv, "")
 
 	entries, err := os.ReadDir(filepath.Join("..", "..", "configs"))
 	if err != nil {
@@ -485,6 +567,48 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.registryMirrors %q accepted", mirror)
 		}
+	}
+}
+
+func TestValidateDockerDaemonProxy(t *testing.T) {
+	cfg := Default()
+	cfg.Docker.HTTPProxy = "http://proxy.example.test:3128"
+	cfg.Docker.HTTPSProxy = "https://proxy.example.test:8443"
+	cfg.Docker.NoProxy = "localhost,127.0.0.1,.example.test,10.0.0.0/8,*"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid Docker daemon proxy rejected: %v", err)
+	}
+
+	for _, proxyURL := range []string{
+		"proxy.example.test:3128",
+		"ftp://proxy.example.test",
+		"http://user:password@proxy.example.test",
+		"http://proxy.example.test/path",
+		"http://proxy.example.test?x=1",
+		" http://proxy.example.test",
+	} {
+		cfg := Default()
+		cfg.Docker.HTTPProxy = proxyURL
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("docker.httpProxy %q accepted", proxyURL)
+		}
+	}
+
+	for _, noProxy := range []string{"localhost,,example.test", " localhost", "http://example.test", "user@example.test", "10.0.0.0/not-a-prefix"} {
+		cfg := Default()
+		cfg.Docker.NoProxy = noProxy
+		if err := Validate(cfg); err == nil {
+			t.Fatalf("docker.noProxy %q accepted", noProxy)
+		}
+	}
+}
+
+func TestDockerConfigNeedsHostGatewayForProxy(t *testing.T) {
+	if !DockerConfigNeedsHostGateway(DockerConfig{HTTPSProxy: "http://host.docker.internal:3128"}) {
+		t.Fatal("host.docker.internal proxy should request docker-dind host gateway")
+	}
+	if DockerConfigNeedsHostGateway(DockerConfig{HTTPSProxy: "http://http.docker.internal:3128"}) {
+		t.Fatal("http.docker.internal proxy should not request host.docker.internal mapping")
 	}
 }
 

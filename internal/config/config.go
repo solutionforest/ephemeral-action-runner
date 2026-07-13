@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -29,14 +30,15 @@ type GitHubConfig struct {
 }
 
 type ImageConfig struct {
-	SourceImage          string
-	SourceType           string
-	SourcePlatform       string
-	OutputImage          string
-	UpstreamDir          string
-	UpstreamLock         string
-	RunnerVersion        string
-	CustomInstallScripts []string
+	SourceImage               string
+	SourceType                string
+	SourcePlatform            string
+	OutputImage               string
+	UpstreamDir               string
+	UpstreamLock              string
+	RunnerVersion             string
+	CustomInstallScripts      []string
+	TrustedCACertificatePaths []string
 }
 
 type PoolConfig struct {
@@ -49,6 +51,8 @@ type RunnerConfig struct {
 	Labels           []string
 	IncludeHostLabel bool
 	Ephemeral        bool
+	Group            string
+	NoDefaultLabels  bool
 }
 
 type ProviderConfig struct {
@@ -62,6 +66,9 @@ type ProviderConfig struct {
 
 type DockerConfig struct {
 	RegistryMirrors []string
+	HTTPProxy       string
+	HTTPSProxy      string
+	NoProxy         string
 }
 
 type TimeoutConfig struct {
@@ -74,6 +81,7 @@ const (
 	ImageSourceDockerImage = "docker-image"
 	ImageSourceRootFSTar   = "rootfs-tar"
 	MaxRunnerLabelLength   = 256
+	HostNameEnv            = "EPAR_HOST_NAME"
 )
 
 func Default() Config {
@@ -183,6 +191,9 @@ func Load(path string) (Config, error) {
 	applyProviderDefaults(&cfg, explicit)
 	applyRunnerHostLabel(&cfg)
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
+	for i, path := range cfg.Image.TrustedCACertificatePaths {
+		cfg.Image.TrustedCACertificatePaths[i] = expandHome(path)
+	}
 	return cfg, nil
 }
 
@@ -232,6 +243,8 @@ func apply(cfg *Config, section, key, value string) error {
 			return fmt.Errorf("image.profile is not supported; use image.customInstallScripts")
 		case "customInstallScripts":
 			return setListValue(cfg, section, key, parseList(value))
+		case "trustedCaCertificatePaths":
+			return setListValue(cfg, section, key, parseList(value))
 		}
 	case "pool":
 		switch key {
@@ -250,6 +263,8 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "labels":
 			return setListValue(cfg, section, key, parseList(value))
+		case "group":
+			cfg.Runner.Group = value
 		case "includeHostLabel":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -262,6 +277,12 @@ func apply(cfg *Config, section, key, value string) error {
 				return fmt.Errorf("invalid runner.ephemeral: %w", err)
 			}
 			cfg.Runner.Ephemeral = v
+		case "noDefaultLabels":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid runner.noDefaultLabels: %w", err)
+			}
+			cfg.Runner.NoDefaultLabels = v
 		}
 	case "provider":
 		switch key {
@@ -282,6 +303,12 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "registryMirrors":
 			return setListValue(cfg, section, key, parseList(value))
+		case "httpProxy":
+			cfg.Docker.HTTPProxy = value
+		case "httpsProxy":
+			cfg.Docker.HTTPSProxy = value
+		case "noProxy":
+			cfg.Docker.NoProxy = value
 		}
 	case "timeouts":
 		v, err := strconv.Atoi(value)
@@ -317,14 +344,14 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			if sourceType == ImageSourceRootFSTar {
 				cfg.Image.SourceImage = "work/images/ubuntu-24.04-clean.rootfs.tar"
 			} else {
-				cfg.Image.SourceImage = "gitea/runner-images:ubuntu-latest-full"
+				cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
 			}
 		}
 		if !explicit["image.outputImage"] {
 			if sourceType == ImageSourceRootFSTar {
 				cfg.Image.OutputImage = "work/images/epar-ubuntu-24-wsl.tar"
 			} else {
-				cfg.Image.OutputImage = "work/images/epar-wsl-gitea-ubuntu.tar"
+				cfg.Image.OutputImage = "work/images/epar-wsl-catthehacker-ubuntu.tar"
 			}
 		}
 		if sourceType == ImageSourceDockerImage && !explicit["image.sourcePlatform"] {
@@ -337,7 +364,7 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			if sourceType == ImageSourceRootFSTar {
 				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-ubuntu-24.04-base"}
 			} else {
-				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-gitea-ubuntu"}
+				cfg.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-wsl-catthehacker-ubuntu"}
 			}
 		}
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
@@ -348,16 +375,16 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			cfg.Image.SourceType = ImageSourceDockerImage
 		}
 		if !explicit["image.sourceImage"] {
-			cfg.Image.SourceImage = "gitea/runner-images:ubuntu-latest-full"
+			cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
 		}
 		if !explicit["image.outputImage"] {
-			cfg.Image.OutputImage = "epar-docker-dind-gitea-ubuntu"
+			cfg.Image.OutputImage = "epar-docker-dind-catthehacker-ubuntu"
 		}
 		if !explicit["provider.sourceImage"] {
 			cfg.Provider.SourceImage = cfg.Image.OutputImage
 		}
 		if !explicit["runner.labels"] {
-			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-gitea-ubuntu"}
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-catthehacker-ubuntu"}
 		}
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
 			cfg.Pool.NamePrefix = "epar-dind"
@@ -367,11 +394,18 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 
 var osHostname = os.Hostname
 
+func HostName() (string, error) {
+	if hostname := strings.TrimSpace(os.Getenv(HostNameEnv)); hostname != "" {
+		return hostname, nil
+	}
+	return osHostname()
+}
+
 func applyRunnerHostLabel(cfg *Config) {
 	if !cfg.Runner.IncludeHostLabel {
 		return
 	}
-	hostname, err := osHostname()
+	hostname, err := HostName()
 	if err != nil {
 		return
 	}
@@ -449,7 +483,7 @@ func looksLikeRootFSTar(path string) bool {
 func isListKey(section, key string) bool {
 	switch section {
 	case "image":
-		return key == "customInstallScripts"
+		return key == "customInstallScripts" || key == "trustedCaCertificatePaths"
 	case "runner":
 		return key == "labels"
 	case "docker":
@@ -462,8 +496,12 @@ func isListKey(section, key string) bool {
 func setListValue(cfg *Config, section, key string, values []string) error {
 	switch section {
 	case "image":
-		if key == "customInstallScripts" {
+		switch key {
+		case "customInstallScripts":
 			cfg.Image.CustomInstallScripts = values
+			return nil
+		case "trustedCaCertificatePaths":
+			cfg.Image.TrustedCACertificatePaths = values
 			return nil
 		}
 	case "runner":
@@ -487,8 +525,12 @@ func appendListValue(cfg *Config, section, key, value string) error {
 	}
 	switch section {
 	case "image":
-		if key == "customInstallScripts" {
+		switch key {
+		case "customInstallScripts":
 			cfg.Image.CustomInstallScripts = append(cfg.Image.CustomInstallScripts, item)
+			return nil
+		case "trustedCaCertificatePaths":
+			cfg.Image.TrustedCACertificatePaths = append(cfg.Image.TrustedCACertificatePaths, item)
 			return nil
 		}
 	case "runner":
@@ -540,6 +582,11 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("image.customInstallScripts must not contain empty paths")
 		}
 	}
+	for _, path := range cfg.Image.TrustedCACertificatePaths {
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("image.trustedCaCertificatePaths must not contain empty paths")
+		}
+	}
 	switch cfg.Image.SourceType {
 	case "", ImageSourceDockerImage, ImageSourceRootFSTar:
 	default:
@@ -571,6 +618,15 @@ func Validate(cfg Config) error {
 		if err := ValidateDockerRegistryMirror(mirror); err != nil {
 			return err
 		}
+	}
+	if err := ValidateDockerProxyURL("httpProxy", cfg.Docker.HTTPProxy); err != nil {
+		return err
+	}
+	if err := ValidateDockerProxyURL("httpsProxy", cfg.Docker.HTTPSProxy); err != nil {
+		return err
+	}
+	if err := ValidateDockerNoProxy(cfg.Docker.NoProxy); err != nil {
+		return err
 	}
 	return nil
 }
@@ -622,6 +678,71 @@ func DockerRegistryMirrorsNeedHostGateway(mirrors []string) bool {
 		}
 	}
 	return false
+}
+
+func DockerConfigNeedsHostGateway(cfg DockerConfig) bool {
+	if DockerRegistryMirrorsNeedHostGateway(cfg.RegistryMirrors) {
+		return true
+	}
+	for _, proxyURL := range []string{cfg.HTTPProxy, cfg.HTTPSProxy} {
+		parsed, err := url.Parse(proxyURL)
+		if err == nil && strings.EqualFold(parsed.Hostname(), "host.docker.internal") {
+			return true
+		}
+	}
+	return false
+}
+
+func ValidateDockerProxyURL(key, value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.TrimSpace(value) != value || strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("docker.%s URL must not contain whitespace", key)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("docker.%s URL %q is invalid: %w", key, value, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("docker.%s URL %q must use http or https", key, value)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("docker.%s URL %q must include a host", key, value)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("docker.%s URL %q must not include credentials", key, value)
+	}
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("docker.%s URL %q must point at the proxy root without query or fragment", key, value)
+	}
+	return nil
+}
+
+func ValidateDockerNoProxy(value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > 4096 {
+		return fmt.Errorf("docker.noProxy must be 4096 characters or fewer")
+	}
+	if strings.TrimSpace(value) != value || strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("docker.noProxy must not contain whitespace")
+	}
+	for _, item := range strings.Split(value, ",") {
+		if item == "" {
+			return fmt.Errorf("docker.noProxy must not contain empty comma-separated entries")
+		}
+		if strings.Contains(item, "://") || strings.Contains(item, "@") {
+			return fmt.Errorf("docker.noProxy entry %q must be a host, domain, IP address, CIDR, or *", item)
+		}
+		if strings.Contains(item, "/") {
+			if _, _, err := net.ParseCIDR(item); err != nil {
+				return fmt.Errorf("docker.noProxy entry %q has an invalid CIDR", item)
+			}
+		}
+	}
+	return nil
 }
 
 func ValidateDockerPlatform(platform string) error {

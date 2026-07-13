@@ -29,6 +29,7 @@ type GitHubClient interface {
 	RegistrationToken(ctx context.Context) (gh.RegistrationToken, error)
 	ListRunners(ctx context.Context) ([]gh.Runner, error)
 	RunnerByName(ctx context.Context, name string) (gh.Runner, bool, error)
+	WaitRunnerOnline(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error)
 	WaitRunnerOnlineIdle(ctx context.Context, name string, timeout time.Duration) (gh.Runner, error)
 	DeleteRunnerIfExists(ctx context.Context, id int64) error
 	DeleteRunnersByPrefix(ctx context.Context, prefix string) ([]gh.Runner, error)
@@ -57,6 +58,13 @@ type ProvisionedInstance struct {
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
+var runnerReadinessHealthCheckInterval = 2 * time.Second
+
+const (
+	cleanupTimeout                    = 5 * time.Minute
+	runnerReadinessDiagnosticsTimeout = 30 * time.Second
+	runnerReadinessProbeFailureLimit  = 3
+)
 
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	opts.Instances = m.requestedInstances(opts.Instances)
@@ -79,7 +87,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			vm, err := m.provisionOne(ctx, name, opts.RegisterOnly)
+			vm, err := m.provisionOne(ctx, name, opts.RegisterOnly, false)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil && errOnce == nil {
@@ -93,7 +101,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	wg.Wait()
 	if opts.Cleanup {
 		fmt.Printf("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
-		if err := m.Cleanup(ctx); err != nil && errOnce == nil {
+		if err := m.cleanupWithFreshContext(); err != nil && errOnce == nil {
 			errOnce = err
 		}
 	}
@@ -128,12 +136,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		if opts.KeepOnExit {
 			return nil
 		}
-		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		return m.Cleanup(cctx)
+		return m.cleanupWithFreshContext()
 	}
 	for len(active) < opts.Instances {
-		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register)
+		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
 		sequence++
 		if err != nil {
 			_ = cleanup()
@@ -180,7 +186,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
 				fmt.Printf("[%s] creating replacement runner\n", name)
-				vm, err := m.provisionOne(ctx, name, opts.Register)
+				vm, err := m.provisionOne(ctx, name, opts.Register, true)
 				if err != nil {
 					fmt.Printf("[%s] replacement failed: %v\n", name, err)
 					break
@@ -192,12 +198,18 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 }
 
+func (m *Manager) cleanupWithFreshContext() error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	return m.Cleanup(cleanupCtx)
+}
+
 func (m *Manager) ProvisionPool(ctx context.Context, instances int, register bool) ([]ProvisionedInstance, error) {
 	instances = m.requestedInstances(instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, instances, time.Now())
 	out := make([]ProvisionedInstance, 0, len(names))
 	for _, name := range names {
-		vm, err := m.provisionOne(ctx, name, register)
+		vm, err := m.provisionOne(ctx, name, register, false)
 		if err != nil {
 			return out, err
 		}
@@ -277,7 +289,7 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 	return b.String(), nil
 }
 
-func (m *Manager) provisionOne(ctx context.Context, name string, register bool) (ProvisionedInstance, error) {
+func (m *Manager) provisionOne(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
 	logPath := config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir)
 	logPath = filepath.Join(logPath, name+"."+m.Config.Provider.Type+".log")
 	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
@@ -321,28 +333,114 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register bool) 
 			return vm, err
 		}
 		env := map[string]string{
-			"RUNNER_URL":       m.GitHub.OrganizationURL(),
-			"RUNNER_TOKEN":     token.Token,
-			"RUNNER_NAME":      name,
-			"RUNNER_LABELS":    strings.Join(m.Config.Runner.Labels, ","),
-			"RUNNER_EPHEMERAL": fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
+			"RUNNER_URL":               m.GitHub.OrganizationURL(),
+			"RUNNER_TOKEN":             token.Token,
+			"RUNNER_NAME":              name,
+			"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
+			"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
+			"RUNNER_GROUP":             m.Config.Runner.Group,
+			"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
 		}
 		if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
 			return vm, err
 		}
 		fmt.Printf("[%s] starting runner service\n", name)
 		if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
+			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
-		fmt.Printf("[%s] waiting for GitHub online/idle\n", name)
-		runner, err := m.GitHub.WaitRunnerOnlineIdle(ctx, name, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second)
+		readiness := "online/idle"
+		if allowBusy {
+			readiness = "online"
+		}
+		fmt.Printf("[%s] waiting for GitHub %s\n", name, readiness)
+		runner, err := m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
 		if err != nil {
+			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
-		fmt.Printf("[%s] GitHub runner online/idle id=%d\n", name, runner.ID)
+		fmt.Printf("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
 	}
 	return vm, nil
+}
+
+type runnerReadinessResult struct {
+	runner gh.Runner
+	err    error
+}
+
+func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedInstance, timeout time.Duration, allowBusy bool) (gh.Runner, error) {
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resultCh := make(chan runnerReadinessResult, 1)
+	go func() {
+		var runner gh.Runner
+		var err error
+		if allowBusy {
+			runner, err = m.GitHub.WaitRunnerOnline(waitCtx, vm.Name, timeout)
+		} else {
+			runner, err = m.GitHub.WaitRunnerOnlineIdle(waitCtx, vm.Name, timeout)
+		}
+		resultCh <- runnerReadinessResult{runner: runner, err: err}
+	}()
+
+	interval := runnerReadinessHealthCheckInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	consecutiveProbeFailures := 0
+	var lastProbeErr error
+
+	for {
+		select {
+		case result := <-resultCh:
+			return result.runner, result.err
+		case <-ticker.C:
+			err := m.checkRunnerProcess(waitCtx, vm.Name)
+			if err == nil {
+				consecutiveProbeFailures = 0
+				lastProbeErr = nil
+				continue
+			}
+			if ctx.Err() != nil {
+				cancel()
+				return gh.Runner{}, ctx.Err()
+			}
+			consecutiveProbeFailures++
+			lastProbeErr = err
+			if consecutiveProbeFailures < runnerReadinessProbeFailureLimit {
+				fmt.Printf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
+				continue
+			}
+			cancel()
+			readiness := "online/idle"
+			if allowBusy {
+				readiness = "online"
+			}
+			return gh.Runner{}, fmt.Errorf("actions runner process failed %d consecutive checks while waiting for GitHub %s: %w", runnerReadinessProbeFailureLimit, readiness, lastProbeErr)
+		case <-ctx.Done():
+			cancel()
+			return gh.Runner{}, ctx.Err()
+		}
+	}
+}
+
+func (m *Manager) captureRunnerReadinessDiagnostics(name, guestLogPath string) {
+	diagnosticCtx, cancel := context.WithTimeout(context.Background(), runnerReadinessDiagnosticsTimeout)
+	defer cancel()
+	_, err := m.Provider.Exec(
+		diagnosticCtx,
+		name,
+		[]string{"sudo", "bash", "/opt/epar/collect-runner-diagnostics.sh"},
+		provider.ExecOptions{LogPath: guestLogPath},
+	)
+	if err != nil {
+		fmt.Printf("[%s] runner readiness diagnostic collection warning: %v\n", name, err)
+	}
 }
 
 func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
@@ -368,13 +466,17 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 }
 
 func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
-	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	_, serviceErr := m.Provider.Exec(checkCtx, vm.Name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
-	if serviceErr != nil {
+	if err := m.checkRunnerProcess(ctx, vm.Name); err != nil {
 		return false, "actions runner process is no longer active", nil
 	}
 	return true, "", nil
+}
+
+func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, err := m.Provider.Exec(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
+	return err
 }
 
 func isTransientGitHubLivenessError(err error) bool {
