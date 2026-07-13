@@ -270,6 +270,48 @@ docker pull ghcr.io/catthehacker/ubuntu:full-latest
 wsl -l -v
 ```
 
+### WSL Import Exits With `0xffffffff`
+
+If the Docker export completes but the first temporary-distro import fails like this:
+
+```text
+wsl.exe --import ... --version 2 failed: exit status 0xffffffff:
+```
+
+WSL may be in an unstable service or VM session. The error can also appear as
+`Wsl/Service/CreateInstance/E_UNEXPECTED` or `Catastrophic failure` when
+starting an existing distro. When the import itself fails, the advertised WSL
+build and guest logs may be empty or absent because no guest was created yet.
+
+Reset the WSL session before deleting or rebuilding a completed source rootfs:
+
+1. Stop EPAR and quit Docker Desktop cleanly from its tray menu.
+2. Run:
+
+   ```powershell
+   wsl --shutdown
+   ```
+
+3. Start Docker Desktop again and wait until it is ready.
+4. Verify WSL and Docker. Replace `Ubuntu-24.04` if your installed distro has a
+   different name:
+
+   ```powershell
+   wsl -d Ubuntu-24.04 --user root --exec /bin/true
+   $LASTEXITCODE
+   docker version
+   ```
+
+5. When the WSL command returns `0` and Docker is ready, rerun `./start` or
+   `.\start`. EPAR reuses a matching cached
+   `work/images/*.source.rootfs.tar`, avoiding another large Docker export.
+
+`wsl --shutdown` stops every running WSL distro, including Docker Desktop's WSL
+backend. Save work in other distros first. If the failure persists after the
+reset, run `wsl --update`, shut WSL down again, reboot Windows, and retry once.
+For persistent `0x8000FFFF` or `E_UNEXPECTED` failures, follow
+[Microsoft's WSL troubleshooting guidance](https://learn.microsoft.com/windows/wsl/troubleshooting#error-code-0x8000ffff-unexpected-failure).
+
 If the WSL image build fails after import but before systemd is ready, inspect:
 
 ```text

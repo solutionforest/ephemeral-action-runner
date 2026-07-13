@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 )
 
 func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
@@ -64,6 +66,7 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 
 func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
@@ -87,6 +90,7 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 
 func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
@@ -221,6 +225,135 @@ func TestInitChecksDockerByDefault(t *testing.T) {
 	}
 }
 
+func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubWSL2Available(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:     dir,
+		ConfigPath:      path,
+		SkipDockerCheck: true,
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		Out:             &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("..", "..", "configs", "wsl.example.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantText := strings.NewReplacer(
+		"appId: 123456", "appId: 123456",
+		"organization: your-org", "organization: solutionforest",
+		"privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem", "privateKeyPath: .local/github-app.pem",
+		"namePrefix: CHANGE-ME-unique-machine-prefix", "namePrefix: build-box-01-a4f9c2",
+	).Replace(string(want))
+	wantText = strings.ReplaceAll(wantText, "\r\n", "\n")
+	if string(got) != wantText {
+		t.Fatalf("WSL config did not match configs/wsl.example.yml:\nwant:\n%s\ngot:\n%s", wantText, got)
+	}
+	if !strings.Contains(out.String(), "2. WSL2") {
+		t.Fatalf("init output did not offer WSL2:\n%s", out.String())
+	}
+	providerPrompt := strings.Index(out.String(), "Runner provider:")
+	prefixPrompt := strings.Index(out.String(), "Pool name prefix must be unique")
+	if providerPrompt < 0 || prefixPrompt < 0 || providerPrompt > prefixPrompt {
+		t.Fatalf("provider prompt did not appear before pool name prefix:\n%s", out.String())
+	}
+}
+
+func TestInitWSL2ChoiceDefaultsToDockerDindAndRepromptsInvalidValues(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubWSL2Available(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:     dir,
+		ConfigPath:      path,
+		SkipDockerCheck: true,
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ninvalid\n\n\n"),
+		Out:             &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	configBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configBytes), "type: docker-dind") {
+		t.Fatalf("config did not use the default Docker-DinD provider:\n%s", configBytes)
+	}
+	if !strings.Contains(out.String(), "Runner provider must be 1 (Docker-DinD) or 2 (WSL2).") {
+		t.Fatalf("init output did not explain invalid provider input:\n%s", out.String())
+	}
+}
+
+func TestWSL2AvailabilityRequiresNativeWindowsSuccessfulVersion2Status(t *testing.T) {
+	stubWSL2Available(t)
+	for _, test := range []struct {
+		name   string
+		status []byte
+		want   bool
+	}{
+		{
+			name:   "UTF-8",
+			status: []byte("Default Distribution: Ubuntu\r\nDefault Version: 2\r\n"),
+			want:   true,
+		},
+		{
+			name:   "UTF-16LE without BOM",
+			status: utf16LE("Default Distribution: Ubuntu\r\nDefault Version: 2\r\n", false),
+			want:   true,
+		},
+		{
+			name:   "UTF-16LE with BOM",
+			status: utf16LE("Default Version: 2\r\n", true),
+			want:   true,
+		},
+		{
+			name:   "wrong version",
+			status: []byte("Default Version: 1\n"),
+			want:   false,
+		},
+		{
+			name:   "malformed UTF-16LE",
+			status: append(utf16LE("Default Version: 2\r\n", false), 0xff),
+			want:   false,
+		},
+		{
+			name:   "unrecognized output",
+			status: []byte("WSL status unavailable\n"),
+			want:   false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			initWSLStatus = func(context.Context) ([]byte, error) {
+				return test.status, nil
+			}
+			if got := wsl2Available(); got != test.want {
+				t.Fatalf("wsl2Available() = %t, want %t", got, test.want)
+			}
+		})
+	}
+
+	initWSLStatus = func(context.Context) ([]byte, error) {
+		return nil, errors.New("wsl unavailable")
+	}
+	if wsl2Available() {
+		t.Fatal("wsl2Available() = true when wsl.exe --status fails")
+	}
+}
+
 func stubInitHostAndRandom(t *testing.T, hostname string, random []byte) {
 	t.Helper()
 	oldHostname := initHostname
@@ -238,4 +371,45 @@ func fixedRandomRead(random []byte) func([]byte) (int, error) {
 		copy(data, random)
 		return len(data), nil
 	}
+}
+
+func utf16LE(text string, includeBOM bool) []byte {
+	units := utf16.Encode([]rune(text))
+	data := make([]byte, 0, len(units)*2+2)
+	if includeBOM {
+		data = append(data, 0xff, 0xfe)
+	}
+	for _, unit := range units {
+		data = append(data, byte(unit), byte(unit>>8))
+	}
+	return data
+}
+
+func stubNoWSL2(t *testing.T) {
+	t.Helper()
+	oldGOOS := initGOOS
+	oldWSLStatus := initWSLStatus
+	initGOOS = "linux"
+	initWSLStatus = func(context.Context) ([]byte, error) {
+		t.Fatal("wsl.exe --status should not run outside native Windows")
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		initGOOS = oldGOOS
+		initWSLStatus = oldWSLStatus
+	})
+}
+
+func stubWSL2Available(t *testing.T) {
+	t.Helper()
+	oldGOOS := initGOOS
+	oldWSLStatus := initWSLStatus
+	initGOOS = "windows"
+	initWSLStatus = func(context.Context) ([]byte, error) {
+		return []byte("Default Distribution: Ubuntu\nDefault Version: 2\n"), nil
+	}
+	t.Cleanup(func() {
+		initGOOS = oldGOOS
+		initWSLStatus = oldWSLStatus
+	})
 }
