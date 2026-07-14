@@ -52,6 +52,16 @@ func CopyText(ctx context.Context, p Provider, vmName, path, mode, content strin
 	return err
 }
 
+// CopyTextAtomic installs content through a sibling temporary file and then
+// renames it over path. Callers must ensure the destination directory exists.
+func CopyTextAtomic(ctx context.Context, p Provider, vmName, path, mode, content string) error {
+	tmp := path + ".tmp"
+	staging := "/tmp/epar-copy"
+	cmd := []string{"bash", "-lc", fmt.Sprintf("cat > %s && if command -v sudo >/dev/null 2>&1; then sudo install -m %s %s %s && sudo mv -f %s %s; else install -m %s %s %s && mv -f %s %s; fi && rm -f %s", shellQuote(staging), shellQuote(mode), shellQuote(staging), shellQuote(tmp), shellQuote(tmp), shellQuote(path), shellQuote(mode), shellQuote(staging), shellQuote(tmp), shellQuote(tmp), shellQuote(path), shellQuote(staging))}
+	_, err := p.Exec(ctx, vmName, cmd, ExecOptions{Stdin: content})
+	return err
+}
+
 func ShellCommand(script string) []string {
 	return []string{"bash", "-lc", script}
 }

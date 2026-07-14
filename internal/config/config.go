@@ -39,7 +39,17 @@ type ImageConfig struct {
 	RunnerVersion             string
 	CustomInstallScripts      []string
 	TrustedCACertificatePaths []string
+	HostTrustMode             string
+	HostTrustScopes           []string
 }
+
+const (
+	HostTrustModeDisabled = "disabled"
+	HostTrustModeOverlay  = "overlay"
+
+	HostTrustScopeSystem = "system"
+	HostTrustScopeUser   = "user"
+)
 
 type PoolConfig struct {
 	Instances  int
@@ -96,6 +106,10 @@ func Default() Config {
 			UpstreamDir:   "third_party/runner-images",
 			UpstreamLock:  "third_party/runner-images.lock",
 			RunnerVersion: "latest",
+			HostTrustMode: HostTrustModeDisabled,
+			HostTrustScopes: []string{
+				HostTrustScopeSystem,
+			},
 		},
 		Pool: PoolConfig{
 			Instances:  1,
@@ -244,6 +258,10 @@ func apply(cfg *Config, section, key, value string) error {
 		case "customInstallScripts":
 			return setListValue(cfg, section, key, parseList(value))
 		case "trustedCaCertificatePaths":
+			return setListValue(cfg, section, key, parseList(value))
+		case "hostTrustMode":
+			cfg.Image.HostTrustMode = strings.ToLower(value)
+		case "hostTrustScopes":
 			return setListValue(cfg, section, key, parseList(value))
 		}
 	case "pool":
@@ -483,7 +501,7 @@ func looksLikeRootFSTar(path string) bool {
 func isListKey(section, key string) bool {
 	switch section {
 	case "image":
-		return key == "customInstallScripts" || key == "trustedCaCertificatePaths"
+		return key == "customInstallScripts" || key == "trustedCaCertificatePaths" || key == "hostTrustScopes"
 	case "runner":
 		return key == "labels"
 	case "docker":
@@ -502,6 +520,9 @@ func setListValue(cfg *Config, section, key string, values []string) error {
 			return nil
 		case "trustedCaCertificatePaths":
 			cfg.Image.TrustedCACertificatePaths = values
+			return nil
+		case "hostTrustScopes":
+			cfg.Image.HostTrustScopes = values
 			return nil
 		}
 	case "runner":
@@ -531,6 +552,9 @@ func appendListValue(cfg *Config, section, key, value string) error {
 			return nil
 		case "trustedCaCertificatePaths":
 			cfg.Image.TrustedCACertificatePaths = append(cfg.Image.TrustedCACertificatePaths, item)
+			return nil
+		case "hostTrustScopes":
+			cfg.Image.HostTrustScopes = append(cfg.Image.HostTrustScopes, item)
 			return nil
 		}
 	case "runner":
@@ -587,6 +611,9 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("image.trustedCaCertificatePaths must not contain empty paths")
 		}
 	}
+	if err := ValidateHostTrust(cfg.Image, cfg.Provider, cfg.Runner); err != nil {
+		return err
+	}
 	switch cfg.Image.SourceType {
 	case "", ImageSourceDockerImage, ImageSourceRootFSTar:
 	default:
@@ -627,6 +654,49 @@ func Validate(cfg Config) error {
 	}
 	if err := ValidateDockerNoProxy(cfg.Docker.NoProxy); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateHostTrust keeps host trust inheritance deliberately limited to the
+// ephemeral Docker-in-Docker image path. Other providers do not have a
+// portable, unambiguous host trust boundary.
+func ValidateHostTrust(image ImageConfig, provider ProviderConfig, runner RunnerConfig) error {
+	switch image.HostTrustMode {
+	case "", HostTrustModeDisabled:
+		return nil
+	case HostTrustModeOverlay:
+		if provider.Type != "docker-dind" {
+			return fmt.Errorf("image.hostTrustMode %q is only supported with provider.type=docker-dind", HostTrustModeOverlay)
+		}
+		if !runner.Ephemeral {
+			return fmt.Errorf("image.hostTrustMode %q requires runner.ephemeral=true", HostTrustModeOverlay)
+		}
+	default:
+		return fmt.Errorf("unsupported image.hostTrustMode %q", image.HostTrustMode)
+	}
+
+	if image.HostTrustMode != HostTrustModeOverlay {
+		return nil
+	}
+	if len(image.HostTrustScopes) == 0 {
+		return fmt.Errorf("image.hostTrustScopes must not be empty when image.hostTrustMode is %q", HostTrustModeOverlay)
+	}
+	seen := make(map[string]struct{}, len(image.HostTrustScopes))
+	for _, scope := range image.HostTrustScopes {
+		scope = strings.ToLower(strings.TrimSpace(scope))
+		if scope == "" {
+			return fmt.Errorf("image.hostTrustScopes must not contain empty scopes")
+		}
+		switch scope {
+		case HostTrustScopeSystem, HostTrustScopeUser:
+		default:
+			return fmt.Errorf("unsupported image.hostTrustScopes value %q", scope)
+		}
+		if _, exists := seen[scope]; exists {
+			return fmt.Errorf("image.hostTrustScopes must not contain duplicate scope %q", scope)
+		}
+		seen[scope] = struct{}{}
 	}
 	return nil
 }

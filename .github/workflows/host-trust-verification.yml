@@ -1,0 +1,304 @@
+name: Host trust verification
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-trust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native read-only (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Go tests
+        shell: bash
+        run: go test ./...
+
+      - name: Smoke-test native host root collection without trust-store mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir=.epar-host-trust-smoke
+          trap 'rm -rf "${smoke_dir}"' EXIT
+          mkdir -p "${smoke_dir}"
+          cat >"${smoke_dir}/main.go" <<'GO'
+          package main
+
+          import (
+            "context"
+            "fmt"
+            "os"
+            "runtime"
+
+            "github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+          )
+
+          func main() {
+            scopes := []string{hosttrust.ScopeSystem}
+            if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+              scopes = append(scopes, hosttrust.ScopeUser)
+            }
+            snapshot, err := hosttrust.Resolve(context.Background(), hosttrust.Options{
+              Mode:             hosttrust.ModeOverlay,
+              Scopes:           scopes,
+              ControllerHostOS: runtime.GOOS,
+            })
+            if err != nil {
+              fmt.Fprintln(os.Stderr, err)
+              os.Exit(1)
+            }
+            if snapshot.Generation == "" || len(snapshot.Certificates) == 0 {
+              fmt.Fprintln(os.Stderr, "native host trust collector returned an empty generation")
+              os.Exit(1)
+            }
+            fmt.Printf("hostOS=%s scopes=%v roots=%d generation=%s\n",
+              snapshot.HostOS, snapshot.Scopes, len(snapshot.Certificates), snapshot.Generation)
+          }
+          GO
+          go run "./${smoke_dir}"
+
+      - name: Smoke-test Unix no-Go feed contract without trust-store mutations
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir=.epar-host-trust-feed-smoke
+          config_path="${RUNNER_TEMP}/host-trust-smoke.yml"
+          trap 'rm -rf "${smoke_dir}"' EXIT
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            scopes='[system, user]'
+            scopes_csv=system,user
+          else
+            scopes='[system]'
+            scopes_csv=system
+          fi
+          cat >"${config_path}" <<YAML
+          image:
+            hostTrustMode: overlay
+            hostTrustScopes: ${scopes}
+          YAML
+          feed_path="$(bash scripts/host-trust/host-trust-feed.sh sync \
+            --project-root "${GITHUB_WORKSPACE}" --config "${config_path}")"
+          [[ -s "${feed_path}" ]]
+          mkdir -p "${smoke_dir}"
+          cat >"${smoke_dir}/main.go" <<'GO'
+          package main
+
+          import (
+            "context"
+            "fmt"
+            "os"
+            "strings"
+
+            "github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+          )
+
+          func main() {
+            snapshot, err := hosttrust.Resolve(context.Background(), hosttrust.Options{
+              Mode:             hosttrust.ModeOverlay,
+              Scopes:           strings.Split(os.Getenv("EPAR_SMOKE_SCOPES"), ","),
+              FeedPath:         os.Getenv("EPAR_SMOKE_FEED"),
+              ControllerHostOS: os.Getenv("EPAR_SMOKE_HOST_OS"),
+            })
+            if err != nil {
+              panic(err)
+            }
+            if snapshot.Generation == "" || len(snapshot.Certificates) == 0 {
+              panic("external host trust feed returned an empty generation")
+            }
+            fmt.Printf("feed hostOS=%s scopes=%v roots=%d generation=%s\n",
+              snapshot.HostOS, snapshot.Scopes, len(snapshot.Certificates), snapshot.Generation)
+          }
+          GO
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then host_os=darwin; else host_os=linux; fi
+          EPAR_SMOKE_FEED="${feed_path}" \
+          EPAR_SMOKE_HOST_OS="${host_os}" \
+          EPAR_SMOKE_SCOPES="${scopes_csv}" \
+            go run "./${smoke_dir}"
+
+      - name: Smoke-test Windows no-Go feed contract without trust-store mutations
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $smokeDir = '.epar-host-trust-feed-smoke'
+          $configPath = Join-Path $env:RUNNER_TEMP 'host-trust-smoke.yml'
+          try {
+            @'
+          image:
+            hostTrustMode: overlay
+            hostTrustScopes: [system, user]
+          '@ | Set-Content -LiteralPath $configPath -Encoding utf8NoBOM
+            $feedPath = & scripts/host-trust/host-trust-feed.ps1 sync `
+              -ProjectRoot $env:GITHUB_WORKSPACE -Config $configPath
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $feedPath -PathType Leaf)) {
+              throw 'Windows host-trust feed was not produced'
+            }
+            New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+            @'
+          package main
+
+          import (
+            "context"
+            "fmt"
+            "os"
+
+            "github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+          )
+
+          func main() {
+            snapshot, err := hosttrust.Resolve(context.Background(), hosttrust.Options{
+              Mode:             hosttrust.ModeOverlay,
+              Scopes:           []string{hosttrust.ScopeSystem, hosttrust.ScopeUser},
+              FeedPath:         os.Getenv("EPAR_SMOKE_FEED"),
+              ControllerHostOS: "windows",
+            })
+            if err != nil {
+              panic(err)
+            }
+            if snapshot.Generation == "" || len(snapshot.Certificates) == 0 {
+              panic("external host trust feed returned an empty generation")
+            }
+            fmt.Printf("feed hostOS=%s scopes=%v roots=%d generation=%s\n",
+              snapshot.HostOS, snapshot.Scopes, len(snapshot.Certificates), snapshot.Generation)
+          }
+          '@ | Set-Content -LiteralPath "$smokeDir/main.go" -Encoding utf8NoBOM
+            $env:EPAR_SMOKE_FEED = [string] $feedPath
+            go run "./$smokeDir"
+            if ($LASTEXITCODE -ne 0) { throw 'Windows host-trust feed smoke failed' }
+          } finally {
+            Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Exercise official wrapper feed lifecycle and singleton lock
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: scripts/test/host-trust-wrapper-smoke.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+
+      - name: Exercise no-Go first-run start lifecycle
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: scripts/test/no-go-first-run-smoke.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+
+      - name: Exercise official wrapper feed lifecycle and singleton lock
+        shell: bash
+        if: runner.os != 'Windows'
+        run: bash scripts/test/host-trust-wrapper-smoke.sh
+
+      - name: Exercise no-Go first-run start lifecycle
+        shell: bash
+        if: runner.os != 'Windows'
+        run: bash scripts/test/no-go-first-run-smoke.sh
+
+      - name: Parse Bash host-trust scripts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n \
+            start \
+            scripts/run-with-docker.sh \
+            scripts/host-trust/host-trust-feed.sh \
+            scripts/host-trust/wrapper-lib.sh \
+            scripts/test/host-trust-wrapper-smoke.sh \
+            scripts/test/no-go-first-run-smoke.sh \
+            scripts/guest/ubuntu/apply-trusted-ca-runtime.sh \
+            scripts/guest/ubuntu/check-host-trust-generation.sh
+
+      - name: Parse PowerShell host-trust scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'start.ps1',
+            'scripts/run-with-docker.ps1',
+            'scripts/host-trust/host-trust-feed.ps1',
+            'scripts/host-trust/wrapper-lib.ps1',
+            'scripts/test/host-trust-wrapper-smoke.ps1',
+            'scripts/test/no-go-first-run-smoke.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              throw "$file has parser errors: $($errors -join '; ')"
+            }
+          }
+
+  cgo-free-builds:
+    name: CGO-free ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build controller
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -o "${RUNNER_TEMP}/ephemeral-action-runner-${{ matrix.goos }}-${{ matrix.goarch }}" ./cmd/ephemeral-action-runner
+
+  linux-docker-e2e:
+    name: Linux Docker trust rotation E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Exercise disposable roots and generation rotation
+        run: bash scripts/test/host-trust-docker-e2e.sh

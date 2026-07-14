@@ -43,12 +43,12 @@ The default quick start needs a Docker-compatible daemon:
 
 ### 2. Download EPAR Source
 
-Open the [EPAR GitHub repo](https://github.com/solutionforest/ephemeral-action-runner), choose **Code**, then **Download ZIP**.
+Open the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), select the release you want, and download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)**. EPAR releases use these source archives only.
 
-Extract the ZIP and open a terminal in the extracted folder. The folder is usually named `ephemeral-action-runner-main`.
+Extract the source archive and open a terminal in the extracted folder. The folder is usually named `ephemeral-action-runner-<tag>`.
 
 ```bash
-cd path/to/ephemeral-action-runner-main
+cd path/to/ephemeral-action-runner-<tag>
 ```
 
 ### 3. Create A GitHub App
@@ -75,7 +75,7 @@ That's it.
 
 #### What Happens
 
-EPAR initializes `.local/config.yml` for you if it does not exist. You can customize the config afterward; see [Configuration](docs/configuration.md).
+EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2; press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
 
 Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 

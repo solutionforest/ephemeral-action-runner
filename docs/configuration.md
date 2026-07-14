@@ -82,7 +82,54 @@ Use a different config file:
 go run ./cmd/ephemeral-action-runner start --config .local/wsl.yml
 ```
 
-Trust an enterprise TLS inspection or private package-registry CA during image builds:
+### Host trust inheritance
+
+Docker-DinD runners can inherit the host's trusted TLS root anchors:
+
+```yaml
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system, user]
+```
+
+`image.hostTrustMode` accepts `disabled` or `overlay`. Existing configs default
+to `disabled`. A new interactive Docker-DinD initialization asks whether to
+enable host trust inheritance; pressing Enter accepts the displayed `yes`
+default. Enabling the policy is the one-time consent for EPAR to follow later
+host root additions, removals, and rotations automatically.
+
+The supported scopes are:
+
+| Controller host | `system` | `user` |
+| --- | --- | --- |
+| Windows | Local-machine trusted roots, excluding Windows-disallowed certificates | Current-user trusted roots, excluding Windows-disallowed certificates |
+| macOS | System Roots plus CA certificates explicitly trusted for TLS server use in the administrator domain, excluding explicit deny | CA certificates in the user's keychain search list explicitly trusted for TLS server use, excluding explicit deny |
+| Linux | The distribution's generated system CA bundle | Not supported |
+
+Use `[system, user]` on Windows or macOS when the runner should inherit the
+same two trust scopes as the account running EPAR. Linux configs must use
+`[system]`. Overlay mode is supported only for `provider.type: docker-dind` and
+requires `runner.ephemeral: true`.
+If macOS has disabled user-level Trust Settings, the `user` scope contributes
+no certificates until that host policy is enabled again.
+
+The resulting Ubuntu runner trust is additive:
+
+```text
+Ubuntu default roots
++ host roots from the current EPAR generation
++ image.trustedCaCertificatePaths
+```
+
+This is root-anchor inheritance, not exact emulation of Windows or macOS TLS
+policy. macOS positive trust settings constrained by hostname, application, or
+allowed error are not promoted into Ubuntu's unconstrained global root store.
+Removing a host root does not remove an independently bundled Ubuntu root or a
+certificate still listed under `trustedCaCertificatePaths`.
+
+### Explicit CA paths
+
+Trust an additional enterprise TLS inspection or private package-registry CA:
 
 ```yaml
 image:
@@ -92,8 +139,9 @@ image:
 
 Paths may be repository-relative, absolute, or under `~/`. EPAR validates PEM
 or DER X.509 CA certificates before building, normalizes them to deterministic
-`.crt` files, and installs them before any `apt` or `curl` step. This is opt-in:
-only configure a CA that your organization explicitly trusts.
+`.crt` files, and installs them before any `apt` or `curl` step. These paths are
+independent of host trust inheritance and remain trusted until removed from the
+config.
 
 Route the private Docker-DinD daemon through an enterprise network proxy:
 

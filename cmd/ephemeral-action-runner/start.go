@@ -19,6 +19,10 @@ type starterManager interface {
 	RunPool(context.Context, pool.RunOptions) error
 }
 
+type hostTrustLockingStarterManager interface {
+	AcquireHostTrustControllerLock() (io.Closer, error)
+}
+
 type starterManagerFactory func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error)
 
 var newStarterManager starterManagerFactory = func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error) {
@@ -103,6 +107,17 @@ func runStartWithOptions(opts startOptions) error {
 	if err != nil {
 		return err
 	}
+	hostTrustLockHeld := false
+	if lockingManager, ok := manager.(hostTrustLockingStarterManager); ok {
+		controllerLock, err := lockingManager.AcquireHostTrustControllerLock()
+		if err != nil {
+			return err
+		}
+		if controllerLock != nil {
+			defer controllerLock.Close()
+			hostTrustLockHeld = true
+		}
+	}
 	fmt.Fprintf(opts.Out, "Ensuring runner image is current for %s\n", configPath)
 	if err := manager.EnsureImage(opts.Context); err != nil {
 		return err
@@ -113,11 +128,12 @@ func runStartWithOptions(opts startOptions) error {
 		fmt.Fprintf(opts.Out, "Starting EPAR pool using pool.instances from config. Press Ctrl-C to stop; cleanup is enabled by default.\n")
 	}
 	return manager.RunPool(opts.Context, pool.RunOptions{
-		Instances:        opts.Instances,
-		Register:         opts.Register,
-		KeepOnExit:       opts.KeepOnExit,
-		ReplaceCompleted: opts.ReplaceCompleted,
-		MonitorInterval:  opts.MonitorInterval,
+		Instances:         opts.Instances,
+		Register:          opts.Register,
+		KeepOnExit:        opts.KeepOnExit,
+		ReplaceCompleted:  opts.ReplaceCompleted,
+		MonitorInterval:   opts.MonitorInterval,
+		HostTrustLockHeld: hostTrustLockHeld,
 	})
 }
 

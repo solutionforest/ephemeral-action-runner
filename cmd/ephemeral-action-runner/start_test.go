@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 )
 
@@ -77,14 +79,20 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 
 func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	dir := t.TempDir()
+	stubNoWSL2(t)
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
+	oldResolveHostTrust := initResolveHostTrust
 	t.Cleanup(func() {
 		stdinIsInteractive = oldInteractive
 		dockerAvailable = oldDocker
+		initResolveHostTrust = oldResolveHostTrust
 	})
 	stdinIsInteractive = func() bool { return true }
 	dockerAvailable = func(context.Context) error { return nil }
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, nil
+	}
 
 	fake := &fakeStarterManager{}
 	var out bytes.Buffer
@@ -105,6 +113,51 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".local", "config.yml")); err != nil {
 		t.Fatalf("config was not created: %v", err)
+	}
+	if !strings.Contains(out.String(), "Continuing with") {
+		t.Fatalf("output missing continuation message:\n%s", out.String())
+	}
+	if fake.ensureCalls != 1 || fake.runCalls != 1 {
+		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
+	}
+}
+
+func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
+	dir := t.TempDir()
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubWSL2Available(t)
+	oldInteractive := stdinIsInteractive
+	oldDocker := dockerAvailable
+	t.Cleanup(func() {
+		stdinIsInteractive = oldInteractive
+		dockerAvailable = oldDocker
+	})
+	stdinIsInteractive = func() bool { return true }
+	dockerAvailable = func(context.Context) error { return nil }
+
+	fake := &fakeStarterManager{}
+	var out bytes.Buffer
+	err := runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		Out:         &out,
+		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
+			if path != filepath.Join(dir, ".local", "config.yml") {
+				t.Fatalf("config path = %q", path)
+			}
+			return fake, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(dir, ".local", "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider.Type, "wsl"; got != want {
+		t.Fatalf("provider.type = %q, want %q", got, want)
 	}
 	if !strings.Contains(out.String(), "Continuing with") {
 		t.Fatalf("output missing continuation message:\n%s", out.String())

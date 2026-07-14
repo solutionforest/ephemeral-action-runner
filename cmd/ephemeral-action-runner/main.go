@@ -117,6 +117,13 @@ func runImage(args []string) error {
 			return err
 		}
 		ctx := interruptContext()
+		controllerLock, err := m.AcquireHostTrustControllerLock()
+		if err != nil {
+			return err
+		}
+		if controllerLock != nil {
+			defer controllerLock.Close()
+		}
 		if *update {
 			if err := m.UpdateUpstream(ctx); err != nil {
 				return err
@@ -286,6 +293,7 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		Provider:    provider,
 		GitHub:      client,
 		ProjectRoot: projectRoot,
+		ConfigPath:  resolvedConfigPath,
 		DryRun:      dryRun,
 	}, nil
 }

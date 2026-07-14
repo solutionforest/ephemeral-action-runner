@@ -1,3 +1,3 @@
 module github.com/solutionforest/ephemeral-action-runner
 
-go 1.22
+go 1.25

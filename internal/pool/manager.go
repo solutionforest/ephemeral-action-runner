@@ -13,6 +13,7 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -21,7 +22,12 @@ type Manager struct {
 	Provider    provider.Provider
 	GitHub      GitHubClient
 	ProjectRoot string
+	ConfigPath  string
 	DryRun      bool
+
+	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
+	hostTrustImageEnsurer func(context.Context) error
+	hostTrustImageMu      sync.Mutex
 }
 
 type GitHubClient interface {
@@ -42,19 +48,21 @@ type VerifyOptions struct {
 }
 
 type RunOptions struct {
-	Instances        int
-	Register         bool
-	KeepOnExit       bool
-	ReplaceCompleted bool
-	MonitorInterval  time.Duration
+	Instances         int
+	Register          bool
+	KeepOnExit        bool
+	ReplaceCompleted  bool
+	MonitorInterval   time.Duration
+	HostTrustLockHeld bool
 }
 
 type ProvisionedInstance struct {
-	Name         string
-	IP           string
-	LogPath      string
-	GuestLogPath string
-	RunnerID     int64
+	Name                string
+	IP                  string
+	LogPath             string
+	GuestLogPath        string
+	RunnerID            int64
+	HostTrustGeneration string
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
@@ -67,6 +75,13 @@ const (
 )
 
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
+	controllerLock, err := m.acquireHostTrustControllerLock()
+	if err != nil {
+		return err
+	}
+	if controllerLock != nil {
+		defer controllerLock.Close()
+	}
 	opts.Instances = m.requestedInstances(opts.Instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, opts.Instances, time.Now())
 	fmt.Printf("verifying %d instance(s): %s\n", opts.Instances, strings.Join(names, ", "))
@@ -82,6 +97,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 		wg      sync.WaitGroup
 		errOnce error
 	)
+	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for _, name := range names {
 		name := name
 		wg.Add(1)
@@ -95,10 +111,12 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 			}
 			if vm.Name != "" {
 				created = append(created, vm)
+				leaseAdd(vm)
 			}
 		}()
 	}
 	wg.Wait()
+	stopLeaseKeeper()
 	if opts.Cleanup {
 		fmt.Printf("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
 		if err := m.cleanupWithFreshContext(); err != nil && errOnce == nil {
@@ -126,58 +144,152 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
+	if !opts.HostTrustLockHeld {
+		controllerLock, err := m.AcquireHostTrustControllerLock()
+		if err != nil {
+			return err
+		}
+		if controllerLock != nil {
+			defer controllerLock.Close()
+		}
+	}
 	opts.Instances = m.requestedInstances(opts.Instances)
 	if opts.MonitorInterval <= 0 {
 		opts.MonitorInterval = 15 * time.Second
 	}
 	active := make(map[string]ProvisionedInstance)
 	sequence := 1
+	poolTrustGeneration := ""
 	cleanup := func() error {
 		if opts.KeepOnExit {
 			return nil
 		}
 		return m.cleanupWithFreshContext()
 	}
+	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for len(active) < opts.Instances {
 		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
 		sequence++
 		if err != nil {
+			stopLeaseKeeper()
 			_ = cleanup()
 			return err
 		}
 		active[vm.Name] = vm
+		leaseAdd(vm)
+		if vm.HostTrustGeneration != "" {
+			poolTrustGeneration = vm.HostTrustGeneration
+		}
 		fmt.Printf("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 	}
-	if !opts.Register || !opts.ReplaceCompleted {
+	stopLeaseKeeper()
+	if !opts.Register || (!opts.ReplaceCompleted && !m.hostTrustEnabled()) {
 		fmt.Println("pool is running; press Ctrl-C to stop")
 		<-ctx.Done()
 		return cleanup()
 	}
 	fmt.Printf("pool supervisor is running; monitoring every %s; press Ctrl-C to stop\n", opts.MonitorInterval)
-	ticker := time.NewTicker(opts.MonitorInterval)
+	tickInterval := opts.MonitorInterval
+	if m.hostTrustEnabled() && tickInterval > hostTrustRefreshInterval {
+		tickInterval = hostTrustRefreshInterval
+	}
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
+	nextLivenessCheck := time.Now().Add(opts.MonitorInterval)
+	nextHostTrustCollection := time.Time{}
+	var currentHostTrust hosttrust.Snapshot
 	for {
 		select {
 		case <-ctx.Done():
 			return cleanup()
 		case <-ticker.C:
-			for name, vm := range active {
-				alive, reason, err := m.runnerAlive(ctx, vm)
-				if err != nil {
-					fmt.Printf("[%s] liveness check warning: %v\n", name, err)
-					continue
+			trustRetired := 0
+			trustCapacityReady := true
+			if m.hostTrustEnabled() {
+				now := time.Now()
+				if currentHostTrust.Generation == "" || !now.Before(nextHostTrustCollection) {
+					current, err := m.resolveHostTrust(ctx)
+					nextHostTrustCollection = now.Add(m.hostTrustCollectionInterval())
+					if err != nil {
+						currentHostTrust = hosttrust.Snapshot{}
+						fmt.Printf("host trust refresh warning; existing leases will expire closed: %v\n", err)
+					} else {
+						ready := true
+						if poolTrustGeneration != current.Generation {
+							// Stop old-generation assignment before the replacement build.
+							// Idle runners are removed now; busy runners keep running but
+							// receive a mismatching lease so no subsequent job can start.
+							currentHostTrust = current
+							trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
+							fmt.Printf("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
+							ready = false
+							for attempt := 1; attempt <= 3; attempt++ {
+								generationBeforeEnsure := current.Generation
+								if err := m.ensureHostTrustImage(ctx); err != nil {
+									fmt.Printf("host trust replacement image warning: %v\n", err)
+									nextHostTrustCollection = time.Now()
+									break
+								}
+								current, err = m.resolveHostTrust(ctx)
+								if err != nil {
+									fmt.Printf("host trust post-build refresh warning: %v\n", err)
+									nextHostTrustCollection = time.Now()
+									break
+								}
+								if current.Generation == generationBeforeEnsure {
+									poolTrustGeneration = current.Generation
+									ready = true
+									break
+								}
+								if attempt < 3 {
+									fmt.Printf("host trust changed again during replacement image publication (%s -> %s); retrying %d/3\n", generationBeforeEnsure, current.Generation, attempt+1)
+								} else {
+									fmt.Printf("host trust did not stabilize across 3 replacement image attempts (%s -> %s)\n", generationBeforeEnsure, current.Generation)
+								}
+							}
+							trustCapacityReady = ready
+						}
+						if ready {
+							currentHostTrust = current
+						}
+					}
 				}
-				if alive {
-					continue
+				if currentHostTrust.Generation != "" {
+					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust)
 				}
-				fmt.Printf("[%s] runner is finished or unhealthy: %s\n", name, reason)
-				if err := m.retireInstance(context.Background(), vm, reason); err != nil {
-					fmt.Printf("[%s] retirement warning: %v\n", name, err)
-					continue
-				}
-				delete(active, name)
 			}
-			for len(active) < opts.Instances {
+			if opts.ReplaceCompleted && !time.Now().Before(nextLivenessCheck) {
+				nextLivenessCheck = time.Now().Add(opts.MonitorInterval)
+				for name, vm := range active {
+					alive, reason, err := m.runnerAlive(ctx, vm)
+					if err != nil {
+						fmt.Printf("[%s] liveness check warning: %v\n", name, err)
+						continue
+					}
+					if alive {
+						continue
+					}
+					fmt.Printf("[%s] runner is finished or unhealthy: %s\n", name, reason)
+					if err := m.retireInstance(context.Background(), vm, reason); err != nil {
+						fmt.Printf("[%s] retirement warning: %v\n", name, err)
+						continue
+					}
+					delete(active, name)
+				}
+			}
+			if m.hostTrustEnabled() && currentHostTrust.Generation != "" && currentHostTrust.Generation != poolTrustGeneration {
+				trustCapacityReady = false
+			}
+			replacementCapacity := len(active)
+			needsTrustCapacity := false
+			if m.hostTrustEnabled() && currentHostTrust.Generation != "" {
+				replacementCapacity = currentHostTrustCapacity(active, currentHostTrust.Generation)
+				needsTrustCapacity = replacementCapacity < opts.Instances
+			}
+			if !trustCapacityReady || (!opts.ReplaceCompleted && trustRetired == 0 && !needsTrustCapacity) {
+				continue
+			}
+			for replacementCapacity < opts.Instances {
 				select {
 				case <-ctx.Done():
 					return cleanup()
@@ -192,10 +304,24 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					break
 				}
 				active[vm.Name] = vm
+				replacementCapacity++
+				if vm.HostTrustGeneration != "" {
+					poolTrustGeneration = vm.HostTrustGeneration
+				}
 				fmt.Printf("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 			}
 		}
 	}
+}
+
+func currentHostTrustCapacity(active map[string]ProvisionedInstance, generation string) int {
+	capacity := 0
+	for _, instance := range active {
+		if instance.HostTrustGeneration == generation {
+			capacity++
+		}
+	}
+	return capacity
 }
 
 func (m *Manager) cleanupWithFreshContext() error {
@@ -289,11 +415,45 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 	return b.String(), nil
 }
 
+var errHostTrustImageMismatch = errors.New("runner image host trust generation does not match current host trust")
+
 func (m *Manager) provisionOne(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
+	const attempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		vm, err := m.provisionOneAttempt(ctx, name, register, allowBusy)
+		if err == nil || !errors.Is(err, errHostTrustImageMismatch) {
+			return vm, err
+		}
+		lastErr = err
+		if vm.Name != "" {
+			_ = m.retireInstance(context.Background(), vm, "discarding stale host-trust image generation")
+		}
+		if attempt == attempts {
+			break
+		}
+		fmt.Printf("[%s] host trust changed before runner publication; rebuilding image (attempt %d/%d)\n", name, attempt+1, attempts)
+		if err := m.ensureHostTrustImage(ctx); err != nil {
+			return vm, fmt.Errorf("rebuild image after host trust changed during provisioning: %w", err)
+		}
+	}
+	return ProvisionedInstance{Name: name}, fmt.Errorf("provision runner after %d host trust image stabilization attempts: %w", attempts, lastErr)
+}
+
+func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
 	logPath := config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir)
 	logPath = filepath.Join(logPath, name+"."+m.Config.Provider.Type+".log")
 	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
 	vm := ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath}
+	var trustSnapshot hosttrust.Snapshot
+	if m.hostTrustEnabled() {
+		var err error
+		trustSnapshot, err = m.resolveHostTrust(ctx)
+		if err != nil {
+			return vm, fmt.Errorf("resolve host trust before provisioning: %w", err)
+		}
+		vm.HostTrustGeneration = trustSnapshot.Generation
+	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
 		return vm, err
 	}
@@ -319,7 +479,28 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 		return vm, err
 	}
 	fmt.Printf("[%s] runtime validation passed\n", name)
+	if m.hostTrustEnabled() {
+		marker, err := m.readInstanceHostTrustMarker(ctx, name)
+		if err != nil {
+			return vm, fmt.Errorf("%w: %v", errHostTrustImageMismatch, err)
+		}
+		currentTrust, err := m.resolveHostTrust(ctx)
+		if err != nil {
+			return vm, fmt.Errorf("%w: refresh host trust after runtime validation: %v", errHostTrustImageMismatch, err)
+		}
+		if err := validateHostTrustMarkerAgainstSnapshot(marker, currentTrust); err != nil {
+			return vm, fmt.Errorf("%w: %v", errHostTrustImageMismatch, err)
+		}
+		// Track the immutable generation read from the cloned image, not merely
+		// the pre-clone snapshot. This prevents a trust-store change racing image
+		// cloning from making the supervisor believe a stale image is current.
+		vm.HostTrustGeneration = marker.Generation
+		trustSnapshot = currentTrust
+	}
 	if register {
+		if err := m.issueHostTrustLease(ctx, name, trustSnapshot); err != nil {
+			return vm, fmt.Errorf("issue host trust lease: %w", err)
+		}
 		if m.GitHub == nil {
 			if m.DryRun {
 				fmt.Printf("[dry-run] would register GitHub runner %s with labels %s\n", name, strings.Join(m.Config.Runner.Labels, ","))
@@ -394,12 +575,32 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 	defer ticker.Stop()
 	consecutiveProbeFailures := 0
 	var lastProbeErr error
+	nextLeaseRefresh := time.Now().Add(hostTrustRefreshInterval)
 
 	for {
 		select {
 		case result := <-resultCh:
 			return result.runner, result.err
 		case <-ticker.C:
+			if m.hostTrustEnabled() && !time.Now().Before(nextLeaseRefresh) {
+				current, err := m.resolveHostTrust(waitCtx)
+				if err != nil {
+					cancel()
+					return gh.Runner{}, fmt.Errorf("refresh host trust while waiting for runner readiness: %w", err)
+				}
+				if current.Generation != vm.HostTrustGeneration {
+					if revokeErr := m.issueHostTrustLease(waitCtx, vm.Name, current); revokeErr != nil {
+						fmt.Printf("[%s] host trust readiness revocation warning: %v\n", vm.Name, revokeErr)
+					}
+					cancel()
+					return gh.Runner{}, fmt.Errorf("host trust changed while runner %s was registering (%s -> %s)", vm.Name, vm.HostTrustGeneration, current.Generation)
+				}
+				if err := m.issueHostTrustLease(waitCtx, vm.Name, current); err != nil {
+					cancel()
+					return gh.Runner{}, fmt.Errorf("refresh host trust lease while waiting for runner readiness: %w", err)
+				}
+				nextLeaseRefresh = time.Now().Add(hostTrustRefreshInterval)
+			}
 			err := m.checkRunnerProcess(waitCtx, vm.Name)
 			if err == nil {
 				consecutiveProbeFailures = 0

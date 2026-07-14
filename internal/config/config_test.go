@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -110,6 +111,72 @@ func TestValidateRejectsEmptyTrustedCACertificatePath(t *testing.T) {
 	cfg.Image.TrustedCACertificatePaths = []string{" "}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "image.trustedCaCertificatePaths") {
 		t.Fatalf("Validate() error = %v, want trusted CA path error", err)
+	}
+}
+
+func TestHostTrustDefaultsToDisabledWithSystemScope(t *testing.T) {
+	cfg := Default()
+	if cfg.Image.HostTrustMode != HostTrustModeDisabled {
+		t.Fatalf("image.hostTrustMode = %q, want %q", cfg.Image.HostTrustMode, HostTrustModeDisabled)
+	}
+	if got, want := cfg.Image.HostTrustScopes, []string{HostTrustScopeSystem}; !slices.Equal(got, want) {
+		t.Fatalf("image.hostTrustScopes = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadAndValidateHostTrustOverlay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system, user]
+provider:
+  type: docker-dind
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.HostTrustMode, HostTrustModeOverlay; got != want {
+		t.Fatalf("image.hostTrustMode = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.HostTrustScopes, []string{HostTrustScopeSystem, HostTrustScopeUser}; !slices.Equal(got, want) {
+		t.Fatalf("image.hostTrustScopes = %#v, want %#v", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateRejectsInvalidHostTrustConfigurations(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mode      string
+		scopes    []string
+		provider  string
+		ephemeral bool
+	}{
+		{name: "unknown mode", mode: "mirror", scopes: []string{HostTrustScopeSystem}, provider: "docker-dind", ephemeral: true},
+		{name: "wrong provider", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "wsl", ephemeral: true},
+		{name: "non-ephemeral", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "docker-dind"},
+		{name: "empty scopes", mode: HostTrustModeOverlay, provider: "docker-dind", ephemeral: true},
+		{name: "unknown scope", mode: HostTrustModeOverlay, scopes: []string{"global"}, provider: "docker-dind", ephemeral: true},
+		{name: "duplicate scope", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem, HostTrustScopeSystem}, provider: "docker-dind", ephemeral: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Provider.Type = test.provider
+			cfg.Provider.SourceImage = "runner-image"
+			cfg.Runner.Ephemeral = test.ephemeral
+			cfg.Image.HostTrustMode = test.mode
+			cfg.Image.HostTrustScopes = test.scopes
+			if err := Validate(cfg); err == nil {
+				t.Fatal("Validate accepted invalid host trust configuration")
+			}
+		})
 	}
 }
 

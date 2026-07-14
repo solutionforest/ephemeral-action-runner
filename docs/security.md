@@ -36,6 +36,18 @@ runner instances. CA certificates are not treated as secrets. Add only CA roots
 or intermediates that your organization has explicitly authorized, and rebuild
 the image when they are rotated or revoked.
 
+`image.hostTrustMode: overlay` is a broader policy choice: after the operator
+enables it, EPAR follows every root anchor in the configured host scopes,
+including later additions, removals, and rotations. Windows and macOS user scope
+can include roots installed by software running as that account. Enable it only
+when the host trust administrators are also authorized to control runner trust.
+
+Host trust inheritance is additive to Ubuntu's default roots and explicit CA
+paths. It does not emulate every Windows or macOS certificate-policy constraint,
+and removing a host root cannot revoke an identical Ubuntu-bundled or explicitly
+configured anchor. EPAR applies host changes through immutable runner generations:
+running jobs keep their starting trust, while stale idle runners are replaced.
+
 The GitHub App private key remains on the host. Guest instances receive only short-lived registration tokens at runtime. Do not bake tokens or private keys into runner images.
 
 ## Registry Mirrors

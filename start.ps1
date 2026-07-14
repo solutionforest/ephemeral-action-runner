@@ -13,6 +13,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $Root
+. (Join-Path $Root "scripts\host-trust\wrapper-lib.ps1")
 
 $GoBin = if ($env:EPAR_GO_BIN) { $env:EPAR_GO_BIN } else { "go" }
 $UseDockerRun = if ($env:EPAR_USE_DOCKER_RUN) { $env:EPAR_USE_DOCKER_RUN } else { "auto" }
@@ -45,5 +46,19 @@ if (-not $goUsable) {
     exit 1
 }
 
-& $GoBin run ./cmd/ephemeral-action-runner @StartArgs
-exit $LASTEXITCODE
+$bridge = Start-EparHostTrustBridge -ProjectRoot $Root -Command "start" -Arguments $EparArgs
+$previousHostOS = $env:EPAR_CONTROLLER_HOST_OS
+$previousFeed = $env:EPAR_HOST_TRUST_FEED
+try {
+    if ($bridge.FeedDir) {
+        $env:EPAR_CONTROLLER_HOST_OS = Get-EparHostTrustHostOS
+        $env:EPAR_HOST_TRUST_FEED = Join-Path $bridge.FeedDir "current.json"
+    }
+    & $GoBin run ./cmd/ephemeral-action-runner @StartArgs
+    $exitCode = $LASTEXITCODE
+} finally {
+    Stop-EparHostTrustBridge -Bridge $bridge
+    if ($null -eq $previousHostOS) { Remove-Item Env:EPAR_CONTROLLER_HOST_OS -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_HOST_OS = $previousHostOS }
+    if ($null -eq $previousFeed) { Remove-Item Env:EPAR_HOST_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_TRUST_FEED = $previousFeed }
+}
+exit $exitCode

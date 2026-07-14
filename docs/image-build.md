@@ -46,13 +46,15 @@ flowchart TD
 
 Several layers control what is pre-installed in the Ubuntu image:
 
-1. `image.trustedCaCertificatePaths`, when configured, installs explicitly trusted enterprise CA certificates before guest install steps access the network.
-2. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
-3. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
-4. WSL builds from Docker-image sources validate Docker Engine from the base image and preserve source image environment metadata for runner jobs.
-5. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
-6. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
-7. `image.customInstallScripts` adds optional tool layers.
+1. `image.hostTrustMode: overlay`, when enabled for Docker-DinD, snapshots and installs the controller host's trusted root anchors.
+2. `image.trustedCaCertificatePaths`, when configured, installs additional explicitly trusted enterprise CA certificates.
+3. EPAR installs both CA sources before guest install steps access the network.
+4. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
+5. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
+6. WSL builds from Docker-image sources validate Docker Engine from the base image and preserve source image environment metadata for runner jobs.
+7. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
+8. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
+9. `image.customInstallScripts` adds optional tool layers.
 
 ```mermaid
 flowchart LR
@@ -74,6 +76,40 @@ EPAR ships reusable install scripts for common cases:
 - `scripts/guest/ubuntu/install-web-e2e.sh` includes Docker/browser support and ensures Node.js/npm, `zip`, `rsync`, and `mysql-client` for common web app and browser E2E workflows.
 
 Built-in install scripts call `scripts/guest/ubuntu/wait-apt-ready.sh` before package installs. It stops active `apt-daily` jobs for the current boot only, waits for dpkg locks to clear, and leaves Ubuntu's normal apt timer enablement unchanged in the finalized image.
+
+### Host trust overlay
+
+Docker-DinD can snapshot all trusted root anchors visible in configured host
+scopes and add them to Ubuntu's default CA store:
+
+```yaml
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system, user]
+```
+
+Windows and macOS support `system` and `user`; Linux supports `system` only.
+Each canonical root set has a content generation recorded in the EPAR image
+manifest. An addition, removal, or rotation creates a new generation, invalidates
+image reuse, and causes idle runners from the earlier generation to be replaced.
+A job already running keeps its immutable starting generation.
+
+The pool keeps its normal 15-second liveness interval. With overlay mode
+enabled, a native controller recollects host trust every 15 seconds; a
+containerized controller checks its read-only feed and refreshes idle-runner
+leases every 5 seconds. The official no-Go wrappers run a host-side collector
+every 10 seconds. Feed data must be no more than 30 seconds old. A runner receives a
+20-second controller lease, and its synchronous
+pre-job hook fails closed if the lease is missing, expired, or belongs to a
+different generation. A rare assignment racing runner retirement can therefore
+fail before workflow steps rather than run with stale trust.
+
+Host trust is copied into the image build context; the host trust feed is not
+mounted into job containers. EPAR does not alter a running job's CA store.
+
+This is an additive Ubuntu overlay. It does not reproduce every Windows or
+macOS trust-policy constraint and does not remove an independently bundled
+Ubuntu root. See [Docker-DinD Host Trust Inheritance](providers/docker-dind.md#host-trust-inheritance).
 
 ### Enterprise CA certificates
 
