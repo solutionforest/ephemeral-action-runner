@@ -44,6 +44,11 @@ project_root="$(cd "$project_root" && pwd -P)"
 if [[ "$config_path" != /* ]]; then
   config_path="$project_root/$config_path"
 fi
+if [[ ! -f "$config_path" ]]; then
+  # The first `start` can create config interactively. Treat missing config as
+  # disabled: native controller code will re-evaluate after init.
+  exit 0
+fi
 config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
 if command -v realpath >/dev/null 2>&1; then
   config_path="$(realpath "$config_path")"
@@ -84,12 +89,6 @@ config_values() {
     }
   ' "$config_path"
 }
-
-if [[ ! -f "$config_path" ]]; then
-  # The first `start` can create config interactively. Treat missing config as
-  # disabled: native controller code will re-evaluate after init.
-  exit 0
-fi
 
 mode=""
 scopes=()

@@ -200,6 +200,30 @@ fi
 EPAR_HOST_TRUST_HELPER="$helper"
 # shellcheck disable=SC1091
 . "$project_root/scripts/host-trust/wrapper-lib.sh"
+
+missing_config="$temporary/missing-project/.local/config.yml"
+missing_output="$("$helper" sync --project-root "$project_root" --config "$missing_config")"
+[[ -z "$missing_output" ]] || { echo "missing config unexpectedly produced a host-trust feed" >&2; exit 1; }
+
+native_project="$temporary/native-go-project"
+fake_go="$temporary/fake-go"
+fake_go_log="$temporary/fake-go.log"
+mkdir -p "$native_project/scripts/host-trust"
+cp "$project_root/start" "$native_project/start"
+cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$native_project/scripts/host-trust/"
+cat >"$fake_go" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == version ]]; then
+  echo 'go version go1.25.0 test/arch'
+  exit 0
+fi
+printf '%s\n' "$*" >>"$FAKE_GO_LOG"
+SH
+chmod +x "$fake_go"
+(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" ./start)
+grep -Fxq 'run ./cmd/ephemeral-action-runner start' "$fake_go_log"
+
 nested_root="$temporary/nested-project"
 mkdir -p "$nested_root/.local"
 [[ "$(epar_host_trust_config_path "$temporary" start --project-root nested-project)" == "$nested_root/.local/config.yml" ]]
