@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -33,6 +34,7 @@ type wslExporter interface {
 }
 
 var (
+	runHostCommand       = runHost
 	runHostLoggedCommand = runHostLogged
 	runHostOutputCommand = runHostOutput
 	runHostQuietCommand  = runHostQuiet
@@ -108,14 +110,56 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 			return fmt.Errorf("docker image %s already exists; rerun with --replace", m.Config.Image.OutputImage)
 		}
 	}
-	if opts.Manifest == nil {
-		manifest, err := m.desiredImageManifest(ctx)
+	attempts := 1
+	if m.hostTrustEnabled() {
+		attempts = 3
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		snapshot, err := m.resolveHostTrust(ctx)
 		if err != nil {
 			return err
 		}
-		opts.Manifest = &manifest
+		manifest := opts.Manifest
+		if m.hostTrustEnabled() || manifest == nil {
+			value, err := m.desiredImageManifestWithHostTrust(ctx, snapshot)
+			if err != nil {
+				return err
+			}
+			manifest = &value
+		}
+		targetImage := m.Config.Image.OutputImage
+		if m.hostTrustEnabled() {
+			targetImage = temporaryDockerImageTag(targetImage, snapshot.Generation, attempt)
+		}
+		if err := m.buildDockerDindImageAttempt(ctx, upstreamDir, buildLogPath, targetImage, *manifest, snapshot); err != nil {
+			return err
+		}
+		if m.DryRun || !m.hostTrustEnabled() {
+			return nil
+		}
+		current, err := m.resolveHostTrust(ctx)
+		if err != nil {
+			_ = runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+			return err
+		}
+		if current.Generation != snapshot.Generation {
+			fmt.Printf("host trust changed during image build (%s -> %s); discarding attempt %d/%d\n", snapshot.Generation, current.Generation, attempt, attempts)
+			_ = runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+			continue
+		}
+		if err := runHostCommand(ctx, "docker", "image", "tag", targetImage, m.Config.Image.OutputImage); err != nil {
+			_ = runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+			return err
+		}
+		_ = runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+		fmt.Printf("image build complete: %s is available in `docker image ls`\n", m.Config.Image.OutputImage)
+		return nil
 	}
-	manifestContent, manifestHash, err := storedImageManifestContent(*opts.Manifest)
+	return fmt.Errorf("host trust changed during all %d image build attempts; retry after the host trust store stabilizes", attempts)
+}
+
+func (m *Manager) buildDockerDindImageAttempt(ctx context.Context, upstreamDir, buildLogPath, targetImage string, manifest ImageManifest, snapshot hosttrust.Snapshot) error {
+	manifestContent, manifestHash, err := storedImageManifestContent(manifest)
 	if err != nil {
 		return err
 	}
@@ -124,12 +168,12 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 		return err
 	}
 	defer os.RemoveAll(buildCtx)
-	if err := m.prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestContent); err != nil {
+	if err := m.prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, snapshot); err != nil {
 		return err
 	}
-	fmt.Printf("building Docker-DinD image %s from %s\n", m.Config.Image.OutputImage, m.Config.Image.SourceImage)
+	fmt.Printf("building Docker-DinD image %s from %s\n", targetImage, m.Config.Image.SourceImage)
 	fmt.Printf("log: %s\n", buildLogPath)
-	args := []string{"build", "-t", m.Config.Image.OutputImage}
+	args := []string{"build", "-t", targetImage}
 	if m.Config.Provider.Platform != "" {
 		args = append(args, "--platform", m.Config.Provider.Platform)
 	}
@@ -141,14 +185,24 @@ func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptio
 	)
 	if m.DryRun {
 		fmt.Printf("[dry-run] docker %s\n", strings.Join(args, " "))
-		fmt.Printf("image build dry run complete: %s\n", m.Config.Image.OutputImage)
+		fmt.Printf("image build dry run complete: %s\n", targetImage)
 		return nil
 	}
-	if err := runHostLogged(ctx, buildLogPath, "docker", args...); err != nil {
+	if err := runHostLoggedCommand(ctx, buildLogPath, "docker", args...); err != nil {
 		return err
 	}
-	fmt.Printf("image build complete: %s is available in `docker image ls`\n", m.Config.Image.OutputImage)
+	if !m.hostTrustEnabled() {
+		fmt.Printf("image build complete: %s is available in `docker image ls`\n", targetImage)
+	}
 	return nil
+}
+
+func temporaryDockerImageTag(output, generation string, attempt int) string {
+	short := generation
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	return fmt.Sprintf("%s-epar-build-%s-%d", output, short, attempt)
 }
 
 func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
@@ -863,6 +917,10 @@ func (m *Manager) runnerImagesCopyMode() runnerImagesCopyMode {
 }
 
 func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestContent string) error {
+	return m.prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, hosttrust.Snapshot{})
+}
+
+func (m *Manager) prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent string, snapshot hosttrust.Snapshot) error {
 	if err := copyDir(filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu"), filepath.Join(buildCtx, "scripts", "guest", "ubuntu")); err != nil {
 		return err
 	}
@@ -890,6 +948,9 @@ func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestC
 		return err
 	}
 	if err := m.copyTrustedCACertificatesToDir(filepath.Join(buildCtx, "trusted-ca-certificates")); err != nil {
+		return err
+	}
+	if err := m.writeHostTrustBuildInputs(buildCtx, snapshot); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(buildCtx, "image-manifest.json"), []byte(manifestContent), 0644); err != nil {
@@ -922,11 +983,15 @@ LABEL `+imageManifestLabel+`="${EPAR_IMAGE_MANIFEST_SHA256}"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NEEDRESTART_MODE=l
 ENV NEEDRESTART_SUSPEND=1
+RUN rm -rf `+trustedCAGuestDir+` `+hostTrustGuestDir+` `+hostTrustMarkerGuest+` \
+ && install -d -m 0755 `+trustedCAGuestDir+` `+hostTrustGuestDir+` /opt/epar
 COPY scripts/guest/ubuntu/ /opt/epar/
 COPY scripts/container/ubuntu/entrypoint.sh /opt/epar/container-entrypoint.sh
 COPY upstream/runner-images/ /opt/epar/upstream/runner-images/
 COPY custom-install/ /opt/epar/custom-install/
 COPY trusted-ca-certificates/ `+trustedCAGuestDir+`/
+COPY host-trust-certificates/ `+hostTrustGuestDir+`/
+COPY host-trust-metadata/ /opt/epar/
 COPY image-manifest.json /opt/epar/image-manifest.json
 RUN chmod 0755 /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
 RUN bash /opt/epar/install-trusted-ca-certificates.sh

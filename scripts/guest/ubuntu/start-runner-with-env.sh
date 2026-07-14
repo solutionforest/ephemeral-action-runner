@@ -8,6 +8,13 @@ if [[ -f /opt/epar/source-image.env ]]; then
   set +a
 fi
 
+# shellcheck disable=SC1091
+. /opt/epar/apply-trusted-ca-runtime.sh
+
+if [[ -s /opt/epar/host-trust-generation.json ]]; then
+  export ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/check-host-trust-generation.sh
+fi
+
 runner_work_dir="${EPAR_RUNNER_WORK_DIR:-/opt/actions-runner}"
 
 cd "${runner_work_dir}"

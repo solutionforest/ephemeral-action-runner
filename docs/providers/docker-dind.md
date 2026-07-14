@@ -87,9 +87,55 @@ EPAR sets these values on the outer container before it starts, allowing
 `dockerd` to inherit them on its first launch. Empty values preserve direct
 networking. Proxy URLs are limited to credential-free HTTP(S) roots; use network
 controls rather than embedding proxy passwords. Put host-specific endpoints in
-ignored `.local/config.yml`. If the proxy performs TLS inspection, also configure
-the authorized root under `image.trustedCaCertificatePaths` so verified HTTPS
-continues to work.
+ignored `.local/config.yml`. If the proxy performs TLS inspection, enable host
+trust inheritance or configure the authorized root under
+`image.trustedCaCertificatePaths` so verified HTTPS continues to work.
+
+## Host Trust Inheritance
+
+On Windows, macOS, and Linux controller hosts, Docker-DinD can add the host's
+trusted TLS root anchors to each disposable Ubuntu runner:
+
+```yaml
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system, user]
+```
+
+Use `[system, user]` on Windows or macOS. Use `[system]` on Linux; Linux has no
+portable per-user TLS root store. Overlay mode requires ephemeral Docker-DinD
+runners. Existing configs remain disabled. New interactive Docker-DinD setup
+shows a yes/no prompt and defaults to enabling inheritance.
+
+EPAR treats the host's root set as a versioned generation. It installs that
+generation alongside Ubuntu's default roots and any certificates from
+`image.trustedCaCertificatePaths`. The pool keeps its normal 15-second liveness
+interval. A native controller recollects host trust every 15 seconds; a
+containerized controller checks its read-only feed and refreshes idle-runner
+leases every 5 seconds. Official no-Go launchers keep collection outside the
+Linux toolchain container: their host-side watcher refreshes a read-only feed
+every 10 seconds. The wrapper fails rather than use
+the toolchain container's unrelated CA bundle when the configured feed is
+missing, empty, invalid, or older than 30 seconds.
+
+When a generation changes, EPAR stops leasing old idle runners, removes them,
+builds the replacement image, and registers replacement capacity. A busy runner
+finishes its current job without having its trust changed. A synchronous
+`ACTIONS_RUNNER_HOOK_JOB_STARTED` gate requires a current 20-second controller
+lease and matching image generation. If GitHub assigns an old runner while it
+is being retired, the gate fails before repository workflow steps run; the job
+can still appear failed because GitHub assignment has already happened.
+
+The host trust snapshot and no-Go feed are controller inputs only. They are not
+mounted into runner containers, and workflow code cannot use the feed as a host
+filesystem channel.
+
+This feature inherits root anchors, not every host TLS-policy rule. The overlay
+is additive, so removing a host root does not remove a matching root already in
+Ubuntu or explicitly configured by path. Host Docker daemon trust is also
+separate: a source-image pull can fail before EPAR can build the guest overlay.
+Applications with private trust stores, including Java keystores, can require
+additional configuration.
 
 ## Image Build
 

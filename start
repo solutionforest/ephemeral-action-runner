@@ -9,7 +9,18 @@ set -euo pipefail
 # See docs/advanced/no-go-install.md.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    ps_script="$script_dir/start.ps1"
+    command -v cygpath >/dev/null 2>&1 && ps_script="$(cygpath -w "$ps_script")"
+    exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$ps_script" "$@"
+    ;;
+esac
 cd "${script_dir}"
+
+EPAR_HOST_TRUST_HELPER="${script_dir}/scripts/host-trust/host-trust-feed.sh"
+# shellcheck disable=SC1091
+. "${script_dir}/scripts/host-trust/wrapper-lib.sh"
 
 GO_BIN="${EPAR_GO_BIN:-go}"
 USE_DOCKER_RUN="${EPAR_USE_DOCKER_RUN:-auto}"
@@ -32,4 +43,14 @@ if ! go_usable "${GO_BIN}"; then
   exit 1
 fi
 
-exec "${GO_BIN}" run ./cmd/ephemeral-action-runner start "$@"
+epar_host_trust_prepare "${script_dir}" start "$@"
+trap epar_host_trust_cleanup EXIT INT TERM
+if [[ -n "${EPAR_HOST_TRUST_FEED_DIR}" ]]; then
+  export EPAR_CONTROLLER_HOST_OS="$(epar_host_trust_host_os)"
+  export EPAR_HOST_TRUST_FEED="${EPAR_HOST_TRUST_FEED_DIR}/current.json"
+fi
+"${GO_BIN}" run ./cmd/ephemeral-action-runner start "$@"
+status=$?
+epar_host_trust_cleanup
+trap - EXIT INT TERM
+exit "$status"

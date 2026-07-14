@@ -20,6 +20,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
 var dockerAvailable = func(ctx context.Context) error {
@@ -32,15 +33,27 @@ var initRandomRead = rand.Read
 
 var initGOOS = runtime.GOOS
 
+var initHostTrustOS = detectedInitHostTrustOS()
+
 var initWSLStatus = wslStatus
 
+var initResolveHostTrust = hosttrust.Resolve
+
+func detectedInitHostTrustOS() string {
+	if hostOS := strings.TrimSpace(os.Getenv("EPAR_CONTROLLER_HOST_OS")); hostOS != "" {
+		return hostOS
+	}
+	return runtime.GOOS
+}
+
 type initOptions struct {
-	ProjectRoot     string
-	ConfigPath      string
-	Force           bool
-	SkipDockerCheck bool
-	In              io.Reader
-	Out             io.Writer
+	ProjectRoot        string
+	ConfigPath         string
+	Force              bool
+	SkipDockerCheck    bool
+	SkipHostTrustCheck bool
+	In                 io.Reader
+	Out                io.Writer
 }
 
 func runInit(args []string) error {
@@ -48,6 +61,7 @@ func runInit(args []string) error {
 	common := addCommonFlags(fs)
 	force := fs.Bool("force", false, "overwrite an existing config file")
 	skipDockerCheck := fs.Bool("skip-docker-check", false, "create the config without checking for Docker")
+	skipHostTrustCheck := fs.Bool("skip-host-trust-check", false, "create the config without collecting host trust roots")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -64,12 +78,13 @@ func runInit(args []string) error {
 	}
 
 	return runInitWithOptions(initOptions{
-		ProjectRoot:     projectRoot,
-		ConfigPath:      configPath,
-		Force:           *force,
-		SkipDockerCheck: *skipDockerCheck,
-		In:              os.Stdin,
-		Out:             os.Stdout,
+		ProjectRoot:        projectRoot,
+		ConfigPath:         configPath,
+		Force:              *force,
+		SkipDockerCheck:    *skipDockerCheck,
+		SkipHostTrustCheck: *skipHostTrustCheck,
+		In:                 os.Stdin,
+		Out:                os.Stdout,
 	})
 }
 
@@ -137,7 +152,33 @@ func runInitWithOptions(opts initOptions) error {
 		return err
 	}
 
-	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix)
+	hostTrustMode := config.HostTrustModeDisabled
+	hostTrustScopes := []string{config.HostTrustScopeSystem}
+	if providerType == "docker-dind" {
+		enabled, promptErr := promptYesNo(opts.Out, reader, "Inherit this host's trusted TLS roots into disposable runners?", true)
+		if promptErr != nil {
+			return promptErr
+		}
+		if enabled {
+			hostTrustMode = config.HostTrustModeOverlay
+			hostTrustScopes = hostTrustScopesForOS(initHostTrustOS)
+			deferred := os.Getenv("EPAR_HOST_TRUST_INIT_DEFERRED") == "1"
+			if !opts.SkipHostTrustCheck && !deferred {
+				preflightCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, collectErr := initResolveHostTrust(preflightCtx, hosttrust.Options{
+					Mode:             hostTrustMode,
+					Scopes:           hostTrustScopes,
+					ControllerHostOS: initHostTrustOS,
+				})
+				cancel()
+				if collectErr != nil {
+					return fmt.Errorf("collect host trusted TLS roots before writing config: %w", collectErr)
+				}
+			}
+		}
+	}
+
+	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes)
 	if providerType == "wsl" {
 		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix)
 	}
@@ -253,6 +294,37 @@ func promptDefault(out io.Writer, reader *bufio.Reader, label string, defaultVal
 		return defaultValue, hitEOF, nil
 	}
 	return value, hitEOF, nil
+}
+
+func promptYesNo(out io.Writer, reader *bufio.Reader, label string, defaultYes bool) (bool, error) {
+	defaultValue := "Y"
+	if !defaultYes {
+		defaultValue = "N"
+	}
+	for {
+		value, hitEOF, err := promptDefault(out, reader, label+" [Y/n]", defaultValue)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		default:
+			fmt.Fprintln(out, "Please answer yes or no.")
+			if hitEOF {
+				return false, fmt.Errorf("invalid yes/no response %q", value)
+			}
+		}
+	}
+}
+
+func hostTrustScopesForOS(goos string) []string {
+	if goos == "windows" || goos == "darwin" {
+		return []string{config.HostTrustScopeSystem, config.HostTrustScopeUser}
+	}
+	return []string{config.HostTrustScopeSystem}
 }
 
 func generatedPoolNamePrefix() (string, error) {
@@ -387,7 +459,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string) string {
+func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -402,6 +474,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  hostTrustMode: %s
+  hostTrustScopes: [%s]
   customInstallScripts:
 
 pool:
@@ -427,7 +501,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, poolNamePrefix)
+`, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix)
 }
 
 func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string) string {

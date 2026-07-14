@@ -37,6 +37,9 @@ if (-not $HostName) {
 }
 $DockerEnvFlags = @()
 $DockerEnvFlags += @("-e", "DOCKER_CLI_HINTS=$DockerCliHints")
+if ($env:EPAR_CONFIG) {
+    $DockerEnvFlags += @("-e", "EPAR_CONFIG=$($env:EPAR_CONFIG)")
+}
 if ($HostName) {
     $DockerEnvFlags += @("-e", "EPAR_HOST_NAME=$HostName")
 }
@@ -47,6 +50,14 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+. (Join-Path $RepoRoot "scripts\host-trust\wrapper-lib.ps1")
+$EparCommand = if ($EparArgs -and $EparArgs.Count -gt 0) { [string] $EparArgs[0] } else { "start" }
+$ConfigPath = Get-EparHostTrustConfigPath -ProjectRoot $RepoRoot -Arguments $EparArgs
+$ImplicitInit = $EparCommand -eq "start" -and -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)
+if ($EparCommand -eq "init" -or $ImplicitInit) {
+    $DockerEnvFlags += @("-e", "EPAR_HOST_TRUST_INIT_DEFERRED=1")
+    $DockerEnvFlags += @("-e", "EPAR_CONTROLLER_HOST_OS=$(Get-EparHostTrustHostOS)")
+}
 $DockerRunFlags = @("--rm", "-i")
 try {
     if (-not [Console]::IsInputRedirected) {
@@ -57,6 +68,7 @@ try {
 }
 
 $ExitCode = 0
+$bridge = $null
 try {
     docker build --quiet `
         --build-arg "GO_IMAGE=$Image" `
@@ -67,18 +79,48 @@ try {
     if ($LASTEXITCODE -ne 0) {
         $ExitCode = $LASTEXITCODE
     } else {
-        docker run @DockerRunFlags `
-            @DockerEnvFlags `
-            -v "${RepoRoot}:/app" -w /app `
-            -v "${GomodVolume}:/go/pkg/mod" `
-            -v "${GocacheVolume}:/root/.cache/go-build" `
-            -v "${DockerSock}:/var/run/docker.sock" `
-            $DevImage `
-            go run ./cmd/ephemeral-action-runner @EparArgs
+        if ($ImplicitInit) {
+            $InitArgs = @(Get-EparHostTrustInitArguments -Arguments $EparArgs)
+            docker run @DockerRunFlags `
+                @DockerEnvFlags `
+                -v "${RepoRoot}:/app" -w /app `
+                -v "${GomodVolume}:/go/pkg/mod" `
+                -v "${GocacheVolume}:/root/.cache/go-build" `
+                -v "${DockerSock}:/var/run/docker.sock" `
+                $DevImage `
+                go run ./cmd/ephemeral-action-runner @InitArgs
+            $ExitCode = $LASTEXITCODE
+            if ($ExitCode -eq 0) {
+                $initBridge = [pscustomobject]@{ FeedDir = $null; WatchProcess = $null; Config = $ConfigPath; PostInit = $true }
+                Complete-EparHostTrustInit -ProjectRoot $RepoRoot -Bridge $initBridge
+            }
+        }
+        if ($ExitCode -eq 0) {
+            $bridge = Start-EparHostTrustBridge -ProjectRoot $RepoRoot -Command $EparCommand -Arguments $EparArgs
+            $HostTrustFlags = @()
+            if ($bridge.FeedDir) {
+                $HostTrustFlags += @("-e", "EPAR_CONTROLLER_HOST_OS=$(Get-EparHostTrustHostOS)")
+                $HostTrustFlags += @("-e", "EPAR_HOST_TRUST_FEED=/run/epar-host-trust/current.json")
+                $HostTrustFlags += @("-v", "$($bridge.FeedDir):/run/epar-host-trust:ro")
+            }
+            docker run @DockerRunFlags `
+                @DockerEnvFlags `
+                @HostTrustFlags `
+                -v "${RepoRoot}:/app" -w /app `
+                -v "${GomodVolume}:/go/pkg/mod" `
+                -v "${GocacheVolume}:/root/.cache/go-build" `
+                -v "${DockerSock}:/var/run/docker.sock" `
+                $DevImage `
+                go run ./cmd/ephemeral-action-runner @EparArgs
 
-        $ExitCode = $LASTEXITCODE
+            $ExitCode = $LASTEXITCODE
+            if ($ExitCode -eq 0 -and $EparCommand -eq "init") {
+                Complete-EparHostTrustInit -ProjectRoot $RepoRoot -Bridge $bridge
+            }
+        }
     }
 } finally {
+    Stop-EparHostTrustBridge -Bridge $bridge
     if ($OriginalDockerCliHintsExists) {
         $env:DOCKER_CLI_HINTS = $OriginalDockerCliHints
     } else {

@@ -4,3 +4,4 @@
 ARG GO_IMAGE=golang:1.24
 FROM ${GO_IMAGE}
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:27-cli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins

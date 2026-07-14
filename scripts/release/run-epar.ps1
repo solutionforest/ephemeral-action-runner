@@ -4,6 +4,7 @@ param(
 )
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $Root "scripts\host-trust\wrapper-lib.ps1")
 $Exe = Join-Path $Root "ephemeral-action-runner.exe"
 $LogDir = Join-Path $Root "work\logs"
 $LogFile = Join-Path $LogDir "epar-last-run.log"
@@ -28,6 +29,9 @@ if (-not (Test-Path -LiteralPath $Exe)) {
 }
 
 $transcriptStarted = $false
+$bridge = $null
+$previousHostOS = $null
+$previousFeed = $null
 try {
     Start-Transcript -LiteralPath $LogFile -Append -Force | Out-Null
     $transcriptStarted = $true
@@ -36,9 +40,23 @@ try {
 }
 
 try {
+    $command = if ($EparArgs -and $EparArgs.Count -gt 0) { [string] $EparArgs[0] } else { "start" }
+    $bridge = Start-EparHostTrustBridge -ProjectRoot $Root -Command $command -Arguments $EparArgs
+    $previousHostOS = $env:EPAR_CONTROLLER_HOST_OS
+    $previousFeed = $env:EPAR_HOST_TRUST_FEED
+    if ($bridge.FeedDir) {
+        $env:EPAR_CONTROLLER_HOST_OS = Get-EparHostTrustHostOS
+        $env:EPAR_HOST_TRUST_FEED = Join-Path $bridge.FeedDir "current.json"
+    }
     & $Exe @EparArgs
     $code = $LASTEXITCODE
+    if ($code -eq 0 -and $command -eq "init") {
+        Complete-EparHostTrustInit -ProjectRoot $Root -Bridge $bridge
+    }
 } finally {
+    Stop-EparHostTrustBridge -Bridge $bridge
+    if ($null -eq $previousHostOS) { Remove-Item Env:EPAR_CONTROLLER_HOST_OS -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_HOST_OS = $previousHostOS }
+    if ($null -eq $previousFeed) { Remove-Item Env:EPAR_HOST_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_TRUST_FEED = $previousFeed }
     if ($transcriptStarted) {
         Stop-Transcript | Out-Null
     }

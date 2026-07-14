@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -185,6 +187,75 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 0 {
 		t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want supervised pool to accept busy runners", got)
+	}
+}
+
+func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{
+		runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+		found:      true,
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test", LogDir: t.TempDir()},
+			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+			Image: config.ImageConfig{
+				HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"},
+			},
+		},
+		Provider:    fake,
+		GitHub:      github,
+		ProjectRoot: t.TempDir(),
+	}
+	var resolveCalls int32
+	snapshot := func(generation string) hosttrust.Snapshot {
+		return hosttrust.Snapshot{
+			Generation: generation, HostOS: "linux", Scopes: []string{"system"},
+			Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+			CollectedAt:  time.Now().UTC(),
+		}
+	}
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
+		if atomic.AddInt32(&resolveCalls, 1) <= 2 {
+			return snapshot("g1"), nil
+		}
+		return snapshot("g2"), nil
+	}
+	var imageEnsures int32
+	manager.hostTrustImageEnsurer = func(context.Context) error {
+		atomic.AddInt32(&imageEnsures, 1)
+		return nil
+	}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), hostTrustMarkerGuest) {
+			generation := "g1"
+			if atomic.LoadInt32(&fake.cloneCalls) >= 2 {
+				generation = "g2"
+			}
+			marker := fmt.Sprintf(`{"schemaVersion":1,"generation":%q,"hostOS":"linux","mode":"overlay","scopes":["system"],"certificateCount":1}`, generation)
+			return provider.ExecResult{Stdout: marker}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	if err := manager.RunPool(ctx, RunOptions{
+		Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: false, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&fake.cloneCalls); got < 2 {
+		t.Fatalf("Clone called %d time(s), want G2 replacement while busy G1 drains", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("busy G1 was deleted %d time(s), want it left draining", got)
+	}
+	if got := atomic.LoadInt32(&imageEnsures); got == 0 {
+		t.Fatal("G2 replacement image was not ensured")
 	}
 }
 

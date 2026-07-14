@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -23,20 +24,21 @@ const (
 )
 
 type ImageManifest struct {
-	SchemaVersion         int          `json:"schemaVersion"`
-	ProviderType          string       `json:"providerType"`
-	ProviderPlatform      string       `json:"providerPlatform,omitempty"`
-	ProviderRosettaTag    string       `json:"providerRosettaTag,omitempty"`
-	SourceType            string       `json:"sourceType,omitempty"`
-	SourceImage           string       `json:"sourceImage"`
-	SourcePlatform        string       `json:"sourcePlatform,omitempty"`
-	SourceDigest          string       `json:"sourceDigest,omitempty"`
-	OutputImage           string       `json:"outputImage"`
-	RunnerVersion         string       `json:"runnerVersion"`
-	UpstreamCommit        string       `json:"upstreamCommit,omitempty"`
-	EPARScripts           []fileDigest `json:"eparScripts,omitempty"`
-	CustomInstallScripts  []fileDigest `json:"customInstallScripts,omitempty"`
-	TrustedCACertificates []fileDigest `json:"trustedCaCertificates,omitempty"`
+	SchemaVersion         int                     `json:"schemaVersion"`
+	ProviderType          string                  `json:"providerType"`
+	ProviderPlatform      string                  `json:"providerPlatform,omitempty"`
+	ProviderRosettaTag    string                  `json:"providerRosettaTag,omitempty"`
+	SourceType            string                  `json:"sourceType,omitempty"`
+	SourceImage           string                  `json:"sourceImage"`
+	SourcePlatform        string                  `json:"sourcePlatform,omitempty"`
+	SourceDigest          string                  `json:"sourceDigest,omitempty"`
+	OutputImage           string                  `json:"outputImage"`
+	RunnerVersion         string                  `json:"runnerVersion"`
+	UpstreamCommit        string                  `json:"upstreamCommit,omitempty"`
+	EPARScripts           []fileDigest            `json:"eparScripts,omitempty"`
+	CustomInstallScripts  []fileDigest            `json:"customInstallScripts,omitempty"`
+	TrustedCACertificates []fileDigest            `json:"trustedCaCertificates,omitempty"`
+	HostTrust             *hostTrustImageMetadata `json:"hostTrust,omitempty"`
 }
 
 type fileDigest struct {
@@ -176,6 +178,14 @@ func (m *Manager) currentTartImageState(ctx context.Context) (imageState, error)
 }
 
 func (m *Manager) desiredImageManifest(ctx context.Context) (ImageManifest, error) {
+	snapshot, err := m.resolveHostTrust(ctx)
+	if err != nil {
+		return ImageManifest{}, err
+	}
+	return m.desiredImageManifestWithHostTrust(ctx, snapshot)
+}
+
+func (m *Manager) desiredImageManifestWithHostTrust(ctx context.Context, snapshot hosttrust.Snapshot) (ImageManifest, error) {
 	sourceType := m.Config.Image.SourceType
 	if sourceType == "" {
 		sourceType = config.ImageSourceRootFSTar
@@ -193,6 +203,7 @@ func (m *Manager) desiredImageManifest(ctx context.Context) (ImageManifest, erro
 		SourcePlatform:     m.Config.Image.SourcePlatform,
 		OutputImage:        m.Config.Image.OutputImage,
 		RunnerVersion:      m.Config.Image.RunnerVersion,
+		HostTrust:          hostTrustMetadata(snapshot),
 	}
 	switch sourceType {
 	case config.ImageSourceDockerImage:

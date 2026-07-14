@@ -6,11 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf16"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
 func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
@@ -22,11 +25,12 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	var out bytes.Buffer
 
 	if err := runInitWithOptions(initOptions{
-		ProjectRoot:     dir,
-		ConfigPath:      path,
-		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\n"),
-		Out:             &out,
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\n"),
+		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +51,13 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
+	if got, want := cfg.Image.HostTrustMode, config.HostTrustModeOverlay; got != want {
+		t.Fatalf("image.hostTrustMode = %q, want %q", got, want)
+	}
+	wantScopes := hostTrustScopesForOS(runtime.GOOS)
+	if got := cfg.Image.HostTrustScopes; !slices.Equal(got, wantScopes) {
+		t.Fatalf("image.hostTrustScopes = %#v, want %#v", got, wantScopes)
+	}
 	if got, want := cfg.Pool.Instances, 1; got != want {
 		t.Fatalf("pool.instances = %d, want %d", got, want)
 	}
@@ -64,6 +75,62 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	}
 }
 
+func TestDetectedInitHostTrustOSUsesWrapperHost(t *testing.T) {
+	t.Setenv("EPAR_CONTROLLER_HOST_OS", " windows ")
+	if got, want := detectedInitHostTrustOS(), "windows"; got != want {
+		t.Fatalf("detectedInitHostTrustOS() = %q, want %q", got, want)
+	}
+}
+
+func TestInitCanDisableHostTrustOverlay(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\nn\n"),
+		Out:                &bytes.Buffer{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Image.HostTrustMode != config.HostTrustModeDisabled {
+		t.Fatalf("image.hostTrustMode = %q, want disabled", cfg.Image.HostTrustMode)
+	}
+}
+
+func TestInitDoesNotWriteEnabledConfigWhenHostTrustPreflightFails(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	oldResolve := initResolveHostTrust
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, errors.New("collector unavailable")
+	}
+	t.Cleanup(func() { initResolveHostTrust = oldResolve })
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	err := runInitWithOptions(initOptions{
+		ProjectRoot:     dir,
+		ConfigPath:      path,
+		SkipDockerCheck: true,
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\n\n"),
+		Out:             &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "collector unavailable") {
+		t.Fatalf("init error = %v, want collector failure", err)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("config exists after failed preflight: %v", statErr)
+	}
+}
+
 func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
@@ -71,11 +138,12 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
 	if err := runInitWithOptions(initOptions{
-		ProjectRoot:     dir,
-		ConfigPath:      path,
-		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ncustom-prefix\n"),
-		Out:             &bytes.Buffer{},
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ncustom-prefix\n"),
+		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -96,11 +164,12 @@ func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{
-		ProjectRoot:     dir,
-		ConfigPath:      path,
-		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n-bad\nfixed-prefix\n"),
-		Out:             &out,
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n-bad\nfixed-prefix\n"),
+		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -194,11 +263,12 @@ func TestInitRefusesExistingConfig(t *testing.T) {
 	}
 
 	err := runInitWithOptions(initOptions{
-		ProjectRoot:     dir,
-		ConfigPath:      path,
-		SkipDockerCheck: true,
-		In:              strings.NewReader("123\norg\nkey.pem\n"),
-		Out:             &bytes.Buffer{},
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\norg\nkey.pem\n"),
+		Out:                &bytes.Buffer{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "config already exists") {
 		t.Fatalf("error = %v, want existing config refusal", err)
@@ -233,11 +303,12 @@ func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{
-		ProjectRoot:     dir,
-		ConfigPath:      path,
-		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
-		Out:             &out,
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -278,11 +349,12 @@ func TestInitWSL2ChoiceDefaultsToDockerDindAndRepromptsInvalidValues(t *testing.
 	path := filepath.Join(dir, ".local", "config.yml")
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{
-		ProjectRoot:     dir,
-		ConfigPath:      path,
-		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ninvalid\n\n\n"),
-		Out:             &out,
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ninvalid\n\n\n"),
+		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
 	}

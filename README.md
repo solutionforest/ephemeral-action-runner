@@ -75,7 +75,7 @@ That's it.
 
 #### What Happens
 
-EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. On native Windows, the wizard also offers WSL2 when `wsl.exe --status` confirms default version 2; press Enter to keep Docker-DinD. You can customize the config afterward; see [Configuration](docs/configuration.md).
+EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2; press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
 
 Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 

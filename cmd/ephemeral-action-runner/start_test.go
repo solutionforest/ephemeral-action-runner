@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 )
 
@@ -81,12 +82,17 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	stubNoWSL2(t)
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
+	oldResolveHostTrust := initResolveHostTrust
 	t.Cleanup(func() {
 		stdinIsInteractive = oldInteractive
 		dockerAvailable = oldDocker
+		initResolveHostTrust = oldResolveHostTrust
 	})
 	stdinIsInteractive = func() bool { return true }
 	dockerAvailable = func(context.Context) error { return nil }
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, nil
+	}
 
 	fake := &fakeStarterManager{}
 	var out bytes.Buffer

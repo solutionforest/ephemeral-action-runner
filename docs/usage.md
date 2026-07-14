@@ -67,7 +67,7 @@ Equivalent without the wrapper:
 go run ./cmd/ephemeral-action-runner
 ```
 
-If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. Docker-DinD is the default. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config; press Enter to retain Docker-DinD. The Docker preflight still applies because the default WSL image uses Docker for its one-time rootfs export. EPAR then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config; press Enter to retain Docker-DinD. The Docker preflight still applies because the default WSL image uses Docker for its one-time rootfs export. EPAR then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
 Pass flags through `./start` to choose a config or runner count:
 

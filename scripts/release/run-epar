@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -u
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    ps_script="$script_dir/run-epar.ps1"
+    command -v cygpath >/dev/null 2>&1 && ps_script="$(cygpath -w "$ps_script")"
+    exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$ps_script" "$@"
+    ;;
+esac
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exe="$root/ephemeral-action-runner"
 log_dir="$root/work/logs"
@@ -9,6 +18,16 @@ error_file="$log_dir/epar-last-error.log"
 
 cd "$root" || exit 1
 mkdir -p "$log_dir"
+
+EPAR_HOST_TRUST_HELPER="$root/scripts/host-trust/host-trust-feed.sh"
+# shellcheck disable=SC1091
+. "$root/scripts/host-trust/wrapper-lib.sh"
+epar_host_trust_prepare "$root" "${1:-start}" "$@" || exit $?
+trap epar_host_trust_cleanup EXIT INT TERM
+if [[ -n "${EPAR_HOST_TRUST_FEED_DIR}" ]]; then
+  export EPAR_CONTROLLER_HOST_OS="$(epar_host_trust_host_os)"
+  export EPAR_HOST_TRUST_FEED="${EPAR_HOST_TRUST_FEED_DIR}/current.json"
+fi
 
 {
   echo "EPAR run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -26,6 +45,12 @@ fi
 
 "$exe" "$@" 2>&1 | tee -a "$log_file"
 code="${PIPESTATUS[0]}"
+
+if [[ "$code" == "0" && "${1:-}" == "init" ]]; then
+  epar_host_trust_post_init "$root" || code=$?
+fi
+epar_host_trust_cleanup
+trap - EXIT INT TERM
 
 if [[ "$code" -ne 0 ]]; then
   {

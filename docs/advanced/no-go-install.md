@@ -32,6 +32,44 @@ docker run --rm -it \
 
 This is `go run` — the same thing the docs recommend when Go is installed locally — just executed inside a container. **No binary is built or written to disk.** The Docker CLI baked into that small image is what lets EPAR's own runtime Docker calls (image build, container create, etc.) reach your host's Docker daemon through the mounted socket; without it, `docker run golang:1.24 go run ...` fails with "Docker is required" even with the socket mounted, because the bare `golang` image has no `docker` client binary.
 
+### Host trust bridge
+
+When the selected config enables `image.hostTrustMode: overlay`, the controller
+must inherit trust from the real Windows, macOS, or Linux host, not from the
+temporary Linux Go-toolchain container. The official wrappers handle this
+boundary automatically:
+
+1. A native host helper reads the configured host trust scopes.
+2. It rejects an empty collection and publishes a fresh, content-addressed
+   snapshot in the host user's cache.
+3. A watcher refreshes the snapshot every 10 seconds.
+4. The wrapper bind-mounts only that feed read-only at
+   `/run/epar-host-trust` and identifies the real controller host OS.
+5. The containerized controller validates certificate hashes, scopes, host OS,
+   and the 30-second feed expiry before using it.
+
+On a first `start` with no config, the wrapper performs this as two phases: it
+runs interactive initialization with the real host OS identity, validates and
+publishes the selected host roots, then starts the controller again with the
+new feed mounted. A failed collection leaves the generated config disabled and
+does not start a controller with the toolchain container's trust store.
+
+On Windows the helper reads local-machine and current-user root stores and
+excludes Windows-disallowed certificates. On macOS it evaluates the system,
+administrator, and selected user's native trust settings for TLS server use,
+with explicit deny taking precedence. On Linux it reads the distribution-generated
+system CA bundle; set `EPAR_HOST_TRUST_BUNDLE` to a readable generated PEM bundle
+when the host uses an unsupported layout.
+
+The watcher and controller are tied to the wrapper lifecycle. If the host helper
+stops, its feed expires and EPAR stops authorizing stale idle runners. The feed
+is never mounted into the disposable runner containers.
+
+Do not replace the official wrapper with a bare `docker run` when overlay mode
+is enabled. A containerized controller without `EPAR_CONTROLLER_HOST_OS`, a
+fresh `EPAR_HOST_TRUST_FEED`, and the corresponding read-only mount fails closed;
+it does not fall back to the toolchain container's CA store.
+
 You can run the script directly instead of through `./start`:
 
 ```bash
