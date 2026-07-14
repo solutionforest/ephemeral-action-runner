@@ -226,7 +226,6 @@ jobs:
           bash -n \
             start \
             scripts/run-with-docker.sh \
-            scripts/release/run-epar \
             scripts/host-trust/host-trust-feed.sh \
             scripts/host-trust/wrapper-lib.sh \
             scripts/test/host-trust-wrapper-smoke.sh \
@@ -242,7 +241,6 @@ jobs:
           $files = @(
             'start.ps1',
             'scripts/run-with-docker.ps1',
-            'scripts/release/run-epar.ps1',
             'scripts/host-trust/host-trust-feed.ps1',
             'scripts/host-trust/wrapper-lib.ps1',
             'scripts/test/host-trust-wrapper-smoke.ps1',

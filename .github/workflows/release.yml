@@ -4,12 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to package"
+        description: "Existing SemVer tag with optional v prefix and optional -alpha.N, -beta.N, or -rc.N"
         required: true
         type: string
       confirmation:
-        description: 'Type "package unsigned release assets"'
+        description: 'Type "publish source-only release"'
         required: true
+        type: string
+      promotion_from:
+        description: "Optional prerelease tag to promote to this stable tag; it must resolve to the same commit"
+        required: false
         type: string
 
 permissions:
@@ -21,25 +25,122 @@ concurrency:
 
 jobs:
   release:
-    name: Build release assets
+    name: Publish source-only release
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Check out repository
+      - name: Check out main for release validation
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: main
           fetch-depth: 0
+          fetch-tags: false
 
-      - name: Confirm manual unsigned packaging
+      - name: Validate release request
+        id: validate
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          PROMOTION_FROM: ${{ inputs.promotion_from }}
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.confirmation }}" != "package unsigned release assets" ]]; then
-            echo 'confirmation must be exactly: package unsigned release assets' >&2
+
+          if [[ "$CONFIRMATION" != "publish source-only release" ]]; then
+            echo 'confirmation must be exactly: publish source-only release' >&2
             exit 1
           fi
+
+          semver_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          stable_tag_pattern="^v?${semver_core}$"
+          prerelease_tag_pattern="^v?${semver_core}-(alpha|beta|rc)\.(0|[1-9][0-9]*)$"
+          prerelease=false
+          if [[ "$TAG" =~ $stable_tag_pattern ]]; then
+            :
+          elif [[ "$TAG" =~ $prerelease_tag_pattern ]]; then
+            prerelease=true
+          else
+            echo "tag must match [v]MAJOR.MINOR.PATCH or [v]MAJOR.MINOR.PATCH-(alpha|beta|rc).N: $TAG" >&2
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "remote tag does not exist: $TAG" >&2
+            exit 1
+          fi
+          git fetch --force --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          if [[ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]]; then
+            echo "tag must be an annotated Git tag: $TAG" >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "$TAG^{commit}")"
+          tag_core="${TAG#v}"
+          tag_core="${tag_core%%-*}"
+          git fetch --force --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "tag commit is not reachable from origin/main: $TAG ($tag_commit)" >&2
+            exit 1
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release already exists for tag: $TAG" >&2
+            exit 1
+          fi
+
+          if [[ -n "$PROMOTION_FROM" ]]; then
+            if [[ "$prerelease" == "true" ]]; then
+              echo 'promotion_from is allowed only for stable releases' >&2
+              exit 1
+            fi
+            if [[ ! "$PROMOTION_FROM" =~ $prerelease_tag_pattern ]]; then
+              echo "promotion_from must be an alpha, beta, or rc tag: $PROMOTION_FROM" >&2
+              exit 1
+            fi
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$PROMOTION_FROM" >/dev/null; then
+              echo "promotion_from tag does not exist on origin: $PROMOTION_FROM" >&2
+              exit 1
+            fi
+            git fetch --force --no-tags origin "refs/tags/$PROMOTION_FROM:refs/tags/$PROMOTION_FROM"
+            if [[ "$(git cat-file -t "refs/tags/$PROMOTION_FROM")" != "tag" ]]; then
+              echo "promotion_from must be an annotated Git tag: $PROMOTION_FROM" >&2
+              exit 1
+            fi
+            promotion_commit="$(git rev-parse "$PROMOTION_FROM^{commit}")"
+            promotion_core="${PROMOTION_FROM#v}"
+            promotion_core="${promotion_core%%-*}"
+            if [[ "$promotion_core" != "$tag_core" ]]; then
+              echo "promotion_from must share the MAJOR.MINOR.PATCH version core of $TAG" >&2
+              exit 1
+            fi
+            if [[ "$promotion_commit" != "$tag_commit" ]]; then
+              echo "promotion_from must point to the same commit as $TAG" >&2
+              exit 1
+            fi
+            if ! gh release view "$PROMOTION_FROM" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "promotion_from must already have a GitHub Release: $PROMOTION_FROM" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "commit=$tag_commit"
+            echo "prerelease=$prerelease"
+            echo "promotion_from=$PROMOTION_FROM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out and test the exact tagged commit
+        shell: bash
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+          TAG_COMMIT: ${{ steps.validate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git checkout --detach "$TAG_COMMIT"
+          [[ "$(git rev-parse HEAD)" == "$TAG_COMMIT" ]]
+          [[ "$(git rev-parse "$TAG^{commit}")" == "$TAG_COMMIT" ]]
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -47,64 +148,42 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test
+      - name: Test tagged source
         run: go test ./...
 
-      - name: Prepare release metadata
-        id: meta
+      - name: Publish GitHub release without uploaded assets
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.validate.outputs.tag }}
+          COMMIT: ${{ steps.validate.outputs.commit }}
+          PRERELEASE: ${{ steps.validate.outputs.prerelease }}
+          PROMOTION_FROM: ${{ steps.validate.outputs.promotion_from }}
         run: |
           set -euo pipefail
 
-          tag="${{ inputs.tag }}"
-          commit="$(git rev-parse HEAD)"
-          build_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          prerelease=false
-          if [[ "$tag" == *-* ]]; then
-            prerelease=true
-          fi
+          source_only_preface="$(cat <<'NOTES'
+          ## Source-only release
 
-          {
-            echo "tag=$tag"
-            echo "commit=$commit"
-            echo "build_date=$build_date"
-            echo "prerelease=$prerelease"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build archives
-        shell: bash
-        env:
-          VERSION: ${{ steps.meta.outputs.tag }}
-          COMMIT: ${{ steps.meta.outputs.commit }}
-          BUILD_DATE: ${{ steps.meta.outputs.build_date }}
-        run: bash scripts/build-release-archives.sh
-
-      - name: Publish GitHub release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
-        run: |
-          set -euo pipefail
-
-          assets=(dist/*.tar.gz dist/*.zip dist/checksums.txt)
-          release_notes="$(cat <<NOTES
-          ## Source-first beta
-
-          The recommended public beta path is to download the source ZIP from GitHub and run:
-
-          \`\`\`bash
-          go run ./cmd/ephemeral-action-runner
-          \`\`\`
-
-          These unsigned archives are maintainer testing artifacts and may be blocked by operating-system or antivirus checks.
+          This release has no uploaded binary assets. Download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)** for this tag, then follow the source-based Quick Start in the repository README.
           NOTES
           )"
-          release_args=(gh release create "$TAG" --verify-tag --title "$TAG" --notes "$release_notes" --generate-notes)
+
+          release_args=(gh release create "$TAG" --verify-tag --title "$TAG")
           if [[ "$PRERELEASE" == "true" ]]; then
-            release_args+=(--prerelease --latest=false)
+            release_args+=(--prerelease --latest=false --notes "$source_only_preface" --generate-notes)
+          elif [[ -n "$PROMOTION_FROM" ]]; then
+            promotion_notes="$(cat <<NOTES
+          ## Source-only stable promotion
+
+          This stable release promotes [$PROMOTION_FROM](https://github.com/$GITHUB_REPOSITORY/releases/tag/$PROMOTION_FROM) from the identical commit \`$COMMIT\`.
+
+          This release has no uploaded binary assets. Download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)** for this tag, then follow the source-based Quick Start in the repository README.
+          NOTES
+          )"
+            release_args+=(--latest=true --notes "$promotion_notes")
+          else
+            release_args+=(--latest=true --notes "$source_only_preface" --generate-notes)
           fi
-          release_args+=("${assets[@]}")
 
           "${release_args[@]}"

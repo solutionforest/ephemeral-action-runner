@@ -12,8 +12,7 @@ Install the host tools you need:
 
 | Required for | Tool |
 | --- | --- |
-| Source ZIP quick start | Go 1.25 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
-| Local binary build | Go 1.25 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
+| Source archive quick start | Go 1.25 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
 | Updating the pinned `actions/runner-images` checkout | Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |
@@ -28,34 +27,20 @@ Set up the GitHub App before registering runners. The image build command can ru
 
 ## Get The Source
 
-For normal beta use, download the source ZIP from the [EPAR GitHub repo](https://github.com/solutionforest/ephemeral-action-runner), extract it, and open a terminal in the extracted folder:
+For normal use, open the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), select the release you want, and download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)**. Extract the source archive and open a terminal in the extracted folder:
 
 ```bash
-cd path/to/ephemeral-action-runner-main
+cd path/to/ephemeral-action-runner-<tag>
 go run ./cmd/ephemeral-action-runner version
 ```
 
-If you want a local binary for automation or scheduled startup, build it from the source folder:
+The examples below use `go run ./cmd/ephemeral-action-runner` for the public source-first path.
 
-```powershell
-go build -o .\bin\ephemeral-action-runner.exe .\cmd\ephemeral-action-runner
-.\bin\ephemeral-action-runner.exe version
-```
-
-macOS/Linux:
-
-```bash
-go build -o ./bin/ephemeral-action-runner ./cmd/ephemeral-action-runner
-./bin/ephemeral-action-runner version
-```
-
-The examples below use `go run ./cmd/ephemeral-action-runner` for the public source-first path. If you built a local binary, use `./bin/ephemeral-action-runner` or `.\bin\ephemeral-action-runner.exe` instead.
-
-Don't want to install Go at all? See [Running EPAR Without Installing Go](advanced/no-go-install.md) for running from source in a container, or downloading a prebuilt release binary.
+Don't want to install Go at all? See [Running EPAR Without Installing Go](advanced/no-go-install.md) for running the source archive in a container.
 
 ## One-Command Start
 
-For the default Docker-DinD setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, with no binary written to disk (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
+For the default Docker-DinD setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, without creating a standalone EPAR executable (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
 
 ```bash
 ./start
@@ -354,26 +339,15 @@ Use `--dry-run` to inspect provider command construction without mutating local 
 go run ./cmd/ephemeral-action-runner pool verify --dry-run --instances 2
 ```
 
-## Maintainer Packaging
+## Maintainer Source-Only Releases
 
-Unsigned binary releases are not the normal public beta path. Maintainers can still package archives manually for testing, but the release workflow no longer runs on pushed tags.
+Releases are manually dispatched from GitHub Actions and contain no uploaded assets. GitHub automatically provides **Source code (zip)** and **Source code (tar.gz)** downloads for each release tag.
 
 ```bash
 git tag -a v0.1.0-beta.1 -m "v0.1.0-beta.1"
 git push origin v0.1.0-beta.1
 ```
 
-To run the disabled release workflow, start it manually from GitHub Actions and provide the tag plus the confirmation phrase. The workflow builds five unsigned archives and `checksums.txt`. It does not upload generated Docker images, WSL rootfs tars, local configs, or private keys.
+Before dispatching, a repository administrator must enable immutable releases in the repository. In **Actions → Release → Run workflow**, supply an existing remote tag that matches `[v]MAJOR.MINOR.PATCH` or `[v]MAJOR.MINOR.PATCH-(alpha|beta|rc).N`, then type `publish source-only release` exactly. The workflow requires annotated tags, verifies the remote tag, confirms its commit is reachable from `origin/main`, checks out and tests that exact commit, and refuses to overwrite an existing release.
 
-To test release packaging locally, run the same script used by the workflow:
-
-```bash
-VERSION=v0.0.0-local \
-COMMIT="$(git rev-parse HEAD)" \
-BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-bash scripts/build-release-archives.sh
-```
-
-The default output is `dist/`, which is ignored by Git.
-
-On Windows, run that command from Git Bash when using the Windows Go toolchain. WSL Bash can accidentally call `go.exe` through WSL interop, which does not handle the `GOOS` and `GOARCH` assignments correctly.
+Alpha, beta, and RC tags are published as prereleases and are not marked latest. To promote a prerelease to a stable tag without changing the commit, provide the existing prerelease tag in `promotion_from`; the workflow verifies that the tag and its GitHub Release exist, that its normalized `MAJOR.MINOR.PATCH` core matches the stable tag, and that both tags point to the same commit, then creates stable promotion notes instead of a generated delta.
