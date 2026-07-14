@@ -36,27 +36,44 @@ exit 0
 SH
 chmod +x "$temporary/bin/docker" "$project/scripts/run-with-docker.sh" "$project/scripts/host-trust/host-trust-feed.sh"
 
-source_bundle=/etc/ssl/certs/ca-certificates.crt
-[[ -r "$source_bundle" ]] || { echo "system CA bundle unavailable" >&2; exit 1; }
-bundle="$temporary/one-root.pem"
-awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' "$source_bundle" >"$bundle"
+host_os="$(uname -s)"
+case "$host_os" in
+  Linux)
+    source_bundle=/etc/ssl/certs/ca-certificates.crt
+    [[ -r "$source_bundle" ]] || { echo "system CA bundle unavailable" >&2; exit 1; }
+    bundle="$temporary/one-root.pem"
+    awk '/-----BEGIN CERTIFICATE-----/{copy=1} copy{print} /-----END CERTIFICATE-----/{exit}' "$source_bundle" >"$bundle"
+    expected_controller_os=linux
+    ;;
+  Darwin)
+    : "${HOME:?HOME must be set to read the macOS system trust store}"
+    expected_controller_os=darwin
+    ;;
+  *)
+    echo "Unix no-Go first-run smoke supports Linux and macOS only" >&2
+    exit 1
+    ;;
+esac
 
 export PATH="$temporary/bin:$PATH"
-export HOME="$temporary/home"
 export XDG_CACHE_HOME="$temporary/cache"
-export EPAR_HOST_TRUST_BUNDLE="$bundle"
+if [[ "$host_os" == Linux ]]; then
+  export HOME="$temporary/home"
+  export EPAR_HOST_TRUST_BUNDLE="$bundle"
+fi
 export FAKE_PROJECT="$project"
 export FAKE_DOCKER_LOG="$temporary/docker.log"
 
 (cd "$project" && scripts/run-with-docker.sh start)
-mapfile -t run_calls < <(grep ' <run>' "$FAKE_DOCKER_LOG")
-[[ "${#run_calls[@]}" == 2 ]]
-[[ "${run_calls[0]}" == *" <EPAR_HOST_TRUST_INIT_DEFERRED=1>"* ]]
-[[ "${run_calls[0]}" == *" <EPAR_CONTROLLER_HOST_OS=linux>"* ]]
-[[ "${run_calls[0]}" == *" <init>"* ]]
-[[ "${run_calls[1]}" == *" <EPAR_HOST_TRUST_FEED=/run/epar-host-trust/current.json>"* ]]
-[[ "${run_calls[1]}" == *":/run/epar-host-trust:ro>"* ]]
-[[ "${run_calls[1]}" == *" <start>"* ]]
+[[ "$(grep -c ' <run>' "$FAKE_DOCKER_LOG")" == 2 ]]
+first_run_call="$(grep ' <run>' "$FAKE_DOCKER_LOG" | sed -n '1p')"
+second_run_call="$(grep ' <run>' "$FAKE_DOCKER_LOG" | sed -n '2p')"
+[[ "$first_run_call" == *" <EPAR_HOST_TRUST_INIT_DEFERRED=1>"* ]]
+[[ "$first_run_call" == *" <EPAR_CONTROLLER_HOST_OS=$expected_controller_os>"* ]]
+[[ "$first_run_call" == *" <init>"* ]]
+[[ "$second_run_call" == *" <EPAR_HOST_TRUST_FEED=/run/epar-host-trust/current.json>"* ]]
+[[ "$second_run_call" == *":/run/epar-host-trust:ro>"* ]]
+[[ "$second_run_call" == *" <start>"* ]]
 
 rm -rf "$project/.local" "$temporary/cache"
 : >"$FAKE_DOCKER_LOG"

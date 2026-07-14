@@ -14,10 +14,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-export HOME="$temporary/home"
-export XDG_CACHE_HOME="$temporary/cache"
-mkdir -p "$HOME"
 host_os="$(uname -s)"
+export XDG_CACHE_HOME="$temporary/cache"
+if [[ "$host_os" == Darwin ]]; then
+  : "${HOME:?HOME must be set to read the macOS user keychain search list}"
+else
+  export HOME="$temporary/home"
+  mkdir -p "$HOME"
+fi
 if [[ "$host_os" == Linux && -z "${EPAR_HOST_TRUST_BUNDLE:-}" ]]; then
   source_bundle=/etc/ssl/certs/ca-certificates.crt
   [[ -r "$source_bundle" ]] || { echo "system CA bundle unavailable for wrapper smoke" >&2; exit 1; }
