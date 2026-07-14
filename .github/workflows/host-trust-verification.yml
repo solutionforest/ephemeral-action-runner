@@ -5,51 +5,10 @@ on:
     branches:
       - develop
       - main
-    paths:
-      - .github/workflows/host-trust-verification.yml
-      - cmd/ephemeral-action-runner/**
-      - configs/docker-dind*.yml
-      - internal/config/**
-      - internal/hosttrust/**
-      - internal/pool/**
-      - internal/provider/**
-      - scripts/guest/ubuntu/**
-      - scripts/host-trust/**
-      - scripts/release/run-epar
-      - scripts/release/run-epar.ps1
-      - scripts/run-with-docker.sh
-      - scripts/run-with-docker.ps1
-      - scripts/test/host-trust-*.sh
-      - scripts/test/host-trust-*.ps1
-      - scripts/test/no-go-first-run-*.sh
-      - scripts/test/no-go-first-run-*.ps1
-      - start
-      - start.ps1
   push:
     branches:
       - develop
       - main
-      - codex/fix-host-trust-ci
-    paths:
-      - .github/workflows/host-trust-verification.yml
-      - cmd/ephemeral-action-runner/**
-      - configs/docker-dind*.yml
-      - internal/config/**
-      - internal/hosttrust/**
-      - internal/pool/**
-      - internal/provider/**
-      - scripts/guest/ubuntu/**
-      - scripts/host-trust/**
-      - scripts/release/run-epar
-      - scripts/release/run-epar.ps1
-      - scripts/run-with-docker.sh
-      - scripts/run-with-docker.ps1
-      - scripts/test/host-trust-*.sh
-      - scripts/test/host-trust-*.ps1
-      - scripts/test/no-go-first-run-*.sh
-      - scripts/test/no-go-first-run-*.ps1
-      - start
-      - start.ps1
   workflow_dispatch:
 
 permissions:
