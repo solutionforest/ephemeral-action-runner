@@ -14,10 +14,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-export HOME="$temporary/home"
-export XDG_CACHE_HOME="$temporary/cache"
-mkdir -p "$HOME"
 host_os="$(uname -s)"
+export XDG_CACHE_HOME="$temporary/cache"
+if [[ "$host_os" == Darwin ]]; then
+  : "${HOME:?HOME must be set to read the macOS user keychain search list}"
+else
+  export HOME="$temporary/home"
+  mkdir -p "$HOME"
+fi
 if [[ "$host_os" == Linux && -z "${EPAR_HOST_TRUST_BUNDLE:-}" ]]; then
   source_bundle=/etc/ssl/certs/ca-certificates.crt
   [[ -r "$source_bundle" ]] || { echo "system CA bundle unavailable for wrapper smoke" >&2; exit 1; }
@@ -35,22 +39,66 @@ YAML
 
 if [[ "$host_os" == Darwin ]]; then
   fingerprint="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-  valid_json="$temporary/macos-valid.json"
-  printf '{"trustVersion":1,"trustList":{"%s":{"trustSettings":[]}}}\n' "$fingerprint" >"$valid_json"
-  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_json")" == "allow $fingerprint" ]]
-  printf '{"trustVersion":1,"trustList":{"%s":{"trustSettings":[{"kSecTrustSettingsPolicy":"opaque","kSecTrustSettingsPolicyName":"sslServer","kSecTrustSettingsKeyUsage":8,"kSecTrustSettingsResult":2}]}}}\n' "$fingerprint" >"$valid_json"
-  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_json")" == "allow $fingerprint" ]]
-  printf '{"trustVersion":1,"trustList":{"%s":{"trustSettings":[{"kSecTrustSettingsKeyUsage":9,"kSecTrustSettingsResult":1}]}}}\n' "$fingerprint" >"$valid_json"
-  [[ -z "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_json")" ]]
+  valid_plist="$temporary/macos-valid.plist"
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array/></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data>
+  AQID
+</data><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsResult</key><integer>2</integer></dict></array></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data/><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsResult</key><integer>2</integer></dict></array></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>issuerName</key><data>AQID</data><key>serialNumber</key><data>BAUG</data></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data>AQID</data><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsKeyUsage</key><integer>8</integer><key>kSecTrustSettingsResult</key><integer>2</integer></dict></array></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
+  for constrained_setting in \
+    '<key>kSecTrustSettingsPolicy</key><data>AQID</data><key>kSecTrustSettingsResult</key><integer>2</integer>' \
+    '<key>kSecTrustSettingsPolicy</key><string>not-data</string><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsResult</key><integer>2</integer>' \
+    '<key>kSecTrustSettingsAllowedError</key><integer>-1</integer><key>kSecTrustSettingsPolicy</key><data>AQID</data><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsResult</key><integer>2</integer>' \
+    '<key>kSecTrustSettingsPolicyString</key><string>restricted.example</string><key>kSecTrustSettingsPolicy</key><data>AQID</data><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsResult</key><integer>2</integer>'; do
+    cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict>$constrained_setting</dict></array></dict></dict></dict></plist>
+PLIST
+    [[ -z "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" ]]
+  done
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsResult</key><integer>1</integer></dict><dict><key>kSecTrustSettingsPolicyString</key><string>restricted.example</string><key>kSecTrustSettingsResult</key><integer>3</integer></dict></array></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "deny $fingerprint" ]]
   for invalid in \
-    '{"trustVersion":1,"trustList":null}' \
-    "{\"trustVersion\":1,\"trustList\":{\"$fingerprint\":{}}}" \
-    "{\"trustVersion\":1,\"trustList\":{\"$fingerprint\":{\"trustSettings\":[null]}}}" \
-    "{\"trustVersion\":1,\"trustList\":{\"$fingerprint\":{\"trustSettings\":[5]}}}"; do
-    invalid_json="$temporary/macos-invalid-$RANDOM.json"
-    printf '%s\n' "$invalid" >"$invalid_json"
-    if osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$invalid_json" >/dev/null 2>&1; then
-      echo "malformed macOS trust settings fixture was accepted: $invalid" >&2
+    '<plist version="1.0"><dict>' \
+    '<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><string>invalid</string></dict></plist>' \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><date>2026-07-14T00:00:00Z</date></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><dict/></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><string>invalid</string></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><data>AQID</data></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><date>2026-07-14T00:00:00Z</date></array></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><string>invalid</string></array></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data>A===</data></dict></array></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data encoding=\"base64\">AQID</data></dict></array></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data>%%%not-base64%%%</data></dict></array></dict></dict></dict></plist>"; do
+    invalid_plist="$temporary/macos-invalid-$RANDOM.plist"
+    printf '%s\n' "$invalid" >"$invalid_plist"
+    if osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$invalid_plist" >/dev/null 2>&1; then
+      echo "malformed macOS trust settings plist fixture was accepted: $invalid" >&2
       exit 1
     fi
   done
@@ -59,8 +107,71 @@ fi
 first="$($helper sync --project-root "$project_root" --config "$config")"
 second="$($helper sync --project-root "$project_root" --config "$config")"
 [[ "$first" == "$second" && -s "$first" ]]
+grep -Fq '"pem":"-----BEGIN CERTIFICATE-----\n' "$first"
+grep -Fq '\n-----END CERTIFICATE-----"' "$first"
 
 if [[ "$host_os" == Darwin ]]; then
+  system_config="$temporary/system-only.yml"
+  cat >"$system_config" <<'YAML'
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system]
+YAML
+  fake_optional_keychains="$temporary/fake-optional-keychains"
+  mkdir -p "$fake_optional_keychains"
+  cat >"$fake_optional_keychains/security" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+if [[ "$args" == *" user-trust-settings-enable "* ]]; then
+  echo 'User-level Trust Settings are Enabled'
+  exit 0
+fi
+if [[ "$args" == *" list-keychains -d user "* ]]; then
+  echo '"/tmp/epar-empty-user.keychain-db"'
+  exit 0
+fi
+if [[ "$args" == *" find-certificate "* ]] && { [[ "$args" == *" -p /Library/Keychains/System.keychain "* ]] || [[ "$args" == *" -p /tmp/epar-empty-user.keychain-db "* ]]; }; then
+  exit 0
+fi
+if [[ "$args" == *" trust-settings-export "* ]]; then
+  if [[ "$args" == *" -s "* ]]; then
+    output="${!#}"
+    cat >"$output" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict/></dict></plist>
+PLIST
+    exit 0
+  fi
+  echo 'SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.' >&2
+  exit 1
+fi
+exec /usr/bin/security "$@"
+SH
+  chmod +x "$fake_optional_keychains/security"
+  optional_feed="$(PATH="$fake_optional_keychains:$PATH" "$helper" sync --project-root "$project_root" --config "$config")"
+  [[ -s "$optional_feed" ]] || { echo "macOS baseline roots were not retained with empty admin/user keychains and empty explicit trust settings" >&2; exit 1; }
+
+  for required_output in empty malformed; do
+    fake_required_keychain="$temporary/fake-required-keychain-$required_output"
+    mkdir -p "$fake_required_keychain"
+    cat >"$fake_required_keychain/security" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ " \$* " == *" find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain "* ]]; then
+  [[ "$required_output" == malformed ]] && echo 'not a certificate'
+  exit 0
+fi
+exec /usr/bin/security "\$@"
+SH
+    chmod +x "$fake_required_keychain/security"
+    if PATH="$fake_required_keychain:$PATH" "$helper" sync --project-root "$project_root" --config "$system_config" >/dev/null 2>&1; then
+      echo "macOS required SystemRootCertificates $required_output output was accepted" >&2
+      exit 1
+    fi
+  done
+
   fake_osascript="$temporary/fake-osascript"
   mkdir -p "$fake_osascript"
   printf '#!/usr/bin/env bash\nexit 17\n' >"$fake_osascript/osascript"
@@ -89,6 +200,30 @@ fi
 EPAR_HOST_TRUST_HELPER="$helper"
 # shellcheck disable=SC1091
 . "$project_root/scripts/host-trust/wrapper-lib.sh"
+
+missing_config="$temporary/missing-project/.local/config.yml"
+missing_output="$("$helper" sync --project-root "$project_root" --config "$missing_config")"
+[[ -z "$missing_output" ]] || { echo "missing config unexpectedly produced a host-trust feed" >&2; exit 1; }
+
+native_project="$temporary/native-go-project"
+fake_go="$temporary/fake-go"
+fake_go_log="$temporary/fake-go.log"
+mkdir -p "$native_project/scripts/host-trust"
+cp "$project_root/start" "$native_project/start"
+cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$native_project/scripts/host-trust/"
+cat >"$fake_go" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == version ]]; then
+  echo 'go version go1.25.0 test/arch'
+  exit 0
+fi
+printf '%s\n' "$*" >>"$FAKE_GO_LOG"
+SH
+chmod +x "$fake_go"
+(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" ./start)
+grep -Fxq 'run ./cmd/ephemeral-action-runner start' "$fake_go_log"
+
 nested_root="$temporary/nested-project"
 mkdir -p "$nested_root/.local"
 [[ "$(epar_host_trust_config_path "$temporary" start --project-root nested-project)" == "$nested_root/.local/config.yml" ]]

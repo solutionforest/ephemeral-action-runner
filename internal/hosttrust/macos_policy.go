@@ -1,9 +1,11 @@
 package hosttrust
 
 import (
+	"bytes"
+	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -12,51 +14,83 @@ type macTrustDecision struct {
 	Deny  bool
 }
 
-type macExternalTrustDocument struct {
-	TrustVersion int `json:"trustVersion"`
-	TrustList    map[string]struct {
-		TrustSettings json.RawMessage `json:"trustSettings"`
-	} `json:"trustList"`
+func parseMacKeychainCertificates(content []byte, required bool) ([]*x509.Certificate, error) {
+	if len(bytes.TrimSpace(content)) == 0 {
+		if required {
+			return nil, fmt.Errorf("no certificates found")
+		}
+		return nil, nil
+	}
+	return parseCertificates(content)
 }
 
-// macTrustDecisionsFromJSON interprets the external representation produced by
+func macSelectedCertificates(baseline, explicitlyAllowed map[string]Certificate, denied map[string]struct{}) []Certificate {
+	selected := make(map[string]Certificate, len(baseline)+len(explicitlyAllowed))
+	for hash, certificate := range baseline {
+		selected[hash] = certificate
+	}
+	for hash, certificate := range explicitlyAllowed {
+		selected[hash] = certificate
+	}
+	for hash := range denied {
+		delete(selected, hash)
+	}
+	out := make([]Certificate, 0, len(selected))
+	for _, certificate := range selected {
+		out = append(out, certificate)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SHA256 < out[j].SHA256 })
+	return out
+}
+
+// macTrustDecisionsFromPlist interprets the external representation produced by
 // `security trust-settings-export`. Positive settings are deliberately
 // conservative because Ubuntu's global PEM store cannot preserve hostname,
 // application, allowed-error, or unknown constraints. Deny always wins.
-func macTrustDecisionsFromJSON(content []byte) (map[string]macTrustDecision, error) {
-	var document macExternalTrustDocument
-	if err := json.Unmarshal(content, &document); err != nil {
+func macTrustDecisionsFromPlist(content []byte) (map[string]macTrustDecision, error) {
+	document, err := parseMacXMLPlist(content)
+	if err != nil {
 		return nil, err
 	}
-	if document.TrustVersion != 1 {
-		return nil, fmt.Errorf("unsupported trustVersion %d", document.TrustVersion)
+	if document.kind != macPlistDictionary {
+		return nil, fmt.Errorf("macOS trust settings document must be a dictionary")
 	}
-	if document.TrustList == nil {
+	version, found := document.dictionary["trustVersion"]
+	if !found || version.kind != macPlistInteger || version.integer != 1 {
+		return nil, fmt.Errorf("unsupported trustVersion")
+	}
+	trustList, found := document.dictionary["trustList"]
+	if !found || trustList.kind != macPlistDictionary {
 		return nil, fmt.Errorf("trustList must be a present object")
 	}
-	decisions := make(map[string]macTrustDecision, len(document.TrustList))
-	for fingerprint, entry := range document.TrustList {
+	decisions := make(map[string]macTrustDecision, len(trustList.dictionary))
+	for fingerprint, entry := range trustList.dictionary {
 		fingerprint = strings.ToUpper(strings.TrimSpace(fingerprint))
 		decoded, err := hex.DecodeString(fingerprint)
 		if err != nil || len(decoded) != 20 {
 			return nil, fmt.Errorf("unsupported non-certificate/default trust entry %q", fingerprint)
 		}
-		if len(entry.TrustSettings) == 0 || string(entry.TrustSettings) == "null" {
-			return nil, fmt.Errorf("trust entry %s has missing or null trustSettings", fingerprint)
-		}
-		var settings []map[string]any
-		if err := json.Unmarshal(entry.TrustSettings, &settings); err != nil || settings == nil {
-			return nil, fmt.Errorf("trust entry %s trustSettings must be an array", fingerprint)
+		if entry.kind != macPlistDictionary {
+			return nil, fmt.Errorf("trust entry %s must be a dictionary", fingerprint)
 		}
 		decision := macTrustDecision{}
-		if len(settings) == 0 {
+		settings, found := entry.dictionary["trustSettings"]
+		if !found {
+			decision.Allow = true // Apple's persisted schema omits zero usage constraints.
+			decisions[fingerprint] = decision
+			continue
+		}
+		if settings.kind != macPlistArray {
+			return nil, fmt.Errorf("trust entry %s trustSettings must be an array", fingerprint)
+		}
+		if len(settings.array) == 0 {
 			decision.Allow = true // Apple's documented unconditional trustRoot array.
 		}
-		for index, setting := range settings {
-			if setting == nil {
+		for index, setting := range settings.array {
+			if setting.kind != macPlistDictionary {
 				return nil, fmt.Errorf("trust entry %s setting %d must be an object", fingerprint, index)
 			}
-			result, err := macTrustSettingResult(setting)
+			result, err := macTrustSettingResult(setting.dictionary)
 			if err != nil {
 				return nil, fmt.Errorf("trust entry %s: %w", fingerprint, err)
 			}
@@ -64,7 +98,7 @@ func macTrustDecisionsFromJSON(content []byte) (map[string]macTrustDecision, err
 				decision.Deny = true
 				continue
 			}
-			if (result == 1 || result == 2) && macPositiveTrustSettingIsExportable(setting) {
+			if (result == 1 || result == 2) && macPositiveTrustSettingIsExportable(setting.dictionary) {
 				decision.Allow = true
 			}
 		}
@@ -92,19 +126,18 @@ func macUserTrustSettingsEnabledFromOutput(content []byte) (bool, error) {
 	}
 }
 
-func macTrustSettingResult(setting map[string]any) (int, error) {
+func macTrustSettingResult(setting map[string]macPlistValue) (int, error) {
 	value, found := setting["kSecTrustSettingsResult"]
 	if !found {
 		return 1, nil // documented default is trustRoot
 	}
-	number, ok := value.(float64)
-	if !ok || number != float64(int(number)) || number < 0 || number > 4 {
-		return 0, fmt.Errorf("invalid kSecTrustSettingsResult %v", value)
+	if value.kind != macPlistInteger || value.integer < 0 || value.integer > 4 {
+		return 0, fmt.Errorf("invalid kSecTrustSettingsResult")
 	}
-	return int(number), nil
+	return int(value.integer), nil
 }
 
-func macPositiveTrustSettingIsExportable(setting map[string]any) bool {
+func macPositiveTrustSettingIsExportable(setting map[string]macPlistValue) bool {
 	allowedKeys := map[string]struct{}{
 		"kSecTrustSettingsPolicy":     {},
 		"kSecTrustSettingsPolicyName": {},
@@ -116,23 +149,22 @@ func macPositiveTrustSettingIsExportable(setting map[string]any) bool {
 			return false
 		}
 	}
-	if _, hasPolicy := setting["kSecTrustSettingsPolicy"]; hasPolicy {
-		name, ok := setting["kSecTrustSettingsPolicyName"].(string)
-		if !ok || name != "sslServer" {
+	if policy, hasPolicy := setting["kSecTrustSettingsPolicy"]; hasPolicy {
+		name, found := setting["kSecTrustSettingsPolicyName"]
+		if policy.kind != macPlistData || !found || name.kind != macPlistString || name.text != "sslServer" {
 			return false
 		}
 	} else if _, hasName := setting["kSecTrustSettingsPolicyName"]; hasName {
 		return false
 	}
 	if value, found := setting["kSecTrustSettingsKeyUsage"]; found {
-		number, ok := value.(float64)
-		if !ok || number != float64(int64(number)) {
+		if value.kind != macPlistInteger {
 			return false
 		}
 		// Apple key-use constants that can safely represent CA/server-chain
 		// validation in a global PEM trust store. Require exact constants;
 		// other uses and combined bitmasks remain conditional and are skipped.
-		if number != -1 && number != 0xffffffff && number != 0x1 && number != 0x8 {
+		if value.integer != -1 && value.integer != 0xffffffff && value.integer != 0x1 && value.integer != 0x8 {
 			return false
 		}
 	}

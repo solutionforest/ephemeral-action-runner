@@ -24,6 +24,7 @@ type macCandidate struct {
 
 func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 	candidates := make(map[string]macCandidate)
+	baseline := make(map[string]Certificate)
 	allowed := make(map[string]Certificate)
 	denied := make(map[string]struct{})
 	var snapshot Snapshot
@@ -40,12 +41,12 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 		snapshot.Sources = append(snapshot.Sources, Source{Scope: ScopeUser, Kind: fmt.Sprintf("macos-user-trust-settings-enabled-%t", userTrustEnabled), Path: "security user-trust-settings-enable"})
 	}
 
-	addKeychain := func(scope, kind, path string) error {
+	addKeychain := func(scope, kind, path string, required, baselineAllowed bool) error {
 		output, err := runMacSecurity(ctx, "find-certificate", "-a", "-p", path)
 		if err != nil {
 			return err
 		}
-		parsed, err := parseCertificates(output)
+		parsed, err := parseMacKeychainCertificates(output, required)
 		if err != nil {
 			return fmt.Errorf("parse certificates from macOS keychain %s: %w", path, err)
 		}
@@ -57,16 +58,19 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 			fingerprint := sha1.Sum(certificate.Raw)
 			key := strings.ToUpper(hex.EncodeToString(fingerprint[:]))
 			candidates[key] = macCandidate{certificate: canonical}
+			if baselineAllowed {
+				baseline[canonical.SHA256] = canonical
+			}
 		}
 		snapshot.Sources = append(snapshot.Sources, Source{Scope: scope, Kind: kind, Path: path})
 		return nil
 	}
 
 	if hasScope(scopes, ScopeSystem) {
-		if err := addKeychain(ScopeSystem, "macos-system-roots", macSystemRootsKeychain); err != nil {
+		if err := addKeychain(ScopeSystem, "macos-system-roots", macSystemRootsKeychain, true, true); err != nil {
 			return Snapshot{}, err
 		}
-		if err := addKeychain(ScopeSystem, "macos-admin-keychain", macAdminKeychain); err != nil {
+		if err := addKeychain(ScopeSystem, "macos-admin-keychain", macAdminKeychain, false, false); err != nil {
 			return Snapshot{}, err
 		}
 	}
@@ -76,21 +80,21 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 		for _, keychain := range keychains {
-			if err := addKeychain(ScopeUser, "macos-user-keychain", keychain); err != nil {
+			if err := addKeychain(ScopeUser, "macos-user-keychain", keychain, false, false); err != nil {
 				return Snapshot{}, err
 			}
 		}
 	}
 
 	applyDomain := func(scope, domain string, required bool) error {
-		content, present, err := exportMacTrustSettingsJSON(ctx, domain, required)
+		content, present, err := exportMacTrustSettingsPlist(ctx, domain, required)
 		if err != nil {
 			return err
 		}
 		if !present {
 			return nil
 		}
-		decisions, err := macTrustDecisionsFromJSON(content)
+		decisions, err := macTrustDecisionsFromPlist(content)
 		if err != nil {
 			return fmt.Errorf("parse macOS %s trust settings: %w", domain, err)
 		}
@@ -126,11 +130,7 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 	}
-	for hash, certificate := range allowed {
-		if _, blocked := denied[hash]; !blocked {
-			snapshot.Certificates = append(snapshot.Certificates, certificate)
-		}
-	}
+	snapshot.Certificates = macSelectedCertificates(baseline, allowed, denied)
 	return snapshot, nil
 }
 
@@ -152,7 +152,7 @@ func macUserKeychains(ctx context.Context) ([]string, error) {
 	return paths, nil
 }
 
-func exportMacTrustSettingsJSON(ctx context.Context, domain string, required bool) ([]byte, bool, error) {
+func exportMacTrustSettingsPlist(ctx context.Context, domain string, required bool) ([]byte, bool, error) {
 	directory, err := os.MkdirTemp("", "epar-macos-trust-settings-")
 	if err != nil {
 		return nil, false, err
@@ -173,7 +173,7 @@ func exportMacTrustSettingsJSON(ctx context.Context, domain string, required boo
 		}
 		return nil, false, err
 	}
-	command := exec.CommandContext(ctx, "plutil", "-convert", "json", "-o", "-", path)
+	command := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", path)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return nil, false, fmt.Errorf("plutil convert macOS %s trust settings: %w: %s", domain, err, strings.TrimSpace(string(output)))

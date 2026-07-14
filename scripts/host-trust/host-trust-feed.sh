@@ -44,6 +44,11 @@ project_root="$(cd "$project_root" && pwd -P)"
 if [[ "$config_path" != /* ]]; then
   config_path="$project_root/$config_path"
 fi
+if [[ ! -f "$config_path" ]]; then
+  # The first `start` can create config interactively. Treat missing config as
+  # disabled: native controller code will re-evaluate after init.
+  exit 0
+fi
 config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
 if command -v realpath >/dev/null 2>&1; then
   config_path="$(realpath "$config_path")"
@@ -84,12 +89,6 @@ config_values() {
     }
   ' "$config_path"
 }
-
-if [[ ! -f "$config_path" ]]; then
-  # The first `start` can create config interactively. Treat missing config as
-  # disabled: native controller code will re-evaluate after init.
-  exit 0
-fi
 
 mode=""
 scopes=()
@@ -164,6 +163,30 @@ write_pem_blocks() {
   ' "$input"
 }
 
+write_strict_pem_blocks() {
+  local input="$1" output_dir="$2" prefix="$3"
+  awk -v out="$output_dir" -v prefix="$prefix" '
+    $0 == "-----BEGIN CERTIFICATE-----" {
+      if (writing) invalid=1
+      n++
+      f=sprintf("%s/%s-%06d.pem",out,prefix,n)
+      writing=1
+      print > f
+      next
+    }
+    $0 == "-----END CERTIFICATE-----" {
+      if (!writing) { invalid=1; next }
+      print > f
+      close(f)
+      writing=0
+      next
+    }
+    writing { print > f; next }
+    $0 !~ /^[[:space:]]*$/ { invalid=1 }
+    END { if (writing || invalid || n == 0) exit 1 }
+  ' "$input"
+}
+
 collect_certificates() {
   local raw_dir="$1" tmp=""
   mkdir -p "$raw_dir"
@@ -187,10 +210,28 @@ collect_certificates() {
       ;;
     Darwin)
       local mac_dir="$work/macos" candidates="$work/macos/candidates"
-      local combined="$mac_dir/candidates.pem" system_pem="$mac_dir/system.pem"
       local allowed="$mac_dir/allowed.txt" denied="$mac_dir/denied.txt" candidate_index="$mac_dir/candidates.txt"
       mkdir -p "$candidates"
-      : >"$combined"; : >"$allowed"; : >"$denied"; : >"$candidate_index"
+      : >"$allowed"; : >"$denied"; : >"$candidate_index"
+      collect_mac_keychain_certificates() {
+        local path="$1" required="$2" prefix="$3"
+        local output="$mac_dir/$prefix.pem"
+        if ! security find-certificate -a -p "$path" >"$output"; then
+          echo "macOS keychain collection failed: $path" >&2
+          return 1
+        fi
+        if ! grep -q '[^[:space:]]' "$output"; then
+          if [[ "$required" == required ]]; then
+            echo "macOS required keychain returned no certificates: $path" >&2
+            return 1
+          fi
+          return 0
+        fi
+        if ! write_strict_pem_blocks "$output" "$candidates" "$prefix"; then
+          echo "macOS keychain emitted malformed nonempty certificate output: $path" >&2
+          return 1
+        fi
+      }
       local user_trust_enabled=0 user_trust_state=""
       if printf '%s\n' "${scopes[@]}" | grep -qx user; then
         user_trust_state="$(security user-trust-settings-enable)" || return 1
@@ -201,29 +242,34 @@ collect_certificates() {
         esac
       fi
       if printf '%s\n' "${scopes[@]}" | grep -qx system; then
-        security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain >"$system_pem"
-        cat "$system_pem" >>"$combined"
-        security find-certificate -a -p /Library/Keychains/System.keychain >>"$combined"
+        collect_mac_keychain_certificates /System/Library/Keychains/SystemRootCertificates.keychain required system
+        collect_mac_keychain_certificates /Library/Keychains/System.keychain optional admin
       fi
       if [[ "$user_trust_enabled" == 1 ]]; then
-        local user_keychain found_user_keychain=0
+        local user_keychain found_user_keychain=0 user_keychain_index=0
         while IFS= read -r user_keychain; do
           user_keychain="${user_keychain#\"}"; user_keychain="${user_keychain%\"}"
           [[ -n "$user_keychain" ]] || continue
-          security find-certificate -a -p "$user_keychain" >>"$combined"
+          user_keychain_index=$((user_keychain_index + 1))
+          collect_mac_keychain_certificates "$user_keychain" optional "user-$(printf '%06d' "$user_keychain_index")"
           found_user_keychain=1
         done < <(security list-keychains -d user | sed 's/^[[:space:]]*//')
         [[ "$found_user_keychain" == 1 ]] || { echo "macOS user keychain search list is unavailable" >&2; return 1; }
       fi
-      write_pem_blocks "$combined" "$candidates"
       local candidate fingerprint
       shopt -s nullglob
       for candidate in "$candidates"/*.pem; do
-        fingerprint="$(openssl x509 -in "$candidate" -noout -fingerprint -sha1 | sed 's/^[^=]*=//;s/://g' | tr '[:lower:]' '[:upper:]')"
+        if ! fingerprint="$(openssl x509 -in "$candidate" -noout -fingerprint -sha1 | sed 's/^[^=]*=//;s/://g' | tr '[:lower:]' '[:upper:]')"; then
+          echo "macOS keychain emitted an invalid certificate" >&2
+          return 1
+        fi
         printf '%s %s\n' "$fingerprint" "$candidate" >>"$candidate_index"
+        if [[ "$(basename "$candidate")" == system-* ]]; then
+          printf '%s\n' "$fingerprint" >>"$allowed"
+        fi
       done
       collect_mac_domain_decisions() {
-        local domain="$1" required="$2" plist="$mac_dir/$1.plist" json="$mac_dir/$1.json" decisions="$mac_dir/$1.decisions" decision hash export_output
+        local domain="$1" required="$2" plist="$mac_dir/$1.plist" decisions="$mac_dir/$1.decisions" decision hash export_output
         rm -f "$plist"
         local args=(trust-settings-export)
         if [[ "$domain" == system ]]; then args+=(-s); fi
@@ -237,8 +283,7 @@ collect_certificates() {
           echo "macOS $domain trust settings export failed" >&2
           return 1
         fi
-        plutil -convert json -o "$json" "$plist"
-        if ! osascript -l JavaScript "$script_dir/macos-trust-settings.js" "$json" >"$decisions"; then
+        if ! osascript -l JavaScript "$script_dir/macos-trust-settings.js" "$plist" >"$decisions"; then
           echo "macOS $domain trust settings parser failed" >&2
           return 1
         fi
@@ -303,7 +348,10 @@ publish_once() {
     local first=1 pem_json
     for cert_file in "$cert"/*.pem; do
       cert_hash="$(basename "$cert_file" .pem)"
-      pem_json="$(sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g' "$cert_file")"
+      # OpenSSL normalized this file immediately above, so PEM lines contain
+      # no JSON-special quotes, backslashes, or control characters. Only join
+      # line boundaries with literal \n escapes, portably across BSD/GNU awk.
+      pem_json="$(awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }' "$cert_file")"
       [[ $first == 1 ]] || printf ','
       printf '\n    {"sha256":"%s","pem":"%s"}' "$cert_hash" "$pem_json"
       first=0

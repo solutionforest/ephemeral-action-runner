@@ -12,9 +12,7 @@ import (
 )
 
 func TestCheckRunnerPIDFilePath(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("requires POSIX process signaling")
-	}
+	requireLinuxProc(t)
 	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "actions-runner.pid")
@@ -87,9 +85,7 @@ func TestCheckRunnerPIDFilePath(t *testing.T) {
 }
 
 func TestCheckRunnerRejectsLivePIDWithUnexpectedWorkingDirectory(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("requires POSIX process signaling")
-	}
+	requireLinuxProc(t)
 	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "actions-runner.pid")
@@ -130,9 +126,7 @@ func TestCheckRunnerRejectsLivePIDWithUnexpectedWorkingDirectory(t *testing.T) {
 }
 
 func TestCheckRunnerRejectsZombiePID(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("requires POSIX process state")
-	}
+	requireLinuxProc(t)
 	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "actions-runner.pid")
@@ -175,9 +169,7 @@ func TestCheckRunnerRejectsZombiePID(t *testing.T) {
 }
 
 func TestCheckRunnerSystemdPath(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("requires POSIX systemd command simulation")
-	}
+	requireLinuxProc(t)
 	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-runner.sh"))
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "systemctl.args")
@@ -225,6 +217,13 @@ exit 0
 	}
 	if args != "is-active --quiet actions-runner.service\nshow actions-runner.service --property=MainPID --value" {
 		t.Fatalf("systemctl args = %q", args)
+	}
+}
+
+func requireLinuxProc(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux /proc process metadata")
 	}
 }
 

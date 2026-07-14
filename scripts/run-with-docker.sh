@@ -69,15 +69,20 @@ fi
 
 host_trust_docker_flags=()
 run_controller() {
-  docker run "${tty_flags[@]}" \
-    "${docker_env_flags[@]}" \
-    "${host_trust_docker_flags[@]}" \
-    -v "${repo_root}:/app" -w /app \
-    -v "${gomod_volume}:/go/pkg/mod" \
-    -v "${gocache_volume}:/root/.cache/go-build" \
-    -v "${docker_sock}:/var/run/docker.sock" \
-    "$dev_image" \
+  local -a docker_args=(run)
+  docker_args+=("${tty_flags[@]}" "${docker_env_flags[@]}")
+  if ((${#host_trust_docker_flags[@]})); then
+    docker_args+=("${host_trust_docker_flags[@]}")
+  fi
+  docker_args+=(
+    -v "${repo_root}:/app" -w /app
+    -v "${gomod_volume}:/go/pkg/mod"
+    -v "${gocache_volume}:/root/.cache/go-build"
+    -v "${docker_sock}:/var/run/docker.sock"
+    "$dev_image"
     go run ./cmd/ephemeral-action-runner "$@"
+  )
+  docker "${docker_args[@]}"
 }
 
 trap epar_host_trust_cleanup EXIT INT TERM

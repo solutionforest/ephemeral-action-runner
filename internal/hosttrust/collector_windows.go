@@ -69,7 +69,12 @@ func windowsCAAnchors(derCertificates [][]byte, denied map[string]struct{}) ([]C
 		}
 		certificate, err := x509.ParseCertificate(der)
 		if err != nil {
-			return nil, fmt.Errorf("parse Windows root certificate: %w", err)
+			// Windows can carry legacy roots which CryptoAPI accepts but Go's
+			// stricter X.509 parser rejects (for example, a negative serial
+			// number). Skip only the unreadable native-store entry. Explicit
+			// certificates and external feeds continue through their strict
+			// validation paths.
+			continue
 		}
 		if !certificate.IsCA {
 			continue
