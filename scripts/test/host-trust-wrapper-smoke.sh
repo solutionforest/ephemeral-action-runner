@@ -89,6 +89,8 @@ fi
 first="$($helper sync --project-root "$project_root" --config "$config")"
 second="$($helper sync --project-root "$project_root" --config "$config")"
 [[ "$first" == "$second" && -s "$first" ]]
+grep -Fq '"pem":"-----BEGIN CERTIFICATE-----\n' "$first"
+grep -Fq '\n-----END CERTIFICATE-----"' "$first"
 
 if [[ "$host_os" == Darwin ]]; then
   system_config="$temporary/system-only.yml"

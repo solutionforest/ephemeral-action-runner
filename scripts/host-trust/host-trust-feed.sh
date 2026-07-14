@@ -349,7 +349,10 @@ publish_once() {
     local first=1 pem_json
     for cert_file in "$cert"/*.pem; do
       cert_hash="$(basename "$cert_file" .pem)"
-      pem_json="$(sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g' "$cert_file")"
+      # OpenSSL normalized this file immediately above, so PEM lines contain
+      # no JSON-special quotes, backslashes, or control characters. Only join
+      # line boundaries with literal \n escapes, portably across BSD/GNU awk.
+      pem_json="$(awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }' "$cert_file")"
       [[ $first == 1 ]] || printf ','
       printf '\n    {"sha256":"%s","pem":"%s"}' "$cert_hash" "$pem_json"
       first=0
