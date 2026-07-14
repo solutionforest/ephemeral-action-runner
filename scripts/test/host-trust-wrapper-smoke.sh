@@ -43,6 +43,11 @@ PLIST
   [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
   cat >"$valid_plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>issuerName</key><data>AQID</data><key>serialNumber</key><data>BAUG</data></dict></dict></dict></plist>
+PLIST
+  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
+  cat >"$valid_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data>AQID</data><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsKeyUsage</key><integer>8</integer><key>kSecTrustSettingsResult</key><integer>2</integer></dict></array></dict></dict></dict></plist>
 PLIST
   [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
@@ -64,7 +69,9 @@ PLIST
   for invalid in \
     '<plist version="1.0"><dict>' \
     '<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><string>invalid</string></dict></plist>' \
-    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict/></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><dict/></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><string>invalid</string></dict></dict></dict></plist>" \
+    "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><data>AQID</data></dict></dict></dict></plist>" \
     "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><string>invalid</string></array></dict></dict></dict></plist>" \
     "<plist version=\"1.0\"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data>%%%not-base64%%%</data></dict></array></dict></dict></dict></plist>"; do
     invalid_plist="$temporary/macos-invalid-$RANDOM.plist"

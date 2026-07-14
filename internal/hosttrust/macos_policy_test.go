@@ -131,7 +131,7 @@ func TestMacUserTrustSettingsEnabledFromOutput(t *testing.T) {
 	}
 }
 
-func TestMacTrustDocumentRejectsMissingOrInvalidTrustSettings(t *testing.T) {
+func TestMacTrustDocumentAllowsOmittedTrustSettingsAndRejectsInvalidPresentValue(t *testing.T) {
 	fingerprint := strings.Repeat("C", 40)
 	for _, value := range []string{`<data>AQID</data>`, `<dict/>`, `<string>not-an-array</string>`} {
 		content := macTrustSettingsPlist(fingerprint, value)
@@ -139,12 +139,13 @@ func TestMacTrustDocumentRejectsMissingOrInvalidTrustSettings(t *testing.T) {
 			t.Fatalf("trustSettings=%s was accepted", value)
 		}
 	}
-	missing := macTrustEntryPlist(fingerprint, ``)
-	if _, err := macTrustDecisionsFromPlist(missing); err == nil {
-		t.Fatal("missing trustSettings was accepted")
+	omitted := macTrustEntryPlist(fingerprint, `<key>issuerName</key><data>AQID</data><key>serialNumber</key><data>BAUG</data>`)
+	decisions, err := macTrustDecisionsFromPlist(omitted)
+	if err != nil || !decisions[fingerprint].Allow || decisions[fingerprint].Deny {
+		t.Fatalf("omitted trustSettings should be unconditional trust: decisions=%v error=%v", decisions, err)
 	}
 	empty := macTrustSettingsPlist(fingerprint, `<array/>`)
-	decisions, err := macTrustDecisionsFromPlist(empty)
+	decisions, err = macTrustDecisionsFromPlist(empty)
 	if err != nil || !decisions[fingerprint].Allow {
 		t.Fatalf("present empty trustSettings should be unconditional trust: decisions=%v error=%v", decisions, err)
 	}

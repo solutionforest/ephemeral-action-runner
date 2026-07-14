@@ -73,7 +73,11 @@ function run(argv) {
     const entry = dictionaryValue(trustList, rawFingerprint);
     if (!isKind(entry, $.NSDictionary)) fail('trust entry must be a dictionary for ' + fingerprint);
     const settings = dictionaryValue(entry, 'trustSettings');
-    if (!isKind(settings, $.NSArray)) fail('trustSettings must be a present array for ' + fingerprint);
+    if (!settings) {
+      lines.push('allow ' + fingerprint);
+      continue;
+    }
+    if (!isKind(settings, $.NSArray)) fail('trustSettings must be an array for ' + fingerprint);
 
     let allow = Number(settings.count) === 0;
     let deny = false;

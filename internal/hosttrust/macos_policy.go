@@ -73,11 +73,16 @@ func macTrustDecisionsFromPlist(content []byte) (map[string]macTrustDecision, er
 		if entry.kind != macPlistDictionary {
 			return nil, fmt.Errorf("trust entry %s must be a dictionary", fingerprint)
 		}
+		decision := macTrustDecision{}
 		settings, found := entry.dictionary["trustSettings"]
-		if !found || settings.kind != macPlistArray {
+		if !found {
+			decision.Allow = true // Apple's persisted schema omits zero usage constraints.
+			decisions[fingerprint] = decision
+			continue
+		}
+		if settings.kind != macPlistArray {
 			return nil, fmt.Errorf("trust entry %s trustSettings must be an array", fingerprint)
 		}
-		decision := macTrustDecision{}
 		if len(settings.array) == 0 {
 			decision.Allow = true // Apple's documented unconditional trustRoot array.
 		}
