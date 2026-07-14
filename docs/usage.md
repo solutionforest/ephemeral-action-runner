@@ -12,8 +12,8 @@ Install the host tools you need:
 
 | Required for | Tool |
 | --- | --- |
-| Source ZIP quick start | Go 1.22 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
-| Local binary build | Go 1.22 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
+| Source ZIP quick start | Go 1.25 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
+| Local binary build | Go 1.25 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
 | Updating the pinned `actions/runner-images` checkout | Git |
 | macOS provider | Tart |
 | Windows provider | WSL2 |

@@ -1,6 +1,6 @@
 # Running EPAR Without Installing Go
 
-The normal beta path (`go run ./cmd/ephemeral-action-runner`, see [Usage](../usage.md)) needs Go 1.22+ on the host. If you don't want to install Go, use one of the two paths below instead. Both still need Docker for the default Docker-DinD provider.
+The normal beta path (`go run ./cmd/ephemeral-action-runner`, see [Usage](../usage.md)) needs Go 1.25+ on the host. If you don't want to install Go, use one of the two paths below instead. Both still need Docker for the default Docker-DinD provider.
 
 | Path | What you get | Best for |
 | --- | --- | --- |
@@ -30,7 +30,7 @@ docker run --rm -it \
   go run ./cmd/ephemeral-action-runner ...
 ```
 
-This is `go run` — the same thing the docs recommend when Go is installed locally — just executed inside a container. **No binary is built or written to disk.** The Docker CLI baked into that small image is what lets EPAR's own runtime Docker calls (image build, container create, etc.) reach your host's Docker daemon through the mounted socket; without it, `docker run golang:1.24 go run ...` fails with "Docker is required" even with the socket mounted, because the bare `golang` image has no `docker` client binary.
+This is `go run` — the same thing the docs recommend when Go is installed locally — just executed inside a container. **No binary is built or written to disk.** The Docker CLI baked into that small image is what lets EPAR's own runtime Docker calls (image build, container create, etc.) reach your host's Docker daemon through the mounted socket; without it, `docker run golang:1.25 go run ...` fails with "Docker is required" even with the socket mounted, because the bare `golang` image has no `docker` client binary.
 
 ### Host trust bridge
 

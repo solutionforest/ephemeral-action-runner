@@ -507,10 +507,16 @@ func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
 	t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldInterval })
 
 	var healthChecks int32
+	ready := make(chan struct{})
 	fake := &fakeProvider{ip: "127.0.0.1"}
 	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
-		if strings.Contains(strings.Join(command, " "), "check-runner.sh") && atomic.AddInt32(&healthChecks, 1) == 1 {
-			return provider.ExecResult{}, errors.New("transient provider exec timeout")
+		if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
+			switch atomic.AddInt32(&healthChecks, 1) {
+			case 1:
+				return provider.ExecResult{}, errors.New("transient provider exec timeout")
+			case 2:
+				close(ready)
+			}
 		}
 		return provider.ExecResult{}, nil
 	}
@@ -519,7 +525,7 @@ func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
 			select {
 			case <-ctx.Done():
 				return gh.Runner{}, ctx.Err()
-			case <-time.After(10 * time.Millisecond):
+			case <-ready:
 				return gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"}, nil
 			}
 		},
