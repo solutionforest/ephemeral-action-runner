@@ -18,6 +18,24 @@ function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function isStandardBase64(value) {
+  if (value === '') return true;
+  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
+}
+
+function validateXMLDataElements(xml) {
+  const openingCount = (xml.match(/<data(?=[\s/>])/g) || []).length;
+  const element = /<data>([\s\S]*?)<\/data>|<data\s*\/>/g;
+  let validatedCount = 0;
+  let match;
+  while ((match = element.exec(xml)) !== null) {
+    const encoded = (match[1] || '').replace(/[ \t\r\n]/g, '');
+    if (!isStandardBase64(encoded)) fail('plist data must contain standard base64');
+    validatedCount++;
+  }
+  if (validatedCount !== openingCount) fail('plist data elements must be attribute-free and well formed');
+}
+
 function positiveSettingIsExportable(setting) {
   const allowed = new Set([
     'kSecTrustSettingsPolicy',
@@ -46,6 +64,12 @@ function run(argv) {
   if (argv.length !== 1) fail('usage: macos-trust-settings.js <export.plist>');
   const data = $.NSData.dataWithContentsOfFile($(argv[0]));
   if (!data) fail('cannot read exported trust settings plist');
+  const source = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+  if (!source) fail('exported trust settings plist must be UTF-8 XML');
+  const xml = ObjC.unwrap(source);
+  const trimmedXML = xml.replace(/^[ \t\r\n]+/, '');
+  if (!trimmedXML.startsWith('<?xml') && !trimmedXML.startsWith('<plist')) fail('exported trust settings plist must be XML');
+  validateXMLDataElements(xml);
   const propertyList = $.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(data, 0, null, null);
   if (!propertyList) fail('cannot parse exported trust settings plist');
   const document = ObjC.deepUnwrap(propertyList);
