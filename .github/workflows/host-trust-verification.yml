@@ -19,6 +19,10 @@ on:
       - scripts/release/run-epar.ps1
       - scripts/run-with-docker.sh
       - scripts/run-with-docker.ps1
+      - scripts/test/host-trust-*.sh
+      - scripts/test/host-trust-*.ps1
+      - scripts/test/no-go-first-run-*.sh
+      - scripts/test/no-go-first-run-*.ps1
       - start
       - start.ps1
   push:
@@ -40,6 +44,10 @@ on:
       - scripts/release/run-epar.ps1
       - scripts/run-with-docker.sh
       - scripts/run-with-docker.ps1
+      - scripts/test/host-trust-*.sh
+      - scripts/test/host-trust-*.ps1
+      - scripts/test/no-go-first-run-*.sh
+      - scripts/test/no-go-first-run-*.ps1
       - start
       - start.ps1
   workflow_dispatch:
