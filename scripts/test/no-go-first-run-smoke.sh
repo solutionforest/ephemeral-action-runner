@@ -68,6 +68,8 @@ export FAKE_DOCKER_LOG="$temporary/docker.log"
 [[ "$(grep -c ' <run>' "$FAKE_DOCKER_LOG")" == 2 ]]
 first_run_call="$(grep ' <run>' "$FAKE_DOCKER_LOG" | sed -n '1p')"
 second_run_call="$(grep ' <run>' "$FAKE_DOCKER_LOG" | sed -n '2p')"
+# The implicit-init invocation has no trust-feed flags; the fake Docker log renders an empty argv element as <>.
+[[ "$first_run_call" != *" <>"* ]]
 [[ "$first_run_call" == *" <EPAR_HOST_TRUST_INIT_DEFERRED=1>"* ]]
 [[ "$first_run_call" == *" <EPAR_CONTROLLER_HOST_OS=$expected_controller_os>"* ]]
 [[ "$first_run_call" == *" <init>"* ]]
