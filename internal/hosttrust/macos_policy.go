@@ -1,9 +1,12 @@
 package hosttrust
 
 import (
+	"bytes"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -17,6 +20,35 @@ type macExternalTrustDocument struct {
 	TrustList    map[string]struct {
 		TrustSettings json.RawMessage `json:"trustSettings"`
 	} `json:"trustList"`
+}
+
+func parseMacKeychainCertificates(content []byte, required bool) ([]*x509.Certificate, error) {
+	if len(bytes.TrimSpace(content)) == 0 {
+		if required {
+			return nil, fmt.Errorf("no certificates found")
+		}
+		return nil, nil
+	}
+	return parseCertificates(content)
+}
+
+func macSelectedCertificates(baseline, explicitlyAllowed map[string]Certificate, denied map[string]struct{}) []Certificate {
+	selected := make(map[string]Certificate, len(baseline)+len(explicitlyAllowed))
+	for hash, certificate := range baseline {
+		selected[hash] = certificate
+	}
+	for hash, certificate := range explicitlyAllowed {
+		selected[hash] = certificate
+	}
+	for hash := range denied {
+		delete(selected, hash)
+	}
+	out := make([]Certificate, 0, len(selected))
+	for _, certificate := range selected {
+		out = append(out, certificate)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SHA256 < out[j].SHA256 })
+	return out
 }
 
 // macTrustDecisionsFromJSON interprets the external representation produced by

@@ -19,6 +19,30 @@ image:
     [System.IO.File]::WriteAllText($config, $configContent, [System.Text.UTF8Encoding]::new($false))
 
     $helper = Join-Path $ProjectRoot 'scripts\host-trust\host-trust-feed.ps1'
+    $tokens = $null
+    $parseErrors = $null
+    $helperAst = [System.Management.Automation.Language.Parser]::ParseFile($helper, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { throw "host-trust-feed.ps1 has parser errors: $($parseErrors -join '; ')" }
+    $derFunctions = @($helperAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Read-DerElement', 'Test-DerCertificateSerialNumberNonnegative')
+    }, $true))
+    if ($derFunctions.Count -ne 2) { throw "expected two DER helper functions, got $($derFunctions.Count)" }
+    . ([scriptblock]::Create(($derFunctions.Extent.Text -join "`n")))
+    $positiveSerial = [byte[]](0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01)
+    $negativeSerial = [byte[]](0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x80)
+    if (-not (Test-DerCertificateSerialNumberNonnegative $positiveSerial)) { throw 'positive DER serial number was rejected' }
+    if (Test-DerCertificateSerialNumberNonnegative $negativeSerial) { throw 'negative DER serial number was accepted' }
+    foreach ($malformedDer in @(
+        [byte[]](0x30, 0x82, 0x01),
+        [byte[]](0x30, 0x7f, 0x30, 0x03, 0x02, 0x01, 0x01),
+        [byte[]](0x30, 0x80),
+        [byte[]](0x30, 0x04, 0x30, 0x02, 0x02, 0x00)
+    )) {
+        $rejected = $false
+        try { [void](Test-DerCertificateSerialNumberNonnegative $malformedDer) } catch { $rejected = $true }
+        if (-not $rejected) { throw "malformed DER fixture was accepted: $([BitConverter]::ToString($malformedDer))" }
+    }
     $first = [string](& $helper sync -ProjectRoot $ProjectRoot -Config $config)
     if ($LASTEXITCODE -ne 0) { throw 'first Windows feed sync failed' }
     $second = [string](& $helper sync -ProjectRoot $ProjectRoot -Config $config)

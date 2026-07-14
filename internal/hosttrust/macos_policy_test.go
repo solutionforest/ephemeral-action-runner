@@ -156,3 +156,52 @@ func TestMacTrustSettingsExportAbsentClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestParseMacKeychainCertificatesRequiredAndOptionalEmptyOutput(t *testing.T) {
+	for _, content := range [][]byte{nil, []byte(" \r\n\t")} {
+		parsed, err := parseMacKeychainCertificates(content, false)
+		if err != nil || len(parsed) != 0 {
+			t.Fatalf("optional empty keychain output parsed=%v error=%v", parsed, err)
+		}
+		if _, err := parseMacKeychainCertificates(content, true); err == nil {
+			t.Fatal("required empty keychain output was accepted")
+		}
+	}
+	if _, err := parseMacKeychainCertificates([]byte("not a certificate"), false); err == nil {
+		t.Fatal("optional nonempty malformed keychain output was accepted")
+	}
+	parsed, err := parseMacKeychainCertificates(testCertificatePEM(t, true, "macOS Keychain Root"), true)
+	if err != nil || len(parsed) != 1 {
+		t.Fatalf("valid required keychain output parsed=%d error=%v", len(parsed), err)
+	}
+}
+
+func TestMacSelectedCertificatesUsesSystemRootsBaselineAndDenyWins(t *testing.T) {
+	root := mustTestCertificate(t, "macOS System Root")
+	explicit := mustTestCertificate(t, "macOS Explicit Root")
+	selected := macSelectedCertificates(
+		map[string]Certificate{root.SHA256: root},
+		map[string]Certificate{explicit.SHA256: explicit},
+		map[string]struct{}{explicit.SHA256: {}},
+	)
+	if len(selected) != 1 || selected[0].SHA256 != root.SHA256 {
+		t.Fatalf("selected certificates = %#v, want baseline root only", selected)
+	}
+	selected = macSelectedCertificates(
+		map[string]Certificate{root.SHA256: root},
+		map[string]Certificate{explicit.SHA256: explicit},
+		map[string]struct{}{root.SHA256: {}},
+	)
+	if len(selected) != 1 || selected[0].SHA256 != explicit.SHA256 {
+		t.Fatalf("selected certificates = %#v, want explicit root only", selected)
+	}
+}
+
+func mustTestCertificate(t *testing.T, commonName string) Certificate {
+	t.Helper()
+	certificates, err := CertificatesFromBytes(testCertificatePEM(t, true, commonName))
+	if err != nil || len(certificates) != 1 {
+		t.Fatalf("create test certificate: count=%d error=%v", len(certificates), err)
+	}
+	return certificates[0]
+}

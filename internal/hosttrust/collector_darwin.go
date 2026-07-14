@@ -24,6 +24,7 @@ type macCandidate struct {
 
 func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 	candidates := make(map[string]macCandidate)
+	baseline := make(map[string]Certificate)
 	allowed := make(map[string]Certificate)
 	denied := make(map[string]struct{})
 	var snapshot Snapshot
@@ -40,12 +41,12 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 		snapshot.Sources = append(snapshot.Sources, Source{Scope: ScopeUser, Kind: fmt.Sprintf("macos-user-trust-settings-enabled-%t", userTrustEnabled), Path: "security user-trust-settings-enable"})
 	}
 
-	addKeychain := func(scope, kind, path string) error {
+	addKeychain := func(scope, kind, path string, required, baselineAllowed bool) error {
 		output, err := runMacSecurity(ctx, "find-certificate", "-a", "-p", path)
 		if err != nil {
 			return err
 		}
-		parsed, err := parseCertificates(output)
+		parsed, err := parseMacKeychainCertificates(output, required)
 		if err != nil {
 			return fmt.Errorf("parse certificates from macOS keychain %s: %w", path, err)
 		}
@@ -57,16 +58,19 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 			fingerprint := sha1.Sum(certificate.Raw)
 			key := strings.ToUpper(hex.EncodeToString(fingerprint[:]))
 			candidates[key] = macCandidate{certificate: canonical}
+			if baselineAllowed {
+				baseline[canonical.SHA256] = canonical
+			}
 		}
 		snapshot.Sources = append(snapshot.Sources, Source{Scope: scope, Kind: kind, Path: path})
 		return nil
 	}
 
 	if hasScope(scopes, ScopeSystem) {
-		if err := addKeychain(ScopeSystem, "macos-system-roots", macSystemRootsKeychain); err != nil {
+		if err := addKeychain(ScopeSystem, "macos-system-roots", macSystemRootsKeychain, true, true); err != nil {
 			return Snapshot{}, err
 		}
-		if err := addKeychain(ScopeSystem, "macos-admin-keychain", macAdminKeychain); err != nil {
+		if err := addKeychain(ScopeSystem, "macos-admin-keychain", macAdminKeychain, false, false); err != nil {
 			return Snapshot{}, err
 		}
 	}
@@ -76,7 +80,7 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 		for _, keychain := range keychains {
-			if err := addKeychain(ScopeUser, "macos-user-keychain", keychain); err != nil {
+			if err := addKeychain(ScopeUser, "macos-user-keychain", keychain, false, false); err != nil {
 				return Snapshot{}, err
 			}
 		}
@@ -126,11 +130,7 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 	}
-	for hash, certificate := range allowed {
-		if _, blocked := denied[hash]; !blocked {
-			snapshot.Certificates = append(snapshot.Certificates, certificate)
-		}
-	}
+	snapshot.Certificates = macSelectedCertificates(baseline, allowed, denied)
 	return snapshot, nil
 }
 

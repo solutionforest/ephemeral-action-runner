@@ -25,6 +25,7 @@ on:
     branches:
       - develop
       - main
+      - codex/fix-host-trust-ci
     paths:
       - .github/workflows/host-trust-verification.yml
       - cmd/ephemeral-action-runner/**

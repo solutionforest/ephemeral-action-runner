@@ -83,6 +83,50 @@ function Test-CertificateAuthority {
     return $false
 }
 
+function Read-DerElement {
+    param([byte[]] $Bytes, [int] $Offset, [int] $Limit)
+    if ($Offset -lt 0 -or $Limit -gt $Bytes.Length -or $Offset -ge $Limit) { throw 'truncated DER element tag' }
+    $tag = $Bytes[$Offset]
+    $cursor = $Offset + 1
+    if ($cursor -ge $Limit) { throw 'truncated DER element length' }
+    $firstLength = [int]$Bytes[$cursor]
+    $cursor++
+    if (($firstLength -band 0x80) -eq 0) {
+        [uint64]$contentLength = $firstLength
+    } else {
+        $lengthBytes = $firstLength -band 0x7f
+        if ($lengthBytes -eq 0) { throw 'indefinite DER lengths are not permitted' }
+        if ($lengthBytes -gt 4 -or $lengthBytes -gt ($Limit - $cursor)) { throw 'invalid DER length-of-length' }
+        [uint64]$contentLength = 0
+        for ($index = 0; $index -lt $lengthBytes; $index++) {
+            $contentLength = ($contentLength -shl 8) -bor $Bytes[$cursor]
+            $cursor++
+        }
+    }
+    if ($contentLength -gt [uint64]($Limit - $cursor)) { throw 'DER element length exceeds its enclosing value' }
+    return [pscustomobject]@{
+        Tag = $tag
+        ContentOffset = $cursor
+        ContentLength = [int]$contentLength
+        EndOffset = $cursor + [int]$contentLength
+    }
+}
+
+function Test-DerCertificateSerialNumberNonnegative {
+    param([byte[]] $Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { throw 'certificate DER is empty' }
+    $certificate = Read-DerElement $Bytes 0 $Bytes.Length
+    if ($certificate.Tag -ne 0x30 -or $certificate.EndOffset -ne $Bytes.Length) { throw 'certificate DER must be one complete sequence' }
+    $tbsCertificate = Read-DerElement $Bytes $certificate.ContentOffset $certificate.EndOffset
+    if ($tbsCertificate.Tag -ne 0x30) { throw 'certificate DER is missing TBSCertificate sequence' }
+    $serialOffset = $tbsCertificate.ContentOffset
+    $firstField = Read-DerElement $Bytes $serialOffset $tbsCertificate.EndOffset
+    if ($firstField.Tag -eq 0xa0) { $serialOffset = $firstField.EndOffset }
+    $serialNumber = Read-DerElement $Bytes $serialOffset $tbsCertificate.EndOffset
+    if ($serialNumber.Tag -ne 0x02 -or $serialNumber.ContentLength -eq 0) { throw 'certificate DER has an invalid serial number' }
+    return (($Bytes[$serialNumber.ContentOffset] -band 0x80) -eq 0)
+}
+
 function Write-Feed {
     param([string] $FeedRoot, [System.Collections.Generic.List[string]] $Scopes)
     $raw = @{}
@@ -101,7 +145,7 @@ function Write-Feed {
         $storePath = if ($scope -eq 'system') { 'Cert:\LocalMachine\Root' } else { 'Cert:\CurrentUser\Root' }
         if (-not (Test-Path -LiteralPath $storePath)) { continue }
         Get-ChildItem -LiteralPath $storePath | ForEach-Object {
-            if ($_.RawData -and $_.RawData.Length -gt 0 -and (Test-CertificateAuthority $_)) {
+            if ($_.RawData -and $_.RawData.Length -gt 0 -and (Test-DerCertificateSerialNumberNonnegative $_.RawData) -and (Test-CertificateAuthority $_)) {
                 $hash = Get-Sha256Hex $_.RawData
                 if (-not $disallowed.Contains($hash)) { $raw[$hash] = $_.RawData }
             }

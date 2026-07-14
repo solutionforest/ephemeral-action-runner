@@ -61,6 +61,67 @@ second="$($helper sync --project-root "$project_root" --config "$config")"
 [[ "$first" == "$second" && -s "$first" ]]
 
 if [[ "$host_os" == Darwin ]]; then
+  system_config="$temporary/system-only.yml"
+  cat >"$system_config" <<'YAML'
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system]
+YAML
+  fake_optional_keychains="$temporary/fake-optional-keychains"
+  mkdir -p "$fake_optional_keychains"
+  cat >"$fake_optional_keychains/security" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+if [[ "$args" == *" user-trust-settings-enable "* ]]; then
+  echo 'User-level Trust Settings are Enabled'
+  exit 0
+fi
+if [[ "$args" == *" list-keychains -d user "* ]]; then
+  echo '"/tmp/epar-empty-user.keychain-db"'
+  exit 0
+fi
+if [[ "$args" == *" find-certificate "* ]] && { [[ "$args" == *" -p /Library/Keychains/System.keychain "* ]] || [[ "$args" == *" -p /tmp/epar-empty-user.keychain-db "* ]]; }; then
+  exit 0
+fi
+if [[ "$args" == *" trust-settings-export "* ]]; then
+  if [[ "$args" == *" -s "* ]]; then
+    output="${!#}"
+    cat >"$output" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict/></dict></plist>
+PLIST
+    exit 0
+  fi
+  echo 'SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.' >&2
+  exit 1
+fi
+exec /usr/bin/security "$@"
+SH
+  chmod +x "$fake_optional_keychains/security"
+  optional_feed="$(PATH="$fake_optional_keychains:$PATH" "$helper" sync --project-root "$project_root" --config "$config")"
+  [[ -s "$optional_feed" ]] || { echo "macOS baseline roots were not retained with empty admin/user keychains and empty explicit trust settings" >&2; exit 1; }
+
+  for required_output in empty malformed; do
+    fake_required_keychain="$temporary/fake-required-keychain-$required_output"
+    mkdir -p "$fake_required_keychain"
+    cat >"$fake_required_keychain/security" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ " \$* " == *" find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain "* ]]; then
+  [[ "$required_output" == malformed ]] && echo 'not a certificate'
+  exit 0
+fi
+exec /usr/bin/security "\$@"
+SH
+    chmod +x "$fake_required_keychain/security"
+    if PATH="$fake_required_keychain:$PATH" "$helper" sync --project-root "$project_root" --config "$system_config" >/dev/null 2>&1; then
+      echo "macOS required SystemRootCertificates $required_output output was accepted" >&2
+      exit 1
+    fi
+  done
+
   fake_osascript="$temporary/fake-osascript"
   mkdir -p "$fake_osascript"
   printf '#!/usr/bin/env bash\nexit 17\n' >"$fake_osascript/osascript"
