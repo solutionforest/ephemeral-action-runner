@@ -43,12 +43,12 @@ The default quick start needs a Docker-compatible daemon:
 
 ### 2. Download EPAR Source
 
-Open the [EPAR GitHub repo](https://github.com/solutionforest/ephemeral-action-runner), choose **Code**, then **Download ZIP**.
+Open the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), select the release you want, and download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)**. EPAR releases use these source archives only.
 
-Extract the ZIP and open a terminal in the extracted folder. The folder is usually named `ephemeral-action-runner-main`.
+Extract the source archive and open a terminal in the extracted folder. The folder is usually named `ephemeral-action-runner-<tag>`.
 
 ```bash
-cd path/to/ephemeral-action-runner-main
+cd path/to/ephemeral-action-runner-<tag>
 ```
 
 ### 3. Create A GitHub App
