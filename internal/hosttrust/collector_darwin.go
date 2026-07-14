@@ -87,14 +87,14 @@ func collectNative(ctx context.Context, scopes []string) (Snapshot, error) {
 	}
 
 	applyDomain := func(scope, domain string, required bool) error {
-		content, present, err := exportMacTrustSettingsJSON(ctx, domain, required)
+		content, present, err := exportMacTrustSettingsPlist(ctx, domain, required)
 		if err != nil {
 			return err
 		}
 		if !present {
 			return nil
 		}
-		decisions, err := macTrustDecisionsFromJSON(content)
+		decisions, err := macTrustDecisionsFromPlist(content)
 		if err != nil {
 			return fmt.Errorf("parse macOS %s trust settings: %w", domain, err)
 		}
@@ -152,7 +152,7 @@ func macUserKeychains(ctx context.Context) ([]string, error) {
 	return paths, nil
 }
 
-func exportMacTrustSettingsJSON(ctx context.Context, domain string, required bool) ([]byte, bool, error) {
+func exportMacTrustSettingsPlist(ctx context.Context, domain string, required bool) ([]byte, bool, error) {
 	directory, err := os.MkdirTemp("", "epar-macos-trust-settings-")
 	if err != nil {
 		return nil, false, err
@@ -173,7 +173,7 @@ func exportMacTrustSettingsJSON(ctx context.Context, domain string, required boo
 		}
 		return nil, false, err
 	}
-	command := exec.CommandContext(ctx, "plutil", "-convert", "json", "-o", "-", path)
+	command := exec.CommandContext(ctx, "plutil", "-convert", "xml1", "-o", "-", path)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return nil, false, fmt.Errorf("plutil convert macOS %s trust settings: %w: %s", domain, err, strings.TrimSpace(string(output)))

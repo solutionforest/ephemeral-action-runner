@@ -270,7 +270,7 @@ collect_certificates() {
         fi
       done
       collect_mac_domain_decisions() {
-        local domain="$1" required="$2" plist="$mac_dir/$1.plist" json="$mac_dir/$1.json" decisions="$mac_dir/$1.decisions" decision hash export_output
+        local domain="$1" required="$2" plist="$mac_dir/$1.plist" decisions="$mac_dir/$1.decisions" decision hash export_output
         rm -f "$plist"
         local args=(trust-settings-export)
         if [[ "$domain" == system ]]; then args+=(-s); fi
@@ -284,8 +284,7 @@ collect_certificates() {
           echo "macOS $domain trust settings export failed" >&2
           return 1
         fi
-        plutil -convert json -o "$json" "$plist"
-        if ! osascript -l JavaScript "$script_dir/macos-trust-settings.js" "$json" >"$decisions"; then
+        if ! osascript -l JavaScript "$script_dir/macos-trust-settings.js" "$plist" >"$decisions"; then
           echo "macOS $domain trust settings parser failed" >&2
           return 1
         fi
