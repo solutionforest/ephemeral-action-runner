@@ -106,11 +106,28 @@ func canonicalPath(path string) (string, error) {
 		return "", fmt.Errorf("resolve absolute path: %w", err)
 	}
 	absolute = filepath.Clean(absolute)
-	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
-	if err == nil {
-		absolute = filepath.Join(parent, filepath.Base(absolute))
+
+	// Transcript paths are commonly validated before their category directory or
+	// log file exists. Resolve the nearest existing ancestor instead of only the
+	// direct parent so root aliases (such as /var on macOS or Windows short
+	// paths) cannot leave root and child paths in different representations.
+	var tail []string
+	for candidate := absolute; ; {
+		resolved, resolveErr := filepath.EvalSymlinks(candidate)
+		if resolveErr == nil {
+			for index := len(tail) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, tail[index])
+			}
+			return canonicalCase(resolved), nil
+		}
+
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return canonicalCase(absolute), nil
+		}
+		tail = append(tail, filepath.Base(candidate))
+		candidate = parent
 	}
-	return canonicalCase(absolute), nil
 }
 
 func pathWithin(root, path string) bool {
