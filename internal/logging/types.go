@@ -140,6 +140,8 @@ func (options Options) normalized() (Options, error) {
 	if options.Stderr == nil {
 		options.Stderr = os.Stderr
 	}
+	options.Stdout = ConsoleWriter(options.Stdout)
+	options.Stderr = ConsoleWriter(options.Stderr)
 	if options.Now == nil {
 		options.Now = time.Now
 	}

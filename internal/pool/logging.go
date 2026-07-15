@@ -18,7 +18,7 @@ func (m *Manager) logger() *slog.Logger {
 	if m != nil && m.Logging != nil {
 		return m.Logging.Logger()
 	}
-	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: func(_ []string, attribute slog.Attr) slog.Attr {
+	return slog.New(slog.NewTextHandler(logging.ConsoleWriter(os.Stdout), &slog.HandlerOptions{ReplaceAttr: func(_ []string, attribute slog.Attr) slog.Attr {
 		if attribute.Key == slog.TimeKey || attribute.Key == slog.LevelKey {
 			return slog.Attr{}
 		}
