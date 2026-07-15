@@ -1,6 +1,7 @@
 package dockerdind
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -10,6 +11,30 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
+
+func TestExecPassesInjectedTranscriptWriters(t *testing.T) {
+	p := New("docker", "", false)
+	var stdout, stderr bytes.Buffer
+	p.runCommand = func(_ context.Context, _ io.Reader, logPath string, gotStdout, gotStderr io.Writer, _ ...string) (provider.ExecResult, error) {
+		if logPath != "display.log" {
+			t.Fatalf("logPath = %q", logPath)
+		}
+		_, _ = gotStdout.Write([]byte("out"))
+		_, _ = gotStderr.Write([]byte("err"))
+		return provider.ExecResult{}, nil
+	}
+	_, err := p.Exec(context.Background(), "runner", []string{"true"}, provider.ExecOptions{
+		LogPath: "display.log",
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "out" || stderr.String() != "err" {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
 
 func TestCreateArgsUsePrivilegedWithoutHostSocketOrPorts(t *testing.T) {
 	p := NewWithOptions("docker", "linux/arm64", true, map[string]string{
@@ -49,7 +74,7 @@ func TestExecArgsPreserveEnvAndStdin(t *testing.T) {
 	p := New("docker", "", false)
 	var gotArgs []string
 	var gotStdin bool
-	p.runCommand = func(_ context.Context, stdin io.Reader, _ string, args ...string) (provider.ExecResult, error) {
+	p.runCommand = func(_ context.Context, stdin io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
 		gotArgs = append([]string(nil), args...)
 		gotStdin = stdin != nil
 		return provider.ExecResult{}, nil
@@ -72,7 +97,7 @@ func TestExecArgsPreserveEnvAndStdin(t *testing.T) {
 
 func TestListParsesDockerPSOutput(t *testing.T) {
 	p := New("docker", "", false)
-	p.runCommand = func(_ context.Context, _ io.Reader, _ string, args ...string) (provider.ExecResult, error) {
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
 		if strings.Join(args, " ") != "ps -a --filter label=epar.provider=docker-dind --format {{.Names}}\t{{.Image}}\t{{.Status}}" {
 			t.Fatalf("unexpected list args: %#v", args)
 		}
@@ -109,7 +134,7 @@ func TestStopAndDeleteIgnoreMissingContainer(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			p := New("docker", "", false)
-			p.runCommand = func(_ context.Context, _ io.Reader, _ string, _ ...string) (provider.ExecResult, error) {
+			p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, _ ...string) (provider.ExecResult, error) {
 				return provider.ExecResult{Stderr: "Error response from daemon: No such container: epar-core-1"}, errors.New("exit status 1")
 			}
 			if err := test.call(p); err != nil {

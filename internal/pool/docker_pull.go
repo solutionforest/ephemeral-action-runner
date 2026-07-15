@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -74,7 +73,7 @@ func (m *Manager) pullDockerSource(ctx context.Context, opts dockerSourcePullOpt
 	if err != nil {
 		return fmt.Errorf("Docker Engine pull %s: %w", opts.Image, err)
 	}
-	if err := renderDockerPullProgress(ctx, response, opts.LogPath); err != nil {
+	if err := m.renderDockerPullProgress(ctx, response, opts.LogPath); err != nil {
 		return fmt.Errorf("Docker Engine pull %s: %w", opts.Image, err)
 	}
 	m.writeDockerPullNotice(opts.LogPath, "Docker source pull complete: "+opts.Image)
@@ -82,14 +81,14 @@ func (m *Manager) pullDockerSource(ctx context.Context, opts dockerSourcePullOpt
 }
 
 func (m *Manager) pullDockerSourceWithCLI(ctx context.Context, opts dockerSourcePullOptions, apiErr error) error {
-	fmt.Printf("warning: %v; falling back to docker pull CLI\n", apiErr)
+	m.warnf("warning: %v; falling back to docker pull CLI\n", apiErr)
 	m.writeDockerPullNotice(opts.LogPath, "warning: "+sanitizeTimingError(apiErr)+"; falling back to docker pull CLI")
 	args := []string{"pull"}
 	if opts.Platform != "" {
 		args = append(args, "--platform", opts.Platform)
 	}
 	args = append(args, opts.Image)
-	return runHostLoggedCommand(ctx, opts.LogPath, "docker", args...)
+	return m.runHostLogged(ctx, opts.LogPath, "docker", args...)
 }
 
 func (m *Manager) resolveDockerPullPlatform(ctx context.Context, cli *client.Client, configured string) (ocispec.Platform, error) {
@@ -210,15 +209,16 @@ func dockerImageReferenceAndAuth(image string) (name.Reference, authn.Authentica
 	return ref, authenticator, nil
 }
 
-func renderDockerPullProgress(ctx context.Context, response client.ImagePullResponse, logPath string) error {
-	logFile, err := openDockerPullLog(logPath)
+func (m *Manager) renderDockerPullProgress(ctx context.Context, response client.ImagePullResponse, logPath string) error {
+	transcript, err := m.transcript(logPath, "", "docker-pull")
 	if err != nil {
 		return err
 	}
-	if logFile != nil {
-		defer logFile.Close()
+	interactive := term.IsTerminal(int(os.Stdout.Fd())) && containsString(m.Config.Logging.TranscriptSinks, "console") && m.Config.Logging.TranscriptConsoleFormat == "text"
+	eventWriter := transcript.Stdout
+	if interactive {
+		eventWriter = transcript.File
 	}
-	interactive := term.IsTerminal(int(os.Stdout.Fd()))
 	layers := map[string]dockerLayerProgress{}
 	lastRender := time.Time{}
 	rendered := false
@@ -226,7 +226,7 @@ func renderDockerPullProgress(ctx context.Context, response client.ImagePullResp
 		if streamErr != nil {
 			return streamErr
 		}
-		writeDockerPullEvent(logFile, message.ID, message.Status, message.Progress, message.Stream, message.Error)
+		writeDockerPullEvent(eventWriter, message.ID, message.Status, message.Progress, message.Stream, message.Error)
 		if message.Error != nil {
 			return message.Error
 		}
@@ -247,13 +247,21 @@ func renderDockerPullProgress(ctx context.Context, response client.ImagePullResp
 			layers[message.ID] = layer
 		}
 		if time.Since(lastRender) >= dockerPullProgressInterval {
-			writeDockerPullSummary(os.Stdout, interactive, layers)
+			if interactive {
+				writeDockerPullSummary(os.Stdout, true, layers)
+			} else {
+				writeDockerPullSummary(transcript.Stdout, false, layers)
+			}
 			lastRender = time.Now()
 			rendered = true
 		}
 	}
 	if rendered {
-		writeDockerPullSummary(os.Stdout, interactive, layers)
+		if interactive {
+			writeDockerPullSummary(os.Stdout, true, layers)
+		} else {
+			writeDockerPullSummary(transcript.Stdout, false, layers)
+		}
 		if interactive {
 			fmt.Fprintln(os.Stdout)
 		}
@@ -261,26 +269,22 @@ func renderDockerPullProgress(ctx context.Context, response client.ImagePullResp
 	return nil
 }
 
-func openDockerPullLog(path string) (*os.File, error) {
-	if path == "" {
-		return nil, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return nil, err
-	}
-	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-}
-
 func (m *Manager) writeDockerPullNotice(logPath, message string) {
-	fmt.Println(message)
-	logFile, err := openDockerPullLog(logPath)
+	transcript, err := m.transcript(logPath, "", "docker-pull")
 	if err != nil {
+		m.logger().Warn("docker pull transcript unavailable", "operation", "docker-pull", "logPath", logPath, "error", err)
 		return
 	}
-	if logFile != nil {
-		defer logFile.Close()
-		fmt.Fprintf(logFile, "%s %s\n", time.Now().UTC().Format(time.RFC3339Nano), message)
+	_, _ = fmt.Fprintf(transcript.Stdout, "%s\n", message)
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
 	}
+	return false
 }
 
 func writeDockerPullEvent(logFile io.Writer, id, status string, progress *jsonstream.Progress, stream string, pullErr error) {

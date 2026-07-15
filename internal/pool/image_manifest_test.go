@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -214,7 +215,7 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 	}
 
 	var calls []string
-	runHostLoggedCommand = func(_ context.Context, _ string, name string, args ...string) error {
+	runHostLoggedCommand = func(_ context.Context, _ string, _, _ io.Writer, name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		if len(args) > 0 && args[0] == "export" {
 			for i := 0; i+1 < len(args); i++ {

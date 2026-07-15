@@ -17,8 +17,8 @@ work/logs/epar-last-error.log
 Image build logs use provider-specific names, for example:
 
 ```text
-work/logs/epar-docker-dind-catthehacker-ubuntu.docker-build.log
-work/logs/epar-wsl-catthehacker-ubuntu.wsl-build.log
+work/logs/builds/epar-docker-dind-catthehacker-ubuntu.docker-build.log
+work/logs/builds/epar-wsl-catthehacker-ubuntu.wsl-build.log
 ```
 
 Check the EPAR version and selected config:
@@ -339,8 +339,8 @@ For persistent `0x8000FFFF` or `E_UNEXPECTED` failures, follow
 If the WSL image build fails after import but before systemd is ready, inspect:
 
 ```text
-work/logs/<image>.wsl-build.log
-work/logs/<temporary-distro>.guest.log
+work/logs/builds/<image>.wsl-build.log
+work/logs/builds/<temporary-distro>.guest.log
 ```
 
 ## GitHub Runner Registration Fails

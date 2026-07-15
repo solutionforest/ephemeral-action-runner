@@ -14,6 +14,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -24,7 +25,10 @@ type Manager struct {
 	ProjectRoot   string
 	ConfigPath    string
 	DryRun        bool
+	Logging       *logging.Runtime
 	startupTiming *startupTiming
+	transcriptMu  sync.Mutex
+	transcripts   map[string]*logging.Transcript
 
 	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
@@ -85,12 +89,11 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	}
 	opts.Instances = m.requestedInstances(opts.Instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, opts.Instances, time.Now())
-	fmt.Printf("verifying %d instance(s): %s\n", opts.Instances, strings.Join(names, ", "))
-	fmt.Printf("source image: %s\n", m.Config.Provider.SourceImage)
+	m.logger().Info("verifying instances", "provider", m.Config.Provider.Type, "operation", "verify", "instances", opts.Instances, "instanceNames", strings.Join(names, ", "), "sourceImage", m.Config.Provider.SourceImage)
 	if opts.RegisterOnly {
-		fmt.Printf("registration: GitHub ephemeral runners for %s\n", m.Config.GitHub.Organization)
+		m.infof("registration: GitHub ephemeral runners for %s\n", m.Config.GitHub.Organization)
 	} else {
-		fmt.Printf("registration: skipped\n")
+		m.infof("registration: skipped\n")
 	}
 	var (
 		mu      sync.Mutex
@@ -119,26 +122,26 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	wg.Wait()
 	stopLeaseKeeper()
 	if opts.Cleanup {
-		fmt.Printf("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
+		m.infof("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
 		if err := m.cleanupWithFreshContext(); err != nil && errOnce == nil {
 			errOnce = err
 		}
 	}
 	if errOnce == nil {
-		fmt.Printf("verify complete: %d instance(s) validated", len(created))
+		m.infof("verify complete: %d instance(s) validated", len(created))
 		if opts.RegisterOnly {
-			fmt.Printf(" and registered online/idle")
+			m.infof(" and registered online/idle")
 		}
 		if opts.Cleanup {
-			fmt.Printf("; cleanup complete")
+			m.infof("; cleanup complete")
 		}
-		fmt.Printf("\n")
+		m.infof("\n")
 		for _, vm := range created {
-			fmt.Printf("  %s ip=%s providerLog=%s guestLog=%s", vm.Name, emptyDash(vm.IP), vm.LogPath, vm.GuestLogPath)
+			m.infof("  %s ip=%s providerLog=%s guestLog=%s", vm.Name, emptyDash(vm.IP), vm.LogPath, vm.GuestLogPath)
 			if vm.RunnerID != 0 {
-				fmt.Printf(" runnerID=%d", vm.RunnerID)
+				m.infof(" runnerID=%d", vm.RunnerID)
 			}
-			fmt.Printf("\n")
+			m.infof("\n")
 		}
 	}
 	return errOnce
@@ -181,15 +184,27 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		if vm.HostTrustGeneration != "" {
 			poolTrustGeneration = vm.HostTrustGeneration
 		}
-		fmt.Printf("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
+		m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 	}
 	stopLeaseKeeper()
 	if !opts.Register || (!opts.ReplaceCompleted && !m.hostTrustEnabled()) {
-		fmt.Println("pool is running; press Ctrl-C to stop")
-		<-ctx.Done()
-		return cleanup()
+		m.infof("pool is running; press Ctrl-C to stop")
+		if !m.Config.Logging.RetentionEnabled {
+			<-ctx.Done()
+			return cleanup()
+		}
+		retentionTicker := time.NewTicker(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
+		defer retentionTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return cleanup()
+			case <-retentionTicker.C:
+				m.pruneLogsBestEffort()
+			}
+		}
 	}
-	fmt.Printf("pool supervisor is running; monitoring every %s; press Ctrl-C to stop\n", opts.MonitorInterval)
+	m.infof("pool supervisor is running; monitoring every %s; press Ctrl-C to stop\n", opts.MonitorInterval)
 	tickInterval := opts.MonitorInterval
 	if m.hostTrustEnabled() && tickInterval > hostTrustRefreshInterval {
 		tickInterval = hostTrustRefreshInterval
@@ -197,6 +212,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	nextLivenessCheck := time.Now().Add(opts.MonitorInterval)
+	nextRetention := time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 	nextHostTrustCollection := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
 	for {
@@ -204,6 +220,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		case <-ctx.Done():
 			return cleanup()
 		case <-ticker.C:
+			if m.Config.Logging.RetentionEnabled && !time.Now().Before(nextRetention) {
+				m.pruneLogsBestEffort()
+				nextRetention = time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
+			}
 			trustRetired := 0
 			trustCapacityReady := true
 			if m.hostTrustEnabled() {
@@ -213,7 +233,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					nextHostTrustCollection = now.Add(m.hostTrustCollectionInterval())
 					if err != nil {
 						currentHostTrust = hosttrust.Snapshot{}
-						fmt.Printf("host trust refresh warning; existing leases will expire closed: %v\n", err)
+						m.warnf("host trust refresh warning; existing leases will expire closed: %v\n", err)
 					} else {
 						ready := true
 						if poolTrustGeneration != current.Generation {
@@ -222,18 +242,18 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							// receive a mismatching lease so no subsequent job can start.
 							currentHostTrust = current
 							trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
-							fmt.Printf("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
+							m.infof("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
 							ready = false
 							for attempt := 1; attempt <= 3; attempt++ {
 								generationBeforeEnsure := current.Generation
 								if err := m.ensureHostTrustImage(ctx); err != nil {
-									fmt.Printf("host trust replacement image warning: %v\n", err)
+									m.warnf("host trust replacement image warning: %v\n", err)
 									nextHostTrustCollection = time.Now()
 									break
 								}
 								current, err = m.resolveHostTrust(ctx)
 								if err != nil {
-									fmt.Printf("host trust post-build refresh warning: %v\n", err)
+									m.warnf("host trust post-build refresh warning: %v\n", err)
 									nextHostTrustCollection = time.Now()
 									break
 								}
@@ -243,9 +263,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 									break
 								}
 								if attempt < 3 {
-									fmt.Printf("host trust changed again during replacement image publication (%s -> %s); retrying %d/3\n", generationBeforeEnsure, current.Generation, attempt+1)
+									m.infof("host trust changed again during replacement image publication (%s -> %s); retrying %d/3\n", generationBeforeEnsure, current.Generation, attempt+1)
 								} else {
-									fmt.Printf("host trust did not stabilize across 3 replacement image attempts (%s -> %s)\n", generationBeforeEnsure, current.Generation)
+									m.warnf("host trust did not stabilize across 3 replacement image attempts (%s -> %s)\n", generationBeforeEnsure, current.Generation)
 								}
 							}
 							trustCapacityReady = ready
@@ -264,15 +284,15 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				for name, vm := range active {
 					alive, reason, err := m.runnerAlive(ctx, vm)
 					if err != nil {
-						fmt.Printf("[%s] liveness check warning: %v\n", name, err)
+						m.logger().Warn("liveness check failed", "provider", m.Config.Provider.Type, "instance", name, "operation", "liveness-check", "error", err)
 						continue
 					}
 					if alive {
 						continue
 					}
-					fmt.Printf("[%s] runner is finished or unhealthy: %s\n", name, reason)
+					m.infof("[%s] runner is finished or unhealthy: %s\n", name, reason)
 					if err := m.retireInstance(context.Background(), vm, reason); err != nil {
-						fmt.Printf("[%s] retirement warning: %v\n", name, err)
+						m.warnf("[%s] retirement warning: %v\n", name, err)
 						continue
 					}
 					delete(active, name)
@@ -298,10 +318,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
-				fmt.Printf("[%s] creating replacement runner\n", name)
+				m.infof("[%s] creating replacement runner\n", name)
 				vm, err := m.provisionOne(ctx, name, opts.Register, true)
 				if err != nil {
-					fmt.Printf("[%s] replacement failed: %v\n", name, err)
+					m.warnf("[%s] replacement failed: %v\n", name, err)
 					break
 				}
 				active[vm.Name] = vm
@@ -309,7 +329,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				if vm.HostTrustGeneration != "" {
 					poolTrustGeneration = vm.HostTrustGeneration
 				}
-				fmt.Printf("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
+				m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 			}
 		}
 	}
@@ -365,13 +385,24 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 		if !HasPrefix(vm.Name, m.Config.Pool.NamePrefix) {
 			continue
 		}
-		fmt.Printf("cleanup: deleting instance %s\n", vm.Name)
+		m.infof("cleanup: deleting instance %s\n", vm.Name)
 		stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
 		_ = m.Provider.Stop(stopCtx, vm.Name)
 		stopCancel()
 		deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
-		if err := m.Provider.Delete(deleteCtx, vm.Name); err != nil && firstErr == nil {
-			firstErr = err
+		deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+		if deleteErr != nil && firstErr == nil {
+			firstErr = deleteErr
+		}
+		if deleteErr == nil {
+			paths := ProvisionedInstance{
+				Name:         vm.Name,
+				LogPath:      m.instanceLogPath(vm.Name, "."+m.Config.Provider.Type+".log"),
+				GuestLogPath: m.instanceLogPath(vm.Name, ".guest.log"),
+			}
+			if releaseErr := m.releaseInstanceTranscripts(paths); releaseErr != nil {
+				m.logger().Warn("instance transcript close failed after cleanup", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "cleanup", "error", releaseErr)
+			}
 		}
 		deleteCancel()
 	}
@@ -383,7 +414,7 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 			firstErr = err
 		}
 		for _, runner := range deleted {
-			fmt.Printf("cleanup: deleted GitHub runner %s id=%d\n", runner.Name, runner.ID)
+			m.infof("cleanup: deleted GitHub runner %s id=%d\n", runner.Name, runner.ID)
 		}
 	}
 	return firstErr
@@ -433,7 +464,7 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 		if attempt == attempts {
 			break
 		}
-		fmt.Printf("[%s] host trust changed before runner publication; rebuilding image (attempt %d/%d)\n", name, attempt+1, attempts)
+		m.infof("[%s] host trust changed before runner publication; rebuilding image (attempt %d/%d)\n", name, attempt+1, attempts)
 		if err := m.ensureHostTrustImage(ctx); err != nil {
 			return vm, fmt.Errorf("rebuild image after host trust changed during provisioning: %w", err)
 		}
@@ -442,9 +473,8 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 }
 
 func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
-	logPath := config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir)
-	logPath = filepath.Join(logPath, name+"."+m.Config.Provider.Type+".log")
-	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
+	logPath := m.instanceLogPath(name, "."+m.Config.Provider.Type+".log")
+	guestLogPath := m.instanceLogPath(name, ".guest.log")
 	vm := ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath}
 	var trustSnapshot hosttrust.Snapshot
 	if m.hostTrustEnabled() {
@@ -458,15 +488,19 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
 		return vm, err
 	}
-	fmt.Printf("[%s] cloning %s\n", name, m.Config.Provider.SourceImage)
+	m.logger().Info("cloning instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "clone", "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
 	if err := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
 		return m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name)
 	}); err != nil {
 		return vm, err
 	}
-	fmt.Printf("[%s] starting instance\n", name)
+	m.logger().Info("starting instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "start", "logPath", logPath)
 	if err := m.timeFirstInstanceStage(name, m.startupInstanceStartStage(), func() error {
-		_, err := m.Provider.Start(ctx, name, m.startOptions(logPath))
+		startOptions, startOptionsErr := m.startOptions(logPath, name)
+		if startOptionsErr != nil {
+			return startOptionsErr
+		}
+		_, err := m.Provider.Start(ctx, name, startOptions)
 		return err
 	}); err != nil {
 		return vm, err
@@ -476,8 +510,8 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		return vm, err
 	}
 	vm.IP = ip
-	fmt.Printf("[%s] reachable at %s\n", name, ip)
-	fmt.Printf("[%s] validating runner runtime\n", name)
+	m.logger().Info("instance reachable", "provider", m.Config.Provider.Type, "instance", name, "operation", "wait-reachable", "address", ip)
+	m.logger().Info("validating runner runtime", "provider", m.Config.Provider.Type, "instance", name, "operation", "validate-runtime", "stage", "start")
 	if err := m.timeFirstInstanceStage(name, "runtime_validation", func() error {
 		if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
 			return err
@@ -486,7 +520,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	}); err != nil {
 		return vm, err
 	}
-	fmt.Printf("[%s] runtime validation passed\n", name)
+	m.infof("[%s] runtime validation passed\n", name)
 	if m.hostTrustEnabled() {
 		marker, err := m.readInstanceHostTrustMarker(ctx, name)
 		if err != nil {
@@ -511,7 +545,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		}
 		if m.GitHub == nil {
 			if m.DryRun {
-				fmt.Printf("[dry-run] would register GitHub runner %s with labels %s\n", name, strings.Join(m.Config.Runner.Labels, ","))
+				m.infof("[dry-run] would register GitHub runner %s with labels %s\n", name, strings.Join(m.Config.Runner.Labels, ","))
 				return vm, nil
 			}
 			return vm, fmt.Errorf("github client is required for registration")
@@ -522,7 +556,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			readiness = "online/idle"
 		)
 		if err := m.timeFirstInstanceStage(name, "github_registration_and_online_idle", func() error {
-			fmt.Printf("[%s] requesting GitHub registration token\n", name)
+			m.infof("[%s] requesting GitHub registration token\n", name)
 			var err error
 			token, err = m.GitHub.RegistrationToken(ctx)
 			if err != nil {
@@ -540,14 +574,14 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
 				return err
 			}
-			fmt.Printf("[%s] starting runner service\n", name)
+			m.infof("[%s] starting runner service\n", name)
 			if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
 				return err
 			}
 			if allowBusy {
 				readiness = "online"
 			}
-			fmt.Printf("[%s] waiting for GitHub %s\n", name, readiness)
+			m.infof("[%s] waiting for GitHub %s\n", name, readiness)
 			runner, err = m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
 			return err
 		}); err != nil {
@@ -555,7 +589,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
-		fmt.Printf("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
+		m.infof("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
 		m.finishFirstRunnerReady(name)
 	} else {
 		m.finishFirstRunnerReady(name)
@@ -614,7 +648,7 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 				}
 				if current.Generation != vm.HostTrustGeneration {
 					if revokeErr := m.issueHostTrustLease(waitCtx, vm.Name, current); revokeErr != nil {
-						fmt.Printf("[%s] host trust readiness revocation warning: %v\n", vm.Name, revokeErr)
+						m.warnf("[%s] host trust readiness revocation warning: %v\n", vm.Name, revokeErr)
 					}
 					cancel()
 					return gh.Runner{}, fmt.Errorf("host trust changed while runner %s was registering (%s -> %s)", vm.Name, vm.HostTrustGeneration, current.Generation)
@@ -638,7 +672,7 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 			consecutiveProbeFailures++
 			lastProbeErr = err
 			if consecutiveProbeFailures < runnerReadinessProbeFailureLimit {
-				fmt.Printf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
+				m.warnf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
 				continue
 			}
 			cancel()
@@ -657,14 +691,14 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 func (m *Manager) captureRunnerReadinessDiagnostics(name, guestLogPath string) {
 	diagnosticCtx, cancel := context.WithTimeout(context.Background(), runnerReadinessDiagnosticsTimeout)
 	defer cancel()
-	_, err := m.Provider.Exec(
+	_, err := m.execGuest(
 		diagnosticCtx,
 		name,
 		[]string{"sudo", "bash", "/opt/epar/collect-runner-diagnostics.sh"},
 		provider.ExecOptions{LogPath: guestLogPath},
 	)
 	if err != nil {
-		fmt.Printf("[%s] runner readiness diagnostic collection warning: %v\n", name, err)
+		m.warnf("[%s] runner readiness diagnostic collection warning: %v\n", name, err)
 	}
 }
 
@@ -700,7 +734,7 @@ func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance
 func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, err := m.Provider.Exec(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
+	_, err := m.execGuest(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
 	return err
 }
 
@@ -710,7 +744,7 @@ func isTransientGitHubLivenessError(err error) bool {
 }
 
 func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, reason string) error {
-	fmt.Printf("[%s] retiring instance: %s\n", vm.Name, reason)
+	m.infof("[%s] retiring instance: %s\n", vm.Name, reason)
 	var firstErr error
 	if m.GitHub != nil && vm.RunnerID != 0 {
 		deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -724,8 +758,14 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 	_ = m.Provider.Stop(stopCtx, vm.Name)
 	stopCancel()
 	deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
-	if err := m.Provider.Delete(deleteCtx, vm.Name); err != nil && firstErr == nil {
-		firstErr = err
+	deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+	if deleteErr != nil && firstErr == nil {
+		firstErr = deleteErr
+	}
+	if deleteErr == nil {
+		if releaseErr := m.releaseInstanceTranscripts(vm); releaseErr != nil {
+			m.logger().Warn("instance transcript close failed after retirement", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "retire", "error", releaseErr)
+		}
 	}
 	deleteCancel()
 	return firstErr
@@ -751,8 +791,8 @@ func (m *Manager) validateRuntimeWithRetry(ctx context.Context, name, guestLogPa
 		if attempt == attempts {
 			break
 		}
-		fmt.Printf("[%s] runtime validation attempt %d/%d failed: %v\n", name, attempt, attempts, err)
-		fmt.Printf("[%s] retrying runtime validation in %s; guest log: %s\n", name, runtimeValidationRetryDelay, guestLogPath)
+		m.warnf("[%s] runtime validation attempt %d/%d failed: %v\n", name, attempt, attempts, err)
+		m.infof("[%s] retrying runtime validation in %s; guest log: %s\n", name, runtimeValidationRetryDelay, guestLogPath)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -766,7 +806,7 @@ func (m *Manager) configureDockerRegistryMirrors(ctx context.Context, name strin
 	if len(m.Config.Docker.RegistryMirrors) == 0 {
 		return nil
 	}
-	fmt.Printf("[%s] configuring Docker registry mirror(s): %s\n", name, strings.Join(m.Config.Docker.RegistryMirrors, ", "))
+	m.infof("[%s] configuring Docker registry mirror(s): %s\n", name, strings.Join(m.Config.Docker.RegistryMirrors, ", "))
 	hostPath := filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu", "configure-docker-daemon.sh")
 	content, err := os.ReadFile(hostPath)
 	if err != nil {
@@ -789,8 +829,14 @@ func (m *Manager) execGuest(ctx context.Context, name string, cmd []string, opts
 		timeout = 15 * time.Minute
 	}
 	if opts.LogPath == "" {
-		opts.LogPath = filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
+		opts.LogPath = m.instanceLogPath(name, ".guest.log")
 	}
+	transcript, err := m.transcript(opts.LogPath, name, transcriptComponent(opts.LogPath))
+	if err != nil {
+		return provider.ExecResult{}, err
+	}
+	opts.Stdout = transcript.Stdout
+	opts.Stderr = transcript.Stderr
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return m.Provider.Exec(cctx, name, cmd, opts)

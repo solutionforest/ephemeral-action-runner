@@ -481,7 +481,25 @@ image:
 pool:
   instances: 1
   namePrefix: %s
-  logDir: work/logs
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
@@ -527,7 +545,25 @@ pool:
   instances: 1
   # Must be unique for this machine/config within the GitHub organization.
   namePrefix: %s
-  logDir: work/logs
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   labels: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]

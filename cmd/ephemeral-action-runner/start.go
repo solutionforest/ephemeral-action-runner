@@ -28,6 +28,10 @@ type startupTimingStarterManager interface {
 	FinishStartupTiming(error)
 }
 
+type closingStarterManager interface {
+	Close() error
+}
+
 type starterManagerFactory func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error)
 
 var newStarterManager starterManagerFactory = func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error) {
@@ -111,6 +115,9 @@ func runStartWithOptions(opts startOptions) (err error) {
 	manager, err := opts.ManagerFactory(configPath, projectRoot, opts.DryRun, opts.Register)
 	if err != nil {
 		return err
+	}
+	if closingManager, ok := manager.(closingStarterManager); ok {
+		defer closingManager.Close()
 	}
 	if timingManager, ok := manager.(startupTimingStarterManager); ok {
 		if _, err := timingManager.StartStartupTiming(); err != nil {

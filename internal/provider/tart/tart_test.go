@@ -22,6 +22,17 @@ func TestListParsesTartOutputShape(t *testing.T) {
 	}
 }
 
+func TestCaptureWriterCopiesToCaptureAndInjectedSink(t *testing.T) {
+	var capture, sink bytes.Buffer
+	writer := captureWriter(&capture, &sink)
+	if _, err := writer.Write([]byte("transcript")); err != nil {
+		t.Fatal(err)
+	}
+	if capture.String() != "transcript" || sink.String() != "transcript" {
+		t.Fatalf("capture=%q sink=%q", capture.String(), sink.String())
+	}
+}
+
 func TestStartDryRunIncludesRosettaBeforeName(t *testing.T) {
 	p := New("tart", true)
 	out := captureStdout(t, func() {

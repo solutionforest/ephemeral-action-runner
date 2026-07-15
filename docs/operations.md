@@ -2,14 +2,12 @@
 
 ## Logs
 
-Host-side provider logs go under `work/logs` by default. Runner logs inside the Ubuntu guest are under:
+Host-side logs go under `work/logs` by default. Run `ephemeral-action-runner logs path` to print the resolved directory. When `managerSinks` includes `file`, manager events use `work/logs/epar.log`; the default manager sink is console-only. Instance transcripts use `work/logs/instances/`, build/source transcripts use `work/logs/builds/`, startup timing JSONL uses `work/logs/benchmarks/`, and timestamped error reports use `work/logs/errors/`. See [Logging](logging.md) for sink, rotation, retention, and shipping configuration. Runner logs inside the Ubuntu guest are under:
 
 - `/var/log/actions-runner/run.log`
 - `/opt/actions-runner/_diag`
 
-Guest provisioning command output is streamed to
-`work/logs/<instance-name>.guest.log`. If runner launch or GitHub online
-readiness fails, EPAR first appends bounded diagnostics to that host guest log:
+Guest provisioning command output is streamed to `work/logs/instances/<instance-name>.guest.log`. If runner launch or GitHub online readiness fails, EPAR first appends bounded diagnostics to that host guest log:
 runner PID/process state, tails from `run.log` and the latest `Runner_*.log`,
 and the Docker-DinD daemon log when present. Diagnostic collection is
 best-effort and does not replace the original readiness error.
@@ -50,7 +48,7 @@ This section is a compact checklist. For symptom-first diagnostics with host/pro
 
 - If a Docker/browser or web/E2E image build fails before package installation, run `image update-upstream`.
 - If an image build fails with `E: You don't have enough free space in /var/cache/apt/archives/.`, check the Docker daemon or VM storage with `docker system df` and `docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /`. On Windows Docker Desktop with WSL2, the container-visible disk can be much smaller than Windows Explorer free space; see [Windows Docker Desktop WSL2 Disk Is Smaller Than Expected](troubleshooting.md#windows-docker-desktop-wsl2-disk-is-smaller-than-expected).
-- If Docker validation fails for a Docker-enabled image, inspect `work/logs/<image>.guest.log`.
+- If Docker validation fails for a Docker-enabled image, inspect `work/logs/builds/<image>.guest.log`.
 - If browser validation fails on ARM64, confirm `epar-browser` exists inside the guest and inspect `/opt/epar/browser`.
 - If a Docker Compose job uses an amd64-only runtime image on an ARM64 Tart runner and fails with `exec format error` or repeated container exits such as status `139`, use a runner label that supports that image instead of changing application runtime settings only for runner compatibility. Suitable targets include Docker-DinD with verified `linux/amd64` emulation, WSL x64, an x64 Linux host, or a Tart image with Rosetta enabled and validated.
 - If a workflow uses fixed Compose project names, fixed container names, or fixed ports, Docker-DinD is often a better fit than a shared host Docker socket because each runner gets a private inner Docker daemon. Verify by starting two unregistered instances, running the same compose stack in both, and confirming host Docker only shows the outer EPAR runner containers.
@@ -60,7 +58,7 @@ This section is a compact checklist. For symptom-first diagnostics with host/pro
 - If stale runners remain, run `ephemeral-action-runner cleanup`.
 - If using Tart `softnet`, verify the host has the privileges Tart requires.
 - If default WSL image build fails before import, confirm Docker Desktop, Docker Engine, or another Docker daemon is reachable so EPAR can export `ghcr.io/catthehacker/ubuntu:full-latest` into a rootfs tar. For lean WSL configs, confirm the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.
-- If WSL image build fails before systemd is ready, confirm WSL2 is enabled and inspect `work/logs/<image>.guest.log`.
+- If WSL image build fails before systemd is ready, confirm WSL2 is enabled and inspect `work/logs/builds/<image>.guest.log`.
 - If Docker-DinD startup fails, confirm the host Docker runtime supports privileged containers and inspect `/var/log/epar-dockerd.log` inside the runner container.
 - If Docker-DinD `docker run` fails with nested overlay mount errors, keep the default `EPAR_DOCKERD_STORAGE_DRIVER=vfs`. Only switch to `overlay2` or `auto` in a derived image after proving that storage driver works on the exact host runtime.
 - If the default WSL or Docker-DinD build cannot validate Docker, confirm the source image still provides `docker`, `dockerd`, Compose, Buildx, and `iptables`. If you intentionally use a clean Ubuntu source image instead of Catthehacker's runner image, run `image update-upstream` first and use a config that installs Docker from EPAR's pinned `actions/runner-images` Docker install harness.

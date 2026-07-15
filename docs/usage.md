@@ -210,7 +210,7 @@ Docker-DinD output is a Docker image tag, such as `epar-docker-dind-catthehacker
 docker image ls epar-docker-dind-catthehacker-ubuntu
 ```
 
-Build logs are written under `work/logs`.
+Build logs are written under `work/logs/builds` by default. Run `ephemeral-action-runner logs path` to resolve a customized logging root and see [Logging](logging.md) for rotation and retention.
 
 ## Customize The Image
 

@@ -20,7 +20,8 @@ EPAR looks for config in this order:
 | `github` | GitHub App ID, organization, private key path, and optional GitHub API/web URLs. |
 | `provider` | How EPAR creates disposable runners: `docker-dind`, `wsl`, or `tart`. |
 | `image` | Source image/rootfs, output image, runner version, and optional install scripts. |
-| `pool` | Runner count, instance name prefix, and log directory. |
+| `pool` | Runner count and instance name prefix. |
+| `logging` | Manager and transcript sinks, formats, rotation, retention, and log directory. |
 | `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
 | `docker` | Optional Docker registry mirrors and Docker-DinD daemon proxy settings. |
 | `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
@@ -81,6 +82,8 @@ Use a different config file:
 ```bash
 go run ./cmd/ephemeral-action-runner start --config .local/wsl.yml
 ```
+
+Configure logging and retention in the top-level `logging` section. The complete schema and local/Kubernetes examples are in [Logging](logging.md). Unknown configuration keys are rejected. For compatibility, a legacy `pool.logDir` value is used as `logging.directory` with a migration warning when the new key is absent; the file is not rewritten automatically. A configuration containing both keys is rejected as ambiguous.
 
 ### Host trust inheritance
 

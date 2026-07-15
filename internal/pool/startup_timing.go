@@ -2,15 +2,13 @@ package pool
 
 import (
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 )
 
 var timingSecretPattern = regexp.MustCompile(`(?i)((?:runner_)?token|password|secret|private[_-]?key)=\S+`)
@@ -39,6 +37,7 @@ type startupTiming struct {
 	stages        []startupTimingStage
 	firstInstance string
 	closed        bool
+	logger        *slog.Logger
 }
 
 // StartStartupTiming records the initial Docker-DinD or WSL start path.
@@ -47,7 +46,7 @@ func (m *Manager) StartStartupTiming() (string, error) {
 	if !supportsStartupTiming(provider) {
 		return "", nil
 	}
-	dir := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), "benchmarks")
+	dir := filepath.Join(m.logRoot(), "benchmarks")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
@@ -63,6 +62,7 @@ func (m *Manager) StartStartupTiming() (string, error) {
 		path:      path,
 		provider:  provider,
 		startedAt: startedAt,
+		logger:    m.logger(),
 	}
 	m.startupTiming = timing
 	timing.eventLocked("total_startup", "started", 0, nil)
@@ -152,11 +152,9 @@ func (t *startupTiming) finish(err error) {
 	} else {
 		t.stages = append(t.stages, startupTimingStage{name: "total_startup", elapsed: elapsed})
 		t.eventLocked("total_startup", "completed", elapsed, nil)
-		fmt.Printf("%s startup timing (first runner online/idle):\n", startupTimingLabel(t.provider))
 		for _, stage := range t.stages {
-			fmt.Printf("  %s: %s\n", stage.name, stage.elapsed.Round(time.Millisecond))
+			t.logger.Info("startup timing", "provider", t.provider, "operation", "startup", "stage", stage.name, "duration", stage.elapsed.Round(time.Millisecond), "logPath", t.path)
 		}
-		fmt.Printf("  timing log: %s\n", t.path)
 	}
 	t.closed = true
 	_ = t.file.Close()

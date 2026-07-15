@@ -64,6 +64,16 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Pool.NamePrefix, "build-box-01-a4f9c2"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
+	if got, want := cfg.Logging.Directory, "work/logs"; got != want {
+		t.Fatalf("logging.directory = %q, want %q", got, want)
+	}
+	configText, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configText), "logging:\n  directory: work/logs\n  managerSinks: [console]\n") {
+		t.Fatalf("generated config did not include logging schema:\n%s", configText)
+	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-catthehacker-ubuntu") {
 		t.Fatalf("runner labels = %q", got)
 	}

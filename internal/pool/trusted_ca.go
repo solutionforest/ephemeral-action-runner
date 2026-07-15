@@ -129,7 +129,7 @@ func (m *Manager) installTrustedCACertificates(ctx context.Context, vmName strin
 	if len(certificates) == 0 {
 		return nil
 	}
-	if _, err := m.Provider.Exec(ctx, vmName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo mkdir -p "+shellQuote(trustedCAGuestDir)+"; else mkdir -p "+shellQuote(trustedCAGuestDir)+"; fi"), provider.ExecOptions{}); err != nil {
+	if _, err := m.execGuest(ctx, vmName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo mkdir -p "+shellQuote(trustedCAGuestDir)+"; else mkdir -p "+shellQuote(trustedCAGuestDir)+"; fi"), provider.ExecOptions{}); err != nil {
 		return err
 	}
 	for _, certificate := range certificates {

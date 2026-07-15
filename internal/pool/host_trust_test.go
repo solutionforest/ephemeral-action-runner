@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,8 +225,8 @@ func TestHostTrustReconciliationRevokesAndRetiresIdleOldGeneration(t *testing.T)
 	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: false}, found: true}
 	manager := Manager{
 		Config: config.Config{
-			Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
-			Pool:  config.PoolConfig{LogDir: t.TempDir()},
+			Image:   config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
+			Logging: config.LoggingConfig{Directory: t.TempDir()},
 		},
 		Provider: provider,
 		GitHub:   github,
@@ -320,7 +321,7 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 			},
 			Provider: config.ProviderConfig{Type: "docker-dind"},
 			Runner:   config.RunnerConfig{Ephemeral: true},
-			Pool:     config.PoolConfig{LogDir: "work/logs"},
+			Logging:  config.LoggingConfig{Directory: "work/logs"},
 		},
 		ProjectRoot: root,
 	}
@@ -348,7 +349,7 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 	})
 	builds := 0
 	tagged := false
-	runHostLoggedCommand = func(_ context.Context, _ string, name string, args ...string) error {
+	runHostLoggedCommand = func(_ context.Context, _ string, _, _ io.Writer, name string, args ...string) error {
 		if name == "docker" && len(args) > 0 && args[0] == "build" {
 			builds++
 		}

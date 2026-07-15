@@ -33,7 +33,7 @@ WAIT_FOR_DOCKER="${EPAR_WAIT_FOR_DOCKER:-1}"
 DOCKER_WAIT_ATTEMPTS="${EPAR_DOCKER_WAIT_ATTEMPTS:-120}"
 
 cd "${EPAR_ROOT}"
-mkdir -p work/logs
+mkdir -p work/state
 
 if [[ "${WAIT_FOR_DOCKER}" != "0" ]]; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] waiting for Docker to become ready..."

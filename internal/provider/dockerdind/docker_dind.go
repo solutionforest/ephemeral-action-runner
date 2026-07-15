@@ -5,9 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,7 +26,7 @@ type Provider struct {
 	runCommand  runCommandFunc
 }
 
-type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error)
+type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, stdout, stderr io.Writer, args ...string) (provider.ExecResult, error)
 
 func New(binary, platform string, dryRun bool) *Provider {
 	return NewWithOptions(binary, platform, false, nil, dryRun)
@@ -54,7 +52,7 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 	if _, err := p.run(ctx, nil, "start", name); err != nil {
 		return nil, err
 	}
-	if err := p.waitDocker(ctx, name, opts.LogPath); err != nil {
+	if err := p.waitDocker(ctx, name, opts); err != nil {
 		return nil, err
 	}
 	return &provider.RunningProcess{Name: name, PID: 0, LogPath: opts.LogPath}, nil
@@ -74,7 +72,7 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 	if opts.Stdin != "" {
 		stdin = strings.NewReader(opts.Stdin)
 	}
-	return p.runWithLog(ctx, stdin, opts.LogPath, args...)
+	return p.runWithLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, args...)
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
@@ -172,11 +170,15 @@ func (p *Provider) createArgs(source, name string) []string {
 	return args
 }
 
-func (p *Provider) waitDocker(ctx context.Context, name, logPath string) error {
+func (p *Provider) waitDocker(ctx context.Context, name string, opts provider.StartOptions) error {
 	deadline := time.Now().Add(120 * time.Second)
 	var lastErr error
 	for {
-		_, err := p.Exec(ctx, name, []string{"docker", "info"}, provider.ExecOptions{LogPath: logPath})
+		_, err := p.Exec(ctx, name, []string{"docker", "info"}, provider.ExecOptions{
+			LogPath: opts.LogPath,
+			Stdout:  opts.Stdout,
+			Stderr:  opts.Stderr,
+		})
 		if err == nil {
 			return nil
 		}
@@ -193,12 +195,12 @@ func (p *Provider) waitDocker(ctx context.Context, name, logPath string) error {
 }
 
 func (p *Provider) run(ctx context.Context, stdin io.Reader, args ...string) (provider.ExecResult, error) {
-	return p.runWithLog(ctx, stdin, "", args...)
+	return p.runWithLog(ctx, stdin, "", nil, nil, args...)
 }
 
-func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error) {
+func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, args ...string) (provider.ExecResult, error) {
 	if p.runCommand != nil {
-		return p.runCommand(ctx, stdin, logPath, args...)
+		return p.runCommand(ctx, stdin, logPath, stdoutSink, stderrSink, args...)
 	}
 	if p.DryRun {
 		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
@@ -209,31 +211,21 @@ func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath stri
 		cmd.Stdin = stdin
 	}
 	var stdout, stderr bytes.Buffer
-	var logFile *os.File
-	if logPath != "" {
-		if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
-			return provider.ExecResult{}, err
-		}
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return provider.ExecResult{}, err
-		}
-		defer f.Close()
-		logFile = f
-	}
-	if logFile != nil {
-		cmd.Stdout = io.MultiWriter(&stdout, logFile)
-		cmd.Stderr = io.MultiWriter(&stderr, logFile)
-	} else {
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-	}
+	cmd.Stdout = captureWriter(&stdout, stdoutSink)
+	cmd.Stderr = captureWriter(&stderr, stderrSink)
 	err := cmd.Run()
 	result := provider.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		return result, fmt.Errorf("%s %s failed: %w: %s", p.Binary, strings.Join(args, " "), err, strings.TrimSpace(result.Stderr))
 	}
 	return result, nil
+}
+
+func captureWriter(capture io.Writer, sink io.Writer) io.Writer {
+	if sink == nil {
+		return capture
+	}
+	return io.MultiWriter(capture, sink)
 }
 
 func isMissingContainer(text string) bool {

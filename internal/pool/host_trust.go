@@ -209,7 +209,7 @@ func hostTrustMarkerJSON(snapshot hosttrust.Snapshot) ([]byte, error) {
 }
 
 func (m *Manager) readInstanceHostTrustMarker(ctx context.Context, instanceName string) (hostTrustMarker, error) {
-	result, err := m.Provider.Exec(ctx, instanceName, []string{"cat", hostTrustMarkerGuest}, provider.ExecOptions{})
+	result, err := m.execGuest(ctx, instanceName, []string{"cat", hostTrustMarkerGuest}, provider.ExecOptions{})
 	if err != nil {
 		return hostTrustMarker{}, fmt.Errorf("read image host trust marker: %w", err)
 	}
@@ -295,7 +295,7 @@ func (m *Manager) issueHostTrustLease(ctx context.Context, instanceName string, 
 	if err != nil {
 		return err
 	}
-	if _, err := m.Provider.Exec(ctx, instanceName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar; else install -d -m 0755 /run/epar; fi"), provider.ExecOptions{}); err != nil {
+	if _, err := m.execGuest(ctx, instanceName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar; else install -d -m 0755 /run/epar; fi"), provider.ExecOptions{}); err != nil {
 		return err
 	}
 	return provider.CopyTextAtomic(ctx, m.Provider, instanceName, hostTrustLeaseGuest, "0644", string(content)+"\n")
@@ -312,12 +312,12 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			// safe for an already-running job (its hook already ran) and closes
 			// the assignment window even when GitHub status is unavailable.
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
-				fmt.Printf("[%s] old-generation revocation warning: %v\n", name, err)
+				m.warnf("[%s] old-generation revocation warning: %v\n", name, err)
 			}
 		}
 		runner, found, err := m.GitHub.RunnerByName(ctx, name)
 		if err != nil {
-			fmt.Printf("[%s] host trust reconciliation warning; lease not refreshed: %v\n", name, err)
+			m.warnf("[%s] host trust reconciliation warning; lease not refreshed: %v\n", name, err)
 			continue
 		}
 		if instance.HostTrustGeneration == current.Generation {
@@ -325,17 +325,17 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 				continue
 			}
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
-				fmt.Printf("[%s] host trust lease refresh warning: %v\n", name, err)
+				m.warnf("[%s] host trust lease refresh warning: %v\n", name, err)
 			}
 			continue
 		}
 		if found && runner.Busy {
-			fmt.Printf("[%s] draining busy runner on old host trust generation %s\n", name, instance.HostTrustGeneration)
+			m.infof("[%s] draining busy runner on old host trust generation %s\n", name, instance.HostTrustGeneration)
 			continue
 		}
 		reason := fmt.Sprintf("host trust generation changed from %s to %s", instance.HostTrustGeneration, current.Generation)
 		if err := m.retireInstance(context.Background(), instance, reason); err != nil {
-			fmt.Printf("[%s] old-generation retirement warning: %v\n", name, err)
+			m.warnf("[%s] old-generation retirement warning: %v\n", name, err)
 			continue
 		}
 		delete(active, name)
@@ -375,7 +375,7 @@ func (m *Manager) startHostTrustLeaseKeeper(parent context.Context) (func(Provis
 					nextCollection = now.Add(m.hostTrustCollectionInterval())
 					if err != nil {
 						current = hosttrust.Snapshot{}
-						fmt.Printf("host trust initial lease refresh warning: %v\n", err)
+						m.warnf("host trust initial lease refresh warning: %v\n", err)
 						continue
 					}
 					current = snapshot
@@ -383,7 +383,7 @@ func (m *Manager) startHostTrustLeaseKeeper(parent context.Context) (func(Provis
 				for name, instance := range active {
 					if instance.HostTrustGeneration != current.Generation {
 						if err := m.issueHostTrustLease(ctx, name, current); err != nil {
-							fmt.Printf("[%s] host trust initial stale-generation revocation warning: %v\n", name, err)
+							m.warnf("[%s] host trust initial stale-generation revocation warning: %v\n", name, err)
 						}
 						continue
 					}
@@ -392,7 +392,7 @@ func (m *Manager) startHostTrustLeaseKeeper(parent context.Context) (func(Provis
 						continue
 					}
 					if err := m.issueHostTrustLease(ctx, name, current); err != nil {
-						fmt.Printf("[%s] host trust initial lease refresh warning: %v\n", name, err)
+						m.warnf("[%s] host trust initial lease refresh warning: %v\n", name, err)
 					}
 				}
 			}

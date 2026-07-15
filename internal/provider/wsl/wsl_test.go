@@ -1,6 +1,7 @@
 package wsl
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,30 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
+
+func TestExecPassesInjectedTranscriptWriters(t *testing.T) {
+	p := New("wsl.exe", t.TempDir(), t.TempDir(), false)
+	var stdout, stderr bytes.Buffer
+	p.runCommand = func(_ context.Context, _ io.Reader, logPath string, gotStdout, gotStderr io.Writer, _ ...string) (provider.ExecResult, error) {
+		if logPath != "display.log" {
+			t.Fatalf("logPath = %q", logPath)
+		}
+		_, _ = gotStdout.Write([]byte("out"))
+		_, _ = gotStderr.Write([]byte("err"))
+		return provider.ExecResult{}, nil
+	}
+	_, err := p.Exec(context.Background(), "runner", []string{"true"}, provider.ExecOptions{
+		LogPath: "display.log",
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "out" || stderr.String() != "err" {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
 
 func TestCommandConstruction(t *testing.T) {
 	p := New("wsl.exe", filepath.Join("C:", "ephemeral"), `D:\repo`, true)
@@ -112,7 +137,7 @@ func TestDeleteIgnoresUnregisterFailureOnlyWhenDistroIsAbsent(t *testing.T) {
 	if err := os.MkdirAll(instanceDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	p.runCommand = func(_ context.Context, _ io.Reader, _ string, args ...string) (provider.ExecResult, error) {
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
 		switch strings.Join(args, " ") {
 		case "--unregister epar-wsl-1":
 			return provider.ExecResult{}, errors.New("wsl.exe --unregister epar-wsl-1 failed: exit status 0xffffffff:")
@@ -134,7 +159,7 @@ func TestDeleteIgnoresUnregisterFailureOnlyWhenDistroIsAbsent(t *testing.T) {
 
 func TestDeleteReturnsUnregisterFailureWhenDistroStillExists(t *testing.T) {
 	p := New("wsl.exe", t.TempDir(), t.TempDir(), false)
-	p.runCommand = func(_ context.Context, _ io.Reader, _ string, args ...string) (provider.ExecResult, error) {
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
 		switch strings.Join(args, " ") {
 		case "--unregister epar-wsl-1":
 			return provider.ExecResult{}, errors.New("wsl.exe --unregister epar-wsl-1 failed: exit status 0xffffffff:")

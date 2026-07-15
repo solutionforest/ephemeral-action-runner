@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
+	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	dockerdindprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockerdind"
@@ -24,20 +26,29 @@ const binaryName = "ephemeral-action-runner"
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, binaryName+":", err)
-		if reportPath := writeLastErrorReport(err); reportPath != "" {
+		if reportPath := writeLastErrorReport(os.Args[1:], err); reportPath != "" {
 			fmt.Fprintln(os.Stderr, "error report:", reportPath)
 		}
 		os.Exit(1)
 	}
 }
 
-func writeLastErrorReport(runErr error) string {
+func writeLastErrorReport(args []string, runErr error) string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return ""
 	}
-	logDir := filepath.Join(cwd, "work", "logs")
+	projectRoot, explicitConfig := errorReportFlags(args, cwd)
+	logDir := filepath.Join(projectRoot, "work", "logs")
+	if resolvedConfig, resolveErr := resolveConfigPath(projectRoot, explicitConfig); resolveErr == nil && resolvedConfig != "" {
+		if cfg, loadErr := config.Load(resolvedConfig); loadErr == nil && config.ValidateLogging(cfg.Logging) == nil {
+			logDir = config.ProjectPath(projectRoot, cfg.Logging.Directory)
+		}
+	}
 	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return ""
+	}
+	if err := os.MkdirAll(filepath.Join(logDir, "errors"), 0755); err != nil {
 		return ""
 	}
 	now := time.Now().UTC()
@@ -50,13 +61,37 @@ command: %q
 error: %v
 `, now.Format(time.RFC3339), cwd, os.Args, versionString(), runErr)
 
-	lastPath := filepath.Join(logDir, "epar-last-error.log")
+	lastPath := logging.LastErrorPath(logDir)
 	if err := os.WriteFile(lastPath, []byte(content), 0644); err != nil {
 		return ""
 	}
-	stampedPath := filepath.Join(logDir, fmt.Sprintf("epar-%s-error.log", now.Format("20060102-150405")))
+	stampedPath := logging.ErrorPath(logDir, now)
 	_ = os.WriteFile(stampedPath, []byte(content), 0644)
 	return lastPath
+}
+
+func errorReportFlags(args []string, fallbackRoot string) (string, string) {
+	projectRoot := fallbackRoot
+	configPath := ""
+	for index := 0; index < len(args); index++ {
+		value := args[index]
+		switch {
+		case value == "--project-root" && index+1 < len(args):
+			index++
+			projectRoot = args[index]
+		case strings.HasPrefix(value, "--project-root="):
+			projectRoot = strings.TrimPrefix(value, "--project-root=")
+		case value == "--config" && index+1 < len(args):
+			index++
+			configPath = args[index]
+		case strings.HasPrefix(value, "--config="):
+			configPath = strings.TrimPrefix(value, "--config=")
+		}
+	}
+	if absolute, absErr := filepath.Abs(projectRoot); absErr == nil {
+		projectRoot = absolute
+	}
+	return projectRoot, configPath
 }
 
 func run(args []string) error {
@@ -76,6 +111,8 @@ func run(args []string) error {
 		return runCleanup(args[1:])
 	case "status":
 		return runStatus(args[1:])
+	case "logs":
+		return runLogs(args[1:])
 	case "version":
 		printVersion(os.Stdout)
 		return nil
@@ -84,6 +121,98 @@ func run(args []string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runLogs(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("logs requires subcommand: path, list, or prune")
+	}
+	fs := flag.NewFlagSet("logs "+args[0], flag.ExitOnError)
+	common := addCommonFlags(fs)
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("logs %s does not accept positional arguments", args[0])
+	}
+	projectRoot, cfg, root, err := loadLoggingConfig(*common.projectRoot, *common.configPath)
+	if err != nil {
+		return err
+	}
+	_ = projectRoot
+	switch args[0] {
+	case "path":
+		fmt.Fprintln(os.Stdout, root)
+		return nil
+	case "list":
+		report, err := logging.ListRetention(root, retentionPolicy(cfg.Logging))
+		if err != nil {
+			return err
+		}
+		for _, entry := range report.Entries {
+			if entry.Recognized {
+				fmt.Fprintf(os.Stdout, "%s\t%s\t%d\t%s\n", entry.Category, entry.Action, entry.Size, entry.Path)
+			}
+		}
+		fmt.Fprintln(os.Stdout, report.Summary())
+		return nil
+	case "prune":
+		report, err := logging.PruneRetention(root, retentionPolicy(cfg.Logging), *common.dryRun)
+		if err != nil {
+			return err
+		}
+		for _, entry := range report.Entries {
+			if entry.Action == logging.RetentionWouldDelete || entry.Action == logging.RetentionDeleted || entry.Action == logging.RetentionSkipped {
+				fmt.Fprintf(os.Stdout, "%s\t%s\t%s\n", entry.Action, entry.Reason, entry.Path)
+			}
+		}
+		fmt.Fprintln(os.Stdout, report.Summary())
+		for _, warning := range report.Warnings {
+			fmt.Fprintln(os.Stderr, "warning:", warning)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown logs subcommand %q", args[0])
+	}
+}
+
+func loadLoggingConfig(projectRoot, configPath string) (string, config.Config, string, error) {
+	projectRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return "", config.Config{}, "", err
+	}
+	resolvedConfigPath, err := resolveConfigPath(projectRoot, configPath)
+	if err != nil {
+		return "", config.Config{}, "", err
+	}
+	if resolvedConfigPath == "" {
+		return "", config.Config{}, "", fmt.Errorf("no config found; run %s init from the EPAR directory to create .local/config.yml", binaryName)
+	}
+	cfg, err := config.Load(resolvedConfigPath)
+	if err != nil {
+		return "", config.Config{}, "", err
+	}
+	printConfigWarnings(cfg)
+	if err := config.Validate(cfg); err != nil {
+		return "", config.Config{}, "", err
+	}
+	root, err := filepath.Abs(config.ProjectPath(projectRoot, cfg.Logging.Directory))
+	if err != nil {
+		return "", config.Config{}, "", err
+	}
+	return projectRoot, cfg, root, nil
+}
+
+func retentionPolicy(cfg config.LoggingConfig) logging.RetentionPolicy {
+	days := func(value int) time.Duration { return time.Duration(value) * 24 * time.Hour }
+	return logging.RetentionPolicy{
+		MaxTotalBytes:   int64(cfg.RetentionMaxTotalMiB) * 1024 * 1024,
+		ManagerMaxAge:   days(cfg.ManagerMaxAgeDays),
+		InstanceMaxAge:  days(cfg.InstanceMaxAgeDays),
+		BuildMaxAge:     days(cfg.BuildMaxAgeDays),
+		ErrorMaxAge:     days(cfg.ErrorMaxAgeDays),
+		BenchmarkMaxAge: days(cfg.BenchmarkMaxAgeDays),
 	}
 }
 
@@ -102,6 +231,7 @@ func runImage(args []string) error {
 		if err != nil {
 			return err
 		}
+		defer m.Close()
 		return m.UpdateUpstream(context.Background())
 	case "build":
 		fs := flag.NewFlagSet("image build", flag.ExitOnError)
@@ -116,11 +246,13 @@ func runImage(args []string) error {
 		if err != nil {
 			return err
 		}
+		defer m.Close()
 		ctx := interruptContext()
 		controllerLock, err := m.AcquireHostTrustControllerLock()
 		if err != nil {
 			return err
 		}
+		defer m.Close()
 		if controllerLock != nil {
 			defer controllerLock.Close()
 		}
@@ -140,6 +272,7 @@ func runImage(args []string) error {
 		if err != nil {
 			return err
 		}
+		defer m.Close()
 		return m.RefreshScripts(interruptContext())
 	default:
 		return fmt.Errorf("unknown image subcommand %q", args[0])
@@ -167,6 +300,7 @@ func runPool(args []string) error {
 		if err != nil {
 			return err
 		}
+		defer m.Close()
 		return m.Verify(interruptContext(), pool.VerifyOptions{Instances: *instances, RegisterOnly: *registerOnly, Cleanup: *cleanup})
 	case "up":
 		fs := flag.NewFlagSet("pool up", flag.ExitOnError)
@@ -211,6 +345,7 @@ func runCleanup(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer m.Close()
 	return m.Cleanup(context.Background())
 }
 
@@ -225,6 +360,7 @@ func runStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer m.Close()
 	status, err := m.Status(context.Background())
 	if err != nil {
 		return err
@@ -274,6 +410,7 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	if err != nil {
 		return nil, err
 	}
+	printConfigWarnings(cfg)
 	if err := config.Validate(cfg); err != nil {
 		return nil, err
 	}
@@ -288,14 +425,63 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	if err != nil {
 		return nil, err
 	}
-	return &pool.Manager{
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:                   config.ProjectPath(projectRoot, cfg.Logging.Directory),
+		ManagerSinks:                loggingSinks(cfg.Logging.ManagerSinks),
+		ManagerConsoleFormat:        logging.Format(cfg.Logging.ManagerConsoleFormat),
+		ManagerConsoleTextFormat:    cfg.Logging.ManagerConsoleTextFormat,
+		ManagerFileFormat:           logging.Format(cfg.Logging.ManagerFileFormat),
+		TranscriptSinks:             loggingSinks(cfg.Logging.TranscriptSinks),
+		TranscriptConsoleFormat:     logging.Format(cfg.Logging.TranscriptConsoleFormat),
+		TranscriptConsoleTextFormat: cfg.Logging.TranscriptConsoleTextFormat,
+		Rotation: logging.Rotation{
+			MaxSizeMiB: cfg.Logging.MaxFileSizeMiB,
+			MaxBackups: cfg.Logging.MaxBackups,
+			Compress:   cfg.Logging.CompressBackups,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	manager := &pool.Manager{
 		Config:      cfg,
 		Provider:    provider,
 		GitHub:      client,
 		ProjectRoot: projectRoot,
 		ConfigPath:  resolvedConfigPath,
 		DryRun:      dryRun,
-	}, nil
+		Logging:     runtime,
+	}
+	if cfg.Logging.RetentionEnabled {
+		report, pruneErr := manager.PruneLogs(false)
+		if pruneErr != nil {
+			runtime.Logger().Warn("log retention failed", "operation", "logs-prune", "error", pruneErr)
+		} else {
+			for _, warning := range report.Warnings {
+				runtime.Logger().Warn("log retention skipped candidate", "operation", "logs-prune", "warning", warning)
+			}
+		}
+	}
+	return manager, nil
+}
+
+func loggingSinks(values []string) logging.Sinks {
+	var sinks logging.Sinks
+	for _, value := range values {
+		switch value {
+		case "console":
+			sinks |= logging.SinkConsole
+		case "file":
+			sinks |= logging.SinkFile
+		}
+	}
+	return sinks
+}
+
+func printConfigWarnings(cfg config.Config) {
+	for _, warning := range cfg.Warnings() {
+		fmt.Fprintln(os.Stderr, "warning:", warning)
+	}
 }
 
 func resolveConfigPath(projectRoot, explicit string) (string, error) {
@@ -365,6 +551,9 @@ Commands:
   ephemeral-action-runner pool down
   ephemeral-action-runner cleanup
   ephemeral-action-runner status
+  ephemeral-action-runner logs path
+  ephemeral-action-runner logs list
+  ephemeral-action-runner logs prune [--dry-run]
   ephemeral-action-runner version
 `)
 }

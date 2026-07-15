@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -16,6 +17,8 @@ type StartOptions struct {
 	Network    string
 	RosettaTag string
 	LogPath    string
+	Stdout     io.Writer
+	Stderr     io.Writer
 }
 
 type RunningProcess struct {
@@ -28,6 +31,8 @@ type ExecOptions struct {
 	Stdin   string
 	Env     map[string]string
 	LogPath string
+	Stdout  io.Writer
+	Stderr  io.Writer
 }
 
 type ExecResult struct {

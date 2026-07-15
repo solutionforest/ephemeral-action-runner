@@ -260,7 +260,25 @@ cat >>"${config_path}" <<EOF
 pool:
   instances: 1
   namePrefix: ${CORE_POOL_PREFIX}
-  logDir: ${log_dir}
+
+logging:
+  directory: ${log_dir}
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   labels: [${CORE_CANARY_LABEL}]

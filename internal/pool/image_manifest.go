@@ -67,7 +67,7 @@ func (m *Manager) EnsureImage(ctx context.Context) error {
 		return err
 	}
 	if m.DryRun {
-		fmt.Printf("[dry-run] would ensure image %s has manifest %s\n", m.Config.Image.OutputImage, hash)
+		m.infof("[dry-run] would ensure image %s has manifest %s\n", m.Config.Image.OutputImage, hash)
 		return m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest})
 	}
 	state, err := m.currentImageState(ctx, hash)
@@ -76,12 +76,12 @@ func (m *Manager) EnsureImage(ctx context.Context) error {
 	}
 	switch state {
 	case imageStateCurrent:
-		fmt.Printf("image is current: %s\n", m.Config.Image.OutputImage)
+		m.infof("image is current: %s\n", m.Config.Image.OutputImage)
 		return nil
 	case imageStateMissing:
-		fmt.Printf("image is missing; building %s\n", m.Config.Image.OutputImage)
+		m.infof("image is missing; building %s\n", m.Config.Image.OutputImage)
 	case imageStateOutdated:
-		fmt.Printf("image is outdated or not aligned with config; rebuilding %s\n", m.Config.Image.OutputImage)
+		m.infof("image is outdated or not aligned with config; rebuilding %s\n", m.Config.Image.OutputImage)
 	}
 	return m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest})
 }
@@ -270,8 +270,9 @@ func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string,
 		return "", fmt.Errorf("image.sourceImage is required when image.sourceType=docker-image")
 	}
 	platform := strings.TrimSpace(m.Config.Image.SourcePlatform)
-	logPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".source.log")
-	fmt.Printf("refreshing Docker source image %s\n", image)
+	logPath := m.buildLogPath(imageLogStem(m.Config.Image.OutputImage) + ".source.log")
+	defer m.releaseTranscript(logPath)
+	m.infof("refreshing Docker source image %s\n", image)
 	if err := pullDockerSourceCommand(m, ctx, dockerSourcePullOptions{
 		Image:              image,
 		Platform:           platform,

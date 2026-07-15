@@ -99,6 +99,195 @@ func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	}
 }
 
+func TestLoggingDefaults(t *testing.T) {
+	got := Default().Logging
+	if got.Directory != "work/logs" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
+		t.Fatalf("unexpected logging destination defaults: %+v", got)
+	}
+	if got.MaxFileSizeMiB != 100 || got.MaxBackups != 3 || !got.CompressBackups || !got.RetentionEnabled || got.RetentionMaxTotalMiB != 1024 {
+		t.Fatalf("unexpected logging retention defaults: %+v", got)
+	}
+	if got.ManagerMaxAgeDays != 14 || got.InstanceMaxAgeDays != 14 || got.BuildMaxAgeDays != 14 || got.ErrorMaxAgeDays != 30 || got.BenchmarkMaxAgeDays != 90 || got.RetentionIntervalMinutes != 60 {
+		t.Fatalf("unexpected logging age defaults: %+v", got)
+	}
+}
+
+func TestCheckedInExampleConfigurationsValidate(t *testing.T) {
+	patterns := []string{
+		filepath.Join("..", "..", "configs", "*.yml"),
+		filepath.Join("..", "..", "examples", "observability", "*.yml"),
+	}
+	for _, pattern := range patterns {
+		paths, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(paths) == 0 {
+			t.Fatalf("no examples matched %s", pattern)
+		}
+		for _, path := range paths {
+			t.Run(filepath.Base(path), func(t *testing.T) {
+				cfg, err := Load(path)
+				if err != nil {
+					t.Fatalf("Load(%s): %v", path, err)
+				}
+				if err := Validate(cfg); err != nil {
+					t.Fatalf("Validate(%s): %v", path, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadLoggingConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+logging:
+  directory: custom/logs
+  managerSinks:
+    - console
+    - file
+  managerConsoleFormat: json
+  managerFileFormat: text
+  transcriptSinks: [file, console]
+  transcriptConsoleFormat: json
+  maxFileSizeMiB: 64
+  maxBackups: 5
+  compressBackups: false
+  retentionEnabled: false
+  retentionMaxTotalMiB: 2048
+  managerMaxAgeDays: 7
+  instanceMaxAgeDays: 8
+  buildMaxAgeDays: 9
+  errorMaxAgeDays: 10
+  benchmarkMaxAgeDays: 11
+  retentionIntervalMinutes: 12
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Logging
+	if got.Directory != "custom/logs" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
+		t.Fatalf("unexpected logging config: %+v", got)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadCustomConsoleTextFormats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Logging.ManagerConsoleTextFormat, "[{level}] {message}{attributes}"; got != want {
+		t.Fatalf("managerConsoleTextFormat = %q, want %q", got, want)
+	}
+	if got, want := cfg.Logging.TranscriptConsoleTextFormat, "{stream} {instance}: {message}"; got != want {
+		t.Fatalf("transcriptConsoleTextFormat = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Logging.Directory, "custom/logs"; got != want {
+		t.Fatalf("logging.directory = %q, want legacy value %q", got, want)
+	}
+	warnings := cfg.Warnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "pool.logDir is deprecated") || !strings.Contains(warnings[0], "logging.directory") {
+		t.Fatalf("Warnings() = %#v, want migration warning", warnings)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadRejectsAmbiguousLegacyAndNewLogDirectories(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "logging:\n  directory: new/logs\npool:\n  logDir: old/logs\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "pool.logDir cannot be used with logging.directory") {
+		t.Fatalf("Load() error = %v, want ambiguous-directory error", err)
+	}
+}
+
+func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
+	for _, text := range []string{
+		"unknown:\n  value: true\n",
+		"github:\n  unknown: value\n",
+		"image:\n  unknown: value\n",
+		"pool:\n  unknown: value\n",
+		"logging:\n  unknown: value\n",
+		"runner:\n  unknown: value\n",
+		"provider:\n  unknown: value\n",
+		"docker:\n  unknown: value\n",
+		"timeouts:\n  unknown: 1\n",
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yml")
+		if err := os.WriteFile(path, []byte(text), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown") {
+			t.Fatalf("Load(%q) error = %v, want unknown-key error", text, err)
+		}
+	}
+}
+
+func TestValidateLoggingRejectsInvalidValues(t *testing.T) {
+	for _, mutate := range []func(*LoggingConfig){
+		func(logging *LoggingConfig) { logging.Directory = " " },
+		func(logging *LoggingConfig) { logging.ManagerSinks = nil },
+		func(logging *LoggingConfig) { logging.TranscriptSinks = []string{"syslog"} },
+		func(logging *LoggingConfig) { logging.ManagerSinks = []string{"Console"} },
+		func(logging *LoggingConfig) { logging.ManagerFileFormat = "yaml" },
+		func(logging *LoggingConfig) { logging.ManagerConsoleFormat = "JSON" },
+		func(logging *LoggingConfig) {
+			logging.ManagerConsoleFormat = "json"
+			logging.ManagerConsoleTextFormat = "{level} {message}"
+		},
+		func(logging *LoggingConfig) { logging.ManagerConsoleTextFormat = "{unknown} {message}" },
+		func(logging *LoggingConfig) { logging.ManagerConsoleTextFormat = "{level}" },
+		func(logging *LoggingConfig) { logging.TranscriptConsoleTextFormat = "{level} {message}" },
+		func(logging *LoggingConfig) { logging.MaxFileSizeMiB = 0 },
+		func(logging *LoggingConfig) { logging.MaxBackups = -1 },
+		func(logging *LoggingConfig) { logging.MaxBackups = 0 },
+		func(logging *LoggingConfig) { logging.RetentionMaxTotalMiB = 0 },
+		func(logging *LoggingConfig) { logging.ErrorMaxAgeDays = 0 },
+		func(logging *LoggingConfig) { logging.RetentionIntervalMinutes = 0 },
+	} {
+		cfg := Default()
+		mutate(&cfg.Logging)
+		if err := ValidateLogging(cfg.Logging); err == nil {
+			t.Fatal("ValidateLogging accepted invalid config")
+		}
+	}
+}
+
 func TestTrustedCACertificatePathsDefaultToEmpty(t *testing.T) {
 	cfg := Default()
 	if len(cfg.Image.TrustedCACertificatePaths) != 0 {
