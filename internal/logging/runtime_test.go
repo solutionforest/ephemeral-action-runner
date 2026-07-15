@@ -414,6 +414,12 @@ func TestRotationCompressesAndHonorsBackupLimit(t *testing.T) {
 		if writeErr != nil {
 			t.Fatal(writeErr)
 		}
+		// Lumberjack backup names have millisecond precision. Keep forced test
+		// rotations distinct so this test verifies compression and backup limits
+		// rather than colliding timestamped filenames on faster hosts.
+		if index < 3 {
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	var backups []string

@@ -33,12 +33,8 @@ func TestLogsPathListAndPrune(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	canonicalLogRoot, err := filepath.EvalSymlinks(logRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.EqualFold(strings.TrimSpace(pathOutput), canonicalLogRoot) {
-		t.Fatalf("logs path output = %q, want %q", pathOutput, canonicalLogRoot)
+	if strings.TrimSpace(pathOutput) != logRoot {
+		t.Fatalf("logs path output = %q, want %q", pathOutput, logRoot)
 	}
 
 	listOutput, err := captureStdout(t, func() error {
