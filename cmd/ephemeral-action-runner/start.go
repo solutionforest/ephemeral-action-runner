@@ -23,6 +23,11 @@ type hostTrustLockingStarterManager interface {
 	AcquireHostTrustControllerLock() (io.Closer, error)
 }
 
+type startupTimingStarterManager interface {
+	StartStartupTiming() (string, error)
+	FinishStartupTiming(error)
+}
+
 type starterManagerFactory func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error)
 
 var newStarterManager starterManagerFactory = func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error) {
@@ -74,7 +79,7 @@ func runStart(args []string) error {
 	})
 }
 
-func runStartWithOptions(opts startOptions) error {
+func runStartWithOptions(opts startOptions) (err error) {
 	if opts.Context == nil {
 		opts.Context = context.Background()
 	}
@@ -107,6 +112,14 @@ func runStartWithOptions(opts startOptions) error {
 	if err != nil {
 		return err
 	}
+	if timingManager, ok := manager.(startupTimingStarterManager); ok {
+		if _, err := timingManager.StartStartupTiming(); err != nil {
+			return fmt.Errorf("start startup timing log: %w", err)
+		}
+		defer func() {
+			timingManager.FinishStartupTiming(err)
+		}()
+	}
 	hostTrustLockHeld := false
 	if lockingManager, ok := manager.(hostTrustLockingStarterManager); ok {
 		controllerLock, err := lockingManager.AcquireHostTrustControllerLock()
@@ -119,7 +132,7 @@ func runStartWithOptions(opts startOptions) error {
 		}
 	}
 	fmt.Fprintf(opts.Out, "Ensuring runner image is current for %s\n", configPath)
-	if err := manager.EnsureImage(opts.Context); err != nil {
+	if err = manager.EnsureImage(opts.Context); err != nil {
 		return err
 	}
 	if opts.Instances > 0 {
@@ -127,7 +140,7 @@ func runStartWithOptions(opts startOptions) error {
 	} else {
 		fmt.Fprintf(opts.Out, "Starting EPAR pool using pool.instances from config. Press Ctrl-C to stop; cleanup is enabled by default.\n")
 	}
-	return manager.RunPool(opts.Context, pool.RunOptions{
+	err = manager.RunPool(opts.Context, pool.RunOptions{
 		Instances:         opts.Instances,
 		Register:          opts.Register,
 		KeepOnExit:        opts.KeepOnExit,
@@ -135,6 +148,7 @@ func runStartWithOptions(opts startOptions) error {
 		MonitorInterval:   opts.MonitorInterval,
 		HostTrustLockHeld: hostTrustLockHeld,
 	})
+	return err
 }
 
 func ensureConfigForStart(opts startOptions) (string, error) {

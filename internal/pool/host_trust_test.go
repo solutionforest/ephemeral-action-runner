@@ -338,11 +338,13 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 	oldOutput := runHostOutputCommand
 	oldQuiet := runHostQuietCommand
 	oldRun := runHostCommand
+	oldPull := pullDockerSourceCommand
 	t.Cleanup(func() {
 		runHostLoggedCommand = oldLogged
 		runHostOutputCommand = oldOutput
 		runHostQuietCommand = oldQuiet
 		runHostCommand = oldRun
+		pullDockerSourceCommand = oldPull
 	})
 	builds := 0
 	tagged := false
@@ -356,6 +358,7 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 		return `["source@sha256:1234"]`, nil
 	}
 	runHostQuietCommand = func(context.Context, string, ...string) error { return nil }
+	pullDockerSourceCommand = func(*Manager, context.Context, dockerSourcePullOptions) error { return nil }
 	runHostCommand = func(_ context.Context, name string, args ...string) error {
 		if name == "docker" && len(args) >= 4 && args[0] == "image" && args[1] == "tag" {
 			tagged = true

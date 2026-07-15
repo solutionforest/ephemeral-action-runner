@@ -18,12 +18,13 @@ import (
 )
 
 type Manager struct {
-	Config      config.Config
-	Provider    provider.Provider
-	GitHub      GitHubClient
-	ProjectRoot string
-	ConfigPath  string
-	DryRun      bool
+	Config        config.Config
+	Provider      provider.Provider
+	GitHub        GitHubClient
+	ProjectRoot   string
+	ConfigPath    string
+	DryRun        bool
+	startupTiming *startupTiming
 
 	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
@@ -458,11 +459,16 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		return vm, err
 	}
 	fmt.Printf("[%s] cloning %s\n", name, m.Config.Provider.SourceImage)
-	if err := m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name); err != nil {
+	if err := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
+		return m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name)
+	}); err != nil {
 		return vm, err
 	}
 	fmt.Printf("[%s] starting instance\n", name)
-	if _, err := m.Provider.Start(ctx, name, m.startOptions(logPath)); err != nil {
+	if err := m.timeFirstInstanceStage(name, m.startupInstanceStartStage(), func() error {
+		_, err := m.Provider.Start(ctx, name, m.startOptions(logPath))
+		return err
+	}); err != nil {
 		return vm, err
 	}
 	ip, err := m.Provider.IP(ctx, name, m.Config.Timeouts.BootSeconds)
@@ -471,11 +477,13 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	}
 	vm.IP = ip
 	fmt.Printf("[%s] reachable at %s\n", name, ip)
-	if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
-		return vm, err
-	}
 	fmt.Printf("[%s] validating runner runtime\n", name)
-	if err := m.validateRuntimeWithRetry(ctx, name, guestLogPath); err != nil {
+	if err := m.timeFirstInstanceStage(name, "runtime_validation", func() error {
+		if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
+			return err
+		}
+		return m.validateRuntimeWithRetry(ctx, name, guestLogPath)
+	}); err != nil {
 		return vm, err
 	}
 	fmt.Printf("[%s] runtime validation passed\n", name)
@@ -508,42 +516,58 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			}
 			return vm, fmt.Errorf("github client is required for registration")
 		}
-		fmt.Printf("[%s] requesting GitHub registration token\n", name)
-		token, err := m.GitHub.RegistrationToken(ctx)
-		if err != nil {
-			return vm, err
-		}
-		env := map[string]string{
-			"RUNNER_URL":               m.GitHub.OrganizationURL(),
-			"RUNNER_TOKEN":             token.Token,
-			"RUNNER_NAME":              name,
-			"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
-			"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
-			"RUNNER_GROUP":             m.Config.Runner.Group,
-			"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
-		}
-		if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
-			return vm, err
-		}
-		fmt.Printf("[%s] starting runner service\n", name)
-		if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
-			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
-			return vm, err
-		}
-		readiness := "online/idle"
-		if allowBusy {
-			readiness = "online"
-		}
-		fmt.Printf("[%s] waiting for GitHub %s\n", name, readiness)
-		runner, err := m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
-		if err != nil {
+		var (
+			token     gh.RegistrationToken
+			runner    gh.Runner
+			readiness = "online/idle"
+		)
+		if err := m.timeFirstInstanceStage(name, "github_registration_and_online_idle", func() error {
+			fmt.Printf("[%s] requesting GitHub registration token\n", name)
+			var err error
+			token, err = m.GitHub.RegistrationToken(ctx)
+			if err != nil {
+				return err
+			}
+			env := map[string]string{
+				"RUNNER_URL":               m.GitHub.OrganizationURL(),
+				"RUNNER_TOKEN":             token.Token,
+				"RUNNER_NAME":              name,
+				"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
+				"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
+				"RUNNER_GROUP":             m.Config.Runner.Group,
+				"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
+			}
+			if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
+				return err
+			}
+			fmt.Printf("[%s] starting runner service\n", name)
+			if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
+				return err
+			}
+			if allowBusy {
+				readiness = "online"
+			}
+			fmt.Printf("[%s] waiting for GitHub %s\n", name, readiness)
+			runner, err = m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
+			return err
+		}); err != nil {
 			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
 		fmt.Printf("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
+		m.finishFirstRunnerReady(name)
+	} else {
+		m.finishFirstRunnerReady(name)
 	}
 	return vm, nil
+}
+
+func (m *Manager) startupInstanceStartStage() string {
+	if m.Config.Provider.Type == "docker-dind" {
+		return "instance_start_and_inner_docker_ready"
+	}
+	return "instance_start_and_provider_ready"
 }
 
 type runnerReadinessResult struct {

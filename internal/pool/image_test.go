@@ -293,10 +293,12 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	oldLogged := runHostLoggedCommand
 	oldOutput := runHostOutputCommand
 	oldQuiet := runHostQuietCommand
+	oldPull := pullDockerSourceCommand
 	defer func() {
 		runHostLoggedCommand = oldLogged
 		runHostOutputCommand = oldOutput
 		runHostQuietCommand = oldQuiet
+		pullDockerSourceCommand = oldPull
 	}()
 
 	var calls []string
@@ -320,6 +322,15 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	}
 	runHostQuietCommand = func(_ context.Context, name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	pullDockerSourceCommand = func(_ *Manager, _ context.Context, opts dockerSourcePullOptions) error {
+		args := []string{"pull"}
+		if opts.Platform != "" {
+			args = append(args, "--platform", opts.Platform)
+		}
+		args = append(args, opts.Image)
+		calls = append(calls, "docker "+strings.Join(args, " "))
 		return nil
 	}
 
@@ -373,11 +384,17 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 	origLogged := runHostLoggedCommand
 	origOutput := runHostOutputCommand
 	origQuiet := runHostQuietCommand
+	origPull := pullDockerSourceCommand
 	defer func() {
 		runHostLoggedCommand = origLogged
 		runHostOutputCommand = origOutput
 		runHostQuietCommand = origQuiet
+		pullDockerSourceCommand = origPull
 	}()
+	pullDockerSourceCommand = func(*Manager, context.Context, dockerSourcePullOptions) error {
+		t.Fatal("docker pull should not run when cached rootfs and env metadata exist")
+		return nil
+	}
 	runHostLoggedCommand = func(context.Context, string, string, ...string) error {
 		t.Fatal("docker command should not run when cached rootfs and env metadata exist")
 		return nil

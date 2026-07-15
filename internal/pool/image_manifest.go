@@ -252,6 +252,16 @@ func (m *Manager) desiredImageManifestWithHostTrust(ctx context.Context, snapsho
 }
 
 func (m *Manager) refreshDockerSourceDigest(ctx context.Context) (string, error) {
+	var digest string
+	err := m.timeStartupStage("source_image_pull", func() error {
+		var err error
+		digest, err = m.refreshDockerSourceDigestUntimed(ctx)
+		return err
+	})
+	return digest, err
+}
+
+func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string, error) {
 	if m.DryRun {
 		return "dry-run", nil
 	}
@@ -260,14 +270,14 @@ func (m *Manager) refreshDockerSourceDigest(ctx context.Context) (string, error)
 		return "", fmt.Errorf("image.sourceImage is required when image.sourceType=docker-image")
 	}
 	platform := strings.TrimSpace(m.Config.Image.SourcePlatform)
-	pullArgs := []string{"pull"}
-	if platform != "" {
-		pullArgs = append(pullArgs, "--platform", platform)
-	}
-	pullArgs = append(pullArgs, image)
 	logPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".source.log")
 	fmt.Printf("refreshing Docker source image %s\n", image)
-	if err := runHostLoggedCommand(ctx, logPath, "docker", pullArgs...); err != nil {
+	if err := pullDockerSourceCommand(m, ctx, dockerSourcePullOptions{
+		Image:              image,
+		Platform:           platform,
+		LogPath:            logPath,
+		AnnounceRemoteSize: true,
+	}); err != nil {
 		return "", fmt.Errorf("refresh Docker source image %s: %w", image, err)
 	}
 	digestsJSON, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)
@@ -280,13 +290,17 @@ func (m *Manager) refreshDockerSourceDigest(ctx context.Context) (string, error)
 	}
 	sort.Strings(digests)
 	if len(digests) > 0 {
-		return digests[0], nil
+		digest := digests[0]
+		m.writeDockerPullNotice(logPath, "Docker source image digest: "+digest)
+		return digest, nil
 	}
 	imageID, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image)
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(imageID), nil
+	digest := strings.TrimSpace(imageID)
+	m.writeDockerPullNotice(logPath, "Docker source image ID: "+digest)
+	return digest, nil
 }
 
 func (m *Manager) eparScriptDigests() ([]fileDigest, error) {

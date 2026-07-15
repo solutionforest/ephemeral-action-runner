@@ -101,6 +101,12 @@ func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error 
 }
 
 func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	return m.timeStartupStage("dind_image_build", func() error {
+		return m.buildDockerDindImageUntimed(ctx, opts, upstreamDir)
+	})
+}
+
+func (m *Manager) buildDockerDindImageUntimed(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
 	buildLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), imageLogStem(m.Config.Image.OutputImage)+".docker-build.log")
 	if err := resetLogs(buildLogPath); err != nil {
 		return err
@@ -288,6 +294,12 @@ func (m *Manager) buildTartImage(ctx context.Context, opts ImageBuildOptions, up
 }
 
 func (m *Manager) buildWSLImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	return m.timeStartupStage("wsl_image_build", func() error {
+		return m.buildWSLImageUntimed(ctx, opts, upstreamDir)
+	})
+}
+
+func (m *Manager) buildWSLImageUntimed(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
 	exporter, ok := m.Provider.(wslExporter)
 	if !ok {
 		return fmt.Errorf("provider.type=wsl requires provider export support")
@@ -517,7 +529,11 @@ func (m *Manager) prepareWSLDockerSourceRootfs(ctx context.Context, outputPath, 
 		return "", "", err
 	}
 	fmt.Printf("preparing WSL source rootfs from Docker image %s\n", image)
-	if err := runHostLoggedCommand(ctx, buildLogPath, "docker", pullArgs...); err != nil {
+	if err := pullDockerSourceCommand(m, ctx, dockerSourcePullOptions{
+		Image:    image,
+		Platform: platform,
+		LogPath:  buildLogPath,
+	}); err != nil {
 		return "", "", fmt.Errorf("wsl image.sourceType=docker-image requires Docker Desktop, Docker Engine, or another reachable Docker daemon; alternatively set image.sourceType=rootfs-tar and provide a prepared rootfs tar: %w", err)
 	}
 	if err := runHostLoggedCommand(ctx, buildLogPath, "docker", createArgs...); err != nil {
