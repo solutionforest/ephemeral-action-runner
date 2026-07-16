@@ -5,12 +5,10 @@ on:
     branches:
       - develop
       - main
-      - feature/fix-ci-failure
   push:
     branches:
       - develop
       - main
-      - feature/fix-ci-failure
   workflow_dispatch:
 
 permissions:
