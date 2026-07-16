@@ -43,8 +43,12 @@ func TestLogsPathListAndPrune(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.ToLower(listOutput), strings.ToLower(oldPath)) {
-		t.Fatalf("logs list output missing %s:\n%s", oldPath, listOutput)
+	canonicalOldPath, err := filepath.EvalSymlinks(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToLower(listOutput), strings.ToLower(canonicalOldPath)) {
+		t.Fatalf("logs list output missing %s:\n%s", canonicalOldPath, listOutput)
 	}
 
 	if _, err := captureStdout(t, func() error {
