@@ -20,6 +20,7 @@ concurrency:
 jobs:
   controller:
     name: Core runner controller
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     environment: epar-live-ci
     # Leaves time for a cold image build and bounded cleanup around the
@@ -83,6 +84,7 @@ jobs:
 
   canary-1:
     name: Core canary 1
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       group: epar-ci-canary
       labels: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
@@ -128,6 +130,7 @@ jobs:
   canary-2:
     name: Core canary 2
     needs: canary-1
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       group: epar-ci-canary
       labels: epar-core-${{ github.run_id }}-${{ github.run_attempt }}
