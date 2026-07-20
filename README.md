@@ -161,5 +161,7 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
 - [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
-- [Security](docs/security.md): trust boundaries and secret handling.
+- [Security](docs/security.md): trust boundaries, secret handling, and private vulnerability reporting.
+- [Contributing](CONTRIBUTING.md): how to propose and validate changes.
+- [Code of Conduct](CODE_OF_CONDUCT.md): community expectations and reporting concerns.
 - [Level 1 Core Runner Verification](docs/core-runner-verification.md): trusted live CI setup, canary behavior, and cleanup.
