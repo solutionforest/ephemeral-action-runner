@@ -67,7 +67,7 @@ Requiring an environment reviewer is possible, but every matching push and same-
 
 ## Trust Boundaries and Triggers
 
-The controller job is privileged and secret-bearing. It receives the GitHub App key and a workflow token with Actions write permission, and it can start privileged containers in its disposable GitHub-hosted VM. It runs only for trusted repository changes: pushes to `develop` or `main`, and pull requests whose source branch is in this repository. Fork pull requests skip all three core-verification jobs before they can receive environment secrets or run on the canary group.
+The controller job is privileged and secret-bearing. It receives the GitHub App key and a workflow token with Actions write permission, and it can start privileged containers in its disposable GitHub-hosted VM. It runs only for trusted repository changes: pushes to `develop` or `main`, and pull requests whose source branch is in this repository. Fork pull requests still trigger the workflow, but all three core-verification jobs skip before they can receive environment secrets or run on the canary group.
 
 The two canary jobs do not receive the GitHub App key. They receive only the
 minimum workflow permissions needed for checkout and artifact operations, and
@@ -76,7 +76,7 @@ container.
 
 The workflow runs on:
 
-- pull requests targeting `develop` or `main` when the source branch belongs to this repository
+- pull requests targeting `develop` or `main` (fork pull requests still trigger this workflow, but core-verification jobs run only when the source branch belongs to this repository)
 - pushes to `develop` or `main`
 - manual `workflow_dispatch` after the workflow is present on the repository's default branch
 
