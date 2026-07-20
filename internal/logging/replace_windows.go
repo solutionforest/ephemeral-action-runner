@@ -29,6 +29,9 @@ func replaceFile(source, destination string) error {
 		moveFileReplaceExisting|moveFileWriteThrough,
 	)
 	if result == 0 {
+		if errno, ok := callErr.(syscall.Errno); ok && errno == 0 {
+			return syscall.EINVAL
+		}
 		return callErr
 	}
 	return nil
