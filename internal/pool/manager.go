@@ -4,9 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +39,8 @@ type Manager struct {
 	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
 	hostTrustImageMu      sync.Mutex
+	now                   func() time.Time
+	randomFloat64         func() float64
 }
 
 type GitHubClient interface {
@@ -59,7 +67,18 @@ type RunOptions struct {
 	ReplaceCompleted  bool
 	MonitorInterval   time.Duration
 	HostTrustLockHeld bool
+	PoolLockHeld      bool
 }
+
+type LifecyclePhase string
+
+const (
+	LifecycleProvisioning   LifecyclePhase = "provisioning"
+	LifecycleReady          LifecyclePhase = "ready"
+	LifecycleDraining       LifecyclePhase = "draining"
+	LifecycleQuarantined    LifecyclePhase = "quarantined"
+	LifecycleCleanupPending LifecyclePhase = "cleanup-pending"
+)
 
 type ProvisionedInstance struct {
 	Name                string
@@ -68,10 +87,12 @@ type ProvisionedInstance struct {
 	GuestLogPath        string
 	RunnerID            int64
 	HostTrustGeneration string
+	Phase               LifecyclePhase
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
 var runnerReadinessHealthCheckInterval = 2 * time.Second
+var dependencyHTTPStatusPattern = regexp.MustCompile(`(?i)(?:status code does not indicate success|http response code)\s*:\s*([0-9]{3})`)
 
 const (
 	cleanupTimeout                    = 5 * time.Minute
@@ -80,6 +101,11 @@ const (
 )
 
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
+	poolLock, err := m.AcquirePoolControllerLock()
+	if err != nil {
+		return err
+	}
+	defer poolLock.Close()
 	controllerLock, err := m.acquireHostTrustControllerLock()
 	if err != nil {
 		return err
@@ -148,6 +174,13 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
+	if !opts.PoolLockHeld {
+		controllerLock, err := m.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		defer controllerLock.Close()
+	}
 	if !opts.HostTrustLockHeld {
 		controllerLock, err := m.AcquireHostTrustControllerLock()
 		if err != nil {
@@ -161,7 +194,20 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if opts.MonitorInterval <= 0 {
 		opts.MonitorInterval = 15 * time.Second
 	}
-	active := make(map[string]ProvisionedInstance)
+	if ctx.Err() != nil {
+		if opts.KeepOnExit {
+			return nil
+		}
+		return m.cleanupWithFreshContext()
+	}
+	active, err := m.reconcilePhysicalPool(ctx, nil, opts.Register)
+	if err != nil {
+		return fmt.Errorf("initial pool reconciliation: %w", err)
+	}
+	active, err = m.reduceOverCapacity(ctx, active, opts.Instances, opts.Register)
+	if err != nil {
+		return fmt.Errorf("initial over-capacity reconciliation: %w", err)
+	}
 	sequence := 1
 	poolTrustGeneration := ""
 	cleanup := func() error {
@@ -172,14 +218,26 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for len(active) < opts.Instances {
-		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
-		sequence++
+		active, err = m.reconcilePhysicalPool(ctx, active, opts.Register)
 		if err != nil {
 			stopLeaseKeeper()
-			_ = cleanup()
-			return err
+			return fmt.Errorf("initial pool reconciliation before allocation: %w", err)
 		}
-		active[vm.Name] = vm
+		if len(active) >= opts.Instances {
+			break
+		}
+		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
+		sequence++
+		if isPhysicalPhase(vm.Phase) {
+			active[vm.Name] = vm
+		}
+		if err != nil {
+			stopLeaseKeeper()
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+		}
 		leaseAdd(vm)
 		if vm.HostTrustGeneration != "" {
 			poolTrustGeneration = vm.HostTrustGeneration
@@ -215,11 +273,14 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	nextRetention := time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 	nextHostTrustCollection := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
+	retry := replacementRetryState{}
 	for {
 		select {
 		case <-ctx.Done():
 			return cleanup()
 		case <-ticker.C:
+			now := m.currentTime()
+			dependencyCooldown := retry.active(now)
 			if m.Config.Logging.RetentionEnabled && !time.Now().Before(nextRetention) {
 				m.pruneLogsBestEffort()
 				nextRetention = time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
@@ -241,7 +302,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							// Idle runners are removed now; busy runners keep running but
 							// receive a mismatching lease so no subsequent job can start.
 							currentHostTrust = current
-							trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
+							if !dependencyCooldown {
+								trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
+							}
 							m.infof("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
 							ready = false
 							for attempt := 1; attempt <= 3; attempt++ {
@@ -275,9 +338,17 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 					}
 				}
-				if currentHostTrust.Generation != "" {
+				if currentHostTrust.Generation != "" && !dependencyCooldown {
 					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust)
 				}
+			}
+			if dependencyCooldown {
+				var localErr error
+				active, localErr = m.reconcileLocalInventory(active)
+				if localErr != nil {
+					m.warnf("local pool housekeeping warning during replacement cooldown: %v\n", localErr)
+				}
+				continue
 			}
 			if opts.ReplaceCompleted && !time.Now().Before(nextLivenessCheck) {
 				nextLivenessCheck = time.Now().Add(opts.MonitorInterval)
@@ -298,16 +369,41 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					delete(active, name)
 				}
 			}
+			var reconcileErr error
+			beforeReconcile := active
+			active, reconcileErr = m.reconcilePhysicalPool(ctx, active, opts.Register)
+			if reconcileErr != nil {
+				if ctx.Err() != nil {
+					return cleanup()
+				}
+				if !isTransientDependencyError(reconcileErr) {
+					return errors.Join(fmt.Errorf("pool reconciliation: %w", reconcileErr), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				retry.schedule(m, now, reconcileErr)
+				m.warnf("pool reconciliation deferred during transient dependency failure; retrying after %s: %v\n", retry.remaining(now), reconcileErr)
+				continue
+			}
+			retry.resetAfterAdoption(beforeReconcile, active)
+			active, reconcileErr = m.reduceOverCapacity(ctx, active, opts.Instances, opts.Register)
+			if reconcileErr != nil {
+				if !isTransientDependencyError(reconcileErr) {
+					return errors.Join(fmt.Errorf("reduce over-capacity pool: %w", reconcileErr), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				retry.schedule(m, now, reconcileErr)
+				continue
+			}
 			if m.hostTrustEnabled() && currentHostTrust.Generation != "" && currentHostTrust.Generation != poolTrustGeneration {
 				trustCapacityReady = false
 			}
 			replacementCapacity := len(active)
 			needsTrustCapacity := false
 			if m.hostTrustEnabled() && currentHostTrust.Generation != "" {
-				replacementCapacity = currentHostTrustCapacity(active, currentHostTrust.Generation)
-				needsTrustCapacity = replacementCapacity < opts.Instances
+				needsTrustCapacity = currentHostTrustCapacity(active, currentHostTrust.Generation) < opts.Instances
 			}
 			if !trustCapacityReady || (!opts.ReplaceCompleted && trustRetired == 0 && !needsTrustCapacity) {
+				continue
+			}
+			if retry.active(now) {
 				continue
 			}
 			for replacementCapacity < opts.Instances {
@@ -318,13 +414,37 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
+				active, err = m.reconcilePhysicalPool(ctx, active, opts.Register)
+				if err != nil {
+					if !isTransientDependencyError(err) {
+						return errors.Join(fmt.Errorf("pool reconciliation before replacement allocation: %w", err), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+					}
+					retry.schedule(m, m.currentTime(), err)
+					m.warnf("[%s] replacement deferred during transient reconciliation failure: %v\n", name, err)
+					break
+				}
+				replacementCapacity = len(active)
+				if replacementCapacity >= opts.Instances {
+					break
+				}
 				m.infof("[%s] creating replacement runner\n", name)
 				vm, err := m.provisionOne(ctx, name, opts.Register, true)
+				if isPhysicalPhase(vm.Phase) {
+					active[vm.Name] = vm
+				}
 				if err != nil {
+					if ctx.Err() != nil {
+						return cleanup()
+					}
 					m.warnf("[%s] replacement failed: %v\n", name, err)
+					if !isTransientDependencyError(err) {
+						return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+					}
+					retry.schedule(m, m.currentTime(), err)
 					break
 				}
 				active[vm.Name] = vm
+				retry.reset()
 				replacementCapacity++
 				if vm.HostTrustGeneration != "" {
 					poolTrustGeneration = vm.HostTrustGeneration
@@ -345,13 +465,401 @@ func currentHostTrustCapacity(active map[string]ProvisionedInstance, generation 
 	return capacity
 }
 
+func isPhysicalPhase(phase LifecyclePhase) bool {
+	return phase == LifecycleProvisioning || phase == LifecycleReady || phase == LifecycleDraining || phase == LifecycleQuarantined || phase == LifecycleCleanupPending
+}
+
+func adoptedReadyInstance(before, after map[string]ProvisionedInstance) bool {
+	for name, instance := range after {
+		previous, found := before[name]
+		if instance.Phase == LifecycleReady && (!found || previous.Phase != LifecycleReady) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]ProvisionedInstance, register bool) (map[string]ProvisionedInstance, error) {
+	reconciled, err := m.reconcileLocalInventoryWithContext(ctx, known)
+	if err != nil {
+		return known, err
+	}
+	if !register {
+		for name, vm := range reconciled {
+			if vm.Phase != LifecycleCleanupPending {
+				vm.Phase = LifecycleReady
+				reconciled[name] = vm
+			}
+		}
+		return reconciled, nil
+	}
+	if m.GitHub == nil {
+		return reconciled, fmt.Errorf("github client is required for registered pool reconciliation")
+	}
+	remoteByName := make(map[string]gh.Runner)
+	runners, err := m.GitHub.ListRunners(ctx)
+	if err != nil {
+		for name, vm := range reconciled {
+			if vm.Phase != LifecycleCleanupPending {
+				vm.Phase = LifecycleQuarantined
+				reconciled[name] = vm
+			}
+		}
+		return reconciled, err
+	}
+	for _, runner := range runners {
+		if HasPrefix(runner.Name, m.Config.Pool.NamePrefix) {
+			remoteByName[runner.Name] = runner
+		}
+	}
+	for name, vm := range reconciled {
+		if vm.Phase == LifecycleCleanupPending {
+			continue
+		}
+		runner, found := remoteByName[name]
+		if !found && isPhysicalPhase(vm.Phase) {
+			var lookupErr error
+			runner, found, lookupErr = m.GitHub.RunnerByName(ctx, name)
+			if lookupErr != nil {
+				vm.Phase = LifecycleQuarantined
+				reconciled[name] = vm
+				return reconciled, lookupErr
+			}
+		}
+		if !found {
+			if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
+				vm.Phase = LifecycleCleanupPending
+				reconciled[name] = vm
+				m.warnf("[%s] unregistered-instance cleanup pending: %v\n", name, err)
+			} else {
+				delete(reconciled, name)
+			}
+			continue
+		}
+		delete(remoteByName, name)
+		vm.RunnerID = runner.ID
+		if runner.Status == "online" {
+			vm.Phase = LifecycleReady
+			reconciled[name] = vm
+			continue
+		}
+		if runner.Busy {
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			continue
+		}
+		if vm.Phase == LifecycleQuarantined {
+			if err := m.retireInstance(context.Background(), vm, "GitHub recovered but quarantined runner remained offline"); err != nil {
+				vm.Phase = LifecycleCleanupPending
+				reconciled[name] = vm
+				m.warnf("[%s] recovered-offline retirement pending: %v\n", name, err)
+			} else {
+				delete(reconciled, name)
+			}
+			continue
+		}
+		alive, _, processErr := m.runnerProcessAlive(ctx, vm)
+		if processErr == nil && alive {
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			continue
+		}
+		if err := m.retireInstance(context.Background(), vm, "reconciliation found offline runner with inactive listener"); err != nil {
+			vm.Phase = LifecycleCleanupPending
+			reconciled[name] = vm
+			m.warnf("[%s] inactive-instance cleanup pending: %v\n", name, err)
+		} else {
+			delete(reconciled, name)
+		}
+	}
+	for _, runner := range remoteByName {
+		if err := m.deleteRemoteRunner(context.Background(), runner); err != nil {
+			return reconciled, err
+		}
+		m.infof("reconciliation: deleted stale GitHub runner %s id=%d\n", runner.Name, runner.ID)
+	}
+	return reconciled, nil
+}
+
+func (m *Manager) reduceOverCapacity(ctx context.Context, active map[string]ProvisionedInstance, target int, register bool) (map[string]ProvisionedInstance, error) {
+	if len(active) <= target || !register || m.GitHub == nil {
+		return active, nil
+	}
+	names := make([]string, 0, len(active))
+	for name := range active {
+		names = append(names, name)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	for _, name := range names {
+		if len(active) <= target {
+			break
+		}
+		vm := active[name]
+		if vm.Phase != LifecycleReady {
+			continue
+		}
+		runner, found, err := m.GitHub.RunnerByName(ctx, name)
+		if err != nil {
+			return active, err
+		}
+		if !found || runner.Busy {
+			continue
+		}
+		vm.RunnerID = runner.ID
+		if err := m.retireInstance(context.Background(), vm, "reconciling legacy physical inventory above pool.instances"); err != nil {
+			vm.Phase = LifecycleCleanupPending
+			active[name] = vm
+			continue
+		}
+		delete(active, name)
+	}
+	return active, nil
+}
+
+func (m *Manager) reconcileLocalInventory(known map[string]ProvisionedInstance) (map[string]ProvisionedInstance, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return m.reconcileLocalInventoryWithContext(ctx, known)
+}
+
+func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known map[string]ProvisionedInstance) (map[string]ProvisionedInstance, error) {
+	locals, err := m.Provider.List(ctx)
+	if err != nil {
+		return known, err
+	}
+	reconciled := make(map[string]ProvisionedInstance)
+	for _, local := range locals {
+		if !HasPrefix(local.Name, m.Config.Pool.NamePrefix) {
+			continue
+		}
+		vm := m.reconciledInstance(known, local.Name)
+		if !localInstanceStopped(local.State) {
+			reconciled[local.Name] = vm
+			continue
+		}
+		if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
+			vm.Phase = LifecycleCleanupPending
+			reconciled[local.Name] = vm
+			m.warnf("[%s] stopped-instance cleanup pending: %v\n", local.Name, err)
+		}
+	}
+	return reconciled, nil
+}
+
+func (m *Manager) reconciledInstance(known map[string]ProvisionedInstance, name string) ProvisionedInstance {
+	if vm, found := known[name]; found {
+		return vm
+	}
+	return ProvisionedInstance{
+		Name:         name,
+		LogPath:      m.instanceLogPath(name, "."+m.Config.Provider.Type+".log"),
+		GuestLogPath: m.instanceLogPath(name, ".guest.log"),
+		Phase:        LifecycleQuarantined,
+	}
+}
+
+func localInstanceStopped(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "stopped", "exited", "dead", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) deleteLocalInstance(ctx context.Context, vm ProvisionedInstance) error {
+	cleanupCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
+	stopCtx, stopCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+	_ = m.Provider.Stop(stopCtx, vm.Name)
+	stopCancel()
+	deleteCtx, deleteCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+	err := m.Provider.Delete(deleteCtx, vm.Name)
+	deleteCancel()
+	if err != nil {
+		return err
+	}
+	if releaseErr := m.releaseInstanceTranscripts(vm); releaseErr != nil {
+		m.logger().Warn("instance transcript close failed after local deletion", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "reconcile", "error", releaseErr)
+	}
+	return nil
+}
+
+func (m *Manager) deleteRemoteRunner(ctx context.Context, runner gh.Runner) error {
+	deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	return m.GitHub.DeleteRunnerIfExists(deleteCtx, runner.ID)
+}
+
+type replacementRetryState struct {
+	attempt int
+	next    time.Time
+}
+
+func (s *replacementRetryState) active(now time.Time) bool {
+	return !s.next.IsZero() && now.Before(s.next)
+}
+
+func (s *replacementRetryState) remaining(now time.Time) time.Duration {
+	if !s.active(now) {
+		return 0
+	}
+	return s.next.Sub(now).Round(time.Second)
+}
+
+func (s *replacementRetryState) schedule(m *Manager, now time.Time, err error) {
+	initial, maximum, multiplier, jitter := m.replacementRetrySettings()
+	nominal := float64(initial) * math.Pow(multiplier, float64(s.attempt))
+	if nominal > float64(maximum) {
+		nominal = float64(maximum)
+	}
+	factor := 1.0
+	if jitter > 0 {
+		factor += ((m.randomValue() * 2) - 1) * jitter
+	}
+	delay := time.Duration(nominal * factor)
+	if delay < time.Second {
+		delay = time.Second
+	}
+	if delay > maximum {
+		delay = maximum
+	}
+	if retryAfter := retryAfterDuration(err); retryAfter > delay {
+		delay = retryAfter
+	}
+	s.attempt++
+	s.next = now.Add(delay)
+}
+
+func (s *replacementRetryState) reset() {
+	s.attempt = 0
+	s.next = time.Time{}
+}
+
+func (s *replacementRetryState) resetAfterAdoption(before, after map[string]ProvisionedInstance) {
+	if adoptedReadyInstance(before, after) {
+		s.reset()
+	}
+}
+
+func (m *Manager) replacementRetrySettings() (time.Duration, time.Duration, float64, float64) {
+	initialSeconds := m.Config.Pool.ReplacementRetryInitialSeconds
+	if initialSeconds <= 0 {
+		initialSeconds = 15
+	}
+	maximumSeconds := m.Config.Pool.ReplacementRetryMaxSeconds
+	if maximumSeconds <= 0 {
+		maximumSeconds = 1800
+	}
+	multiplier := m.Config.Pool.ReplacementRetryMultiplier
+	if multiplier < 1 {
+		multiplier = 2
+	}
+	jitterPercent := m.Config.Pool.ReplacementRetryJitterPercent
+	if jitterPercent < 0 {
+		jitterPercent = 0
+	}
+	return time.Duration(initialSeconds) * time.Second, time.Duration(maximumSeconds) * time.Second, multiplier, float64(jitterPercent) / 100
+}
+
+func (m *Manager) currentTime() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+func (m *Manager) randomValue() float64 {
+	if m.randomFloat64 != nil {
+		return m.randomFloat64()
+	}
+	return rand.Float64()
+}
+
+func retryAfterDuration(err error) time.Duration {
+	var httpErr *gh.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.RetryAfter
+	}
+	return 0
+}
+
+func isTransientDependencyError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var httpErr *gh.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, match := range dependencyHTTPStatusPattern.FindAllStringSubmatch(text, -1) {
+		statusCode, parseErr := strconv.Atoi(match[1])
+		if parseErr == nil && (statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError) {
+			return true
+		}
+	}
+	for _, marker := range []string{
+		"badgateway", "gatewaytimeout", "internalservererror", "serviceunavailable",
+		"bad gateway", "gateway timeout", "internal server error", "service unavailable",
+		"connection reset", "connection refused", "temporary failure",
+		"tls handshake timeout", "i/o timeout", "no such host",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) cleanupWithFreshContext() error {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	return m.Cleanup(cleanupCtx)
+	return m.cleanupUnlocked(cleanupCtx)
+}
+
+func (m *Manager) cleanupAfterTerminalFailure(active map[string]ProvisionedInstance, keep bool) error {
+	if keep {
+		return nil
+	}
+	var firstErr error
+	for _, vm := range active {
+		var err error
+		switch vm.Phase {
+		case LifecycleReady:
+			err = m.retireInstance(context.Background(), vm, "controller stopped after terminal pool failure")
+		case LifecycleCleanupPending, LifecycleProvisioning:
+			err = m.deleteLocalInstance(context.Background(), vm)
+		case LifecycleDraining, LifecycleQuarantined:
+			// These instances may already be running a job. They stay counted and
+			// are reconciled by the next controller instead of being killed merely
+			// because GitHub readiness or status became uncertain.
+			continue
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (m *Manager) ProvisionPool(ctx context.Context, instances int, register bool) ([]ProvisionedInstance, error) {
+	poolLock, err := m.AcquirePoolControllerLock()
+	if err != nil {
+		return nil, err
+	}
+	defer poolLock.Close()
+	hostTrustLock, err := m.AcquireHostTrustControllerLock()
+	if err != nil {
+		return nil, err
+	}
+	if hostTrustLock != nil {
+		defer hostTrustLock.Close()
+	}
 	instances = m.requestedInstances(instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, instances, time.Now())
 	out := make([]ProvisionedInstance, 0, len(names))
@@ -376,6 +884,15 @@ func (m *Manager) requestedInstances(override int) int {
 }
 
 func (m *Manager) Cleanup(ctx context.Context) error {
+	poolLock, err := m.AcquirePoolControllerLock()
+	if err != nil {
+		return err
+	}
+	defer poolLock.Close()
+	return m.cleanupUnlocked(ctx)
+}
+
+func (m *Manager) cleanupUnlocked(ctx context.Context) error {
 	var firstErr error
 	vms, err := m.Provider.List(ctx)
 	if err != nil {
@@ -458,7 +975,7 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 			return vm, err
 		}
 		lastErr = err
-		if vm.Name != "" {
+		if isPhysicalPhase(vm.Phase) {
 			_ = m.retireInstance(context.Background(), vm, "discarding stale host-trust image generation")
 		}
 		if attempt == attempts {
@@ -472,10 +989,56 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 	return ProvisionedInstance{Name: name}, fmt.Errorf("provision runner after %d host trust image stabilization attempts: %w", attempts, lastErr)
 }
 
-func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
+func (m *Manager) deleteRemoteRunnerByNameBestEffort(name string) {
+	if m.GitHub == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	runner, found, err := m.GitHub.RunnerByName(ctx, name)
+	if err != nil {
+		m.warnf("[%s] deferred exact-name GitHub reconciliation after rollback: %v\n", name, err)
+		return
+	}
+	if !found {
+		return
+	}
+	if err := m.GitHub.DeleteRunnerIfExists(ctx, runner.ID); err != nil {
+		m.warnf("[%s] deferred exact-name GitHub runner deletion after rollback: %v\n", name, err)
+	}
+}
+
+func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (vm ProvisionedInstance, err error) {
 	logPath := m.instanceLogPath(name, "."+m.Config.Provider.Type+".log")
 	guestLogPath := m.instanceLogPath(name, ".guest.log")
-	vm := ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath}
+	vm = ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath, Phase: LifecycleProvisioning}
+	localMayExist := false
+	configureAttempted := false
+	listenerMayBeRunning := false
+	defer func() {
+		if err == nil {
+			vm.Phase = LifecycleReady
+			return
+		}
+		if !localMayExist {
+			vm.Phase = ""
+			return
+		}
+		if listenerMayBeRunning {
+			vm.Phase = LifecycleQuarantined
+			return
+		}
+		cleanupErr := m.deleteLocalInstance(context.Background(), vm)
+		if cleanupErr != nil {
+			vm.Phase = LifecycleCleanupPending
+			err = errors.Join(err, fmt.Errorf("rollback local instance %s: %w", name, cleanupErr))
+			return
+		}
+		vm.Phase = ""
+		if configureAttempted {
+			m.deleteRemoteRunnerByNameBestEffort(name)
+		}
+	}()
 	var trustSnapshot hosttrust.Snapshot
 	if m.hostTrustEnabled() {
 		var err error
@@ -489,6 +1052,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		return vm, err
 	}
 	m.logger().Info("cloning instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "clone", "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
+	localMayExist = true
 	if err := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
 		return m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name)
 	}); err != nil {
@@ -564,17 +1128,18 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			}
 			env := map[string]string{
 				"RUNNER_URL":               m.GitHub.OrganizationURL(),
-				"RUNNER_TOKEN":             token.Token,
 				"RUNNER_NAME":              name,
 				"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
 				"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
 				"RUNNER_GROUP":             m.Config.Runner.Group,
 				"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
 			}
-			if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
-				return err
+			configureAttempted = true
+			if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env, Stdin: token.Token + "\n", SensitiveValues: []string{token.Token}}); err != nil {
+				return provider.RedactError(err, token.Token)
 			}
 			m.infof("[%s] starting runner service\n", name)
+			listenerMayBeRunning = true
 			if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
 				return err
 			}

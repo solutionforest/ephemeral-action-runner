@@ -23,6 +23,10 @@ type hostTrustLockingStarterManager interface {
 	AcquireHostTrustControllerLock() (io.Closer, error)
 }
 
+type poolLockingStarterManager interface {
+	AcquirePoolControllerLock() (io.Closer, error)
+}
+
 type startupTimingStarterManager interface {
 	StartStartupTiming() (string, error)
 	FinishStartupTiming(error)
@@ -127,6 +131,17 @@ func runStartWithOptions(opts startOptions) (err error) {
 			timingManager.FinishStartupTiming(err)
 		}()
 	}
+	poolLockHeld := false
+	if lockingManager, ok := manager.(poolLockingStarterManager); ok {
+		controllerLock, err := lockingManager.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		if controllerLock != nil {
+			defer controllerLock.Close()
+			poolLockHeld = true
+		}
+	}
 	hostTrustLockHeld := false
 	if lockingManager, ok := manager.(hostTrustLockingStarterManager); ok {
 		controllerLock, err := lockingManager.AcquireHostTrustControllerLock()
@@ -153,6 +168,7 @@ func runStartWithOptions(opts startOptions) (err error) {
 		KeepOnExit:        opts.KeepOnExit,
 		ReplaceCompleted:  opts.ReplaceCompleted,
 		MonitorInterval:   opts.MonitorInterval,
+		PoolLockHeld:      poolLockHeld,
 		HostTrustLockHeld: hostTrustLockHeld,
 	})
 	return err

@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -59,8 +60,12 @@ const (
 )
 
 type PoolConfig struct {
-	Instances  int
-	NamePrefix string
+	Instances                      int
+	NamePrefix                     string
+	ReplacementRetryInitialSeconds int
+	ReplacementRetryMaxSeconds     int
+	ReplacementRetryMultiplier     float64
+	ReplacementRetryJitterPercent  int
 }
 
 type LoggingConfig struct {
@@ -140,8 +145,12 @@ func Default() Config {
 			},
 		},
 		Pool: PoolConfig{
-			Instances:  1,
-			NamePrefix: "epar",
+			Instances:                      1,
+			NamePrefix:                     "epar",
+			ReplacementRetryInitialSeconds: 15,
+			ReplacementRetryMaxSeconds:     1800,
+			ReplacementRetryMultiplier:     2,
+			ReplacementRetryJitterPercent:  20,
 		},
 		Logging: LoggingConfig{
 			Directory:                "work/logs",
@@ -345,6 +354,30 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Pool.Instances = v
 		case "namePrefix", "vmPrefix":
 			cfg.Pool.NamePrefix = value
+		case "replacementRetryInitialSeconds":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryInitialSeconds: %w", err)
+			}
+			cfg.Pool.ReplacementRetryInitialSeconds = v
+		case "replacementRetryMaxSeconds":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryMaxSeconds: %w", err)
+			}
+			cfg.Pool.ReplacementRetryMaxSeconds = v
+		case "replacementRetryMultiplier":
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryMultiplier: %w", err)
+			}
+			cfg.Pool.ReplacementRetryMultiplier = v
+		case "replacementRetryJitterPercent":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryJitterPercent: %w", err)
+			}
+			cfg.Pool.ReplacementRetryJitterPercent = v
 		case "logDir":
 			return fmt.Errorf("pool.logDir is deprecated; use logging.directory")
 		default:
@@ -814,6 +847,18 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Pool.Instances < 1 {
 		return fmt.Errorf("pool.instances must be 1 or greater")
+	}
+	if cfg.Pool.ReplacementRetryInitialSeconds <= 0 {
+		return fmt.Errorf("pool.replacementRetryInitialSeconds must be greater than zero")
+	}
+	if cfg.Pool.ReplacementRetryMaxSeconds < cfg.Pool.ReplacementRetryInitialSeconds {
+		return fmt.Errorf("pool.replacementRetryMaxSeconds must be greater than or equal to pool.replacementRetryInitialSeconds")
+	}
+	if math.IsNaN(cfg.Pool.ReplacementRetryMultiplier) || math.IsInf(cfg.Pool.ReplacementRetryMultiplier, 0) || cfg.Pool.ReplacementRetryMultiplier < 1 {
+		return fmt.Errorf("pool.replacementRetryMultiplier must be 1 or greater")
+	}
+	if cfg.Pool.ReplacementRetryJitterPercent < 0 || cfg.Pool.ReplacementRetryJitterPercent > 100 {
+		return fmt.Errorf("pool.replacementRetryJitterPercent must be between 0 and 100")
 	}
 	if err := ValidatePrefix(cfg.Pool.NamePrefix); err != nil {
 		return err

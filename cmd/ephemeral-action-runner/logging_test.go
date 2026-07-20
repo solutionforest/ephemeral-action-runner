@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +46,9 @@ func TestLogsPathListAndPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	canonicalOldPath, err := filepath.EvalSymlinks(oldPath)
+	if runtime.GOOS == "windows" && errors.Is(err, fs.ErrPermission) {
+		canonicalOldPath, err = filepath.Abs(oldPath)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +114,63 @@ func TestWriteLastErrorReportUsesConfiguredDirectoryAndFallback(t *testing.T) {
 	fallback := writeLastErrorReport([]string{"start", "--project-root", fallbackRoot, "--config", "missing.yml"}, errors.New("fallback failure"))
 	if fallback != filepath.Join(fallbackRoot, "work", "logs", "epar-last-error.log") {
 		t.Fatalf("fallback report path = %q", fallback)
+	}
+}
+
+func TestWriteLastErrorReportRedactsSecretsAndRestrictsExistingFile(t *testing.T) {
+	root := t.TempDir()
+	configPath := writeLoggingCommandConfig(t, root, "custom-logs")
+	logRoot := filepath.Join(root, "custom-logs")
+	if err := os.MkdirAll(logRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lastPath := filepath.Join(logRoot, "epar-last-error.log")
+	if err := os.WriteFile(lastPath, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const sentinel = "registration-token-sentinel"
+	path := writeLastErrorReport(
+		[]string{"start", "--project-root", root, "--config", configPath},
+		errors.New("docker exec -e RUNNER_TOKEN="+sentinel+" failed"),
+	)
+	if path != lastPath {
+		t.Fatalf("report path = %q, want %q", path, lastPath)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), sentinel) {
+		t.Fatalf("last error report exposed sentinel token: %s", content)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("last error report mode = %#o, want 0600", got)
+		}
+	}
+	archives, err := filepath.Glob(filepath.Join(logRoot, "errors", "epar-*-error.log"))
+	if err != nil || len(archives) != 1 {
+		t.Fatalf("error archives = %v, err = %v", archives, err)
+	}
+	archiveContent, err := os.ReadFile(archives[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(archiveContent), sentinel) {
+		t.Fatalf("archived error report exposed sentinel token: %s", archiveContent)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(archives[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("archived error report mode = %#o, want 0600", got)
+		}
 	}
 }
 

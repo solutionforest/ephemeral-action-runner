@@ -22,6 +22,16 @@ When `docker.registryMirrors` is configured, EPAR writes `/etc/docker/daemon.jso
 
 `pool up` cleans up prefixed instances and GitHub runner records when it exits. Use `--keep-on-exit` only when intentionally debugging a live instance after the supervisor stops. While the supervisor is not running, EPAR cannot retire or replace completed runners.
 
+## Capacity, Reconciliation, and Outage Recovery
+
+`pool.instances` is a strict cap on prefix-owned local resources. EPAR counts provisioning, ready, draining, quarantined, and cleanup-pending instances, so a GitHub outage or a failed cleanup cannot create a replacement storm. Host-trust rotation has no temporary surge allowance; old busy-generation instances retain their slots until they finish or can be safely retired.
+
+Only one controller may mutate a given canonical config, provider, and `pool.namePrefix` at a time. If another EPAR controller holds that lock, stop or reconfigure the other controller instead of forcing concurrent starts; use a distinct unique prefix for intentionally independent pools.
+
+At startup and before allocating a replacement, EPAR reconciles the provider inventory with exact-name GitHub runner records. Healthy pairs are adopted, stopped or proven unregistered local resources are removed, and exact stale GitHub records are deleted when GitHub is reachable. When GitHub is unavailable, an ambiguous local instance is quarantined and continues to consume capacity instead of being deleted or replaced. If old resources already exceed the configured cap, the supervisor creates nothing until safe cleanup or normal draining restores capacity.
+
+For transient network failures and GitHub `429` or `5xx` responses during supervised replacement, EPAR pauses allocation and retries with exponential backoff. The default nominal delays are 15, 30, 60, 120, 240, 480, 960, and 1800 seconds, each with ±20% jitter; a longer `Retry-After` response wins. Monitoring and housekeeping continue during that pause, and a successful adoption or fully online replacement resets the delay. Startup remains fail-fast after compensating rollback, and invalid configuration or GitHub authentication failures do not retry indefinitely.
+
 ## Cleanup Safety
 
 Cleanup only touches local instances and GitHub runner records matching `pool.namePrefix`:
@@ -55,6 +65,8 @@ This section is a compact checklist. For symptom-first diagnostics with host/pro
 - If repeated jobs still pull slowly after configuring a registry mirror, verify the mirror is reachable from inside the runner instance and that it supports the requested registry, image platform, and authentication model. Docker daemon mirrors primarily target Docker Hub; other registry caches may require workflow image references to use the cache registry URL.
 - If a mirrored workflow only improves modestly, check where the time is going. Registry mirrors mainly reduce image pull time; container startup, Compose health checks, database initialization, volume sync, browser tests, private image authentication, and CPU-bound or emulated workloads can still dominate the total job time.
 - If GitHub registration fails, confirm the app has permission to manage organization self-hosted runners and that the private key path is readable by the host user.
+- If GitHub returns transient `500`, `502`, `503`, or `429` errors while the supervisor is replacing a runner, leave the supervisor running so it can retain the strict cap, reconcile exact runner names after recovery, and retry on its configured backoff. Do not manually start a second supervisor with the same `pool.namePrefix`.
+- If registration fails before the runner listener starts, EPAR rolls back the local candidate immediately and later reconciles a possible exact-name GitHub record. If the listener already started but GitHub readiness is uncertain, EPAR quarantines that candidate; inspect the instance transcript and wait for GitHub recovery before manually deleting it.
 - If stale runners remain, run `ephemeral-action-runner cleanup`.
 - If using Tart `softnet`, verify the host has the privileges Tart requires.
 - If default WSL image build fails before import, confirm Docker Desktop, Docker Engine, or another Docker daemon is reachable so EPAR can export `ghcr.io/catthehacker/ubuntu:full-latest` into a rootfs tar. For lean WSL configs, confirm the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.

@@ -38,6 +38,43 @@ func TestExecPassesInjectedTranscriptWriters(t *testing.T) {
 	}
 }
 
+func TestExecRedactsSensitiveValuesFromResultErrorAndSinks(t *testing.T) {
+	const secret = "sentinel-registration-token"
+	p := New("wsl.exe", t.TempDir(), t.TempDir(), false)
+	var stdout, stderr bytes.Buffer
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, gotStdout, gotStderr io.Writer, args ...string) (provider.ExecResult, error) {
+		_, _ = gotStdout.Write([]byte("stream " + secret))
+		_, _ = gotStderr.Write([]byte("RUNNER_TOKEN=" + secret))
+		return provider.ExecResult{Stdout: "result " + secret, Stderr: "SECRET=" + secret}, errors.New("wsl " + strings.Join(args, " ") + " failed with " + secret)
+	}
+	result, err := p.Exec(context.Background(), "runner", []string{"false"}, provider.ExecOptions{
+		Env:             map[string]string{"RUNNER_TOKEN": secret},
+		SensitiveValues: []string{secret},
+		Stdout:          &stdout,
+		Stderr:          &stderr,
+	})
+	combined := stdout.String() + stderr.String() + result.Stdout + result.Stderr + err.Error()
+	if strings.Contains(combined, secret) {
+		t.Fatalf("sensitive WSL exec leaked secret: %q", combined)
+	}
+}
+
+func TestExecRedactsSecretAssignmentsWithoutSensitiveValues(t *testing.T) {
+	const secret = "ordinary-sentinel"
+	p := New("wsl.exe", t.TempDir(), t.TempDir(), false)
+	var stdout, stderr bytes.Buffer
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, gotStdout, gotStderr io.Writer, _ ...string) (provider.ExecResult, error) {
+		_, _ = gotStdout.Write([]byte("PASSWORD=" + secret + "\n"))
+		_, _ = gotStderr.Write([]byte("SECRET=" + secret + "\n"))
+		return provider.ExecResult{Stdout: "TOKEN=" + secret, Stderr: "PRIVATE_KEY=" + secret}, errors.New("RUNNER_TOKEN=" + secret)
+	}
+	result, err := p.Exec(context.Background(), "runner", []string{"false"}, provider.ExecOptions{Stdout: &stdout, Stderr: &stderr})
+	combined := stdout.String() + stderr.String() + result.Stdout + result.Stderr + err.Error()
+	if strings.Contains(combined, secret) {
+		t.Fatalf("ordinary WSL exec leaked secret assignment: %q", combined)
+	}
+}
+
 func TestCommandConstruction(t *testing.T) {
 	p := New("wsl.exe", filepath.Join("C:", "ephemeral"), `D:\repo`, true)
 	installDir, err := p.instanceDir("epar-test-1")

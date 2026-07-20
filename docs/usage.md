@@ -273,7 +273,9 @@ go run ./cmd/ephemeral-action-runner pool up --instances 2
 
 `start` is the recommended public command because it also checks the image before starting runners. `pool up` is the lower-level supervisor command for users who already prepared the image.
 
-`pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement.
+`pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement. The requested count is a strict physical local-instance cap: provisioning, ready, draining, quarantined, and cleanup-pending resources all consume a slot, including old runners during host-trust rotation.
+
+When GitHub registration or readiness has a transient network, `429`, or `5xx` failure during supervised replacement, EPAR pauses allocation and retries with the configured exponential backoff while continuing monitoring and cleanup. It does not create extra candidates while remote state is uncertain; see [Configuration](configuration.md#common-edits) and [Operations](operations.md#capacity-reconciliation-and-outage-recovery) for retry settings and recovery steps.
 
 Stop the supervisor with Ctrl-C. By default, EPAR cleans up active instances and matching GitHub runner records before it exits.
 

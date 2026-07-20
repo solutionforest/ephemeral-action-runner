@@ -331,6 +331,8 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 		}
 		if found && runner.Busy {
 			m.infof("[%s] draining busy runner on old host trust generation %s\n", name, instance.HostTrustGeneration)
+			instance.Phase = LifecycleDraining
+			active[name] = instance
 			continue
 		}
 		reason := fmt.Sprintf("host trust generation changed from %s to %s", instance.HostTrustGeneration, current.Generation)
