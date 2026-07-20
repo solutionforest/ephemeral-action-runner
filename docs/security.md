@@ -4,6 +4,14 @@ EPAR is intended for trusted jobs by default. It adds cleanup and isolation arou
 
 GitHub's self-hosted runner warning still applies: GitHub recommends using self-hosted runners only with private repositories because public repository forks can run code on the runner machine through pull request workflows. Read the official GitHub guidance before exposing any self-hosted runner to public or untrusted workflows: [Adding self-hosted runners](https://docs.github.com/actions/hosting-your-own-runners/adding-self-hosted-runners).
 
+## Reporting A Vulnerability
+
+Security fixes are applied to the latest released version and the current default branch.
+
+Do not disclose suspected vulnerabilities in a public issue, discussion, pull request, or commit. Use this repository's private vulnerability reporting flow: open the **Security** tab, select **Report a vulnerability**, and provide a clear description, affected versions, reproduction steps or a proof of concept, and the potential impact.
+
+If private reporting is unavailable, contact a repository maintainer privately through GitHub and include the same information. We will acknowledge the report, investigate it, and coordinate a fix and disclosure timeline with you.
+
 ## What EPAR Improves
 
 Disposable instances reduce host pollution, stale runner state, and accidental cross-job interference. After a job completes, EPAR retires the instance and creates a replacement. For Docker-DinD, job-created containers, networks, volumes, and inner image cache live inside the runner container's private Docker daemon and are removed with that runner instance.
