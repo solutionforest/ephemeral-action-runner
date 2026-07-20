@@ -1,0 +1,162 @@
+name: Hosted runner Docker architecture proof
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths:
+      - .github/workflows/hosted-runner-docker-architecture.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-docker-architecture-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capability:
+    name: Capability (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-latest
+          - macos-15-intel
+
+    steps:
+      - name: Record host and Docker capability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $summary = [System.Collections.Generic.List[string]]::new()
+          $summary.Add("## $env:RUNNER_OS/$env:RUNNER_ARCH on ``${{ matrix.runner }}``")
+          $summary.Add('')
+          $summary.Add("- Runner OS: ``$env:RUNNER_OS``")
+          $summary.Add("- Runner architecture: ``$env:RUNNER_ARCH``")
+
+          $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
+          if (-not $dockerCommand) {
+            $summary.Add('- Docker CLI: not installed')
+            $summary.Add('- Linux container test: unavailable')
+          } else {
+            $summary.Add("- Docker CLI: ``$($dockerCommand.Source)``")
+            $versionOutput = (& docker version 2>&1 | Out-String).Trim()
+            $versionStatus = $LASTEXITCODE
+            $summary.Add("- Docker daemon reachable: ``$($versionStatus -eq 0)``")
+
+            if ($versionStatus -eq 0) {
+              $serverOS = (& docker info --format '{{.OSType}}' 2>&1 | Out-String).Trim()
+              $serverArchitecture = (& docker info --format '{{.Architecture}}' 2>&1 | Out-String).Trim()
+              $summary.Add("- Docker server: ``$serverOS/$serverArchitecture``")
+              if ($serverOS -eq 'linux') {
+                $summary.Add('- Linux container test: available')
+              } else {
+                $summary.Add('- Linux container test: unavailable because the reachable daemon is not a Linux daemon')
+              }
+            } else {
+              $summary.Add('- Linux container test: unavailable because no Docker daemon is reachable')
+              $summary.Add('')
+              $summary.Add('<details><summary>docker version diagnostic</summary>')
+              $summary.Add('')
+              $summary.Add('```text')
+              $summary.Add($versionOutput)
+              $summary.Add('```')
+              $summary.Add('</details>')
+            }
+          }
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $summary | ForEach-Object { Write-Host $_ }
+
+  linux-cross-architecture:
+    name: Linux ${{ matrix.native }} runs ${{ matrix.foreign }} with explicit QEMU
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            native: amd64
+            native_platform: linux/amd64
+            native_output: x86_64
+            foreign: arm64
+            foreign_platform: linux/arm64
+            foreign_output: aarch64
+          - runner: ubuntu-24.04-arm
+            native: arm64
+            native_platform: linux/arm64
+            native_output: aarch64
+            foreign: amd64
+            foreign_platform: linux/amd64
+            foreign_output: x86_64
+
+    steps:
+      - name: Verify native container execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker info --format 'Docker server: {{.OSType}}/{{.Architecture}}'
+          native_architecture="$(docker run --rm --platform '${{ matrix.native_platform }}' alpine:3.22 uname -m)"
+          echo "Native container reported: ${native_architecture}"
+          [[ "${native_architecture}" == '${{ matrix.native_output }}' ]]
+
+      - name: Observe foreign-architecture behavior before explicit QEMU setup
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          baseline_output="$(docker run --rm --platform '${{ matrix.foreign_platform }}' alpine:3.22 uname -m 2>&1)"
+          baseline_status=$?
+          set -e
+
+          printf '%s\n' "${baseline_output}"
+          {
+            echo '## ${{ matrix.foreign }} container before explicit QEMU setup'
+            echo
+            echo "- Exit status: \`${baseline_status}\`"
+            echo
+            echo '```text'
+            printf '%s\n' "${baseline_output}"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+          if [[ ${baseline_status} -eq 0 ]]; then
+            [[ "${baseline_output}" == *'${{ matrix.foreign_output }}'* ]]
+            echo 'This hosted image already had a compatible foreign-architecture execution path before the workflow configured QEMU.' >>"${GITHUB_STEP_SUMMARY}"
+          elif [[ "${baseline_output}" == *"exec format error"* ]]; then
+            echo 'The baseline failed with the expected missing-emulation error.' >>"${GITHUB_STEP_SUMMARY}"
+          else
+            echo 'The baseline failed for a reason other than a recognized architecture mismatch.' >&2
+            exit 1
+          fi
+
+      - name: Set up foreign-architecture container emulation
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: ${{ matrix.foreign }}
+
+      - name: Verify foreign-architecture container execution after QEMU setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          foreign_architecture="$(docker run --rm --platform '${{ matrix.foreign_platform }}' alpine:3.22 uname -m)"
+          echo "Emulated container reported: ${foreign_architecture}"
+          [[ "${foreign_architecture}" == '${{ matrix.foreign_output }}' ]]
+          {
+            echo '## ${{ matrix.foreign }} container after explicit QEMU setup'
+            echo
+            echo "- Reported architecture: \`${foreign_architecture}\`"
+            echo '- Result: success'
+          } >>"${GITHUB_STEP_SUMMARY}"

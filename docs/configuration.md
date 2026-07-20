@@ -182,7 +182,7 @@ For `provider.type: docker-dind`, EPAR defaults to Catthehacker's full Ubuntu ru
 
 For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
 
-For `provider.type: tart`, start from `configs/tart.example.yml` and adjust labels or image scripts as needed.
+For the experimental `provider.type: tart`, start from `configs/tart.example.yml` and adjust labels or image scripts as needed. Tart runners are ARM64 VMs on Apple Silicon; Rosetta-based amd64 container execution has compatibility limits and must be validated against the exact workflow.
 
 See the provider docs for details:
 

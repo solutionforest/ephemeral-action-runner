@@ -117,7 +117,7 @@ Docker-DinD is the default first choice. Other providers are available when they
 | --- | --- |
 | Docker-DinD | You have a Docker-compatible daemon on Windows, macOS, or Linux, and want a private Docker daemon per runner. |
 | WSL2 | You are on Windows and want runners as disposable WSL distros. |
-| Tart | You are on Apple Silicon macOS and want Linux VM runners; consider Docker-DinD first for Docker-heavy jobs because virtualization limits can affect compatibility. |
+| Tart (experimental) | You are on Apple Silicon macOS and want native ARM64 Linux VM runners. Rosetta-based amd64 container execution has compatibility limits; prefer Docker-DinD for Docker-heavy or amd64-dependent jobs. |
 
 WSL2 also defaults to Catthehacker's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
 
@@ -154,10 +154,11 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [GitHub App Setup](docs/github-app.md): required GitHub App permissions and fields.
 - [Docker-DinD Provider](docs/providers/docker-dind.md): default Docker runner mode.
 - [WSL Provider](docs/providers/wsl.md): Windows WSL2 runners.
-- [Tart Provider](docs/providers/tart.md): Apple Silicon Linux VM runners.
+- [Tart Provider (experimental)](docs/providers/tart.md): Apple Silicon ARM64 Linux VM runners and Rosetta compatibility limits.
 - [Image Build](docs/image-build.md): image internals and customization.
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
 - [Troubleshooting](docs/troubleshooting.md): symptom-first diagnostics by host and provider.
+- [Support](SUPPORT.md): where to start, what diagnostic information to collect, and where to ask for help.
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
 - [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
