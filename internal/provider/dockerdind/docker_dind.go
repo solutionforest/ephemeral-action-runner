@@ -72,7 +72,7 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 	if opts.Stdin != "" {
 		stdin = strings.NewReader(opts.Stdin)
 	}
-	return p.runWithLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, args...)
+	return p.runWithSensitiveLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, opts.SensitiveValues, args...)
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
@@ -199,11 +199,21 @@ func (p *Provider) run(ctx context.Context, stdin io.Reader, args ...string) (pr
 }
 
 func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, args ...string) (provider.ExecResult, error) {
+	return p.runWithSensitiveLog(ctx, stdin, logPath, stdoutSink, stderrSink, nil, args...)
+}
+
+func (p *Provider) runWithSensitiveLog(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, sensitiveValues []string, args ...string) (provider.ExecResult, error) {
+	bufferedStdout, bufferedStderr, flush := provider.BufferSensitiveSinks(sensitiveValues, stdoutSink, stderrSink)
+	result, err := p.runWithLogRaw(ctx, stdin, logPath, bufferedStdout, bufferedStderr, sensitiveValues, args...)
+	return provider.FinishSensitiveExecution(result, err, flush(), sensitiveValues)
+}
+
+func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, sensitiveValues []string, args ...string) (provider.ExecResult, error) {
 	if p.runCommand != nil {
 		return p.runCommand(ctx, stdin, logPath, stdoutSink, stderrSink, args...)
 	}
 	if p.DryRun {
-		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
+		fmt.Printf("[dry-run] %s %s\n", p.Binary, provider.RedactText(strings.Join(args, " "), sensitiveValues...))
 		return provider.ExecResult{}, nil
 	}
 	cmd := exec.CommandContext(ctx, p.Binary, args...)

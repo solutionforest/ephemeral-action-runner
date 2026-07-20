@@ -95,6 +95,43 @@ func TestExecArgsPreserveEnvAndStdin(t *testing.T) {
 	}
 }
 
+func TestExecRedactsSensitiveValuesFromResultErrorAndSinks(t *testing.T) {
+	const secret = "sentinel-registration-token"
+	p := New("docker", "", false)
+	var stdout, stderr bytes.Buffer
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, gotStdout, gotStderr io.Writer, args ...string) (provider.ExecResult, error) {
+		_, _ = gotStdout.Write([]byte("stream " + secret))
+		_, _ = gotStderr.Write([]byte("RUNNER_TOKEN=" + secret))
+		return provider.ExecResult{Stdout: "result " + secret, Stderr: "SECRET=" + secret}, errors.New("docker " + strings.Join(args, " ") + " failed with " + secret)
+	}
+	result, err := p.Exec(context.Background(), "runner", []string{"false"}, provider.ExecOptions{
+		Env:             map[string]string{"RUNNER_TOKEN": secret},
+		SensitiveValues: []string{secret},
+		Stdout:          &stdout,
+		Stderr:          &stderr,
+	})
+	combined := stdout.String() + stderr.String() + result.Stdout + result.Stderr + err.Error()
+	if strings.Contains(combined, secret) {
+		t.Fatalf("sensitive Docker exec leaked secret: %q", combined)
+	}
+}
+
+func TestExecRedactsSecretAssignmentsWithoutSensitiveValues(t *testing.T) {
+	const secret = "ordinary-sentinel"
+	p := New("docker", "", false)
+	var stdout, stderr bytes.Buffer
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, gotStdout, gotStderr io.Writer, _ ...string) (provider.ExecResult, error) {
+		_, _ = gotStdout.Write([]byte("PASSWORD=" + secret + "\n"))
+		_, _ = gotStderr.Write([]byte("SECRET=" + secret + "\n"))
+		return provider.ExecResult{Stdout: "TOKEN=" + secret, Stderr: "PRIVATE_KEY=" + secret}, errors.New("RUNNER_TOKEN=" + secret)
+	}
+	result, err := p.Exec(context.Background(), "runner", []string{"false"}, provider.ExecOptions{Stdout: &stdout, Stderr: &stderr})
+	combined := stdout.String() + stderr.String() + result.Stdout + result.Stderr + err.Error()
+	if strings.Contains(combined, secret) {
+		t.Fatalf("ordinary Docker exec leaked secret assignment: %q", combined)
+	}
+}
+
 func TestListParsesDockerPSOutput(t *testing.T) {
 	p := New("docker", "", false)
 	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {

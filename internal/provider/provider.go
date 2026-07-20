@@ -28,11 +28,12 @@ type RunningProcess struct {
 }
 
 type ExecOptions struct {
-	Stdin   string
-	Env     map[string]string
-	LogPath string
-	Stdout  io.Writer
-	Stderr  io.Writer
+	Stdin           string
+	Env             map[string]string
+	SensitiveValues []string
+	LogPath         string
+	Stdout          io.Writer
+	Stderr          io.Writer
 }
 
 type ExecResult struct {

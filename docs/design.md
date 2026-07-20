@@ -59,6 +59,12 @@ sequenceDiagram
 
 `pool up --instances 2` keeps two runners available in the foreground. Replacement names use `pool.namePrefix` plus a timestamp and sequence suffix, for example `epar-20260703-010530-003`.
 
+The supervisor tracks every prefix-owned local resource as provisioning, ready, draining, quarantined, or cleanup-pending. All five states count against `pool.instances`, which is an absolute physical-instance cap. A cleanup failure, unknown remote state, or busy runner therefore blocks allocation rather than allowing a capacity surge; host-trust rotation follows the same rule.
+
+Reconciliation runs at startup and before each replacement allocation. It adopts healthy exact-name local/GitHub pairs, deletes proven stopped or unregistered local resources, and deletes exact stale GitHub records when GitHub is reachable. A pre-listener provisioning failure is locally rolled back immediately and queued for later exact-name GitHub reconciliation because registration may have partially succeeded. After the listener starts, uncertain GitHub readiness becomes quarantine rather than deletion until the remote state can be resolved.
+
+Supervised replacement treats network errors and GitHub HTTP `429` or `5xx` responses as transient: allocation pauses behind the configured exponential retry policy while monitoring and cleanup continue. A fully online replacement or successful adoption resets the retry delay. Initial pool startup remains fail-fast after safe rollback, and authentication or deterministic configuration failures are terminal rather than retryable.
+
 ## Liveness Model
 
 The foreground supervisor checks each instance every 15 seconds by default. A runner is considered healthy when:

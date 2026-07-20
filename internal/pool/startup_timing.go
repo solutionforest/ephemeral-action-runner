@@ -5,13 +5,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
-)
 
-var timingSecretPattern = regexp.MustCompile(`(?i)((?:runner_)?token|password|secret|private[_-]?key)=\S+`)
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+)
 
 type startupTimingEvent struct {
 	Timestamp string `json:"timestamp"`
@@ -190,10 +189,7 @@ func startupTimingLabel(provider string) string {
 }
 
 func sanitizeTimingError(err error) string {
-	text := strings.Join(strings.Fields(err.Error()), " ")
-	text = timingSecretPattern.ReplaceAllStringFunc(text, func(match string) string {
-		return match[:strings.Index(match, "=")+1] + "[REDACTED]"
-	})
+	text := provider.RedactText(strings.Join(strings.Fields(err.Error()), " "))
 	if len(text) > 500 {
 		return text[:500] + "..."
 	}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -77,6 +78,18 @@ image:
 	}
 	if got, want := cfg.Pool.Instances, 3; got != want {
 		t.Fatalf("pool.instances = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryInitialSeconds, 15; got != want {
+		t.Fatalf("pool.replacementRetryInitialSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMaxSeconds, 1800; got != want {
+		t.Fatalf("pool.replacementRetryMaxSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMultiplier, 2.0; got != want {
+		t.Fatalf("pool.replacementRetryMultiplier = %v, want %v", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryJitterPercent, 20; got != want {
+		t.Fatalf("pool.replacementRetryJitterPercent = %d, want %d", got, want)
 	}
 	if got, want := len(cfg.Image.CustomInstallScripts), 2; got != want {
 		t.Fatalf("custom install scripts = %d, want %d", got, want)
@@ -896,6 +909,106 @@ func TestValidateRejectsInvalidPoolInstances(t *testing.T) {
 	cfg.Pool.Instances = 0
 	if err := Validate(cfg); err == nil {
 		t.Fatal("pool.instances=0 accepted")
+	}
+}
+
+func TestLoadPoolReplacementRetryConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+pool:
+  replacementRetryInitialSeconds: 12
+  replacementRetryMaxSeconds: 720
+  replacementRetryMultiplier: 1.5
+  replacementRetryJitterPercent: 0
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Pool.ReplacementRetryInitialSeconds, 12; got != want {
+		t.Fatalf("pool.replacementRetryInitialSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMaxSeconds, 720; got != want {
+		t.Fatalf("pool.replacementRetryMaxSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMultiplier, 1.5; got != want {
+		t.Fatalf("pool.replacementRetryMultiplier = %v, want %v", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryJitterPercent, 0; got != want {
+		t.Fatalf("pool.replacementRetryJitterPercent = %d, want %d", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateRejectsInvalidPoolReplacementRetryConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "initial retry delay is not positive",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryInitialSeconds = 0 },
+		},
+		{
+			name:   "maximum retry delay is below initial delay",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryMaxSeconds = cfg.Pool.ReplacementRetryInitialSeconds - 1 },
+		},
+		{
+			name:   "retry multiplier is below one",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryMultiplier = 0.5 },
+		},
+		{
+			name:   "retry multiplier is not finite",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryMultiplier = math.NaN() },
+		},
+		{
+			name:   "retry jitter is below zero",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryJitterPercent = -1 },
+		},
+		{
+			name:   "retry jitter exceeds one hundred percent",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryJitterPercent = 101 },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			test.mutate(&cfg)
+			if err := Validate(cfg); err == nil {
+				t.Fatal("Validate accepted invalid replacement retry configuration")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidPoolReplacementRetryValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "initial retry delay", key: "replacementRetryInitialSeconds", value: "invalid"},
+		{name: "maximum retry delay", key: "replacementRetryMaxSeconds", value: "invalid"},
+		{name: "retry multiplier", key: "replacementRetryMultiplier", value: "invalid"},
+		{name: "retry jitter", key: "replacementRetryJitterPercent", value: "invalid"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yml")
+			content := "pool:\n  " + test.key + ": " + test.value + "\n"
+			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load accepted invalid replacement retry value")
+			}
+		})
 	}
 }
 

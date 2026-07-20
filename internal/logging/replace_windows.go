@@ -3,16 +3,33 @@
 package logging
 
 import (
-	"errors"
-	"os"
+	"syscall"
+	"unsafe"
 )
 
+const (
+	moveFileReplaceExisting = 0x00000001
+	moveFileWriteThrough    = 0x00000008
+)
+
+var moveFileEx = syscall.NewLazyDLL("kernel32.dll").NewProc("MoveFileExW")
+
 func replaceFile(source, destination string) error {
-	if err := os.Rename(source, destination); err == nil {
-		return nil
-	}
-	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
+	sourcePath, err := syscall.UTF16PtrFromString(source)
+	if err != nil {
 		return err
 	}
-	return os.Rename(source, destination)
+	destinationPath, err := syscall.UTF16PtrFromString(destination)
+	if err != nil {
+		return err
+	}
+	result, _, callErr := moveFileEx.Call(
+		uintptr(unsafe.Pointer(sourcePath)),
+		uintptr(unsafe.Pointer(destinationPath)),
+		moveFileReplaceExisting|moveFileWriteThrough,
+	)
+	if result == 0 {
+		return callErr
+	}
+	return nil
 }

@@ -52,21 +52,21 @@ func writeLastErrorReport(args []string, runErr error) string {
 		return ""
 	}
 	now := time.Now().UTC()
-	content := fmt.Sprintf(`EPAR failed
+	content := provider.RedactText(fmt.Sprintf(`EPAR failed
 time: %s
 workingDirectory: %s
 command: %q
 
 %s
 error: %v
-`, now.Format(time.RFC3339), cwd, os.Args, versionString(), runErr)
+`, now.Format(time.RFC3339), cwd, os.Args, versionString(), runErr))
 
 	lastPath := logging.LastErrorPath(logDir)
-	if err := os.WriteFile(lastPath, []byte(content), 0644); err != nil {
+	if err := logging.WritePrivateFileAtomic(lastPath, []byte(content)); err != nil {
 		return ""
 	}
 	stampedPath := logging.ErrorPath(logDir, now)
-	_ = os.WriteFile(stampedPath, []byte(content), 0644)
+	_ = logging.WritePrivateFileAtomic(stampedPath, []byte(content))
 	return lastPath
 }
 
@@ -232,6 +232,11 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		controllerLock, err := m.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		defer controllerLock.Close()
 		return m.UpdateUpstream(context.Background())
 	case "build":
 		fs := flag.NewFlagSet("image build", flag.ExitOnError)
@@ -248,13 +253,17 @@ func runImage(args []string) error {
 		}
 		defer m.Close()
 		ctx := interruptContext()
-		controllerLock, err := m.AcquireHostTrustControllerLock()
+		poolControllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
 			return err
 		}
-		defer m.Close()
-		if controllerLock != nil {
-			defer controllerLock.Close()
+		defer poolControllerLock.Close()
+		hostTrustControllerLock, err := m.AcquireHostTrustControllerLock()
+		if err != nil {
+			return err
+		}
+		if hostTrustControllerLock != nil {
+			defer hostTrustControllerLock.Close()
 		}
 		if *update {
 			if err := m.UpdateUpstream(ctx); err != nil {
@@ -273,6 +282,11 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		controllerLock, err := m.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		defer controllerLock.Close()
 		return m.RefreshScripts(interruptContext())
 	default:
 		return fmt.Errorf("unknown image subcommand %q", args[0])

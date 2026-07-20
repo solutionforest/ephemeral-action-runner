@@ -481,6 +481,10 @@ image:
 pool:
   instances: 1
   namePrefix: %s
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
 logging:
   directory: work/logs
   managerSinks: [console]
@@ -545,6 +549,10 @@ pool:
   instances: 1
   # Must be unique for this machine/config within the GitHub organization.
   namePrefix: %s
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
 logging:
   directory: work/logs
   managerSinks: [console]

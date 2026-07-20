@@ -220,6 +220,62 @@ exit 0
 	}
 }
 
+func TestConfigureRunnerReadsTokenFromStdin(t *testing.T) {
+	const secret = "sentinel-registration-token"
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "config.args")
+	for name, content := range map[string]string{
+		"sudo": `#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then
+  shift 2
+fi
+exec "$@"
+`,
+		"config.sh": `#!/usr/bin/env bash
+printf '%s\n' "$@" >"${EPAR_CONFIG_ARGS_FILE}"
+`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	script := filepath.ToSlash(filepath.Join("..", "..", "scripts", "guest", "ubuntu", "configure-runner.sh"))
+	cmd := exec.Command(gitBashForRunnerScriptTest(t), script)
+	cmd.Stdin = strings.NewReader(secret + "\n")
+	cmd.Env = append(os.Environ(),
+		"RUNNER_URL=https://github.test/example",
+		"RUNNER_NAME=epar-test",
+		"RUNNER_LABELS=self-hosted",
+		"EPAR_ACTIONS_RUNNER_DIR="+bashPath(dir),
+		"EPAR_CONFIG_ARGS_FILE="+bashPath(argsFile),
+		"PATH="+bashPath(dir)+":"+os.Getenv("PATH"),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("configure-runner stdin token path failed: %v\n%s", err, out)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--token\n"+secret+"\n") {
+		t.Fatalf("config.sh arguments did not receive stdin token: %q", args)
+	}
+
+	cmd = exec.Command(gitBashForRunnerScriptTest(t), script)
+	cmd.Env = append(os.Environ(),
+		"RUNNER_URL=https://github.test/example",
+		"RUNNER_NAME=epar-test",
+		"RUNNER_LABELS=self-hosted",
+		"EPAR_ACTIONS_RUNNER_DIR="+bashPath(dir),
+		"PATH="+bashPath(dir)+":"+os.Getenv("PATH"),
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "must be provided as one nonempty line on stdin") {
+		t.Fatalf("configure-runner empty stdin error = %v, output = %q", err, out)
+	}
+}
+
 func requireLinuxProc(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -582,7 +638,7 @@ func TestCollectRunnerDiagnosticsValidatesTailLines(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			command := fmt.Sprintf("EPAR_DIAGNOSTIC_TAIL_LINES=%s exec bash %s", tc.value, script)
-			cmd := exec.Command("bash", "-c", command)
+			cmd := exec.Command(gitBashForRunnerScriptTest(t), "-c", command)
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("collect-runner-diagnostics.sh failed: %v\n%s", err, out)

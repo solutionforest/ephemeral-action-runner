@@ -64,6 +64,18 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Pool.NamePrefix, "build-box-01-a4f9c2"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
+	if got, want := cfg.Pool.ReplacementRetryInitialSeconds, 15; got != want {
+		t.Fatalf("pool.replacementRetryInitialSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMaxSeconds, 1800; got != want {
+		t.Fatalf("pool.replacementRetryMaxSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMultiplier, 2.0; got != want {
+		t.Fatalf("pool.replacementRetryMultiplier = %v, want %v", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryJitterPercent, 20; got != want {
+		t.Fatalf("pool.replacementRetryJitterPercent = %d, want %d", got, want)
+	}
 	if got, want := cfg.Logging.Directory, "work/logs"; got != want {
 		t.Fatalf("logging.directory = %q, want %q", got, want)
 	}
@@ -73,6 +85,9 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(configText), "logging:\n  directory: work/logs\n  managerSinks: [console]\n") {
 		t.Fatalf("generated config did not include logging schema:\n%s", configText)
+	}
+	if !strings.Contains(string(configText), "replacementRetryInitialSeconds: 15\n  replacementRetryMaxSeconds: 1800\n  replacementRetryMultiplier: 2\n  replacementRetryJitterPercent: 20\n") {
+		t.Fatalf("generated config did not include replacement retry settings:\n%s", configText)
 	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-catthehacker-ubuntu") {
 		t.Fatalf("runner labels = %q", got)

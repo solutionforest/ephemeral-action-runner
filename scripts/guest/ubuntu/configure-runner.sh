@@ -2,14 +2,19 @@
 set -euo pipefail
 
 : "${RUNNER_URL:?RUNNER_URL is required}"
-: "${RUNNER_TOKEN:?RUNNER_TOKEN is required}"
 : "${RUNNER_NAME:?RUNNER_NAME is required}"
 : "${RUNNER_LABELS:?RUNNER_LABELS is required}"
 RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-true}"
 RUNNER_GROUP="${RUNNER_GROUP:-}"
 RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-false}"
+EPAR_ACTIONS_RUNNER_DIR="${EPAR_ACTIONS_RUNNER_DIR:-/opt/actions-runner}"
 
-cd /opt/actions-runner
+if ! IFS= read -r RUNNER_TOKEN || [[ -z "${RUNNER_TOKEN}" ]]; then
+  echo "RUNNER_TOKEN must be provided as one nonempty line on stdin" >&2
+  exit 1
+fi
+
+cd "${EPAR_ACTIONS_RUNNER_DIR}"
 if [[ -f .runner ]]; then
   sudo -u runner ./config.sh remove --token "${RUNNER_TOKEN}" || true
 fi
