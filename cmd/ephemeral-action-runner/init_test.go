@@ -412,7 +412,7 @@ func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
 		ProjectRoot:        dir,
 		ConfigPath:         path,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		In:                 strings.NewReader("654321\nexample\n.local/github-app.pem\n2\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -427,8 +427,8 @@ func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantText := strings.NewReplacer(
-		"appId: 123456", "appId: 123456",
-		"organization: your-org", "organization: solutionforest",
+		"appId: 123456", "appId: 654321",
+		"organization: your-org", "organization: example",
 		"privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem", "privateKeyPath: .local/github-app.pem",
 		"namePrefix: CHANGE-ME-unique-machine-prefix", "namePrefix: build-box-01-a4f9c2",
 	).Replace(string(want))
