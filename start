@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Uses local Go if present. Otherwise runs EPAR from source inside a
 # containerized Go toolchain via `go run` (no local Go install needed, and
-# no binary is built or left on disk). Docker is required either way.
+# no binary is built or left on disk). The containerized fallback requires Docker.
 # See docs/advanced/no-go-install.md.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"

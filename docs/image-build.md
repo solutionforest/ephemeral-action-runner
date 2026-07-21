@@ -9,6 +9,9 @@ For Tart, the image build has two image names:
 
 These are Tart VM image names. They are stored in Tart's local VM registry and are visible with `tart list`; they are not emitted as repository-local files.
 
+> [!WARNING]
+> Tart support is experimental, and its default source is a basic Ubuntu ARM64 OS image rather than a GitHub-hosted runner image. It does not include the usual dependency inventory from [`actions/runner-images`](https://github.com/actions/runner-images). For a GitHub-runner-like Tart environment, adapt those upstream build scripts to produce and maintain your own bootable Tart VM image, then configure EPAR to use it; EPAR does not automate that image conversion.
+
 For WSL, the image build produces a rootfs tar. It can start from either a Docker image or an existing rootfs tar:
 
 - `image.sourceType`: `docker-image` or `rootfs-tar`, default `docker-image` for WSL.
