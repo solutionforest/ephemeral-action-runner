@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"io"
+	"math"
 	"runtime"
 	"sync"
 
@@ -58,7 +59,14 @@ func windowsConsoleLineEndingsAfter(data []byte, previousCR bool) []byte {
 	if !bytes.Contains(data, []byte{'\n'}) {
 		return data
 	}
-	normalized := make([]byte, 0, len(data)+bytes.Count(data, []byte{'\n'}))
+	insertionCount := windowsConsoleLineEndingInsertions(data, previousCR)
+	capacity, ok := windowsConsoleLineEndingCapacity(len(data), insertionCount)
+	if !ok {
+		// The normalized slice cannot be represented by an int. Preserve the
+		// original output instead of overflowing the allocation size.
+		return data
+	}
+	normalized := make([]byte, 0, capacity)
 	for index, value := range data {
 		precededByCR := index > 0 && data[index-1] == '\r' || index == 0 && previousCR
 		if value == '\n' && !precededByCR {
@@ -67,4 +75,22 @@ func windowsConsoleLineEndingsAfter(data []byte, previousCR bool) []byte {
 		normalized = append(normalized, value)
 	}
 	return normalized
+}
+
+func windowsConsoleLineEndingCapacity(dataLength, insertionCount int) (int, bool) {
+	if insertionCount > math.MaxInt-dataLength {
+		return dataLength, false
+	}
+	return dataLength + insertionCount, true
+}
+
+func windowsConsoleLineEndingInsertions(data []byte, previousCR bool) int {
+	insertionCount := 0
+	for index, value := range data {
+		precededByCR := index > 0 && data[index-1] == '\r' || index == 0 && previousCR
+		if value == '\n' && !precededByCR {
+			insertionCount++
+		}
+	}
+	return insertionCount
 }
