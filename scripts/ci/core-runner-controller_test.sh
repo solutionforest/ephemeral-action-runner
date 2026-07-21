@@ -167,7 +167,7 @@ if [[ " $* " == *" pool up "* ]]; then
       fi
       shift
     done
-    log_dir="$(sed -n 's/^  logDir: //p' "${config_path}")"
+    log_dir="$(sed -n 's/^  directory: //p' "${config_path}")"
     mkdir -p "${log_dir}"
     {
       echo 'guest safe diagnostic'

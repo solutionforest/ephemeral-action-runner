@@ -1,3 +1,5 @@
+# Experimental: this default is a basic Ubuntu ARM64 Tart VM, not a GitHub-hosted runner image.
+# It does not include the broad dependency set from https://github.com/actions/runner-images.
 github:
   appId: 123456
   organization: your-org
@@ -18,7 +20,29 @@ pool:
   instances: 1
   # Must be unique for this machine/config within the GitHub organization.
   namePrefix: CHANGE-ME-unique-machine-prefix
-  logDir: work/logs
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-base]

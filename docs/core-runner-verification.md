@@ -50,9 +50,7 @@ cannot accept them.
 
 ### GitHub App and protected environment
 
-The GitHub App must be installed in the target organization and have
-organization self-hosted-runner read/write permission. Create a GitHub Actions
-environment named `epar-live-ci`, restrict it to trusted branches, and add:
+The GitHub App must be installed in the target organization and have organization self-hosted-runner read/write permission. Create a GitHub Actions environment named `epar-live-ci`, choose **Selected branches and tags**, allow `develop`, `main`, and `refs/pull/*/merge`, and add:
 
 | Kind | Name | Value |
 | --- | --- | --- |
@@ -65,17 +63,11 @@ not store it in repository variables, workflow YAML, a tracked config file, or
 an artifact. The workflow materializes it in a mode-restricted temporary file
 on the controller and removes that file during cleanup.
 
-For the initial feature-branch test, allow
-`feature/level-1-core-runner-verification`. Allow `develop` for the ongoing push
-trigger. Requiring an environment reviewer is possible, but every matching
-push will wait for that approval.
+Requiring an environment reviewer is possible, but every matching push and same-repository pull request will wait for that approval.
 
 ## Trust Boundaries and Triggers
 
-The controller job is privileged and secret-bearing. It receives the GitHub
-App key and a workflow token with Actions write permission, and it can start
-privileged containers in its disposable GitHub-hosted VM. It runs only for
-trusted repository changes and never for pull-request events.
+The controller job is privileged and secret-bearing. It receives the GitHub App key and a workflow token with Actions write permission, and it can start privileged containers in its disposable GitHub-hosted VM. It runs only for trusted repository changes: pushes to `develop` or `main`, and pull requests whose source branch is in this repository. Fork pull requests still trigger the workflow, but all three core-verification jobs skip before they can receive environment secrets or run on the canary group.
 
 The two canary jobs do not receive the GitHub App key. They receive only the
 minimum workflow permissions needed for checkout and artifact operations, and
@@ -84,15 +76,11 @@ container.
 
 The workflow runs on:
 
-- pushes to `feature/level-1-core-runner-verification` during initial rollout
-- pushes to `develop`
-- manual `workflow_dispatch` after the workflow is present on the repository's
-  default branch
+- pull requests targeting `develop` or `main` (fork pull requests still trigger this workflow, but core-verification jobs run only when the source branch belongs to this repository)
+- pushes to `develop` or `main`
+- manual `workflow_dispatch` after the workflow is present on the repository's default branch
 
-It intentionally has no `pull_request` or `pull_request_target` trigger. Do not
-add one: code from an untrusted pull request must not reach the controller,
-environment secrets, or privileged Docker host. Remove the temporary feature
-branch trigger after the initial rollout is complete.
+The workflow does not use `pull_request_target`. Keep the same-repository job guard on every core-verification job so code from a forked pull request cannot reach the controller, environment secrets, or privileged Docker host.
 
 ## Expected Result and Cleanup
 

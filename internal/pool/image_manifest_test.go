@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,10 +188,12 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 	oldLogged := runHostLoggedCommand
 	oldOutput := runHostOutputCommand
 	oldQuiet := runHostQuietCommand
+	oldPull := pullDockerSourceCommand
 	t.Cleanup(func() {
 		runHostLoggedCommand = oldLogged
 		runHostOutputCommand = oldOutput
 		runHostQuietCommand = oldQuiet
+		pullDockerSourceCommand = oldPull
 	})
 	root := t.TempDir()
 	outputPath := filepath.Join(root, "work", "images", "epar-wsl-catthehacker-ubuntu.tar")
@@ -212,7 +215,7 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 	}
 
 	var calls []string
-	runHostLoggedCommand = func(_ context.Context, _ string, name string, args ...string) error {
+	runHostLoggedCommand = func(_ context.Context, _ string, _, _ io.Writer, name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		if len(args) > 0 && args[0] == "export" {
 			for i := 0; i+1 < len(args); i++ {
@@ -227,6 +230,10 @@ func TestPrepareWSLDockerSourceRootfsInvalidatesMismatchedCache(t *testing.T) {
 		return `["ImageVersion=20260707.1"]`, nil
 	}
 	runHostQuietCommand = func(context.Context, string, ...string) error {
+		return nil
+	}
+	pullDockerSourceCommand = func(_ *Manager, _ context.Context, opts dockerSourcePullOptions) error {
+		calls = append(calls, "docker pull "+opts.Image)
 		return nil
 	}
 

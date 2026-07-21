@@ -64,6 +64,31 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if got, want := cfg.Pool.NamePrefix, "build-box-01-a4f9c2"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
+	if got, want := cfg.Pool.ReplacementRetryInitialSeconds, 15; got != want {
+		t.Fatalf("pool.replacementRetryInitialSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMaxSeconds, 1800; got != want {
+		t.Fatalf("pool.replacementRetryMaxSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMultiplier, 2.0; got != want {
+		t.Fatalf("pool.replacementRetryMultiplier = %v, want %v", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryJitterPercent, 20; got != want {
+		t.Fatalf("pool.replacementRetryJitterPercent = %d, want %d", got, want)
+	}
+	if got, want := cfg.Logging.Directory, "work/logs"; got != want {
+		t.Fatalf("logging.directory = %q, want %q", got, want)
+	}
+	configText, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configText), "logging:\n  directory: work/logs\n  managerSinks: [console]\n") {
+		t.Fatalf("generated config did not include logging schema:\n%s", configText)
+	}
+	if !strings.Contains(string(configText), "replacementRetryInitialSeconds: 15\n  replacementRetryMaxSeconds: 1800\n  replacementRetryMultiplier: 2\n  replacementRetryJitterPercent: 20\n") {
+		t.Fatalf("generated config did not include replacement retry settings:\n%s", configText)
+	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-catthehacker-ubuntu") {
 		t.Fatalf("runner labels = %q", got)
 	}
@@ -370,6 +395,80 @@ func TestInitWSL2ChoiceDefaultsToDockerDindAndRepromptsInvalidValues(t *testing.
 	}
 }
 
+func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubTartAvailable(t)
+	oldDockerAvailable := dockerAvailable
+	dockerAvailable = func(context.Context) error {
+		t.Fatal("Docker availability should not be checked for Tart")
+		return nil
+	}
+	t.Cleanup(func() { dockerAvailable = oldDockerAvailable })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("654321\nexample\n.local/github-app.pem\n2\n\n"),
+		Out:                &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("..", "..", "configs", "tart.example.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantText := strings.NewReplacer(
+		"appId: 123456", "appId: 654321",
+		"organization: your-org", "organization: example",
+		"privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem", "privateKeyPath: .local/github-app.pem",
+		"namePrefix: CHANGE-ME-unique-machine-prefix", "namePrefix: build-box-01-a4f9c2",
+	).Replace(string(want))
+	wantText = strings.ReplaceAll(wantText, "\r\n", "\n")
+	if string(got) != wantText {
+		t.Fatalf("Tart config did not match configs/tart.example.yml:\nwant:\n%s\ngot:\n%s", wantText, got)
+	}
+	if !strings.Contains(out.String(), "2. Tart (experimental)") {
+		t.Fatalf("init output did not offer Tart:\n%s", out.String())
+	}
+}
+
+func TestTartAvailabilityRequiresNativeMacOSAndSuccessfulVersion(t *testing.T) {
+	oldGOOS := initGOOS
+	oldTartVersion := initTartVersion
+	t.Cleanup(func() {
+		initGOOS = oldGOOS
+		initTartVersion = oldTartVersion
+	})
+
+	initGOOS = "darwin"
+	initTartVersion = func(context.Context) error { return nil }
+	if !tartAvailable() {
+		t.Fatal("tartAvailable() = false when tart --version succeeds on macOS")
+	}
+	initTartVersion = func(context.Context) error { return errors.New("tart unavailable") }
+	if tartAvailable() {
+		t.Fatal("tartAvailable() = true when tart --version fails")
+	}
+
+	initGOOS = "linux"
+	initTartVersion = func(context.Context) error {
+		t.Fatal("tart --version should not run outside native macOS")
+		return nil
+	}
+	if tartAvailable() {
+		t.Fatal("tartAvailable() = true outside native macOS")
+	}
+}
+
 func TestWSL2AvailabilityRequiresNativeWindowsSuccessfulVersion2Status(t *testing.T) {
 	stubWSL2Available(t)
 	for _, test := range []struct {
@@ -483,5 +582,17 @@ func stubWSL2Available(t *testing.T) {
 	t.Cleanup(func() {
 		initGOOS = oldGOOS
 		initWSLStatus = oldWSLStatus
+	})
+}
+
+func stubTartAvailable(t *testing.T) {
+	t.Helper()
+	oldGOOS := initGOOS
+	oldTartVersion := initTartVersion
+	initGOOS = "darwin"
+	initTartVersion = func(context.Context) error { return nil }
+	t.Cleanup(func() {
+		initGOOS = oldGOOS
+		initTartVersion = oldTartVersion
 	})
 }

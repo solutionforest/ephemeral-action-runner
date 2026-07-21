@@ -4,9 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,20 +20,27 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
 type Manager struct {
-	Config      config.Config
-	Provider    provider.Provider
-	GitHub      GitHubClient
-	ProjectRoot string
-	ConfigPath  string
-	DryRun      bool
+	Config        config.Config
+	Provider      provider.Provider
+	GitHub        GitHubClient
+	ProjectRoot   string
+	ConfigPath    string
+	DryRun        bool
+	Logging       *logging.Runtime
+	startupTiming *startupTiming
+	transcriptMu  sync.Mutex
+	transcripts   map[string]*logging.Transcript
 
 	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
 	hostTrustImageMu      sync.Mutex
+	now                   func() time.Time
+	randomFloat64         func() float64
 }
 
 type GitHubClient interface {
@@ -54,7 +67,18 @@ type RunOptions struct {
 	ReplaceCompleted  bool
 	MonitorInterval   time.Duration
 	HostTrustLockHeld bool
+	PoolLockHeld      bool
 }
+
+type LifecyclePhase string
+
+const (
+	LifecycleProvisioning   LifecyclePhase = "provisioning"
+	LifecycleReady          LifecyclePhase = "ready"
+	LifecycleDraining       LifecyclePhase = "draining"
+	LifecycleQuarantined    LifecyclePhase = "quarantined"
+	LifecycleCleanupPending LifecyclePhase = "cleanup-pending"
+)
 
 type ProvisionedInstance struct {
 	Name                string
@@ -63,10 +87,12 @@ type ProvisionedInstance struct {
 	GuestLogPath        string
 	RunnerID            int64
 	HostTrustGeneration string
+	Phase               LifecyclePhase
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
 var runnerReadinessHealthCheckInterval = 2 * time.Second
+var dependencyHTTPStatusPattern = regexp.MustCompile(`(?i)(?:status code does not indicate success|http response code)\s*:\s*([0-9]{3})`)
 
 const (
 	cleanupTimeout                    = 5 * time.Minute
@@ -75,6 +101,11 @@ const (
 )
 
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
+	poolLock, err := m.AcquirePoolControllerLock()
+	if err != nil {
+		return err
+	}
+	defer poolLock.Close()
 	controllerLock, err := m.acquireHostTrustControllerLock()
 	if err != nil {
 		return err
@@ -84,12 +115,11 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	}
 	opts.Instances = m.requestedInstances(opts.Instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, opts.Instances, time.Now())
-	fmt.Printf("verifying %d instance(s): %s\n", opts.Instances, strings.Join(names, ", "))
-	fmt.Printf("source image: %s\n", m.Config.Provider.SourceImage)
+	m.logger().Info("verifying instances", "provider", m.Config.Provider.Type, "operation", "verify", "instances", opts.Instances, "instanceNames", strings.Join(names, ", "), "sourceImage", m.Config.Provider.SourceImage)
 	if opts.RegisterOnly {
-		fmt.Printf("registration: GitHub ephemeral runners for %s\n", m.Config.GitHub.Organization)
+		m.infof("registration: GitHub ephemeral runners for %s\n", m.Config.GitHub.Organization)
 	} else {
-		fmt.Printf("registration: skipped\n")
+		m.infof("registration: skipped\n")
 	}
 	var (
 		mu      sync.Mutex
@@ -118,32 +148,39 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	wg.Wait()
 	stopLeaseKeeper()
 	if opts.Cleanup {
-		fmt.Printf("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
+		m.infof("cleanup: removing instances and GitHub runners with prefix %q\n", m.Config.Pool.NamePrefix)
 		if err := m.cleanupWithFreshContext(); err != nil && errOnce == nil {
 			errOnce = err
 		}
 	}
 	if errOnce == nil {
-		fmt.Printf("verify complete: %d instance(s) validated", len(created))
+		m.infof("verify complete: %d instance(s) validated", len(created))
 		if opts.RegisterOnly {
-			fmt.Printf(" and registered online/idle")
+			m.infof(" and registered online/idle")
 		}
 		if opts.Cleanup {
-			fmt.Printf("; cleanup complete")
+			m.infof("; cleanup complete")
 		}
-		fmt.Printf("\n")
+		m.infof("\n")
 		for _, vm := range created {
-			fmt.Printf("  %s ip=%s providerLog=%s guestLog=%s", vm.Name, emptyDash(vm.IP), vm.LogPath, vm.GuestLogPath)
+			m.infof("  %s ip=%s providerLog=%s guestLog=%s", vm.Name, emptyDash(vm.IP), vm.LogPath, vm.GuestLogPath)
 			if vm.RunnerID != 0 {
-				fmt.Printf(" runnerID=%d", vm.RunnerID)
+				m.infof(" runnerID=%d", vm.RunnerID)
 			}
-			fmt.Printf("\n")
+			m.infof("\n")
 		}
 	}
 	return errOnce
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
+	if !opts.PoolLockHeld {
+		controllerLock, err := m.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		defer controllerLock.Close()
+	}
 	if !opts.HostTrustLockHeld {
 		controllerLock, err := m.AcquireHostTrustControllerLock()
 		if err != nil {
@@ -157,7 +194,20 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if opts.MonitorInterval <= 0 {
 		opts.MonitorInterval = 15 * time.Second
 	}
-	active := make(map[string]ProvisionedInstance)
+	if ctx.Err() != nil {
+		if opts.KeepOnExit {
+			return nil
+		}
+		return m.cleanupWithFreshContext()
+	}
+	active, err := m.reconcilePhysicalPool(ctx, nil, opts.Register)
+	if err != nil {
+		return fmt.Errorf("initial pool reconciliation: %w", err)
+	}
+	active, err = m.reduceOverCapacity(ctx, active, opts.Instances, opts.Register)
+	if err != nil {
+		return fmt.Errorf("initial over-capacity reconciliation: %w", err)
+	}
 	sequence := 1
 	poolTrustGeneration := ""
 	cleanup := func() error {
@@ -168,27 +218,51 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for len(active) < opts.Instances {
-		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
-		sequence++
+		active, err = m.reconcilePhysicalPool(ctx, active, opts.Register)
 		if err != nil {
 			stopLeaseKeeper()
-			_ = cleanup()
-			return err
+			return fmt.Errorf("initial pool reconciliation before allocation: %w", err)
 		}
-		active[vm.Name] = vm
+		if len(active) >= opts.Instances {
+			break
+		}
+		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
+		sequence++
+		if isPhysicalPhase(vm.Phase) {
+			active[vm.Name] = vm
+		}
+		if err != nil {
+			stopLeaseKeeper()
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+		}
 		leaseAdd(vm)
 		if vm.HostTrustGeneration != "" {
 			poolTrustGeneration = vm.HostTrustGeneration
 		}
-		fmt.Printf("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
+		m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 	}
 	stopLeaseKeeper()
 	if !opts.Register || (!opts.ReplaceCompleted && !m.hostTrustEnabled()) {
-		fmt.Println("pool is running; press Ctrl-C to stop")
-		<-ctx.Done()
-		return cleanup()
+		m.infof("pool is running; press Ctrl-C to stop")
+		if !m.Config.Logging.RetentionEnabled {
+			<-ctx.Done()
+			return cleanup()
+		}
+		retentionTicker := time.NewTicker(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
+		defer retentionTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return cleanup()
+			case <-retentionTicker.C:
+				m.pruneLogsBestEffort()
+			}
+		}
 	}
-	fmt.Printf("pool supervisor is running; monitoring every %s; press Ctrl-C to stop\n", opts.MonitorInterval)
+	m.infof("pool supervisor is running; monitoring every %s; press Ctrl-C to stop\n", opts.MonitorInterval)
 	tickInterval := opts.MonitorInterval
 	if m.hostTrustEnabled() && tickInterval > hostTrustRefreshInterval {
 		tickInterval = hostTrustRefreshInterval
@@ -196,13 +270,21 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	nextLivenessCheck := time.Now().Add(opts.MonitorInterval)
+	nextRetention := time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 	nextHostTrustCollection := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
+	retry := replacementRetryState{}
 	for {
 		select {
 		case <-ctx.Done():
 			return cleanup()
 		case <-ticker.C:
+			now := m.currentTime()
+			dependencyCooldown := retry.active(now)
+			if m.Config.Logging.RetentionEnabled && !time.Now().Before(nextRetention) {
+				m.pruneLogsBestEffort()
+				nextRetention = time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
+			}
 			trustRetired := 0
 			trustCapacityReady := true
 			if m.hostTrustEnabled() {
@@ -212,7 +294,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					nextHostTrustCollection = now.Add(m.hostTrustCollectionInterval())
 					if err != nil {
 						currentHostTrust = hosttrust.Snapshot{}
-						fmt.Printf("host trust refresh warning; existing leases will expire closed: %v\n", err)
+						m.warnf("host trust refresh warning; existing leases will expire closed: %v\n", err)
 					} else {
 						ready := true
 						if poolTrustGeneration != current.Generation {
@@ -220,19 +302,21 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							// Idle runners are removed now; busy runners keep running but
 							// receive a mismatching lease so no subsequent job can start.
 							currentHostTrust = current
-							trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
-							fmt.Printf("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
+							if !dependencyCooldown {
+								trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
+							}
+							m.infof("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
 							ready = false
 							for attempt := 1; attempt <= 3; attempt++ {
 								generationBeforeEnsure := current.Generation
 								if err := m.ensureHostTrustImage(ctx); err != nil {
-									fmt.Printf("host trust replacement image warning: %v\n", err)
+									m.warnf("host trust replacement image warning: %v\n", err)
 									nextHostTrustCollection = time.Now()
 									break
 								}
 								current, err = m.resolveHostTrust(ctx)
 								if err != nil {
-									fmt.Printf("host trust post-build refresh warning: %v\n", err)
+									m.warnf("host trust post-build refresh warning: %v\n", err)
 									nextHostTrustCollection = time.Now()
 									break
 								}
@@ -242,9 +326,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 									break
 								}
 								if attempt < 3 {
-									fmt.Printf("host trust changed again during replacement image publication (%s -> %s); retrying %d/3\n", generationBeforeEnsure, current.Generation, attempt+1)
+									m.infof("host trust changed again during replacement image publication (%s -> %s); retrying %d/3\n", generationBeforeEnsure, current.Generation, attempt+1)
 								} else {
-									fmt.Printf("host trust did not stabilize across 3 replacement image attempts (%s -> %s)\n", generationBeforeEnsure, current.Generation)
+									m.warnf("host trust did not stabilize across 3 replacement image attempts (%s -> %s)\n", generationBeforeEnsure, current.Generation)
 								}
 							}
 							trustCapacityReady = ready
@@ -254,28 +338,59 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 					}
 				}
-				if currentHostTrust.Generation != "" {
+				if currentHostTrust.Generation != "" && !dependencyCooldown {
 					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust)
 				}
+			}
+			if dependencyCooldown {
+				var localErr error
+				active, localErr = m.reconcileLocalInventory(active)
+				if localErr != nil {
+					m.warnf("local pool housekeeping warning during replacement cooldown: %v\n", localErr)
+				}
+				continue
 			}
 			if opts.ReplaceCompleted && !time.Now().Before(nextLivenessCheck) {
 				nextLivenessCheck = time.Now().Add(opts.MonitorInterval)
 				for name, vm := range active {
 					alive, reason, err := m.runnerAlive(ctx, vm)
 					if err != nil {
-						fmt.Printf("[%s] liveness check warning: %v\n", name, err)
+						m.logger().Warn("liveness check failed", "provider", m.Config.Provider.Type, "instance", name, "operation", "liveness-check", "error", err)
 						continue
 					}
 					if alive {
 						continue
 					}
-					fmt.Printf("[%s] runner is finished or unhealthy: %s\n", name, reason)
+					m.infof("[%s] runner is finished or unhealthy: %s\n", name, reason)
 					if err := m.retireInstance(context.Background(), vm, reason); err != nil {
-						fmt.Printf("[%s] retirement warning: %v\n", name, err)
+						m.warnf("[%s] retirement warning: %v\n", name, err)
 						continue
 					}
 					delete(active, name)
 				}
+			}
+			var reconcileErr error
+			beforeReconcile := active
+			active, reconcileErr = m.reconcilePhysicalPool(ctx, active, opts.Register)
+			if reconcileErr != nil {
+				if ctx.Err() != nil {
+					return cleanup()
+				}
+				if !isTransientDependencyError(reconcileErr) {
+					return errors.Join(fmt.Errorf("pool reconciliation: %w", reconcileErr), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				retry.schedule(m, now, reconcileErr)
+				m.warnf("pool reconciliation deferred during transient dependency failure; retrying after %s: %v\n", retry.remaining(now), reconcileErr)
+				continue
+			}
+			retry.resetAfterAdoption(beforeReconcile, active)
+			active, reconcileErr = m.reduceOverCapacity(ctx, active, opts.Instances, opts.Register)
+			if reconcileErr != nil {
+				if !isTransientDependencyError(reconcileErr) {
+					return errors.Join(fmt.Errorf("reduce over-capacity pool: %w", reconcileErr), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				retry.schedule(m, now, reconcileErr)
+				continue
 			}
 			if m.hostTrustEnabled() && currentHostTrust.Generation != "" && currentHostTrust.Generation != poolTrustGeneration {
 				trustCapacityReady = false
@@ -283,10 +398,12 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			replacementCapacity := len(active)
 			needsTrustCapacity := false
 			if m.hostTrustEnabled() && currentHostTrust.Generation != "" {
-				replacementCapacity = currentHostTrustCapacity(active, currentHostTrust.Generation)
-				needsTrustCapacity = replacementCapacity < opts.Instances
+				needsTrustCapacity = currentHostTrustCapacity(active, currentHostTrust.Generation) < opts.Instances
 			}
 			if !trustCapacityReady || (!opts.ReplaceCompleted && trustRetired == 0 && !needsTrustCapacity) {
+				continue
+			}
+			if retry.active(now) {
 				continue
 			}
 			for replacementCapacity < opts.Instances {
@@ -297,18 +414,42 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
-				fmt.Printf("[%s] creating replacement runner\n", name)
-				vm, err := m.provisionOne(ctx, name, opts.Register, true)
+				active, err = m.reconcilePhysicalPool(ctx, active, opts.Register)
 				if err != nil {
-					fmt.Printf("[%s] replacement failed: %v\n", name, err)
+					if !isTransientDependencyError(err) {
+						return errors.Join(fmt.Errorf("pool reconciliation before replacement allocation: %w", err), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+					}
+					retry.schedule(m, m.currentTime(), err)
+					m.warnf("[%s] replacement deferred during transient reconciliation failure: %v\n", name, err)
+					break
+				}
+				replacementCapacity = len(active)
+				if replacementCapacity >= opts.Instances {
+					break
+				}
+				m.infof("[%s] creating replacement runner\n", name)
+				vm, err := m.provisionOne(ctx, name, opts.Register, true)
+				if isPhysicalPhase(vm.Phase) {
+					active[vm.Name] = vm
+				}
+				if err != nil {
+					if ctx.Err() != nil {
+						return cleanup()
+					}
+					m.warnf("[%s] replacement failed: %v\n", name, err)
+					if !isTransientDependencyError(err) {
+						return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+					}
+					retry.schedule(m, m.currentTime(), err)
 					break
 				}
 				active[vm.Name] = vm
+				retry.reset()
 				replacementCapacity++
 				if vm.HostTrustGeneration != "" {
 					poolTrustGeneration = vm.HostTrustGeneration
 				}
-				fmt.Printf("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
+				m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 			}
 		}
 	}
@@ -324,13 +465,401 @@ func currentHostTrustCapacity(active map[string]ProvisionedInstance, generation 
 	return capacity
 }
 
+func isPhysicalPhase(phase LifecyclePhase) bool {
+	return phase == LifecycleProvisioning || phase == LifecycleReady || phase == LifecycleDraining || phase == LifecycleQuarantined || phase == LifecycleCleanupPending
+}
+
+func adoptedReadyInstance(before, after map[string]ProvisionedInstance) bool {
+	for name, instance := range after {
+		previous, found := before[name]
+		if instance.Phase == LifecycleReady && (!found || previous.Phase != LifecycleReady) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]ProvisionedInstance, register bool) (map[string]ProvisionedInstance, error) {
+	reconciled, err := m.reconcileLocalInventoryWithContext(ctx, known)
+	if err != nil {
+		return known, err
+	}
+	if !register {
+		for name, vm := range reconciled {
+			if vm.Phase != LifecycleCleanupPending {
+				vm.Phase = LifecycleReady
+				reconciled[name] = vm
+			}
+		}
+		return reconciled, nil
+	}
+	if m.GitHub == nil {
+		return reconciled, fmt.Errorf("github client is required for registered pool reconciliation")
+	}
+	remoteByName := make(map[string]gh.Runner)
+	runners, err := m.GitHub.ListRunners(ctx)
+	if err != nil {
+		for name, vm := range reconciled {
+			if vm.Phase != LifecycleCleanupPending {
+				vm.Phase = LifecycleQuarantined
+				reconciled[name] = vm
+			}
+		}
+		return reconciled, err
+	}
+	for _, runner := range runners {
+		if HasPrefix(runner.Name, m.Config.Pool.NamePrefix) {
+			remoteByName[runner.Name] = runner
+		}
+	}
+	for name, vm := range reconciled {
+		if vm.Phase == LifecycleCleanupPending {
+			continue
+		}
+		runner, found := remoteByName[name]
+		if !found && isPhysicalPhase(vm.Phase) {
+			var lookupErr error
+			runner, found, lookupErr = m.GitHub.RunnerByName(ctx, name)
+			if lookupErr != nil {
+				vm.Phase = LifecycleQuarantined
+				reconciled[name] = vm
+				return reconciled, lookupErr
+			}
+		}
+		if !found {
+			if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
+				vm.Phase = LifecycleCleanupPending
+				reconciled[name] = vm
+				m.warnf("[%s] unregistered-instance cleanup pending: %v\n", name, err)
+			} else {
+				delete(reconciled, name)
+			}
+			continue
+		}
+		delete(remoteByName, name)
+		vm.RunnerID = runner.ID
+		if runner.Status == "online" {
+			vm.Phase = LifecycleReady
+			reconciled[name] = vm
+			continue
+		}
+		if runner.Busy {
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			continue
+		}
+		if vm.Phase == LifecycleQuarantined {
+			if err := m.retireInstance(context.Background(), vm, "GitHub recovered but quarantined runner remained offline"); err != nil {
+				vm.Phase = LifecycleCleanupPending
+				reconciled[name] = vm
+				m.warnf("[%s] recovered-offline retirement pending: %v\n", name, err)
+			} else {
+				delete(reconciled, name)
+			}
+			continue
+		}
+		alive, _, processErr := m.runnerProcessAlive(ctx, vm)
+		if processErr == nil && alive {
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			continue
+		}
+		if err := m.retireInstance(context.Background(), vm, "reconciliation found offline runner with inactive listener"); err != nil {
+			vm.Phase = LifecycleCleanupPending
+			reconciled[name] = vm
+			m.warnf("[%s] inactive-instance cleanup pending: %v\n", name, err)
+		} else {
+			delete(reconciled, name)
+		}
+	}
+	for _, runner := range remoteByName {
+		if err := m.deleteRemoteRunner(context.Background(), runner); err != nil {
+			return reconciled, err
+		}
+		m.infof("reconciliation: deleted stale GitHub runner %s id=%d\n", runner.Name, runner.ID)
+	}
+	return reconciled, nil
+}
+
+func (m *Manager) reduceOverCapacity(ctx context.Context, active map[string]ProvisionedInstance, target int, register bool) (map[string]ProvisionedInstance, error) {
+	if len(active) <= target || !register || m.GitHub == nil {
+		return active, nil
+	}
+	names := make([]string, 0, len(active))
+	for name := range active {
+		names = append(names, name)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	for _, name := range names {
+		if len(active) <= target {
+			break
+		}
+		vm := active[name]
+		if vm.Phase != LifecycleReady {
+			continue
+		}
+		runner, found, err := m.GitHub.RunnerByName(ctx, name)
+		if err != nil {
+			return active, err
+		}
+		if !found || runner.Busy {
+			continue
+		}
+		vm.RunnerID = runner.ID
+		if err := m.retireInstance(context.Background(), vm, "reconciling legacy physical inventory above pool.instances"); err != nil {
+			vm.Phase = LifecycleCleanupPending
+			active[name] = vm
+			continue
+		}
+		delete(active, name)
+	}
+	return active, nil
+}
+
+func (m *Manager) reconcileLocalInventory(known map[string]ProvisionedInstance) (map[string]ProvisionedInstance, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return m.reconcileLocalInventoryWithContext(ctx, known)
+}
+
+func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known map[string]ProvisionedInstance) (map[string]ProvisionedInstance, error) {
+	locals, err := m.Provider.List(ctx)
+	if err != nil {
+		return known, err
+	}
+	reconciled := make(map[string]ProvisionedInstance)
+	for _, local := range locals {
+		if !HasPrefix(local.Name, m.Config.Pool.NamePrefix) {
+			continue
+		}
+		vm := m.reconciledInstance(known, local.Name)
+		if !localInstanceStopped(local.State) {
+			reconciled[local.Name] = vm
+			continue
+		}
+		if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
+			vm.Phase = LifecycleCleanupPending
+			reconciled[local.Name] = vm
+			m.warnf("[%s] stopped-instance cleanup pending: %v\n", local.Name, err)
+		}
+	}
+	return reconciled, nil
+}
+
+func (m *Manager) reconciledInstance(known map[string]ProvisionedInstance, name string) ProvisionedInstance {
+	if vm, found := known[name]; found {
+		return vm
+	}
+	return ProvisionedInstance{
+		Name:         name,
+		LogPath:      m.instanceLogPath(name, "."+m.Config.Provider.Type+".log"),
+		GuestLogPath: m.instanceLogPath(name, ".guest.log"),
+		Phase:        LifecycleQuarantined,
+	}
+}
+
+func localInstanceStopped(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "stopped", "exited", "dead", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) deleteLocalInstance(ctx context.Context, vm ProvisionedInstance) error {
+	cleanupCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
+	defer cancel()
+	stopCtx, stopCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+	_ = m.Provider.Stop(stopCtx, vm.Name)
+	stopCancel()
+	deleteCtx, deleteCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+	err := m.Provider.Delete(deleteCtx, vm.Name)
+	deleteCancel()
+	if err != nil {
+		return err
+	}
+	if releaseErr := m.releaseInstanceTranscripts(vm); releaseErr != nil {
+		m.logger().Warn("instance transcript close failed after local deletion", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "reconcile", "error", releaseErr)
+	}
+	return nil
+}
+
+func (m *Manager) deleteRemoteRunner(ctx context.Context, runner gh.Runner) error {
+	deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	return m.GitHub.DeleteRunnerIfExists(deleteCtx, runner.ID)
+}
+
+type replacementRetryState struct {
+	attempt int
+	next    time.Time
+}
+
+func (s *replacementRetryState) active(now time.Time) bool {
+	return !s.next.IsZero() && now.Before(s.next)
+}
+
+func (s *replacementRetryState) remaining(now time.Time) time.Duration {
+	if !s.active(now) {
+		return 0
+	}
+	return s.next.Sub(now).Round(time.Second)
+}
+
+func (s *replacementRetryState) schedule(m *Manager, now time.Time, err error) {
+	initial, maximum, multiplier, jitter := m.replacementRetrySettings()
+	nominal := float64(initial) * math.Pow(multiplier, float64(s.attempt))
+	if nominal > float64(maximum) {
+		nominal = float64(maximum)
+	}
+	factor := 1.0
+	if jitter > 0 {
+		factor += ((m.randomValue() * 2) - 1) * jitter
+	}
+	delay := time.Duration(nominal * factor)
+	if delay < time.Second {
+		delay = time.Second
+	}
+	if delay > maximum {
+		delay = maximum
+	}
+	if retryAfter := retryAfterDuration(err); retryAfter > delay {
+		delay = retryAfter
+	}
+	s.attempt++
+	s.next = now.Add(delay)
+}
+
+func (s *replacementRetryState) reset() {
+	s.attempt = 0
+	s.next = time.Time{}
+}
+
+func (s *replacementRetryState) resetAfterAdoption(before, after map[string]ProvisionedInstance) {
+	if adoptedReadyInstance(before, after) {
+		s.reset()
+	}
+}
+
+func (m *Manager) replacementRetrySettings() (time.Duration, time.Duration, float64, float64) {
+	initialSeconds := m.Config.Pool.ReplacementRetryInitialSeconds
+	if initialSeconds <= 0 {
+		initialSeconds = 15
+	}
+	maximumSeconds := m.Config.Pool.ReplacementRetryMaxSeconds
+	if maximumSeconds <= 0 {
+		maximumSeconds = 1800
+	}
+	multiplier := m.Config.Pool.ReplacementRetryMultiplier
+	if multiplier < 1 {
+		multiplier = 2
+	}
+	jitterPercent := m.Config.Pool.ReplacementRetryJitterPercent
+	if jitterPercent < 0 {
+		jitterPercent = 0
+	}
+	return time.Duration(initialSeconds) * time.Second, time.Duration(maximumSeconds) * time.Second, multiplier, float64(jitterPercent) / 100
+}
+
+func (m *Manager) currentTime() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+func (m *Manager) randomValue() float64 {
+	if m.randomFloat64 != nil {
+		return m.randomFloat64()
+	}
+	return rand.Float64()
+}
+
+func retryAfterDuration(err error) time.Duration {
+	var httpErr *gh.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.RetryAfter
+	}
+	return 0
+}
+
+func isTransientDependencyError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var httpErr *gh.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, match := range dependencyHTTPStatusPattern.FindAllStringSubmatch(text, -1) {
+		statusCode, parseErr := strconv.Atoi(match[1])
+		if parseErr == nil && (statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError) {
+			return true
+		}
+	}
+	for _, marker := range []string{
+		"badgateway", "gatewaytimeout", "internalservererror", "serviceunavailable",
+		"bad gateway", "gateway timeout", "internal server error", "service unavailable",
+		"connection reset", "connection refused", "temporary failure",
+		"tls handshake timeout", "i/o timeout", "no such host",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) cleanupWithFreshContext() error {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	return m.Cleanup(cleanupCtx)
+	return m.cleanupUnlocked(cleanupCtx)
+}
+
+func (m *Manager) cleanupAfterTerminalFailure(active map[string]ProvisionedInstance, keep bool) error {
+	if keep {
+		return nil
+	}
+	var firstErr error
+	for _, vm := range active {
+		var err error
+		switch vm.Phase {
+		case LifecycleReady:
+			err = m.retireInstance(context.Background(), vm, "controller stopped after terminal pool failure")
+		case LifecycleCleanupPending, LifecycleProvisioning:
+			err = m.deleteLocalInstance(context.Background(), vm)
+		case LifecycleDraining, LifecycleQuarantined:
+			// These instances may already be running a job. They stay counted and
+			// are reconciled by the next controller instead of being killed merely
+			// because GitHub readiness or status became uncertain.
+			continue
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (m *Manager) ProvisionPool(ctx context.Context, instances int, register bool) ([]ProvisionedInstance, error) {
+	poolLock, err := m.AcquirePoolControllerLock()
+	if err != nil {
+		return nil, err
+	}
+	defer poolLock.Close()
+	hostTrustLock, err := m.AcquireHostTrustControllerLock()
+	if err != nil {
+		return nil, err
+	}
+	if hostTrustLock != nil {
+		defer hostTrustLock.Close()
+	}
 	instances = m.requestedInstances(instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, instances, time.Now())
 	out := make([]ProvisionedInstance, 0, len(names))
@@ -355,6 +884,15 @@ func (m *Manager) requestedInstances(override int) int {
 }
 
 func (m *Manager) Cleanup(ctx context.Context) error {
+	poolLock, err := m.AcquirePoolControllerLock()
+	if err != nil {
+		return err
+	}
+	defer poolLock.Close()
+	return m.cleanupUnlocked(ctx)
+}
+
+func (m *Manager) cleanupUnlocked(ctx context.Context) error {
 	var firstErr error
 	vms, err := m.Provider.List(ctx)
 	if err != nil {
@@ -364,13 +902,24 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 		if !HasPrefix(vm.Name, m.Config.Pool.NamePrefix) {
 			continue
 		}
-		fmt.Printf("cleanup: deleting instance %s\n", vm.Name)
+		m.infof("cleanup: deleting instance %s\n", vm.Name)
 		stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
 		_ = m.Provider.Stop(stopCtx, vm.Name)
 		stopCancel()
 		deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
-		if err := m.Provider.Delete(deleteCtx, vm.Name); err != nil && firstErr == nil {
-			firstErr = err
+		deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+		if deleteErr != nil && firstErr == nil {
+			firstErr = deleteErr
+		}
+		if deleteErr == nil {
+			paths := ProvisionedInstance{
+				Name:         vm.Name,
+				LogPath:      m.instanceLogPath(vm.Name, "."+m.Config.Provider.Type+".log"),
+				GuestLogPath: m.instanceLogPath(vm.Name, ".guest.log"),
+			}
+			if releaseErr := m.releaseInstanceTranscripts(paths); releaseErr != nil {
+				m.logger().Warn("instance transcript close failed after cleanup", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "cleanup", "error", releaseErr)
+			}
 		}
 		deleteCancel()
 	}
@@ -382,7 +931,7 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 			firstErr = err
 		}
 		for _, runner := range deleted {
-			fmt.Printf("cleanup: deleted GitHub runner %s id=%d\n", runner.Name, runner.ID)
+			m.infof("cleanup: deleted GitHub runner %s id=%d\n", runner.Name, runner.ID)
 		}
 	}
 	return firstErr
@@ -426,13 +975,13 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 			return vm, err
 		}
 		lastErr = err
-		if vm.Name != "" {
+		if isPhysicalPhase(vm.Phase) {
 			_ = m.retireInstance(context.Background(), vm, "discarding stale host-trust image generation")
 		}
 		if attempt == attempts {
 			break
 		}
-		fmt.Printf("[%s] host trust changed before runner publication; rebuilding image (attempt %d/%d)\n", name, attempt+1, attempts)
+		m.infof("[%s] host trust changed before runner publication; rebuilding image (attempt %d/%d)\n", name, attempt+1, attempts)
 		if err := m.ensureHostTrustImage(ctx); err != nil {
 			return vm, fmt.Errorf("rebuild image after host trust changed during provisioning: %w", err)
 		}
@@ -440,11 +989,56 @@ func (m *Manager) provisionOne(ctx context.Context, name string, register, allow
 	return ProvisionedInstance{Name: name}, fmt.Errorf("provision runner after %d host trust image stabilization attempts: %w", attempts, lastErr)
 }
 
-func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
-	logPath := config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir)
-	logPath = filepath.Join(logPath, name+"."+m.Config.Provider.Type+".log")
-	guestLogPath := filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
-	vm := ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath}
+func (m *Manager) deleteRemoteRunnerByNameBestEffort(name string) {
+	if m.GitHub == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	runner, found, err := m.GitHub.RunnerByName(ctx, name)
+	if err != nil {
+		m.warnf("[%s] deferred exact-name GitHub reconciliation after rollback: %v\n", name, err)
+		return
+	}
+	if !found {
+		return
+	}
+	if err := m.GitHub.DeleteRunnerIfExists(ctx, runner.ID); err != nil {
+		m.warnf("[%s] deferred exact-name GitHub runner deletion after rollback: %v\n", name, err)
+	}
+}
+
+func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (vm ProvisionedInstance, err error) {
+	logPath := m.instanceLogPath(name, "."+m.Config.Provider.Type+".log")
+	guestLogPath := m.instanceLogPath(name, ".guest.log")
+	vm = ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath, Phase: LifecycleProvisioning}
+	localMayExist := false
+	configureAttempted := false
+	listenerMayBeRunning := false
+	defer func() {
+		if err == nil {
+			vm.Phase = LifecycleReady
+			return
+		}
+		if !localMayExist {
+			vm.Phase = ""
+			return
+		}
+		if listenerMayBeRunning {
+			vm.Phase = LifecycleQuarantined
+			return
+		}
+		cleanupErr := m.deleteLocalInstance(context.Background(), vm)
+		if cleanupErr != nil {
+			vm.Phase = LifecycleCleanupPending
+			err = errors.Join(err, fmt.Errorf("rollback local instance %s: %w", name, cleanupErr))
+			return
+		}
+		vm.Phase = ""
+		if configureAttempted {
+			m.deleteRemoteRunnerByNameBestEffort(name)
+		}
+	}()
 	var trustSnapshot hosttrust.Snapshot
 	if m.hostTrustEnabled() {
 		var err error
@@ -457,12 +1051,22 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
 		return vm, err
 	}
-	fmt.Printf("[%s] cloning %s\n", name, m.Config.Provider.SourceImage)
-	if err := m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name); err != nil {
+	m.logger().Info("cloning instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "clone", "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
+	localMayExist = true
+	if err := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
+		return m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name)
+	}); err != nil {
 		return vm, err
 	}
-	fmt.Printf("[%s] starting instance\n", name)
-	if _, err := m.Provider.Start(ctx, name, m.startOptions(logPath)); err != nil {
+	m.logger().Info("starting instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "start", "logPath", logPath)
+	if err := m.timeFirstInstanceStage(name, m.startupInstanceStartStage(), func() error {
+		startOptions, startOptionsErr := m.startOptions(logPath, name)
+		if startOptionsErr != nil {
+			return startOptionsErr
+		}
+		_, err := m.Provider.Start(ctx, name, startOptions)
+		return err
+	}); err != nil {
 		return vm, err
 	}
 	ip, err := m.Provider.IP(ctx, name, m.Config.Timeouts.BootSeconds)
@@ -470,15 +1074,17 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		return vm, err
 	}
 	vm.IP = ip
-	fmt.Printf("[%s] reachable at %s\n", name, ip)
-	if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
+	m.logger().Info("instance reachable", "provider", m.Config.Provider.Type, "instance", name, "operation", "wait-reachable", "address", ip)
+	m.logger().Info("validating runner runtime", "provider", m.Config.Provider.Type, "instance", name, "operation", "validate-runtime", "stage", "start")
+	if err := m.timeFirstInstanceStage(name, "runtime_validation", func() error {
+		if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
+			return err
+		}
+		return m.validateRuntimeWithRetry(ctx, name, guestLogPath)
+	}); err != nil {
 		return vm, err
 	}
-	fmt.Printf("[%s] validating runner runtime\n", name)
-	if err := m.validateRuntimeWithRetry(ctx, name, guestLogPath); err != nil {
-		return vm, err
-	}
-	fmt.Printf("[%s] runtime validation passed\n", name)
+	m.infof("[%s] runtime validation passed\n", name)
 	if m.hostTrustEnabled() {
 		marker, err := m.readInstanceHostTrustMarker(ctx, name)
 		if err != nil {
@@ -503,47 +1109,64 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		}
 		if m.GitHub == nil {
 			if m.DryRun {
-				fmt.Printf("[dry-run] would register GitHub runner %s with labels %s\n", name, strings.Join(m.Config.Runner.Labels, ","))
+				m.infof("[dry-run] would register GitHub runner %s with labels %s\n", name, strings.Join(m.Config.Runner.Labels, ","))
 				return vm, nil
 			}
 			return vm, fmt.Errorf("github client is required for registration")
 		}
-		fmt.Printf("[%s] requesting GitHub registration token\n", name)
-		token, err := m.GitHub.RegistrationToken(ctx)
-		if err != nil {
-			return vm, err
-		}
-		env := map[string]string{
-			"RUNNER_URL":               m.GitHub.OrganizationURL(),
-			"RUNNER_TOKEN":             token.Token,
-			"RUNNER_NAME":              name,
-			"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
-			"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
-			"RUNNER_GROUP":             m.Config.Runner.Group,
-			"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
-		}
-		if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env}); err != nil {
-			return vm, err
-		}
-		fmt.Printf("[%s] starting runner service\n", name)
-		if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
-			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
-			return vm, err
-		}
-		readiness := "online/idle"
-		if allowBusy {
-			readiness = "online"
-		}
-		fmt.Printf("[%s] waiting for GitHub %s\n", name, readiness)
-		runner, err := m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
-		if err != nil {
+		var (
+			token     gh.RegistrationToken
+			runner    gh.Runner
+			readiness = "online/idle"
+		)
+		if err := m.timeFirstInstanceStage(name, "github_registration_and_online_idle", func() error {
+			m.infof("[%s] requesting GitHub registration token\n", name)
+			var err error
+			token, err = m.GitHub.RegistrationToken(ctx)
+			if err != nil {
+				return err
+			}
+			env := map[string]string{
+				"RUNNER_URL":               m.GitHub.OrganizationURL(),
+				"RUNNER_NAME":              name,
+				"RUNNER_LABELS":            strings.Join(m.Config.Runner.Labels, ","),
+				"RUNNER_EPHEMERAL":         fmt.Sprintf("%t", m.Config.Runner.Ephemeral),
+				"RUNNER_GROUP":             m.Config.Runner.Group,
+				"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
+			}
+			configureAttempted = true
+			if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env, Stdin: token.Token + "\n", SensitiveValues: []string{token.Token}}); err != nil {
+				return provider.RedactError(err, token.Token)
+			}
+			m.infof("[%s] starting runner service\n", name)
+			listenerMayBeRunning = true
+			if _, err := m.execGuest(ctx, name, []string{"sudo", "bash", "/opt/epar/run-runner.sh"}, provider.ExecOptions{}); err != nil {
+				return err
+			}
+			if allowBusy {
+				readiness = "online"
+			}
+			m.infof("[%s] waiting for GitHub %s\n", name, readiness)
+			runner, err = m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
+			return err
+		}); err != nil {
 			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
-		fmt.Printf("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
+		m.infof("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
+		m.finishFirstRunnerReady(name)
+	} else {
+		m.finishFirstRunnerReady(name)
 	}
 	return vm, nil
+}
+
+func (m *Manager) startupInstanceStartStage() string {
+	if m.Config.Provider.Type == "docker-dind" {
+		return "instance_start_and_inner_docker_ready"
+	}
+	return "instance_start_and_provider_ready"
 }
 
 type runnerReadinessResult struct {
@@ -590,7 +1213,7 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 				}
 				if current.Generation != vm.HostTrustGeneration {
 					if revokeErr := m.issueHostTrustLease(waitCtx, vm.Name, current); revokeErr != nil {
-						fmt.Printf("[%s] host trust readiness revocation warning: %v\n", vm.Name, revokeErr)
+						m.warnf("[%s] host trust readiness revocation warning: %v\n", vm.Name, revokeErr)
 					}
 					cancel()
 					return gh.Runner{}, fmt.Errorf("host trust changed while runner %s was registering (%s -> %s)", vm.Name, vm.HostTrustGeneration, current.Generation)
@@ -614,7 +1237,7 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 			consecutiveProbeFailures++
 			lastProbeErr = err
 			if consecutiveProbeFailures < runnerReadinessProbeFailureLimit {
-				fmt.Printf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
+				m.warnf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
 				continue
 			}
 			cancel()
@@ -633,14 +1256,14 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 func (m *Manager) captureRunnerReadinessDiagnostics(name, guestLogPath string) {
 	diagnosticCtx, cancel := context.WithTimeout(context.Background(), runnerReadinessDiagnosticsTimeout)
 	defer cancel()
-	_, err := m.Provider.Exec(
+	_, err := m.execGuest(
 		diagnosticCtx,
 		name,
 		[]string{"sudo", "bash", "/opt/epar/collect-runner-diagnostics.sh"},
 		provider.ExecOptions{LogPath: guestLogPath},
 	)
 	if err != nil {
-		fmt.Printf("[%s] runner readiness diagnostic collection warning: %v\n", name, err)
+		m.warnf("[%s] runner readiness diagnostic collection warning: %v\n", name, err)
 	}
 }
 
@@ -676,7 +1299,7 @@ func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance
 func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, err := m.Provider.Exec(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
+	_, err := m.execGuest(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
 	return err
 }
 
@@ -686,7 +1309,7 @@ func isTransientGitHubLivenessError(err error) bool {
 }
 
 func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, reason string) error {
-	fmt.Printf("[%s] retiring instance: %s\n", vm.Name, reason)
+	m.infof("[%s] retiring instance: %s\n", vm.Name, reason)
 	var firstErr error
 	if m.GitHub != nil && vm.RunnerID != 0 {
 		deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -700,8 +1323,14 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 	_ = m.Provider.Stop(stopCtx, vm.Name)
 	stopCancel()
 	deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
-	if err := m.Provider.Delete(deleteCtx, vm.Name); err != nil && firstErr == nil {
-		firstErr = err
+	deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+	if deleteErr != nil && firstErr == nil {
+		firstErr = deleteErr
+	}
+	if deleteErr == nil {
+		if releaseErr := m.releaseInstanceTranscripts(vm); releaseErr != nil {
+			m.logger().Warn("instance transcript close failed after retirement", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "retire", "error", releaseErr)
+		}
 	}
 	deleteCancel()
 	return firstErr
@@ -727,8 +1356,8 @@ func (m *Manager) validateRuntimeWithRetry(ctx context.Context, name, guestLogPa
 		if attempt == attempts {
 			break
 		}
-		fmt.Printf("[%s] runtime validation attempt %d/%d failed: %v\n", name, attempt, attempts, err)
-		fmt.Printf("[%s] retrying runtime validation in %s; guest log: %s\n", name, runtimeValidationRetryDelay, guestLogPath)
+		m.warnf("[%s] runtime validation attempt %d/%d failed: %v\n", name, attempt, attempts, err)
+		m.infof("[%s] retrying runtime validation in %s; guest log: %s\n", name, runtimeValidationRetryDelay, guestLogPath)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -742,7 +1371,7 @@ func (m *Manager) configureDockerRegistryMirrors(ctx context.Context, name strin
 	if len(m.Config.Docker.RegistryMirrors) == 0 {
 		return nil
 	}
-	fmt.Printf("[%s] configuring Docker registry mirror(s): %s\n", name, strings.Join(m.Config.Docker.RegistryMirrors, ", "))
+	m.infof("[%s] configuring Docker registry mirror(s): %s\n", name, strings.Join(m.Config.Docker.RegistryMirrors, ", "))
 	hostPath := filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu", "configure-docker-daemon.sh")
 	content, err := os.ReadFile(hostPath)
 	if err != nil {
@@ -765,8 +1394,14 @@ func (m *Manager) execGuest(ctx context.Context, name string, cmd []string, opts
 		timeout = 15 * time.Minute
 	}
 	if opts.LogPath == "" {
-		opts.LogPath = filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.Pool.LogDir), name+".guest.log")
+		opts.LogPath = m.instanceLogPath(name, ".guest.log")
 	}
+	transcript, err := m.transcript(opts.LogPath, name, transcriptComponent(opts.LogPath))
+	if err != nil {
+		return provider.ExecResult{}, err
+	}
+	opts.Stdout = transcript.Stdout
+	opts.Stderr = transcript.Stderr
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return m.Provider.Exec(cctx, name, cmd, opts)

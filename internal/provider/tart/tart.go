@@ -5,18 +5,19 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
 type Provider struct {
-	Binary string
-	DryRun bool
+	Binary     string
+	DryRun     bool
+	runCommand runCommandFunc
 }
+
+type runCommandFunc func(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (provider.ExecResult, error)
 
 func New(binary string, dryRun bool) *Provider {
 	if binary == "" {
@@ -49,36 +50,14 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
 		return &provider.RunningProcess{Name: name, PID: 0, LogPath: opts.LogPath}, nil
 	}
-	if opts.LogPath != "" {
-		if err := os.MkdirAll(filepath.Dir(opts.LogPath), 0755); err != nil {
-			return nil, err
-		}
-	}
 	cmd := exec.CommandContext(ctx, p.Binary, args...)
-	var logFile *os.File
-	if opts.LogPath != "" {
-		f, err := os.OpenFile(opts.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return nil, err
-		}
-		logFile = f
-		cmd.Stdout = f
-		cmd.Stderr = f
-	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
+	cmd.Stdout = writerOrDiscard(opts.Stdout)
+	cmd.Stderr = writerOrDiscard(opts.Stderr)
 	if err := cmd.Start(); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
 		return nil, err
 	}
 	go func() {
 		_ = cmd.Wait()
-		if logFile != nil {
-			_ = logFile.Close()
-		}
 	}()
 	return &provider.RunningProcess{Name: name, PID: cmd.Process.Pid, LogPath: opts.LogPath}, nil
 }
@@ -90,7 +69,7 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 	}
 	full = append(full, name)
 	full = append(full, provider.EnvCommand(opts.Env, command)...)
-	return p.runWithLog(ctx, strings.NewReader(opts.Stdin), opts.LogPath, full...)
+	return p.runWithSensitiveLog(ctx, strings.NewReader(opts.Stdin), opts.Stdout, opts.Stderr, opts.SensitiveValues, full...)
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
@@ -135,12 +114,25 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 }
 
 func (p *Provider) run(ctx context.Context, stdin io.Reader, args ...string) (provider.ExecResult, error) {
-	return p.runWithLog(ctx, stdin, "", args...)
+	return p.runWithLog(ctx, stdin, nil, nil, args...)
 }
 
-func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error) {
+func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, stdoutSink, stderrSink io.Writer, args ...string) (provider.ExecResult, error) {
+	return p.runWithSensitiveLog(ctx, stdin, stdoutSink, stderrSink, nil, args...)
+}
+
+func (p *Provider) runWithSensitiveLog(ctx context.Context, stdin io.Reader, stdoutSink, stderrSink io.Writer, sensitiveValues []string, args ...string) (provider.ExecResult, error) {
+	bufferedStdout, bufferedStderr, flush := provider.BufferSensitiveSinks(sensitiveValues, stdoutSink, stderrSink)
+	result, err := p.runWithLogRaw(ctx, stdin, bufferedStdout, bufferedStderr, sensitiveValues, args...)
+	return provider.FinishSensitiveExecution(result, err, flush(), sensitiveValues)
+}
+
+func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, stdoutSink, stderrSink io.Writer, sensitiveValues []string, args ...string) (provider.ExecResult, error) {
+	if p.runCommand != nil {
+		return p.runCommand(ctx, stdin, stdoutSink, stderrSink, args...)
+	}
 	if p.DryRun {
-		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
+		fmt.Printf("[dry-run] %s %s\n", p.Binary, provider.RedactText(strings.Join(args, " "), sensitiveValues...))
 		return provider.ExecResult{}, nil
 	}
 	cmd := exec.CommandContext(ctx, p.Binary, args...)
@@ -148,29 +140,26 @@ func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath stri
 		cmd.Stdin = stdin
 	}
 	var stdout, stderr bytes.Buffer
-	var logFile *os.File
-	if logPath != "" {
-		if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
-			return provider.ExecResult{}, err
-		}
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return provider.ExecResult{}, err
-		}
-		defer f.Close()
-		logFile = f
-	}
-	if logFile != nil {
-		cmd.Stdout = io.MultiWriter(&stdout, logFile)
-		cmd.Stderr = io.MultiWriter(&stderr, logFile)
-	} else {
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-	}
+	cmd.Stdout = captureWriter(&stdout, stdoutSink)
+	cmd.Stderr = captureWriter(&stderr, stderrSink)
 	err := cmd.Run()
 	result := provider.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		return result, fmt.Errorf("%s %s failed: %w: %s", p.Binary, strings.Join(args, " "), err, strings.TrimSpace(result.Stderr))
 	}
 	return result, nil
+}
+
+func captureWriter(capture io.Writer, sink io.Writer) io.Writer {
+	if sink == nil {
+		return capture
+	}
+	return io.MultiWriter(capture, sink)
+}
+
+func writerOrDiscard(writer io.Writer) io.Writer {
+	if writer == nil {
+		return io.Discard
+	}
+	return writer
 }

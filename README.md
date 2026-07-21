@@ -75,7 +75,7 @@ That's it.
 
 #### What Happens
 
-EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2; press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
+EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2. On macOS, it offers experimental Tart mode when `tart --version` succeeds. Press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
 
 Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
@@ -117,9 +117,11 @@ Docker-DinD is the default first choice. Other providers are available when they
 | --- | --- |
 | Docker-DinD | You have a Docker-compatible daemon on Windows, macOS, or Linux, and want a private Docker daemon per runner. |
 | WSL2 | You are on Windows and want runners as disposable WSL distros. |
-| Tart | You are on Apple Silicon macOS and want Linux VM runners; consider Docker-DinD first for Docker-heavy jobs because virtualization limits can affect compatibility. |
+| Tart (experimental) | You are on Apple Silicon macOS and want to experiment with native ARM64 Linux VMs. The default Tart image is a basic Ubuntu OS image and does not include the normal GitHub-hosted runner dependency set. |
 
 WSL2 also defaults to Catthehacker's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
+
+Tart is not a ready-made substitute for GitHub's hosted Ubuntu runners. If you need that environment, build and maintain your own bootable Tart runner image by adapting the scripts from [actions/runner-images](https://github.com/actions/runner-images), then configure EPAR to use it. EPAR does not automate that conversion.
 
 See [Usage](docs/usage.md) for WSL, Tart, source builds, custom configs, and advanced options.
 
@@ -154,12 +156,15 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [GitHub App Setup](docs/github-app.md): required GitHub App permissions and fields.
 - [Docker-DinD Provider](docs/providers/docker-dind.md): default Docker runner mode.
 - [WSL Provider](docs/providers/wsl.md): Windows WSL2 runners.
-- [Tart Provider](docs/providers/tart.md): Apple Silicon Linux VM runners.
+- [Tart Provider (experimental)](docs/providers/tart.md): Apple Silicon ARM64 Linux VM runners and Rosetta compatibility limits.
 - [Image Build](docs/image-build.md): image internals and customization.
 - [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
 - [Troubleshooting](docs/troubleshooting.md): symptom-first diagnostics by host and provider.
+- [Support](SUPPORT.md): where to start, what diagnostic information to collect, and where to ask for help.
 - [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
 - [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
 - [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
-- [Security](docs/security.md): trust boundaries and secret handling.
+- [Security](docs/security.md): trust boundaries, secret handling, and private vulnerability reporting.
+- [Contributing](CONTRIBUTING.md): how to propose and validate changes.
+- [Code of Conduct](CODE_OF_CONDUCT.md): community expectations and reporting concerns.
 - [Level 1 Core Runner Verification](docs/core-runner-verification.md): trusted live CI setup, canary behavior, and cleanup.

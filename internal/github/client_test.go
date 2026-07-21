@@ -27,6 +27,26 @@ func TestJWTShape(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "seconds", value: "120", want: 2 * time.Minute},
+		{name: "http date", value: now.Add(3 * time.Minute).Format(http.TimeFormat), want: 3 * time.Minute},
+		{name: "past date", value: now.Add(-time.Minute).Format(http.TimeFormat), want: 0},
+		{name: "invalid", value: "later", want: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := parseRetryAfter(test.value, now); got != test.want {
+				t.Fatalf("parseRetryAfter(%q) = %s, want %s", test.value, got, test.want)
+			}
+		})
+	}
+}
+
 func TestListRunnersUsesInstallationToken(t *testing.T) {
 	keyPath := writeKey(t)
 	var sawRunnerList bool

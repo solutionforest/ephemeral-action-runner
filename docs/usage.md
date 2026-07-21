@@ -52,7 +52,7 @@ Equivalent without the wrapper:
 go run ./cmd/ephemeral-action-runner
 ```
 
-If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config; press Enter to retain Docker-DinD. The Docker preflight still applies because the default WSL image uses Docker for its one-time rootfs export. EPAR then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker-DinD. The Docker preflight applies to Docker-DinD and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
 Pass flags through `./start` to choose a config or runner count:
 
@@ -84,7 +84,7 @@ If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.ins
 
 ## Configure Only
 
-Use `init` when you only want to create a config without building an image or starting runners. It creates Docker-DinD by default, with the same conditional native-Windows WSL2 choice described above:
+Use `init` when you only want to create a config without building an image or starting runners. It creates Docker-DinD by default, with the same conditional native-Windows WSL2 and macOS Tart choices described above:
 
 ```bash
 go run ./cmd/ephemeral-action-runner init
@@ -96,11 +96,11 @@ On Windows PowerShell:
 go run ./cmd/ephemeral-action-runner init
 ```
 
-For WSL, Tart, or custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
+For other WSL or Tart variants, or for custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
 
 | Host and image | Example config |
 | --- | --- |
-| macOS Tart, runner-only | `configs/tart.example.yml` |
+| macOS Tart, experimental basic Ubuntu ARM64 image | `configs/tart.example.yml` |
 | macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
 | Windows WSL2, default full Catthehacker runner image | `configs/wsl.example.yml` |
 | Windows WSL2, lean runner-only tar | `configs/wsl.lean.example.yml` |
@@ -108,6 +108,8 @@ For WSL, Tart, or custom labels, copy one example config into `.local/config.yml
 | Docker-DinD, default full Catthehacker runner image | `configs/docker-dind.example.yml` |
 | Docker-DinD, Docker-focused Catthehacker Act image | `configs/docker-dind.act.example.yml` |
 | Docker-DinD, smaller web/E2E custom image | `configs/docker-dind.web-e2e.example.yml` |
+
+Tart is experimental. Its default image is a basic Ubuntu ARM64 OS image with the EPAR runner lifecycle, not the dependency-rich environment described by [`actions/runner-images`](https://github.com/actions/runner-images). If your workflows depend on that environment, adapt the upstream build scripts to create and maintain your own bootable Tart image and point `image.sourceImage` at it; EPAR does not automatically create one.
 
 macOS:
 
@@ -210,7 +212,7 @@ Docker-DinD output is a Docker image tag, such as `epar-docker-dind-catthehacker
 docker image ls epar-docker-dind-catthehacker-ubuntu
 ```
 
-Build logs are written under `work/logs`.
+Build logs are written under `work/logs/builds` by default. Run `ephemeral-action-runner logs path` to resolve a customized logging root and see [Logging](logging.md) for rotation and retention.
 
 ## Customize The Image
 
@@ -273,7 +275,9 @@ go run ./cmd/ephemeral-action-runner pool up --instances 2
 
 `start` is the recommended public command because it also checks the image before starting runners. `pool up` is the lower-level supervisor command for users who already prepared the image.
 
-`pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement.
+`pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement. The requested count is a strict physical local-instance cap: provisioning, ready, draining, quarantined, and cleanup-pending resources all consume a slot, including old runners during host-trust rotation.
+
+When GitHub registration or readiness has a transient network, `429`, or `5xx` failure during supervised replacement, EPAR pauses allocation and retries with the configured exponential backoff while continuing monitoring and cleanup. It does not create extra candidates while remote state is uncertain; see [Configuration](configuration.md#common-edits) and [Operations](operations.md#capacity-reconciliation-and-outage-recovery) for retry settings and recovery steps.
 
 Stop the supervisor with Ctrl-C. By default, EPAR cleans up active instances and matching GitHub runner records before it exits.
 

@@ -20,7 +20,8 @@ EPAR looks for config in this order:
 | `github` | GitHub App ID, organization, private key path, and optional GitHub API/web URLs. |
 | `provider` | How EPAR creates disposable runners: `docker-dind`, `wsl`, or `tart`. |
 | `image` | Source image/rootfs, output image, runner version, and optional install scripts. |
-| `pool` | Runner count, instance name prefix, and log directory. |
+| `pool` | Runner count, instance name prefix, and replacement retry policy. |
+| `logging` | Manager and transcript sinks, formats, rotation, retention, and log directory. |
 | `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
 | `docker` | Optional Docker registry mirrors and Docker-DinD daemon proxy settings. |
 | `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
@@ -42,6 +43,22 @@ pool:
 ```
 
 `pool.namePrefix` is both the prefix for generated GitHub runner names and the cleanup boundary for GitHub runner records. It must be 2-40 characters and should leave room for EPAR's generated `-YYYYMMDD-HHMMSS-###` suffix. Do not reuse the same prefix on different machines or for separate EPAR supervisors in the same organization. If two machines share a prefix, one machine's cleanup can delete the other machine's GitHub runner record, causing the other supervisor to report that the runner record is gone and replace a healthy runner.
+
+Configure replacement retry behavior after a transient GitHub or network outage:
+
+```yaml
+pool:
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+```
+
+These values default to `15`, `1800`, `2`, and `20`, so existing configurations remain valid without changes. `replacementRetryInitialSeconds` must be positive, `replacementRetryMaxSeconds` must be at least the initial delay, `replacementRetryMultiplier` must be at least `1`, and `replacementRetryJitterPercent` must be from `0` through `100`.
+
+The supervisor backs off only replacement allocation after transient network errors and GitHub HTTP `429` or `5xx` responses. The nominal delay doubles from 15 seconds to a 30-minute cap with the configured jitter; a longer GitHub `Retry-After` response takes precedence. Authentication and deterministic configuration failures remain fail-fast after safe rollback. Initial `pool up` startup also remains fail-fast rather than entering an unattended retry loop.
+
+`pool.instances` is an absolute local physical-instance cap, not only an online-runner target. Provisioning, ready, draining, quarantined, and cleanup-pending instances all count toward it. Host-trust generation rotation does not receive surge capacity: an old busy runner keeps its slot until it exits or is safely removed.
 
 Add or change workflow labels:
 
@@ -81,6 +98,8 @@ Use a different config file:
 ```bash
 go run ./cmd/ephemeral-action-runner start --config .local/wsl.yml
 ```
+
+Configure logging and retention in the top-level `logging` section. The complete schema and local/Kubernetes examples are in [Logging](logging.md). Unknown configuration keys are rejected. For compatibility, a legacy `pool.logDir` value is used as `logging.directory` with a migration warning when the new key is absent; the file is not rewritten automatically. A configuration containing both keys is rejected as ambiguous.
 
 ### Host trust inheritance
 
@@ -163,7 +182,7 @@ For `provider.type: docker-dind`, EPAR defaults to Catthehacker's full Ubuntu ru
 
 For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
 
-For `provider.type: tart`, start from `configs/tart.example.yml` and adjust labels or image scripts as needed.
+For the experimental `provider.type: tart`, EPAR defaults to `ghcr.io/cirruslabs/ubuntu:latest`, a basic Ubuntu ARM64 VM image. EPAR installs its runner lifecycle but does not add the broad tool and dependency set found in GitHub's hosted runner images. If you require a GitHub-runner-like environment, build and maintain a bootable Tart image yourself by adapting the scripts in [actions/runner-images](https://github.com/actions/runner-images), then set `image.sourceImage` to that Tart image. Rosetta-based amd64 execution also has compatibility limits and must be validated against the exact workflow.
 
 See the provider docs for details:
 

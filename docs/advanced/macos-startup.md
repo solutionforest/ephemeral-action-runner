@@ -98,10 +98,10 @@ Example `~/Library/LaunchAgents/com.example.epar.plist`:
     <string>/path/to/ephemeral-action-runner</string>
 
     <key>StandardOutPath</key>
-    <string>/path/to/ephemeral-action-runner/work/logs/launchd.out.log</string>
+    <string>/path/to/ephemeral-action-runner/work/state/launchd.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/path/to/ephemeral-action-runner/work/logs/launchd.err.log</string>
+    <string>/path/to/ephemeral-action-runner/work/state/launchd.err.log</string>
   </dict>
 </plist>
 ```

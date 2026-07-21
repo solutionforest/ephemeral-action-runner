@@ -23,7 +23,7 @@ type Provider struct {
 	runCommand  runCommandFunc
 }
 
-type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error)
+type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, stdout, stderr io.Writer, args ...string) (provider.ExecResult, error)
 
 func New(binary, installRoot, projectRoot string, dryRun bool) *Provider {
 	if binary == "" {
@@ -70,11 +70,15 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 	default:
 		return nil, fmt.Errorf("unsupported wsl network mode %q", opts.Network)
 	}
-	keeper, err := p.startKeepAlive(name, opts.LogPath)
+	keeper, err := p.startKeepAlive(name, opts.Stdout, opts.Stderr)
 	if err != nil {
 		return nil, err
 	}
-	_, err = p.Exec(ctx, name, []string{"/bin/sh", "-c", "true"}, provider.ExecOptions{LogPath: opts.LogPath})
+	_, err = p.Exec(ctx, name, []string{"/bin/sh", "-c", "true"}, provider.ExecOptions{
+		LogPath: opts.LogPath,
+		Stdout:  opts.Stdout,
+		Stderr:  opts.Stderr,
+	})
 	if err != nil {
 		if keeper != nil && keeper.Process != nil {
 			_ = keeper.Process.Kill()
@@ -93,7 +97,7 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 	if opts.Stdin != "" {
 		stdin = strings.NewReader(opts.Stdin)
 	}
-	return p.runWithLog(ctx, stdin, opts.LogPath, p.execArgs(name, command, opts.Env)...)
+	return p.runWithSensitiveLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, opts.SensitiveValues, p.execArgs(name, command, opts.Env)...)
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
@@ -220,39 +224,22 @@ func (p *Provider) execArgs(name string, command []string, env map[string]string
 	return append(args, provider.EnvCommand(env, command)...)
 }
 
-func (p *Provider) startKeepAlive(name, logPath string) (*exec.Cmd, error) {
+func (p *Provider) startKeepAlive(name string, stdoutSink, stderrSink io.Writer) (*exec.Cmd, error) {
 	args := p.keepAliveArgs(name)
 	if p.DryRun {
 		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
 		return nil, nil
 	}
 	cmd := exec.Command(p.Binary, args...)
-	var logFile *os.File
-	if logPath != "" {
-		if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
-			return nil, err
-		}
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return nil, err
-		}
-		logFile = f
-		cmd.Stdout = f
-		cmd.Stderr = f
-	}
+	cmd.Stdout = writerOrDiscard(stdoutSink)
+	cmd.Stderr = writerOrDiscard(stderrSink)
 	if err := cmd.Start(); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
 		return nil, fmt.Errorf("%s %s failed: %w", p.Binary, strings.Join(args, " "), err)
 	}
 	go func() {
 		err := cmd.Wait()
-		if logFile != nil {
-			if err != nil {
-				_, _ = fmt.Fprintf(logFile, "\n[wsl keepalive exited: %v]\n", err)
-			}
-			_ = logFile.Close()
+		if err != nil && stderrSink != nil {
+			_, _ = fmt.Fprintf(stderrSink, "\n[wsl keepalive exited: %v]\n", err)
 		}
 	}()
 	return cmd, nil
@@ -282,15 +269,25 @@ func (p *Provider) instanceDir(name string) (string, error) {
 }
 
 func (p *Provider) run(ctx context.Context, stdin io.Reader, args ...string) (provider.ExecResult, error) {
-	return p.runWithLog(ctx, stdin, "", args...)
+	return p.runWithLog(ctx, stdin, "", nil, nil, args...)
 }
 
-func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath string, args ...string) (provider.ExecResult, error) {
+func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, args ...string) (provider.ExecResult, error) {
+	return p.runWithSensitiveLog(ctx, stdin, logPath, stdoutSink, stderrSink, nil, args...)
+}
+
+func (p *Provider) runWithSensitiveLog(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, sensitiveValues []string, args ...string) (provider.ExecResult, error) {
+	bufferedStdout, bufferedStderr, flush := provider.BufferSensitiveSinks(sensitiveValues, stdoutSink, stderrSink)
+	result, err := p.runWithLogRaw(ctx, stdin, logPath, bufferedStdout, bufferedStderr, sensitiveValues, args...)
+	return provider.FinishSensitiveExecution(result, err, flush(), sensitiveValues)
+}
+
+func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, logPath string, stdoutSink, stderrSink io.Writer, sensitiveValues []string, args ...string) (provider.ExecResult, error) {
 	if p.runCommand != nil {
-		return p.runCommand(ctx, stdin, logPath, args...)
+		return p.runCommand(ctx, stdin, logPath, stdoutSink, stderrSink, args...)
 	}
 	if p.DryRun {
-		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
+		fmt.Printf("[dry-run] %s %s\n", p.Binary, provider.RedactText(strings.Join(args, " "), sensitiveValues...))
 		return provider.ExecResult{}, nil
 	}
 	cmd := exec.CommandContext(ctx, p.Binary, args...)
@@ -298,25 +295,8 @@ func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath stri
 		cmd.Stdin = stdin
 	}
 	var stdout, stderr bytes.Buffer
-	var logFile *os.File
-	if logPath != "" {
-		if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
-			return provider.ExecResult{}, err
-		}
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			return provider.ExecResult{}, err
-		}
-		defer f.Close()
-		logFile = f
-	}
-	if logFile != nil {
-		cmd.Stdout = io.MultiWriter(&stdout, logFile)
-		cmd.Stderr = io.MultiWriter(&stderr, logFile)
-	} else {
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-	}
+	cmd.Stdout = captureWriter(&stdout, stdoutSink)
+	cmd.Stderr = captureWriter(&stderr, stderrSink)
 	err := cmd.Run()
 	result := provider.ExecResult{
 		Stdout: cleanWSLOutput(stdout.Bytes()),
@@ -326,6 +306,20 @@ func (p *Provider) runWithLog(ctx context.Context, stdin io.Reader, logPath stri
 		return result, fmt.Errorf("%s %s failed: %w: %s", p.Binary, strings.Join(args, " "), err, strings.TrimSpace(result.Stderr))
 	}
 	return result, nil
+}
+
+func captureWriter(capture io.Writer, sink io.Writer) io.Writer {
+	if sink == nil {
+		return capture
+	}
+	return io.MultiWriter(capture, sink)
+}
+
+func writerOrDiscard(writer io.Writer) io.Writer {
+	if writer == nil {
+		return io.Discard
+	}
+	return writer
 }
 
 func parseList(text string) []provider.Instance {

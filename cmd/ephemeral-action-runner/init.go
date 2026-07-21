@@ -37,6 +37,8 @@ var initHostTrustOS = detectedInitHostTrustOS()
 
 var initWSLStatus = wslStatus
 
+var initTartVersion = tartVersion
+
 var initResolveHostTrust = hosttrust.Resolve
 
 func detectedInitHostTrustOS() string {
@@ -105,14 +107,6 @@ func runInitWithOptions(opts initOptions) error {
 			return err
 		}
 	}
-	if !opts.SkipDockerCheck {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := dockerAvailable(ctx); err != nil {
-			return fmt.Errorf("Docker is required for the default Docker-DinD setup. Install Docker Desktop, Docker Engine, or a compatible Docker host, then rerun %s init. If you want WSL or another custom provider, create .local/config.yml from the examples instead", binaryName)
-		}
-	}
-
 	fmt.Fprintln(opts.Out, "EPAR first-run setup")
 	fmt.Fprintln(opts.Out, "")
 	fmt.Fprintln(opts.Out, "This creates .local/config.yml for an EPAR runner.")
@@ -135,9 +129,22 @@ func runInitWithOptions(opts initOptions) error {
 	}
 	providerType := "docker-dind"
 	if wsl2Available() {
-		providerType, err = promptProviderType(opts.Out, reader)
+		providerType, err = promptProviderType(opts.Out, reader, "wsl")
 		if err != nil {
 			return err
+		}
+	} else if tartAvailable() {
+		providerType, err = promptProviderType(opts.Out, reader, "tart")
+		if err != nil {
+			return err
+		}
+	}
+	if !opts.SkipDockerCheck && providerType != "tart" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dockerErr := dockerAvailable(ctx)
+		cancel()
+		if dockerErr != nil {
+			return fmt.Errorf("Docker is required for the selected %s setup. Install Docker Desktop, Docker Engine, or a compatible Docker host, then rerun %s init", providerDisplayName(providerType), binaryName)
 		}
 	}
 	defaultPrefix, err := generatedPoolNamePrefix()
@@ -179,8 +186,11 @@ func runInitWithOptions(opts initOptions) error {
 	}
 
 	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes)
-	if providerType == "wsl" {
+	switch providerType {
+	case "wsl":
 		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix)
+	case "tart":
+		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix)
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.ConfigPath), 0755); err != nil {
 		return err
@@ -255,11 +265,12 @@ func promptPoolNamePrefix(out io.Writer, reader *bufio.Reader, defaultValue stri
 	}
 }
 
-func promptProviderType(out io.Writer, reader *bufio.Reader) (string, error) {
+func promptProviderType(out io.Writer, reader *bufio.Reader, alternative string) (string, error) {
+	alternativeLabel := providerDisplayName(alternative)
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Runner provider:")
 	fmt.Fprintln(out, "  1. Docker-DinD (default)")
-	fmt.Fprintln(out, "  2. WSL2")
+	fmt.Fprintf(out, "  2. %s\n", alternativeLabel)
 	for {
 		value, hitEOF, err := promptDefault(out, reader, "Runner provider", "1")
 		if err != nil {
@@ -268,14 +279,30 @@ func promptProviderType(out io.Writer, reader *bufio.Reader) (string, error) {
 		switch strings.ToLower(value) {
 		case "1", "docker", "docker-dind":
 			return "docker-dind", nil
-		case "2", "wsl", "wsl2":
-			return "wsl", nil
-		default:
-			fmt.Fprintln(out, "Runner provider must be 1 (Docker-DinD) or 2 (WSL2).")
-			if hitEOF {
-				return "", fmt.Errorf("invalid runner provider %q", value)
+		case "2", alternative:
+			return alternative, nil
+		case "wsl2":
+			if alternative == "wsl" {
+				return alternative, nil
 			}
+		default:
+			// Continue below so aliases that belong to an unavailable provider are rejected.
 		}
+		fmt.Fprintf(out, "Runner provider must be 1 (Docker-DinD) or 2 (%s).\n", alternativeLabel)
+		if hitEOF {
+			return "", fmt.Errorf("invalid runner provider %q", value)
+		}
+	}
+}
+
+func providerDisplayName(providerType string) string {
+	switch providerType {
+	case "wsl":
+		return "WSL2"
+	case "tart":
+		return "Tart (experimental)"
+	default:
+		return "Docker-DinD"
 	}
 }
 
@@ -439,6 +466,19 @@ func wslStatus(ctx context.Context) ([]byte, error) {
 	return output.Bytes(), nil
 }
 
+func tartAvailable() bool {
+	if initGOOS != "darwin" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return initTartVersion(ctx) == nil
+}
+
+func tartVersion(ctx context.Context) error {
+	return exec.CommandContext(ctx, "tart", "--version").Run()
+}
+
 type boundedBuffer struct {
 	bytes.Buffer
 	limit    int
@@ -481,7 +521,29 @@ image:
 pool:
   instances: 1
   namePrefix: %s
-  logDir: work/logs
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
@@ -527,7 +589,29 @@ pool:
   instances: 1
   # Must be unique for this machine/config within the GitHub organization.
   namePrefix: %s
-  logDir: work/logs
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   labels: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
@@ -539,6 +623,74 @@ provider:
   sourceImage: work/images/epar-wsl-catthehacker-ubuntu.tar
   network: default
   installRoot: work/wsl
+
+docker:
+  registryMirrors:
+    # - https://mirror.example.test
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900
+`, appID, organization, privateKeyPath, poolNamePrefix)
+}
+
+func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string) string {
+	return fmt.Sprintf(`# Experimental: this default is a basic Ubuntu ARM64 Tart VM, not a GitHub-hosted runner image.
+# It does not include the broad dependency set from https://github.com/actions/runner-images.
+github:
+  appId: %d
+  organization: %s
+  privateKeyPath: %s
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  sourceImage: ghcr.io/cirruslabs/ubuntu:latest
+  outputImage: epar-ubuntu-24-arm64
+  upstreamDir: third_party/runner-images
+  upstreamLock: third_party/runner-images.lock
+  runnerVersion: latest
+  customInstallScripts:
+    # - examples/custom-install/install-extra-apt-tools.sh
+
+pool:
+  instances: 1
+  # Must be unique for this machine/config within the GitHub organization.
+  namePrefix: %s
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
+
+runner:
+  labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-base]
+  includeHostLabel: true
+  ephemeral: true
+
+provider:
+  type: tart
+  sourceImage: epar-ubuntu-24-arm64
+  network: default
 
 docker:
   registryMirrors:

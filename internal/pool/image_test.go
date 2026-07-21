@@ -113,7 +113,7 @@ func TestDockerDindBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
 				OutputImage:   "epar-docker-dind-catthehacker-ubuntu",
 				RunnerVersion: "latest",
 			},
-			Pool:     config.PoolConfig{LogDir: "logs"},
+			Logging:  config.LoggingConfig{Directory: "logs"},
 			Provider: config.ProviderConfig{Type: "docker-dind", Platform: "linux/amd64"},
 		},
 		ProjectRoot: root,
@@ -160,7 +160,7 @@ func TestInstallCustomScriptsRunsInOrder(t *testing.T) {
 			Image: config.ImageConfig{
 				CustomInstallScripts: []string{".local/one.sh", ".local/two.sh"},
 			},
-			Pool: config.PoolConfig{LogDir: "logs"},
+			Logging: config.LoggingConfig{Directory: "logs"},
 		},
 		Provider:    provider,
 		ProjectRoot: root,
@@ -269,7 +269,7 @@ func TestConfigureDockerRegistryMirrors(t *testing.T) {
 			Docker: config.DockerConfig{
 				RegistryMirrors: []string{"http://host.docker.internal:5000", "https://mirror.example.test"},
 			},
-			Pool: config.PoolConfig{LogDir: "logs"},
+			Logging: config.LoggingConfig{Directory: "logs"},
 		},
 		Provider:    provider,
 		ProjectRoot: root,
@@ -293,14 +293,16 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	oldLogged := runHostLoggedCommand
 	oldOutput := runHostOutputCommand
 	oldQuiet := runHostQuietCommand
+	oldPull := pullDockerSourceCommand
 	defer func() {
 		runHostLoggedCommand = oldLogged
 		runHostOutputCommand = oldOutput
 		runHostQuietCommand = oldQuiet
+		pullDockerSourceCommand = oldPull
 	}()
 
 	var calls []string
-	runHostLoggedCommand = func(_ context.Context, _ string, name string, args ...string) error {
+	runHostLoggedCommand = func(_ context.Context, _ string, _, _ io.Writer, name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
 		if len(args) > 0 && args[0] == "export" {
 			for i := 0; i+1 < len(args); i++ {
@@ -320,6 +322,15 @@ func TestPrepareWSLDockerSourceRootfsExportsContainerFilesystem(t *testing.T) {
 	}
 	runHostQuietCommand = func(_ context.Context, name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
+		return nil
+	}
+	pullDockerSourceCommand = func(_ *Manager, _ context.Context, opts dockerSourcePullOptions) error {
+		args := []string{"pull"}
+		if opts.Platform != "" {
+			args = append(args, "--platform", opts.Platform)
+		}
+		args = append(args, opts.Image)
+		calls = append(calls, "docker "+strings.Join(args, " "))
 		return nil
 	}
 
@@ -373,12 +384,18 @@ func TestPrepareWSLDockerSourceRootfsUsesCachedRootfs(t *testing.T) {
 	origLogged := runHostLoggedCommand
 	origOutput := runHostOutputCommand
 	origQuiet := runHostQuietCommand
+	origPull := pullDockerSourceCommand
 	defer func() {
 		runHostLoggedCommand = origLogged
 		runHostOutputCommand = origOutput
 		runHostQuietCommand = origQuiet
+		pullDockerSourceCommand = origPull
 	}()
-	runHostLoggedCommand = func(context.Context, string, string, ...string) error {
+	pullDockerSourceCommand = func(*Manager, context.Context, dockerSourcePullOptions) error {
+		t.Fatal("docker pull should not run when cached rootfs and env metadata exist")
+		return nil
+	}
+	runHostLoggedCommand = func(context.Context, string, io.Writer, io.Writer, string, ...string) error {
 		t.Fatal("docker command should not run when cached rootfs and env metadata exist")
 		return nil
 	}

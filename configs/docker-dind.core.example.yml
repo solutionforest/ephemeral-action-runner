@@ -22,7 +22,29 @@ image:
 pool:
   instances: 1
   namePrefix: epar-ci-core
-  logDir: work/logs
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
 
 runner:
   group: epar-ci-canary

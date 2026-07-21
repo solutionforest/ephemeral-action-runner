@@ -236,6 +236,7 @@ func (c *Client) request(ctx context.Context, method, path, auth string, body, o
 			Path:       path,
 			StatusCode: resp.StatusCode,
 			Body:       strings.TrimSpace(string(respBody)),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		}
 	}
 	if out == nil || len(respBody) == 0 {
@@ -249,8 +250,27 @@ type HTTPError struct {
 	Path       string
 	StatusCode int
 	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("github %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := time.ParseDuration(value + "s"); err == nil {
+		if seconds > 0 {
+			return seconds
+		}
+		return 0
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
 }

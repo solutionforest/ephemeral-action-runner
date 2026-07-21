@@ -1,0 +1,30 @@
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol/file-storage
+
+receivers:
+  filelog/epar:
+    include:
+      - /var/log/epar/epar.log
+      - /var/log/epar/errors/*.log
+      - /var/log/epar/instances/*.log
+      - /var/log/epar/builds/*.log
+      - /var/log/epar/benchmarks/*.jsonl
+    exclude:
+      - /var/log/epar/epar-last-error.log
+      - /var/log/epar/.epar-control/**
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    storage: file_storage
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs:
+      receivers: [filelog/epar]
+      exporters: [debug]

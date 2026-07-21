@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -15,10 +16,17 @@ type Config struct {
 	GitHub   GitHubConfig
 	Image    ImageConfig
 	Pool     PoolConfig
+	Logging  LoggingConfig
 	Runner   RunnerConfig
 	Provider ProviderConfig
 	Docker   DockerConfig
 	Timeouts TimeoutConfig
+	warnings []string
+}
+
+// Warnings returns non-fatal configuration migration notices discovered while loading.
+func (cfg Config) Warnings() []string {
+	return append([]string(nil), cfg.warnings...)
 }
 
 type GitHubConfig struct {
@@ -52,9 +60,34 @@ const (
 )
 
 type PoolConfig struct {
-	Instances  int
-	NamePrefix string
-	LogDir     string
+	Instances                      int
+	NamePrefix                     string
+	ReplacementRetryInitialSeconds int
+	ReplacementRetryMaxSeconds     int
+	ReplacementRetryMultiplier     float64
+	ReplacementRetryJitterPercent  int
+}
+
+type LoggingConfig struct {
+	Directory                   string
+	ManagerSinks                []string
+	ManagerConsoleFormat        string
+	ManagerConsoleTextFormat    string
+	ManagerFileFormat           string
+	TranscriptSinks             []string
+	TranscriptConsoleFormat     string
+	TranscriptConsoleTextFormat string
+	MaxFileSizeMiB              int
+	MaxBackups                  int
+	CompressBackups             bool
+	RetentionEnabled            bool
+	RetentionMaxTotalMiB        int
+	ManagerMaxAgeDays           int
+	InstanceMaxAgeDays          int
+	BuildMaxAgeDays             int
+	ErrorMaxAgeDays             int
+	BenchmarkMaxAgeDays         int
+	RetentionIntervalMinutes    int
 }
 
 type RunnerConfig struct {
@@ -112,9 +145,31 @@ func Default() Config {
 			},
 		},
 		Pool: PoolConfig{
-			Instances:  1,
-			NamePrefix: "epar",
-			LogDir:     "work/logs",
+			Instances:                      1,
+			NamePrefix:                     "epar",
+			ReplacementRetryInitialSeconds: 15,
+			ReplacementRetryMaxSeconds:     1800,
+			ReplacementRetryMultiplier:     2,
+			ReplacementRetryJitterPercent:  20,
+		},
+		Logging: LoggingConfig{
+			Directory:                "work/logs",
+			ManagerSinks:             []string{"console"},
+			ManagerConsoleFormat:     "text",
+			ManagerFileFormat:        "json",
+			TranscriptSinks:          []string{"file"},
+			TranscriptConsoleFormat:  "text",
+			MaxFileSizeMiB:           100,
+			MaxBackups:               3,
+			CompressBackups:          true,
+			RetentionEnabled:         true,
+			RetentionMaxTotalMiB:     1024,
+			ManagerMaxAgeDays:        14,
+			InstanceMaxAgeDays:       14,
+			BuildMaxAgeDays:          14,
+			ErrorMaxAgeDays:          30,
+			BenchmarkMaxAgeDays:      90,
+			RetentionIntervalMinutes: 60,
 		},
 		Runner: RunnerConfig{
 			Labels:           []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
@@ -152,6 +207,8 @@ func Load(path string) (Config, error) {
 	lineNo := 0
 	var pendingList *pendingListKey
 	explicit := map[string]bool{}
+	legacyLogDir := ""
+	legacyLogDirLine := 0
 	for scanner.Scan() {
 		lineNo++
 		raw := strings.TrimRight(scanner.Text(), " \t")
@@ -180,11 +237,23 @@ func Load(path string) (Config, error) {
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
 		if indent == 0 && value == "" {
+			if !isKnownSection(key) {
+				return cfg, fmt.Errorf("%s:%d: unknown section %q", path, lineNo, key)
+			}
 			section = key
 			continue
 		}
+		if indent == 0 {
+			return cfg, fmt.Errorf("%s:%d: section %q must not have a scalar value", path, lineNo, key)
+		}
 		if section == "" {
 			return cfg, fmt.Errorf("%s:%d: key %q must be under a section", path, lineNo, key)
+		}
+		if section == "pool" && key == "logDir" {
+			legacyLogDir = trimQuotes(value)
+			legacyLogDirLine = lineNo
+			explicit["pool.logDir"] = true
+			continue
 		}
 		if value == "" && isListKey(section, key) {
 			if err := setListValue(&cfg, section, key, nil); err != nil {
@@ -201,6 +270,13 @@ func Load(path string) (Config, error) {
 	}
 	if err := scanner.Err(); err != nil {
 		return cfg, err
+	}
+	if explicit["pool.logDir"] {
+		if explicit["logging.directory"] {
+			return cfg, fmt.Errorf("%s:%d: pool.logDir cannot be used with logging.directory; remove pool.logDir", path, legacyLogDirLine)
+		}
+		cfg.Logging.Directory = legacyLogDir
+		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s:%d: pool.logDir is deprecated; using its value as logging.directory (move it to the top-level logging section)", path, legacyLogDirLine))
 	}
 	applyProviderDefaults(&cfg, explicit)
 	applyRunnerHostLabel(&cfg)
@@ -236,6 +312,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.GitHub.APIBaseURL = strings.TrimRight(value, "/")
 		case "webBaseUrl":
 			cfg.GitHub.WebBaseURL = strings.TrimRight(value, "/")
+		default:
+			return unknownKey(section, key)
 		}
 	case "image":
 		switch key {
@@ -263,6 +341,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Image.HostTrustMode = strings.ToLower(value)
 		case "hostTrustScopes":
 			return setListValue(cfg, section, key, parseList(value))
+		default:
+			return unknownKey(section, key)
 		}
 	case "pool":
 		switch key {
@@ -274,8 +354,102 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Pool.Instances = v
 		case "namePrefix", "vmPrefix":
 			cfg.Pool.NamePrefix = value
+		case "replacementRetryInitialSeconds":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryInitialSeconds: %w", err)
+			}
+			cfg.Pool.ReplacementRetryInitialSeconds = v
+		case "replacementRetryMaxSeconds":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryMaxSeconds: %w", err)
+			}
+			cfg.Pool.ReplacementRetryMaxSeconds = v
+		case "replacementRetryMultiplier":
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryMultiplier: %w", err)
+			}
+			cfg.Pool.ReplacementRetryMultiplier = v
+		case "replacementRetryJitterPercent":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid pool.replacementRetryJitterPercent: %w", err)
+			}
+			cfg.Pool.ReplacementRetryJitterPercent = v
 		case "logDir":
-			cfg.Pool.LogDir = value
+			return fmt.Errorf("pool.logDir is deprecated; use logging.directory")
+		default:
+			return unknownKey(section, key)
+		}
+	case "logging":
+		switch key {
+		case "directory":
+			cfg.Logging.Directory = value
+		case "managerSinks", "transcriptSinks":
+			return setListValue(cfg, section, key, parseList(value))
+		case "managerConsoleFormat":
+			cfg.Logging.ManagerConsoleFormat = strings.ToLower(value)
+		case "managerConsoleTextFormat":
+			cfg.Logging.ManagerConsoleTextFormat = value
+		case "managerFileFormat":
+			cfg.Logging.ManagerFileFormat = strings.ToLower(value)
+		case "transcriptConsoleFormat":
+			cfg.Logging.TranscriptConsoleFormat = strings.ToLower(value)
+		case "transcriptConsoleTextFormat":
+			cfg.Logging.TranscriptConsoleTextFormat = value
+		case "maxFileSizeMiB":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid logging.maxFileSizeMiB: %w", err)
+			}
+			cfg.Logging.MaxFileSizeMiB = v
+		case "maxBackups":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid logging.maxBackups: %w", err)
+			}
+			cfg.Logging.MaxBackups = v
+		case "compressBackups":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid logging.compressBackups: %w", err)
+			}
+			cfg.Logging.CompressBackups = v
+		case "retentionEnabled":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid logging.retentionEnabled: %w", err)
+			}
+			cfg.Logging.RetentionEnabled = v
+		case "retentionMaxTotalMiB":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid logging.retentionMaxTotalMiB: %w", err)
+			}
+			cfg.Logging.RetentionMaxTotalMiB = v
+		case "managerMaxAgeDays", "instanceMaxAgeDays", "buildMaxAgeDays", "errorMaxAgeDays", "benchmarkMaxAgeDays", "retentionIntervalMinutes":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid logging.%s: %w", key, err)
+			}
+			switch key {
+			case "managerMaxAgeDays":
+				cfg.Logging.ManagerMaxAgeDays = v
+			case "instanceMaxAgeDays":
+				cfg.Logging.InstanceMaxAgeDays = v
+			case "buildMaxAgeDays":
+				cfg.Logging.BuildMaxAgeDays = v
+			case "errorMaxAgeDays":
+				cfg.Logging.ErrorMaxAgeDays = v
+			case "benchmarkMaxAgeDays":
+				cfg.Logging.BenchmarkMaxAgeDays = v
+			case "retentionIntervalMinutes":
+				cfg.Logging.RetentionIntervalMinutes = v
+			}
+		default:
+			return unknownKey(section, key)
 		}
 	case "runner":
 		switch key {
@@ -301,6 +475,8 @@ func apply(cfg *Config, section, key, value string) error {
 				return fmt.Errorf("invalid runner.noDefaultLabels: %w", err)
 			}
 			cfg.Runner.NoDefaultLabels = v
+		default:
+			return unknownKey(section, key)
 		}
 	case "provider":
 		switch key {
@@ -316,6 +492,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Provider.InstallRoot = value
 		case "platform":
 			cfg.Provider.Platform = value
+		default:
+			return unknownKey(section, key)
 		}
 	case "docker":
 		switch key {
@@ -327,6 +505,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Docker.HTTPSProxy = value
 		case "noProxy":
 			cfg.Docker.NoProxy = value
+		default:
+			return unknownKey(section, key)
 		}
 	case "timeouts":
 		v, err := strconv.Atoi(value)
@@ -340,11 +520,26 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Timeouts.GitHubOnlineSeconds = v
 		case "commandSeconds":
 			cfg.Timeouts.CommandSeconds = v
+		default:
+			return unknownKey(section, key)
 		}
 	default:
 		return fmt.Errorf("unknown section %q", section)
 	}
 	return nil
+}
+
+func unknownKey(section, key string) error {
+	return fmt.Errorf("unknown key %s.%s", section, key)
+}
+
+func isKnownSection(section string) bool {
+	switch section {
+	case "github", "image", "pool", "logging", "runner", "provider", "docker", "timeouts":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
@@ -506,6 +701,8 @@ func isListKey(section, key string) bool {
 		return key == "labels"
 	case "docker":
 		return key == "registryMirrors"
+	case "logging":
+		return key == "managerSinks" || key == "transcriptSinks"
 	default:
 		return false
 	}
@@ -533,6 +730,15 @@ func setListValue(cfg *Config, section, key string, values []string) error {
 	case "docker":
 		if key == "registryMirrors" {
 			cfg.Docker.RegistryMirrors = values
+			return nil
+		}
+	case "logging":
+		switch key {
+		case "managerSinks":
+			cfg.Logging.ManagerSinks = values
+			return nil
+		case "transcriptSinks":
+			cfg.Logging.TranscriptSinks = values
 			return nil
 		}
 	}
@@ -567,11 +773,23 @@ func appendListValue(cfg *Config, section, key, value string) error {
 			cfg.Docker.RegistryMirrors = append(cfg.Docker.RegistryMirrors, item)
 			return nil
 		}
+	case "logging":
+		switch key {
+		case "managerSinks":
+			cfg.Logging.ManagerSinks = append(cfg.Logging.ManagerSinks, item)
+			return nil
+		case "transcriptSinks":
+			cfg.Logging.TranscriptSinks = append(cfg.Logging.TranscriptSinks, item)
+			return nil
+		}
 	}
 	return fmt.Errorf("unsupported list key %s.%s", section, key)
 }
 
 func Validate(cfg Config) error {
+	if err := ValidateLogging(cfg.Logging); err != nil {
+		return err
+	}
 	if cfg.Provider.Type == "" {
 		return fmt.Errorf("provider.type is required")
 	}
@@ -630,6 +848,18 @@ func Validate(cfg Config) error {
 	if cfg.Pool.Instances < 1 {
 		return fmt.Errorf("pool.instances must be 1 or greater")
 	}
+	if cfg.Pool.ReplacementRetryInitialSeconds <= 0 {
+		return fmt.Errorf("pool.replacementRetryInitialSeconds must be greater than zero")
+	}
+	if cfg.Pool.ReplacementRetryMaxSeconds < cfg.Pool.ReplacementRetryInitialSeconds {
+		return fmt.Errorf("pool.replacementRetryMaxSeconds must be greater than or equal to pool.replacementRetryInitialSeconds")
+	}
+	if math.IsNaN(cfg.Pool.ReplacementRetryMultiplier) || math.IsInf(cfg.Pool.ReplacementRetryMultiplier, 0) || cfg.Pool.ReplacementRetryMultiplier < 1 {
+		return fmt.Errorf("pool.replacementRetryMultiplier must be 1 or greater")
+	}
+	if cfg.Pool.ReplacementRetryJitterPercent < 0 || cfg.Pool.ReplacementRetryJitterPercent > 100 {
+		return fmt.Errorf("pool.replacementRetryJitterPercent must be between 0 and 100")
+	}
 	if err := ValidatePrefix(cfg.Pool.NamePrefix); err != nil {
 		return err
 	}
@@ -654,6 +884,125 @@ func Validate(cfg Config) error {
 	}
 	if err := ValidateDockerNoProxy(cfg.Docker.NoProxy); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ValidateLogging(logging LoggingConfig) error {
+	if strings.TrimSpace(logging.Directory) == "" {
+		return fmt.Errorf("logging.directory is required")
+	}
+	if err := validateLoggingSinks("managerSinks", logging.ManagerSinks); err != nil {
+		return err
+	}
+	if err := validateLoggingSinks("transcriptSinks", logging.TranscriptSinks); err != nil {
+		return err
+	}
+	if err := validateLoggingFormat("managerConsoleFormat", logging.ManagerConsoleFormat); err != nil {
+		return err
+	}
+	if err := validateLoggingFormat("managerFileFormat", logging.ManagerFileFormat); err != nil {
+		return err
+	}
+	if err := validateLoggingFormat("transcriptConsoleFormat", logging.TranscriptConsoleFormat); err != nil {
+		return err
+	}
+	if err := validateConsoleTextFormat("managerConsoleTextFormat", logging.ManagerConsoleTextFormat, logging.ManagerConsoleFormat, []string{"time", "level", "message", "attributes"}); err != nil {
+		return err
+	}
+	if err := validateConsoleTextFormat("transcriptConsoleTextFormat", logging.TranscriptConsoleTextFormat, logging.TranscriptConsoleFormat, []string{"time", "instance", "component", "stream", "message", "session", "category", "provider", "attributes"}); err != nil {
+		return err
+	}
+	if logging.MaxFileSizeMiB < 1 {
+		return fmt.Errorf("logging.maxFileSizeMiB must be 1 or greater")
+	}
+	if logging.MaxBackups < 1 {
+		return fmt.Errorf("logging.maxBackups must be 1 or greater")
+	}
+	if logging.RetentionMaxTotalMiB < 1 {
+		return fmt.Errorf("logging.retentionMaxTotalMiB must be 1 or greater")
+	}
+	for key, value := range map[string]int{
+		"managerMaxAgeDays":        logging.ManagerMaxAgeDays,
+		"instanceMaxAgeDays":       logging.InstanceMaxAgeDays,
+		"buildMaxAgeDays":          logging.BuildMaxAgeDays,
+		"errorMaxAgeDays":          logging.ErrorMaxAgeDays,
+		"benchmarkMaxAgeDays":      logging.BenchmarkMaxAgeDays,
+		"retentionIntervalMinutes": logging.RetentionIntervalMinutes,
+	} {
+		if value < 1 {
+			return fmt.Errorf("logging.%s must be 1 or greater", key)
+		}
+	}
+	return nil
+}
+
+func validateLoggingSinks(key string, sinks []string) error {
+	if len(sinks) == 0 {
+		return fmt.Errorf("logging.%s must not be empty", key)
+	}
+	seen := make(map[string]struct{}, len(sinks))
+	for _, sink := range sinks {
+		if sink != "console" && sink != "file" {
+			return fmt.Errorf("unsupported logging.%s value %q", key, sink)
+		}
+		if _, exists := seen[sink]; exists {
+			return fmt.Errorf("logging.%s must not contain duplicate sink %q", key, sink)
+		}
+		seen[sink] = struct{}{}
+	}
+	return nil
+}
+
+func validateLoggingFormat(key, format string) error {
+	switch format {
+	case "text", "json":
+		return nil
+	default:
+		return fmt.Errorf("unsupported logging.%s %q; supported values are text and json", key, format)
+	}
+}
+
+func validateConsoleTextFormat(key, template, outputFormat string, allowed []string) error {
+	if template == "" {
+		return nil
+	}
+	if outputFormat != "text" {
+		return fmt.Errorf("logging.%s is supported only when the corresponding console format is text", key)
+	}
+	if strings.ContainsAny(template, "\r\n") {
+		return fmt.Errorf("logging.%s must be a single line", key)
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, placeholder := range allowed {
+		allowedSet[placeholder] = struct{}{}
+	}
+	foundMessage := false
+	remaining := template
+	for {
+		open := strings.IndexByte(remaining, '{')
+		if open < 0 {
+			if strings.ContainsRune(remaining, '}') {
+				return fmt.Errorf("logging.%s contains an unmatched closing brace", key)
+			}
+			break
+		}
+		if strings.ContainsRune(remaining[:open], '}') {
+			return fmt.Errorf("logging.%s contains an unmatched closing brace", key)
+		}
+		closeOffset := strings.IndexByte(remaining[open+1:], '}')
+		if closeOffset < 0 {
+			return fmt.Errorf("logging.%s contains an unmatched opening brace", key)
+		}
+		placeholder := remaining[open+1 : open+1+closeOffset]
+		if _, ok := allowedSet[placeholder]; !ok {
+			return fmt.Errorf("logging.%s contains unsupported placeholder {%s}", key, placeholder)
+		}
+		foundMessage = foundMessage || placeholder == "message"
+		remaining = remaining[open+closeOffset+2:]
+	}
+	if !foundMessage {
+		return fmt.Errorf("logging.%s must contain {message}", key)
 	}
 	return nil
 }

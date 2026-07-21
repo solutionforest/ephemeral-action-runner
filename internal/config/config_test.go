@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -78,6 +79,18 @@ image:
 	if got, want := cfg.Pool.Instances, 3; got != want {
 		t.Fatalf("pool.instances = %d, want %d", got, want)
 	}
+	if got, want := cfg.Pool.ReplacementRetryInitialSeconds, 15; got != want {
+		t.Fatalf("pool.replacementRetryInitialSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMaxSeconds, 1800; got != want {
+		t.Fatalf("pool.replacementRetryMaxSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMultiplier, 2.0; got != want {
+		t.Fatalf("pool.replacementRetryMultiplier = %v, want %v", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryJitterPercent, 20; got != want {
+		t.Fatalf("pool.replacementRetryJitterPercent = %d, want %d", got, want)
+	}
 	if got, want := len(cfg.Image.CustomInstallScripts), 2; got != want {
 		t.Fatalf("custom install scripts = %d, want %d", got, want)
 	}
@@ -96,6 +109,195 @@ func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	}
 	if cfg.Runner.NoDefaultLabels {
 		t.Fatal("runner.noDefaultLabels = true, want false")
+	}
+}
+
+func TestLoggingDefaults(t *testing.T) {
+	got := Default().Logging
+	if got.Directory != "work/logs" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
+		t.Fatalf("unexpected logging destination defaults: %+v", got)
+	}
+	if got.MaxFileSizeMiB != 100 || got.MaxBackups != 3 || !got.CompressBackups || !got.RetentionEnabled || got.RetentionMaxTotalMiB != 1024 {
+		t.Fatalf("unexpected logging retention defaults: %+v", got)
+	}
+	if got.ManagerMaxAgeDays != 14 || got.InstanceMaxAgeDays != 14 || got.BuildMaxAgeDays != 14 || got.ErrorMaxAgeDays != 30 || got.BenchmarkMaxAgeDays != 90 || got.RetentionIntervalMinutes != 60 {
+		t.Fatalf("unexpected logging age defaults: %+v", got)
+	}
+}
+
+func TestCheckedInExampleConfigurationsValidate(t *testing.T) {
+	patterns := []string{
+		filepath.Join("..", "..", "configs", "*.yml"),
+		filepath.Join("..", "..", "examples", "observability", "*.yml"),
+	}
+	for _, pattern := range patterns {
+		paths, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(paths) == 0 {
+			t.Fatalf("no examples matched %s", pattern)
+		}
+		for _, path := range paths {
+			t.Run(filepath.Base(path), func(t *testing.T) {
+				cfg, err := Load(path)
+				if err != nil {
+					t.Fatalf("Load(%s): %v", path, err)
+				}
+				if err := Validate(cfg); err != nil {
+					t.Fatalf("Validate(%s): %v", path, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadLoggingConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+logging:
+  directory: custom/logs
+  managerSinks:
+    - console
+    - file
+  managerConsoleFormat: json
+  managerFileFormat: text
+  transcriptSinks: [file, console]
+  transcriptConsoleFormat: json
+  maxFileSizeMiB: 64
+  maxBackups: 5
+  compressBackups: false
+  retentionEnabled: false
+  retentionMaxTotalMiB: 2048
+  managerMaxAgeDays: 7
+  instanceMaxAgeDays: 8
+  buildMaxAgeDays: 9
+  errorMaxAgeDays: 10
+  benchmarkMaxAgeDays: 11
+  retentionIntervalMinutes: 12
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Logging
+	if got.Directory != "custom/logs" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
+		t.Fatalf("unexpected logging config: %+v", got)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadCustomConsoleTextFormats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Logging.ManagerConsoleTextFormat, "[{level}] {message}{attributes}"; got != want {
+		t.Fatalf("managerConsoleTextFormat = %q, want %q", got, want)
+	}
+	if got, want := cfg.Logging.TranscriptConsoleTextFormat, "{stream} {instance}: {message}"; got != want {
+		t.Fatalf("transcriptConsoleTextFormat = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Logging.Directory, "custom/logs"; got != want {
+		t.Fatalf("logging.directory = %q, want legacy value %q", got, want)
+	}
+	warnings := cfg.Warnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "pool.logDir is deprecated") || !strings.Contains(warnings[0], "logging.directory") {
+		t.Fatalf("Warnings() = %#v, want migration warning", warnings)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadRejectsAmbiguousLegacyAndNewLogDirectories(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "logging:\n  directory: new/logs\npool:\n  logDir: old/logs\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "pool.logDir cannot be used with logging.directory") {
+		t.Fatalf("Load() error = %v, want ambiguous-directory error", err)
+	}
+}
+
+func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
+	for _, text := range []string{
+		"unknown:\n  value: true\n",
+		"github:\n  unknown: value\n",
+		"image:\n  unknown: value\n",
+		"pool:\n  unknown: value\n",
+		"logging:\n  unknown: value\n",
+		"runner:\n  unknown: value\n",
+		"provider:\n  unknown: value\n",
+		"docker:\n  unknown: value\n",
+		"timeouts:\n  unknown: 1\n",
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yml")
+		if err := os.WriteFile(path, []byte(text), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown") {
+			t.Fatalf("Load(%q) error = %v, want unknown-key error", text, err)
+		}
+	}
+}
+
+func TestValidateLoggingRejectsInvalidValues(t *testing.T) {
+	for _, mutate := range []func(*LoggingConfig){
+		func(logging *LoggingConfig) { logging.Directory = " " },
+		func(logging *LoggingConfig) { logging.ManagerSinks = nil },
+		func(logging *LoggingConfig) { logging.TranscriptSinks = []string{"syslog"} },
+		func(logging *LoggingConfig) { logging.ManagerSinks = []string{"Console"} },
+		func(logging *LoggingConfig) { logging.ManagerFileFormat = "yaml" },
+		func(logging *LoggingConfig) { logging.ManagerConsoleFormat = "JSON" },
+		func(logging *LoggingConfig) {
+			logging.ManagerConsoleFormat = "json"
+			logging.ManagerConsoleTextFormat = "{level} {message}"
+		},
+		func(logging *LoggingConfig) { logging.ManagerConsoleTextFormat = "{unknown} {message}" },
+		func(logging *LoggingConfig) { logging.ManagerConsoleTextFormat = "{level}" },
+		func(logging *LoggingConfig) { logging.TranscriptConsoleTextFormat = "{level} {message}" },
+		func(logging *LoggingConfig) { logging.MaxFileSizeMiB = 0 },
+		func(logging *LoggingConfig) { logging.MaxBackups = -1 },
+		func(logging *LoggingConfig) { logging.MaxBackups = 0 },
+		func(logging *LoggingConfig) { logging.RetentionMaxTotalMiB = 0 },
+		func(logging *LoggingConfig) { logging.ErrorMaxAgeDays = 0 },
+		func(logging *LoggingConfig) { logging.RetentionIntervalMinutes = 0 },
+	} {
+		cfg := Default()
+		mutate(&cfg.Logging)
+		if err := ValidateLogging(cfg.Logging); err == nil {
+			t.Fatal("ValidateLogging accepted invalid config")
+		}
 	}
 }
 
@@ -707,6 +909,106 @@ func TestValidateRejectsInvalidPoolInstances(t *testing.T) {
 	cfg.Pool.Instances = 0
 	if err := Validate(cfg); err == nil {
 		t.Fatal("pool.instances=0 accepted")
+	}
+}
+
+func TestLoadPoolReplacementRetryConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+pool:
+  replacementRetryInitialSeconds: 12
+  replacementRetryMaxSeconds: 720
+  replacementRetryMultiplier: 1.5
+  replacementRetryJitterPercent: 0
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Pool.ReplacementRetryInitialSeconds, 12; got != want {
+		t.Fatalf("pool.replacementRetryInitialSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMaxSeconds, 720; got != want {
+		t.Fatalf("pool.replacementRetryMaxSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryMultiplier, 1.5; got != want {
+		t.Fatalf("pool.replacementRetryMultiplier = %v, want %v", got, want)
+	}
+	if got, want := cfg.Pool.ReplacementRetryJitterPercent, 0; got != want {
+		t.Fatalf("pool.replacementRetryJitterPercent = %d, want %d", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateRejectsInvalidPoolReplacementRetryConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "initial retry delay is not positive",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryInitialSeconds = 0 },
+		},
+		{
+			name:   "maximum retry delay is below initial delay",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryMaxSeconds = cfg.Pool.ReplacementRetryInitialSeconds - 1 },
+		},
+		{
+			name:   "retry multiplier is below one",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryMultiplier = 0.5 },
+		},
+		{
+			name:   "retry multiplier is not finite",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryMultiplier = math.NaN() },
+		},
+		{
+			name:   "retry jitter is below zero",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryJitterPercent = -1 },
+		},
+		{
+			name:   "retry jitter exceeds one hundred percent",
+			mutate: func(cfg *Config) { cfg.Pool.ReplacementRetryJitterPercent = 101 },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			test.mutate(&cfg)
+			if err := Validate(cfg); err == nil {
+				t.Fatal("Validate accepted invalid replacement retry configuration")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidPoolReplacementRetryValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "initial retry delay", key: "replacementRetryInitialSeconds", value: "invalid"},
+		{name: "maximum retry delay", key: "replacementRetryMaxSeconds", value: "invalid"},
+		{name: "retry multiplier", key: "replacementRetryMultiplier", value: "invalid"},
+		{name: "retry jitter", key: "replacementRetryJitterPercent", value: "invalid"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yml")
+			content := "pool:\n  " + test.key + ": " + test.value + "\n"
+			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load accepted invalid replacement retry value")
+			}
+		})
 	}
 }
 
