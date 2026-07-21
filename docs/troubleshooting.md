@@ -84,6 +84,93 @@ docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 
 If the container-visible disk is full, adjust or clean the Docker/OrbStack storage from that product's settings. Finder free space by itself may not reflect the Linux VM storage available to containers.
 
+## Docker Container Fails Because Its Architecture Does Not Match The Runner
+
+### Symptoms
+
+A Docker or Docker Compose service may fail immediately with one of these messages:
+
+```text
+exec /bin/sh: exec format error
+exec user process caused: exec format error
+cannot execute binary file: Exec format error
+```
+
+Docker may also warn that the requested image platform does not match the detected host platform. That warning alone is not a failure: the container can still run when a compatible emulation handler is already registered.
+
+These related messages point to different problems:
+
+- `no matching manifest for linux/arm64/v8` or `no matching manifest for linux/amd64` means the image does not publish the requested platform. QEMU cannot supply a missing image manifest; choose an available platform or publish a multi-platform image.
+- `qemu-x86_64: Could not open '/lib64/ld-linux-x86-64.so.2'` means translation started but the expected foreign-architecture loader or userspace is unavailable or incompatible. Registration alone may not make that image work.
+- Exit code `139` indicates a segmentation fault. Emulation can expose workload-specific incompatibilities, but this code by itself does not prove an architecture mismatch.
+
+### Confirm The Host And Image Platforms
+
+Check the runner architecture and the Docker daemon that will execute the container:
+
+```bash
+uname -m
+docker info --format '{{.OSType}}/{{.Architecture}}'
+```
+
+Inspect the locally selected image platform:
+
+```bash
+docker image inspect --format '{{.Os}}/{{.Architecture}}' IMAGE
+```
+
+Inspect all platforms published by a registry image:
+
+```bash
+docker buildx imagetools inspect IMAGE
+```
+
+For Docker Compose, also inspect the resolved configuration and look for a service-level `platform:` value:
+
+```bash
+docker compose config
+```
+
+An x64 Linux Docker daemon normally runs `linux/amd64` images natively, and an ARM64 daemon normally runs `linux/arm64` images natively. Pulling or loading a foreign image does not prove that the daemon can execute it.
+
+### Match GitHub-Hosted Linux Behavior With Explicit QEMU Setup
+
+GitHub's Ubuntu runner image installs Docker, but its published installation script and software inventory do not promise pre-registered foreign-architecture emulators. When a trusted Linux job must run foreign-architecture containers, configure the requirement explicitly before the first such container starts:
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up ARM64 container emulation
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Verify the foreign container
+        run: docker run --rm --platform linux/arm64 alpine:3.22 uname -m
+```
+
+The expected output is `aarch64`. Add only the platforms the workflow needs; emulated compilation and compute-heavy workloads can be substantially slower than native execution. Keep architecture-sensitive jobs on native runners when performance or full compatibility matters.
+
+`docker/setup-qemu-action` registers user-mode QEMU interpreters through Linux `binfmt_misc`. It helps Linux containers launch foreign-architecture user-space executables; it does not change the runner's CPU architecture, create a foreign-architecture VM, or make arbitrary host executables and libraries compatible. The action uses a privileged helper container, so use it only in trusted workflows and pin reviewed action and helper-image revisions according to your dependency policy.
+
+Provider notes:
+
+- Docker-DinD: run the setup action inside the EPAR job before Docker Compose or other foreign-image commands. It configures the disposable runner's Docker execution environment; no EPAR configuration switch is required.
+- WSL: run the setup action inside the WSL runner when its Linux Docker daemon must execute a foreign image. An x64 WSL runner does not gain ARM64 container support merely by pulling or loading an ARM64 image.
+- Tart: Tart runs an ARM64 VM on Apple Silicon. Its optional Rosetta path is experimental and is not equivalent to QEMU/binfmt compatibility. Prefer Docker-DinD or a native matching architecture when a workload is not compatible.
+- GitHub-hosted Windows and macOS: GitHub documents Docker container actions and service containers as Linux-runner features. A Windows or macOS hardware label alone is therefore not a substitute for a Linux Docker daemon with emulation configured.
+
+Official references:
+
+- [Docker Setup QEMU action](https://github.com/docker/setup-qemu-action)
+- [Docker multi-platform build strategies](https://docs.docker.com/build/building/multi-platform/)
+- [GitHub-hosted runner labels and limitations](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+- [GitHub self-hosted runner container requirements](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#requirements-for-self-hosted-runner-machines)
+- [GitHub Ubuntu runner Docker installation](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/install-docker.sh)
+
 ## Docker Image Build Runs Out Of Space
 
 ### Symptom

@@ -7,8 +7,8 @@ param(
 #
 # Uses local Go if present and actually runnable. Otherwise runs EPAR from
 # source inside a containerized Go toolchain via `go run` (no local Go
-# install needed, and no binary is built or left on disk). Docker is
-# required either way. See docs/advanced/no-go-install.md.
+# install needed, and no binary is built or left on disk). The containerized
+# fallback requires Docker. See docs/advanced/no-go-install.md.
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path

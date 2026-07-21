@@ -86,6 +86,8 @@ Runner startup sources `/opt/epar/source-image.env` before launching `/opt/actio
 
 WSL x64 is the preferred EPAR target for workflows that pull amd64-only Docker runtime images.
 
+An x64 WSL runner can store an ARM64 image with `docker pull` or `docker load`, but it cannot run that image natively. Running ARM64 containers requires an explicitly configured emulation layer such as QEMU registered through `binfmt_misc`, or a native ARM64 runner. EPAR does not install cross-architecture emulation in WSL by default, so validate both the architecture and execution path before routing ARM64-dependent jobs to an x64 WSL label.
+
 If `docker.registryMirrors` is configured, EPAR applies it to Docker Engine inside each disposable WSL distro before validation. Use a mirror URL reachable from inside WSL, such as an organization DNS name or a host/LAN address. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
 
 ## Caveats

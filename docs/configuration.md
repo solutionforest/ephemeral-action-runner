@@ -182,7 +182,7 @@ For `provider.type: docker-dind`, EPAR defaults to Catthehacker's full Ubuntu ru
 
 For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
 
-For `provider.type: tart`, start from `configs/tart.example.yml` and adjust labels or image scripts as needed.
+For the experimental `provider.type: tart`, EPAR defaults to `ghcr.io/cirruslabs/ubuntu:latest`, a basic Ubuntu ARM64 VM image. EPAR installs its runner lifecycle but does not add the broad tool and dependency set found in GitHub's hosted runner images. If you require a GitHub-runner-like environment, build and maintain a bootable Tart image yourself by adapting the scripts in [actions/runner-images](https://github.com/actions/runner-images), then set `image.sourceImage` to that Tart image. Rosetta-based amd64 execution also has compatibility limits and must be validated against the exact workflow.
 
 See the provider docs for details:
 
