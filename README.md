@@ -75,7 +75,7 @@ That's it.
 
 #### What Happens
 
-EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2. On macOS, it offers experimental Tart mode when `tart --version` succeeds. Press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
+EPAR initializes `.local/config.yml` for you if it does not exist. The wizard reads your organization's runner groups, requires an explicit selection, and writes an enforced safety policy; see [Runner Group Security](docs/runner-groups.md). Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2. On macOS, it offers experimental Tart mode when `tart --version` succeeds. Press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
 
 Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
@@ -154,6 +154,7 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Usage](docs/usage.md): setup, image builds, verification, and pool commands.
 - [Configuration](docs/configuration.md): config file sections and common edits.
 - [GitHub App Setup](docs/github-app.md): required GitHub App permissions and fields.
+- [Runner Group Security](docs/runner-groups.md): repository access, wizard choices, and registration preflight policy.
 - [Docker-DinD Provider](docs/providers/docker-dind.md): default Docker runner mode.
 - [WSL Provider](docs/providers/wsl.md): Windows WSL2 runners.
 - [Tart Provider (experimental)](docs/providers/tart.md): Apple Silicon ARM64 Linux VM runners and Rosetta compatibility limits.

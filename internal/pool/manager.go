@@ -45,6 +45,7 @@ type Manager struct {
 
 type GitHubClient interface {
 	OrganizationURL() string
+	EvaluateRunnerGroupPolicy(ctx context.Context, configuredGroup string, policy config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error)
 	RegistrationToken(ctx context.Context) (gh.RegistrationToken, error)
 	ListRunners(ctx context.Context) ([]gh.Runner, error)
 	RunnerByName(ctx context.Context, name string) (gh.Runner, bool, error)
@@ -101,6 +102,11 @@ const (
 )
 
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
+	if opts.RegisterOnly {
+		if err := m.PreflightRunnerGroup(ctx); err != nil {
+			return err
+		}
+	}
 	poolLock, err := m.AcquirePoolControllerLock()
 	if err != nil {
 		return err
@@ -174,6 +180,11 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
+	if opts.Register {
+		if err := m.PreflightRunnerGroup(ctx); err != nil {
+			return err
+		}
+	}
 	if !opts.PoolLockHeld {
 		controllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
@@ -1114,6 +1125,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			}
 			return vm, fmt.Errorf("github client is required for registration")
 		}
+		if err := m.PreflightRunnerGroup(ctx); err != nil {
+			return vm, err
+		}
 		var (
 			token     gh.RegistrationToken
 			runner    gh.Runner
@@ -1160,6 +1174,41 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		m.finishFirstRunnerReady(name)
 	}
 	return vm, nil
+}
+
+func (m *Manager) PreflightRunnerGroup(ctx context.Context) error {
+	if m.DryRun {
+		m.infof("[dry-run] would verify GitHub runner-group security policy before registration\n")
+		return nil
+	}
+	if m.GitHub == nil {
+		return fmt.Errorf("runner-group security preflight requires a GitHub client")
+	}
+	policy := m.Config.Security.RunnerGroup
+	result, err := m.GitHub.EvaluateRunnerGroupPolicy(ctx, m.Config.Runner.Group, policy)
+	if err != nil {
+		message := fmt.Sprintf("runner-group security preflight could not read GitHub policy: %v", err)
+		if policy.Enforcement == config.RunnerGroupEnforcementWarn {
+			m.warnf("warning: %s; continuing because security.runnerGroup.enforcement is warn\n", message)
+			return nil
+		}
+		return fmt.Errorf("%s", message)
+	}
+	for _, advisory := range result.Advisories {
+		m.warnf("warning: runner-group security advisory: %s\n", advisory)
+	}
+	if len(result.Violations) > 0 {
+		message := strings.Join(result.Violations, "; ")
+		if policy.Enforcement == config.RunnerGroupEnforcementWarn {
+			m.warnf("warning: runner-group security policy violation: %s; continuing because security.runnerGroup.enforcement is warn\n", message)
+			return nil
+		}
+		return fmt.Errorf("runner-group security preflight failed: %s", message)
+	}
+	if result.Resolved {
+		m.infof("runner-group security preflight passed for %q\n", result.Group.Name)
+	}
+	return nil
 }
 
 func (m *Manager) startupInstanceStartStage() string {

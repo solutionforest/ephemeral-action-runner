@@ -39,14 +39,11 @@ the Go version declared by `go.mod` before building EPAR.
 
 ### Restricted ephemeral-runner group
 
-In the organization settings, create a runner group named
-`epar-ci-canary` and restrict its repository access to
-`solutionforest/ephemeral-action-runner`.
+In the organization settings, create a runner group named `epar-ci-canary` and restrict its repository access to `solutionforest/ephemeral-action-runner`.
 
-EPAR registers the temporary runners in this group with no GitHub default
-labels and only a per-run label such as `epar-core-123456-1`. The canary jobs
-target both the group and that unique label, so unrelated self-hosted runners
-cannot accept them.
+EPAR registers the temporary runners in this group with no GitHub default labels and only a per-run label such as `epar-core-123456-1`. The canary jobs target both the group and that unique label, so unrelated self-hosted runners cannot accept them.
+
+This repository is public, so its canary config explicitly sets only `security.runnerGroup.requirePublicRepositoriesDisabled: false`. It keeps enforcement, explicit naming, non-default-group use, and selected-repository access enabled. This narrow exception depends on the trusted controller and protected workflow conditions below and is not the recommended deployment model for public repositories.
 
 ### GitHub App and protected environment
 

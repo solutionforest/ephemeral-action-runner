@@ -52,7 +52,7 @@ Equivalent without the wrapper:
 go run ./cmd/ephemeral-action-runner
 ```
 
-If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker-DinD. The Docker preflight applies to Docker-DinD and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then lists the organization's live runner groups. The group choice is explicit and has no Enter-for-default or offline fallback. Default and broad-access groups require warning confirmation; public-enabled groups are blocked by the generated safety policy. See [Runner Group Security](runner-groups.md). Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker-DinD. The Docker preflight applies to Docker-DinD and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks runner-group policy and the configured image, builds or replaces the image when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
 Pass flags through `./start` to choose a config or runner count:
 
@@ -96,7 +96,7 @@ On Windows PowerShell:
 go run ./cmd/ephemeral-action-runner init
 ```
 
-For other WSL or Tart variants, or for custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
+For other WSL or Tart variants, or for custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields, `runner.group`, and any labels you want to expose to workflows. Example group names are placeholders.
 
 | Host and image | Example config |
 | --- | --- |

@@ -15,6 +15,7 @@ import (
 )
 
 type starterManager interface {
+	PreflightRunnerGroup(context.Context) error
 	EnsureImage(context.Context) error
 	RunPool(context.Context, pool.RunOptions) error
 }
@@ -131,6 +132,12 @@ func runStartWithOptions(opts startOptions) (err error) {
 			timingManager.FinishStartupTiming(err)
 		}()
 	}
+	if opts.Register {
+		fmt.Fprintf(opts.Out, "Checking GitHub runner-group security policy for %s\n", configPath)
+		if err = manager.PreflightRunnerGroup(opts.Context); err != nil {
+			return err
+		}
+	}
 	poolLockHeld := false
 	if lockingManager, ok := manager.(poolLockingStarterManager); ok {
 		controllerLock, err := lockingManager.AcquirePoolControllerLock()
@@ -190,6 +197,7 @@ func ensureConfigForStart(opts startOptions) (string, error) {
 	}
 	fmt.Fprintf(opts.Out, "No EPAR config found. Starting first-run setup.\n\n")
 	if err := runInitWithOptions(initOptions{
+		Context:     opts.Context,
 		ProjectRoot: projectRootOrCwd(opts.ProjectRoot),
 		ConfigPath:  path,
 		In:          opts.In,

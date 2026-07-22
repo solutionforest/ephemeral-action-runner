@@ -49,6 +49,34 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+function Test-EparBenignDockerDesktopPrefaceDiagnostic {
+    param([Parameter(Mandatory = $true)][string] $Line)
+    return $Line -match '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} http2: server: error reading preface from client //\./pipe/(?:dockerDesktopLinuxEngine|docker_engine): file has already been closed$'
+}
+
+function Invoke-EparBootstrapDockerBuild {
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        docker build --quiet `
+            --build-arg "GO_IMAGE=$Image" `
+            -t $DevImage `
+            -f (Join-Path $RepoRoot "scripts\docker\dev.Dockerfile") `
+            (Join-Path $RepoRoot "scripts\docker") 2> $stderrPath | Out-Null
+        $buildExitCode = $LASTEXITCODE
+        if (Test-Path -LiteralPath $stderrPath) {
+            foreach ($line in Get-Content -LiteralPath $stderrPath) {
+                if ($buildExitCode -eq 0 -and (Test-EparBenignDockerDesktopPrefaceDiagnostic -Line ([string]$line))) {
+                    continue
+                }
+                [Console]::Error.WriteLine([string]$line)
+            }
+        }
+        return $buildExitCode
+    } finally {
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 . (Join-Path $RepoRoot "scripts\host-trust\wrapper-lib.ps1")
 $EparCommand = if ($EparArgs -and $EparArgs.Count -gt 0) { [string] $EparArgs[0] } else { "start" }
@@ -70,14 +98,9 @@ try {
 $ExitCode = 0
 $bridge = $null
 try {
-    docker build --quiet `
-        --build-arg "GO_IMAGE=$Image" `
-        -t $DevImage `
-        -f (Join-Path $RepoRoot "scripts\docker\dev.Dockerfile") `
-        (Join-Path $RepoRoot "scripts\docker") | Out-Null
-
-    if ($LASTEXITCODE -ne 0) {
-        $ExitCode = $LASTEXITCODE
+    $ExitCode = Invoke-EparBootstrapDockerBuild
+    if ($ExitCode -ne 0) {
+        # Invoke-EparBootstrapDockerBuild already preserved the complete Docker stderr on failure.
     } else {
         if ($ImplicitInit) {
             $InitArgs = @(Get-EparHostTrustInitArguments -Arguments $EparArgs)

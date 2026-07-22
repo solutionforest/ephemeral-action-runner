@@ -10,6 +10,8 @@ $oldLocalAppData = $env:LOCALAPPDATA
 $oldFakeProject = $env:FAKE_PROJECT
 $oldFakeDockerLog = $env:FAKE_DOCKER_LOG
 $oldFakeInitFail = $env:FAKE_INIT_FAIL
+$oldFakeBuildDiagnostic = $env:FAKE_BUILD_DIAGNOSTIC
+$oldFakeBuildFail = $env:FAKE_BUILD_FAIL
 try {
     $hostPowerShell = (Get-Process -Id $PID).Path
     $project = Join-Path $temporary 'project'
@@ -26,7 +28,16 @@ try {
 $ErrorActionPreference = 'Stop'
 $line = 'CALL' + (($args | ForEach-Object { ' <' + $_ + '>' }) -join '')
 Add-Content -LiteralPath $env:FAKE_DOCKER_LOG -Value $line -Encoding utf8
-if ($args.Count -gt 0 -and $args[0] -eq 'build') { exit 0 }
+if ($args.Count -gt 0 -and $args[0] -eq 'build') {
+    if ($env:FAKE_BUILD_DIAGNOSTIC -eq '1') {
+        [Console]::Error.WriteLine('2026/07/22 02:36:46 http2: server: error reading preface from client //./pipe/dockerDesktopLinuxEngine: file has already been closed')
+    }
+    if ($env:FAKE_BUILD_FAIL -eq '1') {
+        [Console]::Error.WriteLine('fake Docker build failure')
+        exit 24
+    }
+    exit 0
+}
 if ($args -contains 'init') {
     if ($env:FAKE_INIT_FAIL -eq '1') { exit 23 }
     $local = Join-Path $env:FAKE_PROJECT '.local'
@@ -45,9 +56,12 @@ exit 0
     $env:FAKE_PROJECT = $project
     $env:FAKE_DOCKER_LOG = Join-Path $temporary 'docker.log'
     Remove-Item Env:FAKE_INIT_FAIL -ErrorAction SilentlyContinue
+    $env:FAKE_BUILD_DIAGNOSTIC = '1'
+    Remove-Item Env:FAKE_BUILD_FAIL -ErrorAction SilentlyContinue
 
-    & $hostPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $project 'scripts\run-with-docker.ps1') start
+    $firstRunOutput = @(& $hostPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $project 'scripts\run-with-docker.ps1') start *>&1)
     if ($LASTEXITCODE -ne 0) { throw "first-run wrapper exited $LASTEXITCODE" }
+    if (($firstRunOutput | Out-String) -match 'http2: server: error reading preface') { throw "successful bootstrap leaked the benign Docker Desktop diagnostic: $($firstRunOutput -join [Environment]::NewLine)" }
     $calls = @(Get-Content -LiteralPath $env:FAKE_DOCKER_LOG | Where-Object { $_ -like '* <run>*' })
     if ($calls.Count -ne 2) { throw "expected two controller runs, got $($calls.Count)" }
     if ($calls[0] -notlike '* <EPAR_HOST_TRUST_INIT_DEFERRED=1>*' -or $calls[0] -notlike '* <EPAR_CONTROLLER_HOST_OS=windows>*' -or $calls[0] -notlike '* <init>*') {
@@ -56,6 +70,15 @@ exit 0
     if ($calls[1] -notlike '* <EPAR_HOST_TRUST_FEED=/run/epar-host-trust/current.json>*' -or $calls[1] -notlike '*:/run/epar-host-trust:ro>*' -or $calls[1] -notlike '* <start>*') {
         throw "second start did not receive the read-only host-trust feed: $($calls[1])"
     }
+
+    $env:FAKE_BUILD_FAIL = '1'
+    $failedBuildOutput = @(& $hostPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $project 'scripts\run-with-docker.ps1') start *>&1)
+    if ($LASTEXITCODE -ne 24) { throw "failing bootstrap build exited $LASTEXITCODE, want 24" }
+    $failedBuildText = $failedBuildOutput | Out-String
+    if ($failedBuildText -notmatch 'http2: server: error reading preface' -or $failedBuildText -notmatch 'fake Docker build failure') {
+        throw "failing bootstrap build did not preserve complete Docker stderr: $failedBuildText"
+    }
+    Remove-Item Env:FAKE_BUILD_FAIL -ErrorAction SilentlyContinue
 
     Remove-Item -LiteralPath (Join-Path $project '.local') -Recurse -Force
     Remove-Item -LiteralPath $env:LOCALAPPDATA -Recurse -Force -ErrorAction SilentlyContinue
@@ -73,5 +96,7 @@ finally {
     if ($null -eq $oldFakeProject) { Remove-Item Env:FAKE_PROJECT -ErrorAction SilentlyContinue } else { $env:FAKE_PROJECT = $oldFakeProject }
     if ($null -eq $oldFakeDockerLog) { Remove-Item Env:FAKE_DOCKER_LOG -ErrorAction SilentlyContinue } else { $env:FAKE_DOCKER_LOG = $oldFakeDockerLog }
     if ($null -eq $oldFakeInitFail) { Remove-Item Env:FAKE_INIT_FAIL -ErrorAction SilentlyContinue } else { $env:FAKE_INIT_FAIL = $oldFakeInitFail }
+    if ($null -eq $oldFakeBuildDiagnostic) { Remove-Item Env:FAKE_BUILD_DIAGNOSTIC -ErrorAction SilentlyContinue } else { $env:FAKE_BUILD_DIAGNOSTIC = $oldFakeBuildDiagnostic }
+    if ($null -eq $oldFakeBuildFail) { Remove-Item Env:FAKE_BUILD_FAIL -ErrorAction SilentlyContinue } else { $env:FAKE_BUILD_FAIL = $oldFakeBuildFail }
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -14,12 +14,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
@@ -41,6 +43,15 @@ var initTartVersion = tartVersion
 
 var initResolveHostTrust = hosttrust.Resolve
 
+type initRunnerGroupClient interface {
+	ListRunnerGroups(context.Context) ([]gh.RunnerGroup, error)
+	ListRunnerGroupRepositories(context.Context, int64) ([]gh.RunnerGroupRepository, error)
+}
+
+var newInitRunnerGroupClient = func(cfg config.GitHubConfig) initRunnerGroupClient {
+	return gh.New(cfg)
+}
+
 func detectedInitHostTrustOS() string {
 	if hostOS := strings.TrimSpace(os.Getenv("EPAR_CONTROLLER_HOST_OS")); hostOS != "" {
 		return hostOS
@@ -49,6 +60,7 @@ func detectedInitHostTrustOS() string {
 }
 
 type initOptions struct {
+	Context            context.Context
 	ProjectRoot        string
 	ConfigPath         string
 	Force              bool
@@ -80,6 +92,7 @@ func runInit(args []string) error {
 	}
 
 	return runInitWithOptions(initOptions{
+		Context:            interruptContext(),
 		ProjectRoot:        projectRoot,
 		ConfigPath:         configPath,
 		Force:              *force,
@@ -91,6 +104,9 @@ func runInit(args []string) error {
 }
 
 func runInitWithOptions(opts initOptions) error {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
 	if opts.In == nil {
 		opts.In = os.Stdin
 	}
@@ -124,6 +140,17 @@ func runInitWithOptions(opts initOptions) error {
 		return err
 	}
 	privateKeyPath, err := promptRequired(opts.Out, reader, "GitHub App private key path")
+	if err != nil {
+		return err
+	}
+	githubConfig := config.GitHubConfig{
+		AppID:          appID,
+		Organization:   organization,
+		PrivateKeyPath: resolveInitPrivateKeyPath(opts.ProjectRoot, privateKeyPath),
+		APIBaseURL:     "https://api.github.com",
+		WebBaseURL:     "https://github.com",
+	}
+	runnerGroup, err := promptRunnerGroup(opts.Context, opts.Out, reader, newInitRunnerGroupClient(githubConfig))
 	if err != nil {
 		return err
 	}
@@ -185,12 +212,12 @@ func runInitWithOptions(opts initOptions) error {
 		}
 	}
 
-	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes)
+	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup)
 	switch providerType {
 	case "wsl":
-		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix)
+		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
 	case "tart":
-		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix)
+		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.ConfigPath), 0755); err != nil {
 		return err
@@ -211,6 +238,312 @@ Manual/advanced:
   %s pool up --instances 2
 `, opts.ConfigPath, binaryName, binaryName, binaryName, binaryName)
 	return nil
+}
+
+type initRunnerGroupSelection struct {
+	Group  gh.RunnerGroup
+	Policy config.RunnerGroupSecurityConfig
+}
+
+func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader, client initRunnerGroupClient) (initRunnerGroupSelection, error) {
+	var groups []gh.RunnerGroup
+	var repositories map[int64][]gh.RunnerGroupRepository
+	for {
+		if groups == nil {
+			var err error
+			groups, repositories, err = loadInitRunnerGroups(ctx, client)
+			if err != nil {
+				return initRunnerGroupSelection{}, fmt.Errorf("load GitHub runner groups: %w", err)
+			}
+		}
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "GitHub runner group:")
+		fmt.Fprintln(out, "  Choose which repositories GitHub may route to these self-hosted runners.")
+		fmt.Fprintln(out, "  Groups are ordered from the most restrictive policy to the least restrictive policy; the first item is not an automatic default.")
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "  Repository access meanings:")
+		fmt.Fprintln(out, "    Selected repositories: Only repositories explicitly added to the group can use its runners. This is recommended.")
+		fmt.Fprintln(out, "    All private repositories: Every current and future private repository in the organization can use its runners.")
+		fmt.Fprintln(out, "    All repositories: Every current and future repository allowed by the public-repository setting can use its runners.")
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "  Recommended policy: a non-default group, Selected repositories, trusted repositories only, and public repository access disabled.")
+		fmt.Fprintln(out, "  See docs/runner-groups.md for details.")
+		for i, group := range groups {
+			printRunnerGroupChoice(out, i+1, group, repositories[group.ID])
+		}
+		fmt.Fprintln(out, "  R. Refresh runner groups")
+		fmt.Fprintln(out, "  Q. Quit without writing a config")
+
+		choice, err := promptRequired(out, reader, "Runner group choice")
+		if err != nil {
+			return initRunnerGroupSelection{}, err
+		}
+		switch strings.ToLower(choice) {
+		case "r", "refresh":
+			groups = nil
+			repositories = nil
+			continue
+		case "q", "quit":
+			return initRunnerGroupSelection{}, fmt.Errorf("runner-group selection cancelled; no config was written")
+		}
+		index, parseErr := strconv.Atoi(choice)
+		if parseErr != nil || index < 1 || index > len(groups) {
+			fmt.Fprintf(out, "Choose a runner group number, R to refresh, or Q to quit.\n")
+			continue
+		}
+		group := groups[index-1]
+		selectedRepositories := repositories[group.ID]
+		_, publicCount := repositoryPrivacyCounts(selectedRepositories)
+		if runnerGroupVisibilityRank(group.Visibility) == 3 {
+			fmt.Fprintln(out, "")
+			fmt.Fprintln(out, "*** SECURITY BLOCK: GITHUB RETURNED AN UNKNOWN REPOSITORY-ACCESS POLICY ***")
+			fmt.Fprintf(out, "Runner group %q uses repository access %q, which this EPAR version cannot evaluate safely.\n", group.Name, group.Visibility)
+			fmt.Fprintln(out, "RECOMMENDED ACTION: Do not select this group. Review its policy in GitHub, update EPAR if support is available, and choose Refresh; otherwise choose another documented group.")
+			refresh, err := promptBackRefreshQuit(out, reader)
+			if err != nil {
+				return initRunnerGroupSelection{}, err
+			}
+			if refresh {
+				groups = nil
+				repositories = nil
+			}
+			continue
+		}
+		if group.AllowsPublicRepositories || publicCount > 0 {
+			fmt.Fprintln(out, "")
+			fmt.Fprintln(out, "*** SECURITY BLOCK: THIS RUNNER GROUP IS NOT ALLOWED BY EPAR'S SAFE DEFAULTS ***")
+			fmt.Fprintf(out, "Runner group %q permits public repository access. A public repository or fork-triggered workflow may run untrusted code on a self-hosted runner and reach the runner host or connected services.\n", group.Name)
+			fmt.Fprintln(out, "RECOMMENDED ACTION: Do not use this group for a normal EPAR deployment. Follow docs/runner-groups.md to create a dedicated non-default group, allow only explicitly selected trusted repositories, and disable public repository access. Then return here and choose that group.")
+			fmt.Fprintln(out, "If you intentionally operate a separately reviewed public-project deployment, finish initialization with a secure group first and document any manual policy override afterward.")
+			refresh, err := promptBackRefreshQuit(out, reader)
+			if err != nil {
+				return initRunnerGroupSelection{}, err
+			}
+			if refresh {
+				groups = nil
+				repositories = nil
+			}
+			continue
+		}
+
+		warnings := runnerGroupSelectionWarnings(group)
+		if len(warnings) > 0 {
+			fmt.Fprintln(out, "")
+			notRecommended := runnerGroupDoesNotMeetRecommendedPolicy(group)
+			if notRecommended {
+				fmt.Fprintln(out, "*** SECURITY WARNING: THIS RUNNER GROUP IS NOT RECOMMENDED ***")
+			} else {
+				fmt.Fprintln(out, "*** SECURITY ADVISORY: ENTERPRISE-MANAGED RUNNER GROUP ***")
+			}
+			fmt.Fprintf(out, "Runner group %q requires explicit review:\n", group.Name)
+			for _, warning := range warnings {
+				fmt.Fprintf(out, "  - %s\n", warning)
+			}
+			continueLabel := "Continue after confirming the enterprise-managed policy"
+			if notRecommended {
+				fmt.Fprintln(out, "RECOMMENDED ACTION: Choose Back. Follow docs/runner-groups.md to create a dedicated non-default group with Selected repositories and public repository access disabled, then select that safer group.")
+				fmt.Fprintln(out, "Continuing will deliberately relax the generated policy to match this broader group. Future repositories may gain access without another EPAR configuration change.")
+				continueLabel = "Continue anyway and generate a relaxed policy"
+			}
+			continueSelection, err := promptContinueOrBack(out, reader, continueLabel)
+			if err != nil {
+				return initRunnerGroupSelection{}, err
+			}
+			if !continueSelection {
+				continue
+			}
+		}
+		return initRunnerGroupSelection{
+			Group: group,
+			Policy: config.RunnerGroupSecurityConfig{
+				Enforcement:                       config.RunnerGroupEnforcementEnforce,
+				RequireExplicitGroup:              true,
+				RequireNonDefaultGroup:            !group.Default,
+				RequiredRepositoryAccess:          group.Visibility,
+				RequirePublicRepositoriesDisabled: true,
+			},
+		}, nil
+	}
+}
+
+func loadInitRunnerGroups(ctx context.Context, client initRunnerGroupClient) ([]gh.RunnerGroup, map[int64][]gh.RunnerGroupRepository, error) {
+	groups, err := client.ListRunnerGroups(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(groups) == 0 {
+		return nil, nil, fmt.Errorf("GitHub returned no runner groups for the organization")
+	}
+	groups = sortRunnerGroupsForWizard(groups)
+	repositories := make(map[int64][]gh.RunnerGroupRepository)
+	for _, group := range groups {
+		if group.Visibility != config.RunnerGroupRepositoryAccessSelected {
+			continue
+		}
+		selected, err := client.ListRunnerGroupRepositories(ctx, group.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		repositories[group.ID] = selected
+	}
+	return groups, repositories, nil
+}
+
+func sortRunnerGroupsForWizard(groups []gh.RunnerGroup) []gh.RunnerGroup {
+	ordered := append([]gh.RunnerGroup(nil), groups...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, right := ordered[i], ordered[j]
+		if left.AllowsPublicRepositories != right.AllowsPublicRepositories {
+			return !left.AllowsPublicRepositories
+		}
+		if leftRank, rightRank := runnerGroupVisibilityRank(left.Visibility), runnerGroupVisibilityRank(right.Visibility); leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		if left.Default != right.Default {
+			return !left.Default
+		}
+		if left.Inherited != right.Inherited {
+			return !left.Inherited
+		}
+		return strings.ToLower(left.Name) < strings.ToLower(right.Name)
+	})
+	return ordered
+}
+
+func runnerGroupVisibilityRank(visibility string) int {
+	switch visibility {
+	case config.RunnerGroupRepositoryAccessSelected:
+		return 0
+	case config.RunnerGroupRepositoryAccessPrivate:
+		return 1
+	case config.RunnerGroupRepositoryAccessAll:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func printRunnerGroupChoice(out io.Writer, number int, group gh.RunnerGroup, repositories []gh.RunnerGroupRepository) {
+	privateCount, publicCount := repositoryPrivacyCounts(repositories)
+	fmt.Fprintf(out, "\n  %d. %s\n", number, group.Name)
+	switch group.Visibility {
+	case config.RunnerGroupRepositoryAccessSelected:
+		fmt.Fprintf(out, "     Repository access: Selected repositories — only the %d private and %d public repositories explicitly selected in GitHub can use this group.\n", privateCount, publicCount)
+	case config.RunnerGroupRepositoryAccessPrivate:
+		fmt.Fprintln(out, "     Repository access: All private repositories — every current and future private repository in the organization can use this group.")
+	case config.RunnerGroupRepositoryAccessAll:
+		fmt.Fprintln(out, "     Repository access: All repositories — every current and future repository permitted by the public-repository setting can use this group.")
+	default:
+		fmt.Fprintf(out, "     Repository access: Unknown GitHub value %q — do not select this group until its policy can be understood.\n", group.Visibility)
+	}
+	if group.AllowsPublicRepositories || publicCount > 0 {
+		fmt.Fprintln(out, "     Public repositories: ALLOWED — public or fork-triggered workflows may reach self-hosted runners.")
+	} else {
+		fmt.Fprintln(out, "     Public repositories: Disabled — public repositories cannot use this group.")
+	}
+	groupTypes := []string{"organization-managed", "non-default"}
+	if group.Default {
+		groupTypes = []string{"GitHub default group"}
+	}
+	if group.Inherited {
+		groupTypes = append(groupTypes, "inherited from the enterprise")
+	}
+	fmt.Fprintf(out, "     Group type: %s.\n", strings.Join(groupTypes, ", "))
+	switch {
+	case group.AllowsPublicRepositories || publicCount > 0:
+		fmt.Fprintln(out, "     Assessment: BLOCKED BY WIZARD — does not satisfy the public-repository safety requirement.")
+	case runnerGroupDoesNotMeetRecommendedPolicy(group):
+		fmt.Fprintln(out, "     Assessment: NOT RECOMMENDED — requires an explicit warning and a relaxed generated policy.")
+	case group.Inherited:
+		fmt.Fprintln(out, "     Assessment: REVIEW REQUIRED — access is restrictive, but policy changes are controlled at enterprise level.")
+	default:
+		fmt.Fprintln(out, "     Assessment: RECOMMENDED — matches EPAR's strict generated policy.")
+	}
+}
+
+func repositoryPrivacyCounts(repositories []gh.RunnerGroupRepository) (privateCount, publicCount int) {
+	for _, repository := range repositories {
+		if repository.Private {
+			privateCount++
+		} else {
+			publicCount++
+		}
+	}
+	return privateCount, publicCount
+}
+
+func runnerGroupSelectionWarnings(group gh.RunnerGroup) []string {
+	var warnings []string
+	if group.Default {
+		warnings = append(warnings, "This is GitHub's default runner group. New or unintended repositories may gain access as organization policy changes.")
+	}
+	switch group.Visibility {
+	case config.RunnerGroupRepositoryAccessPrivate:
+		warnings = append(warnings, "This group is available to every private repository in the organization, including repositories created later.")
+	case config.RunnerGroupRepositoryAccessAll:
+		warnings = append(warnings, "This group is available to every repository allowed by its public-repository setting, including repositories created later.")
+	}
+	if group.Inherited {
+		warnings = append(warnings, "This group is inherited from the enterprise. Its policy must be reviewed and changed at enterprise level.")
+	}
+	return warnings
+}
+
+func runnerGroupDoesNotMeetRecommendedPolicy(group gh.RunnerGroup) bool {
+	return group.Default || group.Visibility != config.RunnerGroupRepositoryAccessSelected
+}
+
+func promptContinueOrBack(out io.Writer, reader *bufio.Reader, continueLabel string) (bool, error) {
+	fmt.Fprintf(out, "  1. %s\n", continueLabel)
+	fmt.Fprintln(out, "  2. Back to group selection")
+	for {
+		choice, err := promptRequired(out, reader, "Choice")
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(choice) {
+		case "1", "continue":
+			return true, nil
+		case "2", "back":
+			return false, nil
+		default:
+			fmt.Fprintln(out, "Choose 1 to continue or 2 to go back.")
+		}
+	}
+}
+
+func promptBackRefreshQuit(out io.Writer, reader *bufio.Reader) (bool, error) {
+	fmt.Fprintln(out, "  1. Back to group selection")
+	fmt.Fprintln(out, "  2. Refresh runner groups")
+	fmt.Fprintln(out, "  3. Quit without writing a config")
+	for {
+		choice, err := promptRequired(out, reader, "Choice")
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(choice) {
+		case "1", "back":
+			return false, nil
+		case "2", "refresh":
+			return true, nil
+		case "3", "quit":
+			return false, fmt.Errorf("runner-group selection cancelled; no config was written")
+		default:
+			fmt.Fprintln(out, "Choose 1 to go back, 2 to refresh, or 3 to quit.")
+		}
+	}
+}
+
+func resolveInitPrivateKeyPath(projectRoot, path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if path == "~" {
+				return home
+			}
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return config.ProjectPath(projectRoot, path)
 }
 
 func promptRequired(out io.Writer, reader *bufio.Reader, label string) (string, error) {
@@ -499,7 +832,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string) string {
+func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -546,9 +879,18 @@ logging:
   retentionIntervalMinutes: 60
 
 runner:
+  group: %s
   labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: %s
+    requireExplicitGroup: %t
+    requireNonDefaultGroup: %t
+    requiredRepositoryAccess: %s
+    requirePublicRepositoriesDisabled: %t
 
 provider:
   type: docker-dind
@@ -563,10 +905,10 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix)
+`, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
-func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string) string {
+func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -614,9 +956,18 @@ logging:
   retentionIntervalMinutes: 60
 
 runner:
+  group: %s
   labels: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: %s
+    requireExplicitGroup: %t
+    requireNonDefaultGroup: %t
+    requiredRepositoryAccess: %s
+    requirePublicRepositoriesDisabled: %t
 
 provider:
   type: wsl
@@ -632,10 +983,10 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, poolNamePrefix)
+`, appID, organization, privateKeyPath, poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
-func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string) string {
+func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection) string {
 	return fmt.Sprintf(`# Experimental: this default is a basic Ubuntu ARM64 Tart VM, not a GitHub-hosted runner image.
 # It does not include the broad dependency set from https://github.com/actions/runner-images.
 github:
@@ -683,9 +1034,18 @@ logging:
   retentionIntervalMinutes: 60
 
 runner:
+  group: %s
   labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-base]
   includeHostLabel: true
   ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: %s
+    requireExplicitGroup: %t
+    requireNonDefaultGroup: %t
+    requiredRepositoryAccess: %s
+    requirePublicRepositoriesDisabled: %t
 
 provider:
   type: tart
@@ -700,7 +1060,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, poolNamePrefix)
+`, appID, organization, privateKeyPath, poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
 var stdinIsInteractive = func() bool {

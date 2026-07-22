@@ -22,7 +22,7 @@ A workflow controls the runner environment while it runs and can access any secr
 
 Do not mount host source directories, Docker sockets, private keys, or long-lived cloud credentials into runner instances unless that is inside your trust boundary.
 
-Use GitHub runner groups, repository restrictions, environment protections, and minimal secrets. Avoid routing public pull request workflows, forked contributions, or unknown third-party workflow code to EPAR runners.
+Use GitHub runner groups, repository restrictions, environment protections, and minimal secrets. EPAR's [runner-group security preflight](runner-groups.md) checks the configured routing policy before registration, but it does not make public pull request workflows, forked contributions, or unknown third-party workflow code trustworthy.
 
 ## Provider Notes
 

@@ -18,6 +18,7 @@ type Config struct {
 	Pool     PoolConfig
 	Logging  LoggingConfig
 	Runner   RunnerConfig
+	Security SecurityConfig
 	Provider ProviderConfig
 	Docker   DockerConfig
 	Timeouts TimeoutConfig
@@ -98,6 +99,27 @@ type RunnerConfig struct {
 	NoDefaultLabels  bool
 }
 
+type SecurityConfig struct {
+	RunnerGroup RunnerGroupSecurityConfig
+}
+
+type RunnerGroupSecurityConfig struct {
+	Enforcement                       string
+	RequireExplicitGroup              bool
+	RequireNonDefaultGroup            bool
+	RequiredRepositoryAccess          string
+	RequirePublicRepositoriesDisabled bool
+}
+
+const (
+	RunnerGroupEnforcementEnforce = "enforce"
+	RunnerGroupEnforcementWarn    = "warn"
+
+	RunnerGroupRepositoryAccessSelected = "selected"
+	RunnerGroupRepositoryAccessPrivate  = "private"
+	RunnerGroupRepositoryAccessAll      = "all"
+)
+
 type ProviderConfig struct {
 	Type        string
 	SourceImage string
@@ -176,6 +198,15 @@ func Default() Config {
 			IncludeHostLabel: true,
 			Ephemeral:        true,
 		},
+		Security: SecurityConfig{
+			RunnerGroup: RunnerGroupSecurityConfig{
+				Enforcement:                       RunnerGroupEnforcementWarn,
+				RequireExplicitGroup:              true,
+				RequireNonDefaultGroup:            true,
+				RequiredRepositoryAccess:          RunnerGroupRepositoryAccessSelected,
+				RequirePublicRepositoriesDisabled: true,
+			},
+		},
 		Provider: ProviderConfig{
 			Type:        "tart",
 			SourceImage: "epar-ubuntu-24-arm64",
@@ -203,6 +234,8 @@ func Load(path string) (Config, error) {
 	defer file.Close()
 
 	section := ""
+	subsection := ""
+	subsectionIndent := 0
 	scanner := bufio.NewScanner(file)
 	lineNo := 0
 	var pendingList *pendingListKey
@@ -241,6 +274,8 @@ func Load(path string) (Config, error) {
 				return cfg, fmt.Errorf("%s:%d: unknown section %q", path, lineNo, key)
 			}
 			section = key
+			subsection = ""
+			subsectionIndent = 0
 			continue
 		}
 		if indent == 0 {
@@ -249,24 +284,42 @@ func Load(path string) (Config, error) {
 		if section == "" {
 			return cfg, fmt.Errorf("%s:%d: key %q must be under a section", path, lineNo, key)
 		}
-		if section == "pool" && key == "logDir" {
+		if section == "security" && value == "" {
+			if key != "runnerGroup" {
+				return cfg, fmt.Errorf("%s:%d: unknown subsection security.%s", path, lineNo, key)
+			}
+			subsection = key
+			subsectionIndent = indent
+			continue
+		}
+		effectiveSection := section
+		if section == "security" {
+			if subsection == "" {
+				return cfg, fmt.Errorf("%s:%d: key %q must be under security.runnerGroup", path, lineNo, key)
+			}
+			if indent <= subsectionIndent {
+				return cfg, fmt.Errorf("%s:%d: key %q must be nested under security.%s", path, lineNo, key, subsection)
+			}
+			effectiveSection = section + "." + subsection
+		}
+		if effectiveSection == "pool" && key == "logDir" {
 			legacyLogDir = trimQuotes(value)
 			legacyLogDirLine = lineNo
 			explicit["pool.logDir"] = true
 			continue
 		}
-		if value == "" && isListKey(section, key) {
-			if err := setListValue(&cfg, section, key, nil); err != nil {
+		if value == "" && isListKey(effectiveSection, key) {
+			if err := setListValue(&cfg, effectiveSection, key, nil); err != nil {
 				return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 			}
-			explicit[section+"."+key] = true
-			pendingList = &pendingListKey{section: section, key: key, indent: indent}
+			explicit[effectiveSection+"."+key] = true
+			pendingList = &pendingListKey{section: effectiveSection, key: key, indent: indent}
 			continue
 		}
-		if err := apply(&cfg, section, key, value); err != nil {
+		if err := apply(&cfg, effectiveSection, key, value); err != nil {
 			return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 		}
-		explicit[section+"."+key] = true
+		explicit[effectiveSection+"."+key] = true
 	}
 	if err := scanner.Err(); err != nil {
 		return cfg, err
@@ -277,6 +330,13 @@ func Load(path string) (Config, error) {
 		}
 		cfg.Logging.Directory = legacyLogDir
 		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s:%d: pool.logDir is deprecated; using its value as logging.directory (move it to the top-level logging section)", path, legacyLogDirLine))
+	}
+	if !explicit["security.runnerGroup.enforcement"] &&
+		!explicit["security.runnerGroup.requireExplicitGroup"] &&
+		!explicit["security.runnerGroup.requireNonDefaultGroup"] &&
+		!explicit["security.runnerGroup.requiredRepositoryAccess"] &&
+		!explicit["security.runnerGroup.requirePublicRepositoriesDisabled"] {
+		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s: runner-group security policy is not configured; using strict recommended checks in warn mode (add security.runnerGroup.enforcement: enforce after reviewing the policy)", path))
 	}
 	applyProviderDefaults(&cfg, explicit)
 	applyRunnerHostLabel(&cfg)
@@ -478,6 +538,33 @@ func apply(cfg *Config, section, key, value string) error {
 		default:
 			return unknownKey(section, key)
 		}
+	case "security.runnerGroup":
+		switch key {
+		case "enforcement":
+			cfg.Security.RunnerGroup.Enforcement = strings.ToLower(value)
+		case "requireExplicitGroup":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid security.runnerGroup.requireExplicitGroup: %w", err)
+			}
+			cfg.Security.RunnerGroup.RequireExplicitGroup = v
+		case "requireNonDefaultGroup":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid security.runnerGroup.requireNonDefaultGroup: %w", err)
+			}
+			cfg.Security.RunnerGroup.RequireNonDefaultGroup = v
+		case "requiredRepositoryAccess":
+			cfg.Security.RunnerGroup.RequiredRepositoryAccess = strings.ToLower(value)
+		case "requirePublicRepositoriesDisabled":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid security.runnerGroup.requirePublicRepositoriesDisabled: %w", err)
+			}
+			cfg.Security.RunnerGroup.RequirePublicRepositoriesDisabled = v
+		default:
+			return unknownKey(section, key)
+		}
 	case "provider":
 		switch key {
 		case "type":
@@ -535,7 +622,7 @@ func unknownKey(section, key string) error {
 
 func isKnownSection(section string) bool {
 	switch section {
-	case "github", "image", "pool", "logging", "runner", "provider", "docker", "timeouts":
+	case "github", "image", "pool", "logging", "runner", "security", "provider", "docker", "timeouts":
 		return true
 	default:
 		return false
@@ -787,6 +874,9 @@ func appendListValue(cfg *Config, section, key, value string) error {
 }
 
 func Validate(cfg Config) error {
+	if err := ValidateRunnerGroupSecurity(cfg.Security.RunnerGroup); err != nil {
+		return err
+	}
 	if err := ValidateLogging(cfg.Logging); err != nil {
 		return err
 	}
@@ -884,6 +974,20 @@ func Validate(cfg Config) error {
 	}
 	if err := ValidateDockerNoProxy(cfg.Docker.NoProxy); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ValidateRunnerGroupSecurity(policy RunnerGroupSecurityConfig) error {
+	switch policy.Enforcement {
+	case RunnerGroupEnforcementEnforce, RunnerGroupEnforcementWarn:
+	default:
+		return fmt.Errorf("unsupported security.runnerGroup.enforcement %q; supported values are enforce and warn", policy.Enforcement)
+	}
+	switch policy.RequiredRepositoryAccess {
+	case RunnerGroupRepositoryAccessSelected, RunnerGroupRepositoryAccessPrivate, RunnerGroupRepositoryAccessAll:
+	default:
+		return fmt.Errorf("unsupported security.runnerGroup.requiredRepositoryAccess %q; supported values are selected, private, and all", policy.RequiredRepositoryAccess)
 	}
 	return nil
 }
@@ -1284,7 +1388,12 @@ func stripComment(s string) string {
 func trimQuotes(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) >= 2 {
-		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+		if s[0] == '"' && s[len(s)-1] == '"' {
+			if value, err := strconv.Unquote(s); err == nil {
+				return value
+			}
+		}
+		if s[0] == '\'' && s[len(s)-1] == '\'' {
 			return s[1 : len(s)-1]
 		}
 	}

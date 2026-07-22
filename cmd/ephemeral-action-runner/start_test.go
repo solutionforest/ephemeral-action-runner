@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,6 +81,7 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	stubNoWSL2(t)
+	stubInitRunnerGroupClient(t)
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
 	oldResolveHostTrust := initResolveHostTrust
@@ -99,7 +101,7 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -140,7 +142,7 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -188,7 +190,7 @@ func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -244,18 +246,70 @@ func TestStartRejectsNonPositiveInstancesOverride(t *testing.T) {
 	}
 }
 
+func TestStartPreflightsBeforeImageAndPool(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeStarterManager{}
+	err := runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		ConfigPath:  configPath,
+		Register:    true,
+		Out:         &bytes.Buffer{},
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			return fake, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "preflight,image,pool" {
+		t.Fatalf("call order = %q, want preflight,image,pool", got)
+	}
+
+	fake = &fakeStarterManager{preflightErr: errors.New("unsafe group")}
+	err = runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		ConfigPath:  configPath,
+		Register:    true,
+		Out:         &bytes.Buffer{},
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			return fake, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe group") {
+		t.Fatalf("start error = %v, want preflight failure", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "preflight" {
+		t.Fatalf("call order after rejection = %q, want preflight only", got)
+	}
+}
+
 type fakeStarterManager struct {
-	ensureCalls int
-	runCalls    int
-	runOptions  pool.RunOptions
+	preflightErr error
+	ensureCalls  int
+	runCalls     int
+	runOptions   pool.RunOptions
+	calls        []string
+}
+
+func (m *fakeStarterManager) PreflightRunnerGroup(context.Context) error {
+	m.calls = append(m.calls, "preflight")
+	return m.preflightErr
 }
 
 func (m *fakeStarterManager) EnsureImage(context.Context) error {
+	m.calls = append(m.calls, "image")
 	m.ensureCalls++
 	return nil
 }
 
 func (m *fakeStarterManager) RunPool(_ context.Context, opts pool.RunOptions) error {
+	m.calls = append(m.calls, "pool")
 	m.runCalls++
 	m.runOptions = opts
 	return nil

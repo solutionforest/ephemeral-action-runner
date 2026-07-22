@@ -13,6 +13,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
@@ -29,7 +30,7 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -41,6 +42,13 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	}
 	if cfg.GitHub.AppID != 123456 || cfg.GitHub.Organization != "solutionforest" || cfg.GitHub.PrivateKeyPath != ".local/github-app.pem" {
 		t.Fatalf("unexpected GitHub config: %+v", cfg.GitHub)
+	}
+	if cfg.Runner.Group != "restricted group" {
+		t.Fatalf("runner.group = %q, want selected group", cfg.Runner.Group)
+	}
+	policy := cfg.Security.RunnerGroup
+	if policy.Enforcement != config.RunnerGroupEnforcementEnforce || !policy.RequireExplicitGroup || !policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != config.RunnerGroupRepositoryAccessSelected || !policy.RequirePublicRepositoriesDisabled {
+		t.Fatalf("unexpected generated runner-group policy: %+v", policy)
 	}
 	if got, want := cfg.Provider.Type, "docker-dind"; got != want {
 		t.Fatalf("provider.type = %q, want %q", got, want)
@@ -98,6 +106,282 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if !strings.Contains(out.String(), "Pool name prefix (press Enter to use build-box-01-a4f9c2):") {
 		t.Fatalf("init output did not explain default prefix acceptance:\n%s", out.String())
 	}
+	for _, want := range []string{"Repository access meanings:", "Selected repositories: Only repositories explicitly added", "Assessment: RECOMMENDED"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("init output did not explain runner-group policy term %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestInitAllowsWarnedDefaultGroupAndWritesMatchingPolicy(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	setInitRunnerGroupClient(t, &fakeInitRunnerGroupClient{groups: []gh.RunnerGroup{{ID: 1, Name: "Default", Visibility: config.RunnerGroupRepositoryAccessAll, Default: true}}})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n\nn\n"),
+		Out:                &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := cfg.Security.RunnerGroup
+	if cfg.Runner.Group != "Default" || policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != config.RunnerGroupRepositoryAccessAll || !policy.RequirePublicRepositoriesDisabled {
+		t.Fatalf("unexpected default-group config: group=%q policy=%+v", cfg.Runner.Group, policy)
+	}
+	if !strings.Contains(out.String(), "*** SECURITY WARNING: THIS RUNNER GROUP IS NOT RECOMMENDED ***") || !strings.Contains(out.String(), "New or unintended repositories") || !strings.Contains(out.String(), "RECOMMENDED ACTION: Choose Back") || !strings.Contains(out.String(), "docs/runner-groups.md") || !strings.Contains(out.String(), "Continue anyway and generate a relaxed policy") || strings.Count(out.String(), "requires explicit review") != 1 {
+		t.Fatalf("default-group warning/back option missing:\n%s", out.String())
+	}
+}
+
+func TestInitCanBackFromBroadGroupAndChooseRestrictedGroup(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	setInitRunnerGroupClient(t, &fakeInitRunnerGroupClient{
+		groups: []gh.RunnerGroup{
+			{ID: 1, Name: "broad", Visibility: config.RunnerGroupRepositoryAccessPrivate},
+			{ID: 2, Name: "restricted", Visibility: config.RunnerGroupRepositoryAccessSelected},
+		},
+		repositories: map[int64][]gh.RunnerGroupRepository{2: {{FullName: "example/private", Private: true}}},
+	})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n2\n2\n1\n\nn\n"),
+		Out:                &bytes.Buffer{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runner.Group != "restricted" || cfg.Security.RunnerGroup.RequiredRepositoryAccess != config.RunnerGroupRepositoryAccessSelected {
+		t.Fatalf("unexpected selection after back: group=%q policy=%+v", cfg.Runner.Group, cfg.Security.RunnerGroup)
+	}
+}
+
+func TestInitRejectsPublicGroupAndAllowsAnotherSelection(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	client := &fakeInitRunnerGroupClient{
+		groups: []gh.RunnerGroup{
+			{ID: 1, Name: "public", Visibility: config.RunnerGroupRepositoryAccessSelected, AllowsPublicRepositories: true},
+			{ID: 2, Name: "restricted", Visibility: config.RunnerGroupRepositoryAccessSelected},
+		},
+		repositories: map[int64][]gh.RunnerGroupRepository{
+			1: {{FullName: "example/public", Private: false}},
+			2: {{FullName: "example/private", Private: true}},
+		},
+	}
+	setInitRunnerGroupClient(t, client)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n2\n1\n1\n\nn\n"),
+		Out:                &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runner.Group != "restricted" {
+		t.Fatalf("runner.group = %q, want restricted", cfg.Runner.Group)
+	}
+	if !strings.Contains(out.String(), "*** SECURITY BLOCK: THIS RUNNER GROUP IS NOT ALLOWED BY EPAR'S SAFE DEFAULTS ***") || !strings.Contains(out.String(), "public repository or fork-triggered workflow") || !strings.Contains(out.String(), "RECOMMENDED ACTION: Do not use this group") || !strings.Contains(out.String(), "docs/runner-groups.md") {
+		t.Fatalf("public-repository warning missing:\n%s", out.String())
+	}
+	if client.groupCalls != 1 {
+		t.Fatalf("ListRunnerGroups calls = %d, want 1 when choosing Back", client.groupCalls)
+	}
+}
+
+func TestInitBlocksUnknownRunnerGroupRepositoryAccess(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	setInitRunnerGroupClient(t, &fakeInitRunnerGroupClient{groups: []gh.RunnerGroup{{ID: 1, Name: "future-policy", Visibility: "future-value"}}})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n3\n"),
+		Out:                &out,
+	})
+	if err == nil || !strings.Contains(err.Error(), "selection cancelled") {
+		t.Fatalf("init error = %v, want cancellation after unknown policy block", err)
+	}
+	if !strings.Contains(out.String(), "*** SECURITY BLOCK: GITHUB RETURNED AN UNKNOWN REPOSITORY-ACCESS POLICY ***") {
+		t.Fatalf("unknown access policy was not blocked clearly:\n%s", out.String())
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("config exists after unknown runner-group policy: %v", statErr)
+	}
+}
+
+func TestSortRunnerGroupsForWizardPutsRestrictiveGroupsFirst(t *testing.T) {
+	groups := []gh.RunnerGroup{
+		{ID: 1, Name: "Default", Visibility: config.RunnerGroupRepositoryAccessAll, Default: true},
+		{ID: 2, Name: "public-selected", Visibility: config.RunnerGroupRepositoryAccessSelected, AllowsPublicRepositories: true},
+		{ID: 3, Name: "all-private-repositories", Visibility: config.RunnerGroupRepositoryAccessPrivate},
+		{ID: 4, Name: "recommended", Visibility: config.RunnerGroupRepositoryAccessSelected},
+		{ID: 5, Name: "inherited-recommended", Visibility: config.RunnerGroupRepositoryAccessSelected, Inherited: true},
+	}
+	ordered := sortRunnerGroupsForWizard(groups)
+	got := make([]string, len(ordered))
+	for i, group := range ordered {
+		got[i] = group.Name
+	}
+	want := []string{"recommended", "inherited-recommended", "all-private-repositories", "Default", "public-selected"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("runner-group order = %#v, want %#v", got, want)
+	}
+	if groups[0].Name != "Default" {
+		t.Fatalf("sort mutated API response order: %#v", groups)
+	}
+}
+
+func TestInitRefreshesRunnerGroupsOnlyWhenRequested(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	client := &fakeInitRunnerGroupClient{
+		groupResponses: [][]gh.RunnerGroup{
+			{{ID: 1, Name: "before-refresh", Visibility: config.RunnerGroupRepositoryAccessSelected}},
+			{{ID: 2, Name: "after-refresh", Visibility: config.RunnerGroupRepositoryAccessSelected}},
+		},
+		repositories: map[int64][]gh.RunnerGroupRepository{
+			1: {{FullName: "example/private", Private: true}},
+			2: {{FullName: "example/private", Private: true}},
+		},
+	}
+	setInitRunnerGroupClient(t, client)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\nr\n1\n\n"),
+		Out:                &bytes.Buffer{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runner.Group != "after-refresh" || client.groupCalls != 2 {
+		t.Fatalf("refresh result: group=%q ListRunnerGroups calls=%d", cfg.Runner.Group, client.groupCalls)
+	}
+}
+
+func TestInitAllowsInheritedGroupWithAdvisory(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	setInitRunnerGroupClient(t, &fakeInitRunnerGroupClient{
+		groups:       []gh.RunnerGroup{{ID: 1, Name: "enterprise-restricted", Visibility: config.RunnerGroupRepositoryAccessSelected, Inherited: true}},
+		repositories: map[int64][]gh.RunnerGroupRepository{1: {{FullName: "example/private", Private: true}}},
+	})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n\n"),
+		Out:                &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runner.Group != "enterprise-restricted" || !cfg.Security.RunnerGroup.RequireNonDefaultGroup || !strings.Contains(out.String(), "enterprise level") {
+		t.Fatalf("inherited selection missing advisory or strict policy: group=%q policy=%+v output=%s", cfg.Runner.Group, cfg.Security.RunnerGroup, out.String())
+	}
+}
+
+func TestInitRunnerGroupAPIFailureDoesNotWriteConfig(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	setInitRunnerGroupClient(t, &fakeInitRunnerGroupClient{err: errors.New("permission denied")})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n"),
+		Out:                &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "load GitHub runner groups") || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("init error = %v, want runner-group API failure", err)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("config exists after runner-group API failure: %v", statErr)
+	}
+}
+
+func TestInitRunnerGroupAPIFailureDoesNotOverwriteExistingConfig(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	setInitRunnerGroupClient(t, &fakeInitRunnerGroupClient{err: errors.New("permission denied")})
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	const original = "existing config must remain\n"
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		Force:              true,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123\nexample\nkey.pem\n"),
+		Out:                &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "load GitHub runner groups") {
+		t.Fatalf("init error = %v, want runner-group API failure", err)
+	}
+	contents, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(contents) != original {
+		t.Fatalf("existing config changed after API failure: %q", contents)
+	}
 }
 
 func TestDetectedInitHostTrustOSUsesWrapperHost(t *testing.T) {
@@ -117,7 +401,7 @@ func TestInitCanDisableHostTrustOverlay(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\nn\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -145,7 +429,7 @@ func TestInitDoesNotWriteEnabledConfigWhenHostTrustPreflightFails(t *testing.T) 
 		ProjectRoot:     dir,
 		ConfigPath:      path,
 		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n\n\n"),
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n"),
 		Out:             &bytes.Buffer{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "collector unavailable") {
@@ -167,7 +451,7 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ncustom-prefix\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ncustom-prefix\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -193,7 +477,7 @@ func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n-bad\nfixed-prefix\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n-bad\nfixed-prefix\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -301,6 +585,7 @@ func TestInitRefusesExistingConfig(t *testing.T) {
 }
 
 func TestInitChecksDockerByDefault(t *testing.T) {
+	stubInitRunnerGroupClient(t)
 	oldDockerAvailable := dockerAvailable
 	t.Cleanup(func() {
 		dockerAvailable = oldDockerAvailable
@@ -312,7 +597,7 @@ func TestInitChecksDockerByDefault(t *testing.T) {
 	err := runInitWithOptions(initOptions{
 		ProjectRoot: t.TempDir(),
 		ConfigPath:  filepath.Join(t.TempDir(), ".local", "config.yml"),
-		In:          strings.NewReader("123\norg\nkey.pem\n"),
+		In:          strings.NewReader("123\norg\nkey.pem\n1\n"),
 		Out:         &bytes.Buffer{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "Docker is required") {
@@ -332,7 +617,7 @@ func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -351,6 +636,7 @@ func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
 		"organization: your-org", "organization: solutionforest",
 		"privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem", "privateKeyPath: .local/github-app.pem",
 		"namePrefix: CHANGE-ME-unique-machine-prefix", "namePrefix: build-box-01-a4f9c2",
+		"group: your-runner-group", "group: \"restricted group\"",
 	).Replace(string(want))
 	wantText = strings.ReplaceAll(wantText, "\r\n", "\n")
 	if string(got) != wantText {
@@ -378,7 +664,7 @@ func TestInitWSL2ChoiceDefaultsToDockerDindAndRepromptsInvalidValues(t *testing.
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\ninvalid\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ninvalid\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -412,7 +698,7 @@ func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
 		ProjectRoot:        dir,
 		ConfigPath:         path,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("654321\nexample\n.local/github-app.pem\n2\n\n"),
+		In:                 strings.NewReader("654321\nexample\n.local/github-app.pem\n1\n2\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -431,6 +717,7 @@ func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
 		"organization: your-org", "organization: example",
 		"privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem", "privateKeyPath: .local/github-app.pem",
 		"namePrefix: CHANGE-ME-unique-machine-prefix", "namePrefix: build-box-01-a4f9c2",
+		"group: your-runner-group", "group: \"restricted group\"",
 	).Replace(string(want))
 	wantText = strings.ReplaceAll(wantText, "\r\n", "\n")
 	if string(got) != wantText {
@@ -531,10 +818,56 @@ func stubInitHostAndRandom(t *testing.T, hostname string, random []byte) {
 	oldRandomRead := initRandomRead
 	initHostname = func() (string, error) { return hostname, nil }
 	initRandomRead = fixedRandomRead(random)
+	stubInitRunnerGroupClient(t)
 	t.Cleanup(func() {
 		initHostname = oldHostname
 		initRandomRead = oldRandomRead
 	})
+}
+
+type fakeInitRunnerGroupClient struct {
+	groups         []gh.RunnerGroup
+	groupResponses [][]gh.RunnerGroup
+	repositories   map[int64][]gh.RunnerGroupRepository
+	err            error
+	groupCalls     int
+}
+
+func (f *fakeInitRunnerGroupClient) ListRunnerGroups(context.Context) ([]gh.RunnerGroup, error) {
+	f.groupCalls++
+	if len(f.groupResponses) > 0 {
+		index := f.groupCalls - 1
+		if index >= len(f.groupResponses) {
+			index = len(f.groupResponses) - 1
+		}
+		return append([]gh.RunnerGroup(nil), f.groupResponses[index]...), f.err
+	}
+	return append([]gh.RunnerGroup(nil), f.groups...), f.err
+}
+
+func (f *fakeInitRunnerGroupClient) ListRunnerGroupRepositories(_ context.Context, groupID int64) ([]gh.RunnerGroupRepository, error) {
+	return append([]gh.RunnerGroupRepository(nil), f.repositories[groupID]...), f.err
+}
+
+func stubInitRunnerGroupClient(t *testing.T) {
+	t.Helper()
+	oldFactory := newInitRunnerGroupClient
+	newInitRunnerGroupClient = func(config.GitHubConfig) initRunnerGroupClient {
+		return &fakeInitRunnerGroupClient{
+			groups: []gh.RunnerGroup{{ID: 1, Name: "restricted group", Visibility: config.RunnerGroupRepositoryAccessSelected}},
+			repositories: map[int64][]gh.RunnerGroupRepository{
+				1: {{ID: 1, FullName: "example/private", Private: true}},
+			},
+		}
+	}
+	t.Cleanup(func() { newInitRunnerGroupClient = oldFactory })
+}
+
+func setInitRunnerGroupClient(t *testing.T, client initRunnerGroupClient) {
+	t.Helper()
+	oldFactory := newInitRunnerGroupClient
+	newInitRunnerGroupClient = func(config.GitHubConfig) initRunnerGroupClient { return client }
+	t.Cleanup(func() { newInitRunnerGroupClient = oldFactory })
 }
 
 func fixedRandomRead(random []byte) func([]byte) (int, error) {

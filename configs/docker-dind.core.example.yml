@@ -53,6 +53,14 @@ runner:
   noDefaultLabels: true
   ephemeral: true
 
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    requirePublicRepositoriesDisabled: false
+
 provider:
   type: docker-dind
   sourceImage: epar-ci-core

@@ -84,6 +84,30 @@ docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 
 If the container-visible disk is full, adjust or clean the Docker/OrbStack storage from that product's settings. Finder free space by itself may not reflect the Linux VM storage available to containers.
 
+## Windows No-Go Startup Prints An HTTP/2 Named-Pipe Diagnostic
+
+### Symptoms
+
+During the containerized Go-toolchain bootstrap, Docker Desktop may print a line like:
+
+```text
+2026/07/22 02:36:46 http2: server: error reading preface from client //./pipe/dockerDesktopLinuxEngine: file has already been closed
+```
+
+This is a Docker Desktop/Windows named-pipe transport diagnostic that can be emitted when a client connection closes. It is not an EPAR runner-group or GitHub API error. If the bootstrap `docker build` exits successfully and the EPAR wizard or command continues, the line does not indicate that EPAR failed.
+
+The Windows no-Go wrapper suppresses only this exact diagnostic when the bootstrap build succeeds. If the Docker build fails, the wrapper preserves the complete Docker stderr, including this line, because it may then be relevant context.
+
+If startup stops instead of continuing, verify the active Docker Desktop engine and context:
+
+```powershell
+docker version
+docker info
+docker context show
+```
+
+Resolve any failed command or unhealthy engine reported by those checks. Do not treat every named-pipe message as harmless when Docker also returns a nonzero exit code.
+
 ## Docker Container Fails Because Its Architecture Does Not Match The Runner
 
 ### Symptoms

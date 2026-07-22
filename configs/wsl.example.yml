@@ -45,9 +45,18 @@ logging:
   retentionIntervalMinutes: 60
 
 runner:
+  group: your-runner-group
   labels: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    requirePublicRepositoriesDisabled: true
 
 provider:
   type: wsl

@@ -23,6 +23,7 @@ EPAR looks for config in this order:
 | `pool` | Runner count, instance name prefix, and replacement retry policy. |
 | `logging` | Manager and transcript sinks, formats, rotation, retention, and log directory. |
 | `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
+| `security` | Runner-group policy requirements checked before runner registration. |
 | `docker` | Optional Docker registry mirrors and Docker-DinD daemon proxy settings. |
 | `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
 
@@ -77,21 +78,27 @@ runner:
   includeHostLabel: false
 ```
 
-Register runners in an organization runner group and omit GitHub's automatic
-`self-hosted`, operating-system, and architecture labels:
+Register runners in an organization runner group and omit GitHub's automatic `self-hosted`, operating-system, and architecture labels:
 
 ```yaml
 runner:
-  group: epar-ci-canary
+  group: your-runner-group
   labels: [epar-core-unique-label]
   includeHostLabel: false
   noDefaultLabels: true
+
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    requirePublicRepositoriesDisabled: true
 ```
 
-`runner.group` is optional. The group must already exist and allow the target
-repository to use it. `runner.noDefaultLabels` defaults to `false`; when it is
-`true`, workflows must target labels explicitly configured under
-`runner.labels` (and may also target the runner group).
+The group must already exist and allow the target repository to use it. `requiredRepositoryAccess` is a maximum breadth: `selected` allows only selected-repository groups, `private` also allows all-private groups, and `all` accepts any repository visibility. The public-repository requirement remains independent. Existing configs without `security.runnerGroup` use strict recommended requirements in `warn` mode; new wizard configs use `enforce`. See [Runner Group Security](runner-groups.md) for default-group choices, enterprise inheritance, overrides, and failure behavior.
+
+`runner.noDefaultLabels` defaults to `false`; when it is `true`, workflows must target labels explicitly configured under `runner.labels` and may also target the runner group.
 
 Use a different config file:
 

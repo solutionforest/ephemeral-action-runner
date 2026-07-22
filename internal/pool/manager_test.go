@@ -42,6 +42,65 @@ func TestRunnerAliveKeepsBusyGitHubRunnerWithoutServiceCheck(t *testing.T) {
 	}
 }
 
+func TestRunnerGroupPreflightEnforcesAndWarns(t *testing.T) {
+	violation := gh.RunnerGroupPolicyResult{Violations: []string{"runner group allows public repositories"}}
+	for _, test := range []struct {
+		name        string
+		enforcement string
+		result      gh.RunnerGroupPolicyResult
+		apiErr      error
+		wantErr     bool
+	}{
+		{name: "enforce violation", enforcement: config.RunnerGroupEnforcementEnforce, result: violation, wantErr: true},
+		{name: "warn violation", enforcement: config.RunnerGroupEnforcementWarn, result: violation},
+		{name: "enforce API failure", enforcement: config.RunnerGroupEnforcementEnforce, apiErr: errors.New("forbidden"), wantErr: true},
+		{name: "warn API failure", enforcement: config.RunnerGroupEnforcementWarn, apiErr: errors.New("forbidden")},
+		{name: "enforce allowed", enforcement: config.RunnerGroupEnforcementEnforce, result: gh.RunnerGroupPolicyResult{Resolved: true, Group: gh.RunnerGroup{Name: "restricted"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Runner.Group = "restricted"
+			cfg.Security.RunnerGroup.Enforcement = test.enforcement
+			github := &fakeGitHub{policyResult: test.result, policyErr: test.apiErr}
+			manager := Manager{Config: cfg, GitHub: github}
+			err := manager.PreflightRunnerGroup(context.Background())
+			if (err != nil) != test.wantErr {
+				t.Fatalf("PreflightRunnerGroup() error = %v, wantErr=%t", err, test.wantErr)
+			}
+			if got := atomic.LoadInt32(&github.policyCalls); got != 1 {
+				t.Fatalf("policy calls = %d, want 1", got)
+			}
+			if got := atomic.LoadInt32(&github.registrationCalls); got != 0 {
+				t.Fatalf("registration-token calls = %d, want 0", got)
+			}
+			if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+				t.Fatalf("runner delete calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestRegistrationPreflightRejectsBeforeTokenRequest(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{policyResult: gh.RunnerGroupPolicyResult{Violations: []string{"unsafe group"}}}
+	manager := newRegisteredTestManager(t, provider, github)
+	manager.Config.Security = config.Default().Security
+	manager.Config.Security.RunnerGroup.Enforcement = config.RunnerGroupEnforcementEnforce
+	_, err := manager.provisionOne(context.Background(), "epar-test-policy", true, false)
+	if err == nil || !strings.Contains(err.Error(), "unsafe group") {
+		t.Fatalf("provisionOne() error = %v, want policy rejection", err)
+	}
+	if got := atomic.LoadInt32(&github.policyCalls); got != 1 {
+		t.Fatalf("policy calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&github.registrationCalls); got != 0 {
+		t.Fatalf("registration-token calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("remote runner delete calls = %d, want 0", got)
+	}
+}
+
 func TestRetiredInstanceTranscriptsBecomeRetentionEligibleWhileLiveInstanceStaysProtected(t *testing.T) {
 	root := t.TempDir()
 	runtime, err := logging.NewRuntime(logging.Options{Directory: root, TranscriptSinks: logging.SinkFile})
@@ -283,6 +342,7 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+			Security: config.Default().Security,
 		},
 		Provider:    provider,
 		GitHub:      github,
@@ -1344,6 +1404,10 @@ type fakeGitHub struct {
 	listFunc            func(context.Context) ([]gh.Runner, error)
 	registrationErr     error
 	registrationToken   string
+	policyResult        gh.RunnerGroupPolicyResult
+	policyErr           error
+	policyCalls         int32
+	registrationCalls   int32
 	deleteCalls         int32
 	deletedIDs          []int64
 	mu                  sync.Mutex
@@ -1355,7 +1419,13 @@ func (g *fakeGitHub) OrganizationURL() string {
 	return "https://github.test/example"
 }
 
+func (g *fakeGitHub) EvaluateRunnerGroupPolicy(context.Context, string, config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error) {
+	atomic.AddInt32(&g.policyCalls, 1)
+	return g.policyResult, g.policyErr
+}
+
 func (g *fakeGitHub) RegistrationToken(context.Context) (gh.RegistrationToken, error) {
+	atomic.AddInt32(&g.registrationCalls, 1)
 	token := g.registrationToken
 	if token == "" {
 		token = "token"

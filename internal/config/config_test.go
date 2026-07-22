@@ -112,6 +112,94 @@ func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	}
 }
 
+func TestRunnerGroupSecurityDefaultsToStrictWarnings(t *testing.T) {
+	policy := Default().Security.RunnerGroup
+	if policy.Enforcement != RunnerGroupEnforcementWarn ||
+		!policy.RequireExplicitGroup ||
+		!policy.RequireNonDefaultGroup ||
+		policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessSelected ||
+		!policy.RequirePublicRepositoriesDisabled {
+		t.Fatalf("unexpected runner-group security defaults: %+v", policy)
+	}
+}
+
+func TestLoadNestedRunnerGroupSecurity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: false
+    requireNonDefaultGroup: false
+    requiredRepositoryAccess: all
+    requirePublicRepositoriesDisabled: false
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := cfg.Security.RunnerGroup
+	if policy.Enforcement != RunnerGroupEnforcementEnforce || policy.RequireExplicitGroup || policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessAll || policy.RequirePublicRepositoriesDisabled {
+		t.Fatalf("unexpected parsed runner-group policy: %+v", policy)
+	}
+	for _, warning := range cfg.Warnings() {
+		if strings.Contains(warning, "runner-group security policy is not configured") {
+			t.Fatalf("unexpected migration warning for configured policy: %q", warning)
+		}
+	}
+}
+
+func TestLoadLegacyConfigWarnsAboutRunnerGroupSecurity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  group: existing-group\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(cfg.Warnings(), func(warning string) bool {
+		return strings.Contains(warning, "runner-group security policy is not configured") && strings.Contains(warning, "warn mode")
+	}) {
+		t.Fatalf("Warnings() = %#v, want runner-group migration warning", cfg.Warnings())
+	}
+}
+
+func TestLoadRejectsInvalidRunnerGroupSecurityNesting(t *testing.T) {
+	for _, content := range []string{
+		"security:\n  unknown:\n    enforcement: enforce\n",
+		"security:\n  enforcement: enforce\n",
+		"security:\n  runnerGroup:\n  enforcement: enforce\n",
+		"security:\n  runnerGroup:\n    unknown: true\n",
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yml")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("Load(%q) succeeded, want nesting/key error", content)
+		}
+	}
+}
+
+func TestValidateRunnerGroupSecurityRejectsInvalidValues(t *testing.T) {
+	for _, mutate := range []func(*RunnerGroupSecurityConfig){
+		func(policy *RunnerGroupSecurityConfig) { policy.Enforcement = "off" },
+		func(policy *RunnerGroupSecurityConfig) { policy.RequiredRepositoryAccess = "repositories" },
+	} {
+		cfg := Default()
+		mutate(&cfg.Security.RunnerGroup)
+		if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "security.runnerGroup") {
+			t.Fatalf("Validate() error = %v, want runner-group policy error", err)
+		}
+	}
+}
+
 func TestLoggingDefaults(t *testing.T) {
 	got := Default().Logging
 	if got.Directory != "work/logs" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
@@ -228,7 +316,9 @@ func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
 		t.Fatalf("logging.directory = %q, want legacy value %q", got, want)
 	}
 	warnings := cfg.Warnings()
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "pool.logDir is deprecated") || !strings.Contains(warnings[0], "logging.directory") {
+	if !slices.ContainsFunc(warnings, func(warning string) bool {
+		return strings.Contains(warning, "pool.logDir is deprecated") && strings.Contains(warning, "logging.directory")
+	}) {
 		t.Fatalf("Warnings() = %#v, want migration warning", warnings)
 	}
 	if err := Validate(cfg); err != nil {
@@ -256,6 +346,7 @@ func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
 		"pool:\n  unknown: value\n",
 		"logging:\n  unknown: value\n",
 		"runner:\n  unknown: value\n",
+		"security:\n  runnerGroup:\n    unknown: value\n",
 		"provider:\n  unknown: value\n",
 		"docker:\n  unknown: value\n",
 		"timeouts:\n  unknown: 1\n",
