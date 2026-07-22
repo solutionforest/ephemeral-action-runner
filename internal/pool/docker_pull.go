@@ -41,6 +41,12 @@ type dockerLayerProgress struct {
 // image preparation tests. Production always uses Manager.pullDockerSource.
 var pullDockerSourceCommand = (*Manager).pullDockerSource
 
+var dockerPullProgressTerminal = func() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+var dockerPullProgressConsole io.Writer = os.Stdout
+
 func (m *Manager) pullDockerSource(ctx context.Context, opts dockerSourcePullOptions) error {
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
@@ -81,7 +87,6 @@ func (m *Manager) pullDockerSource(ctx context.Context, opts dockerSourcePullOpt
 }
 
 func (m *Manager) pullDockerSourceWithCLI(ctx context.Context, opts dockerSourcePullOptions, apiErr error) error {
-	m.warnf("warning: %v; falling back to docker pull CLI\n", apiErr)
 	m.writeDockerPullNotice(opts.LogPath, "warning: "+sanitizeTimingError(apiErr)+"; falling back to docker pull CLI")
 	args := []string{"pull"}
 	if opts.Platform != "" {
@@ -214,11 +219,6 @@ func (m *Manager) renderDockerPullProgress(ctx context.Context, response client.
 	if err != nil {
 		return err
 	}
-	interactive := term.IsTerminal(int(os.Stdout.Fd())) && containsString(m.Config.Logging.TranscriptSinks, "console") && m.Config.Logging.TranscriptConsoleFormat == "text"
-	eventWriter := transcript.Stdout
-	if interactive {
-		eventWriter = transcript.File
-	}
 	layers := map[string]dockerLayerProgress{}
 	lastRender := time.Time{}
 	rendered := false
@@ -226,7 +226,7 @@ func (m *Manager) renderDockerPullProgress(ctx context.Context, response client.
 		if streamErr != nil {
 			return streamErr
 		}
-		writeDockerPullEvent(eventWriter, message.ID, message.Status, message.Progress, message.Stream, message.Error)
+		writeDockerPullEvent(transcript.Stdout, message.ID, message.Status, message.Progress, message.Stream, message.Error)
 		if message.Error != nil {
 			return message.Error
 		}
@@ -247,44 +247,33 @@ func (m *Manager) renderDockerPullProgress(ctx context.Context, response client.
 			layers[message.ID] = layer
 		}
 		if time.Since(lastRender) >= dockerPullProgressInterval {
-			if interactive {
-				writeDockerPullSummary(os.Stdout, true, layers)
-			} else {
-				writeDockerPullSummary(transcript.Stdout, false, layers)
-			}
+			m.writeDockerPullProgress(logPath, layers)
 			lastRender = time.Now()
 			rendered = true
 		}
 	}
 	if rendered {
-		if interactive {
-			writeDockerPullSummary(os.Stdout, true, layers)
-		} else {
-			writeDockerPullSummary(transcript.Stdout, false, layers)
-		}
-		if interactive {
-			fmt.Fprintln(os.Stdout)
+		m.writeDockerPullProgress(logPath, layers)
+		if m.dockerPullProgressIsInteractive() {
+			fmt.Fprintln(dockerPullProgressConsole)
 		}
 	}
 	return nil
 }
 
 func (m *Manager) writeDockerPullNotice(logPath, message string) {
+	attributes := []any{"provider", m.Config.Provider.Type, "operation", "docker-pull", "logPath", logPath}
+	if strings.HasPrefix(message, "warning:") {
+		m.logger().Warn(strings.TrimSpace(strings.TrimPrefix(message, "warning:")), attributes...)
+	} else {
+		m.logger().Info(message, attributes...)
+	}
 	transcript, err := m.transcript(logPath, "", "docker-pull")
 	if err != nil {
 		m.logger().Warn("docker pull transcript unavailable", "operation", "docker-pull", "logPath", logPath, "error", err)
 		return
 	}
 	_, _ = fmt.Fprintf(transcript.Stdout, "%s\n", message)
-}
-
-func containsString(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
 }
 
 func writeDockerPullEvent(logFile io.Writer, id, status string, progress *jsonstream.Progress, stream string, pullErr error) {
@@ -315,7 +304,29 @@ func dockerPullLayerComplete(status string) bool {
 	return status == "pull complete" || status == "already exists" || status == "exists"
 }
 
-func writeDockerPullSummary(w io.Writer, interactive bool, layers map[string]dockerLayerProgress) {
+func (m *Manager) writeDockerPullProgress(logPath string, layers map[string]dockerLayerProgress) {
+	line := dockerPullProgressSummary(layers)
+	if m.dockerPullProgressIsInteractive() {
+		_, _ = fmt.Fprintf(dockerPullProgressConsole, "\r\033[2K%s", line)
+		return
+	}
+	m.logger().Info(line, "provider", m.Config.Provider.Type, "operation", "docker-pull", "logPath", logPath)
+}
+
+func (m *Manager) dockerPullProgressIsInteractive() bool {
+	return dockerPullProgressTerminal() && containsString(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text"
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func dockerPullProgressSummary(layers map[string]dockerLayerProgress) string {
 	var complete, known int
 	var currentBytes, totalBytes int64
 	for _, layer := range layers {
@@ -335,11 +346,7 @@ func writeDockerPullSummary(w io.Writer, interactive bool, layers map[string]doc
 	if known < len(layers) {
 		line += fmt.Sprintf("; %d layer(s) size pending", len(layers)-known)
 	}
-	if interactive {
-		fmt.Fprintf(w, "\r\033[2K%s", line)
-		return
-	}
-	fmt.Fprintf(w, "%s %s\n", time.Now().UTC().Format(time.RFC3339Nano), line)
+	return line
 }
 
 func formatDockerPullBytes(value int64) string {
