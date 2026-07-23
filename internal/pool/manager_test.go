@@ -111,14 +111,14 @@ func TestRetiredInstanceTranscriptsBecomeRetentionEligibleWhileLiveInstanceStays
 	manager := Manager{
 		Config: config.Config{
 			Logging:  config.LoggingConfig{Directory: root},
-			Provider: config.ProviderConfig{Type: "docker-dind"},
+			Provider: config.ProviderConfig{Type: "docker-container"},
 		},
 		ProjectRoot: root,
 		Logging:     runtime,
 	}
 	retired := ProvisionedInstance{
 		Name:         "retired-runner",
-		LogPath:      filepath.Join(root, "instances", "retired-runner.docker-dind.log"),
+		LogPath:      filepath.Join(root, "instances", "retired-runner.docker-container.log"),
 		GuestLogPath: filepath.Join(root, "instances", "retired-runner.guest.log"),
 	}
 	livePath := filepath.Join(root, "instances", "live-runner.guest.log")
@@ -174,13 +174,13 @@ func TestRetirementSuccessIsNotReversedByTranscriptCloseFailure(t *testing.T) {
 	manager := Manager{
 		Config: config.Config{
 			Logging:  config.LoggingConfig{Directory: root},
-			Provider: config.ProviderConfig{Type: "docker-dind"},
+			Provider: config.ProviderConfig{Type: "docker-container"},
 		},
 		Provider:    provider,
 		ProjectRoot: root,
 		Logging:     runtime,
 	}
-	vm := ProvisionedInstance{Name: "retired-runner", LogPath: filepath.Join(root, "instances", "retired-runner.docker-dind.log")}
+	vm := ProvisionedInstance{Name: "retired-runner", LogPath: filepath.Join(root, "instances", "retired-runner.docker-container.log")}
 	transcript, err := manager.transcript(vm.LogPath, vm.Name, "provider")
 	if err != nil {
 		t.Fatal(err)
@@ -384,7 +384,7 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
@@ -453,7 +453,7 @@ func TestVerifyUsesIdleReadiness(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
@@ -513,7 +513,7 @@ func TestProvisionOneRetriesTransientRuntimeValidationFailure(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
@@ -541,7 +541,7 @@ func TestVerifyCleanupUsesFreshContextAfterCancellation(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
@@ -572,7 +572,7 @@ func TestRunPoolCleanupUsesFreshContextAfterCancellation(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
@@ -607,7 +607,7 @@ func TestProvisionOnePassesRunnerRegistrationControlsWithoutPrivateKey(t *testin
 			GitHub: config.GitHubConfig{PrivateKeyPath: "/secret/app.pem"},
 			Provider: config.ProviderConfig{
 				SourceImage: "image",
-				Type:        "docker-dind",
+				Type:        "docker-container",
 			},
 			Pool: config.PoolConfig{
 				Instances:  1,
@@ -1244,7 +1244,7 @@ func newRegisteredTestManager(t *testing.T, provider provider.Provider, github G
 	t.Helper()
 	return Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},

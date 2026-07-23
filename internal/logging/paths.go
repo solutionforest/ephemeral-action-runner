@@ -90,7 +90,7 @@ func validBuildComponent(component string) bool {
 
 func validInstanceComponent(component string) bool {
 	switch component {
-	case "guest", "docker-dind", "wsl", "tart":
+	case "guest", "docker-container", "wsl", "tart":
 		return true
 	default:
 		return false

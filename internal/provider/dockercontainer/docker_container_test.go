@@ -1,4 +1,4 @@
-package dockerdind
+package dockercontainer
 
 import (
 	"bytes"
@@ -42,18 +42,18 @@ func TestCreateArgsUsePrivilegedWithoutHostSocketOrPorts(t *testing.T) {
 		"HTTPS_PROXY": "http://proxy.example.test:3128",
 		"HTTP_PROXY":  "http://proxy.example.test:3128",
 	}, true)
-	args := p.createArgs("runner-image", "epar-dind-1")
+	args := p.createArgs("runner-image", "epar-docker-container-1")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"create",
 		"--platform linux/arm64",
-		"--name epar-dind-1",
+		"--name epar-docker-container-1",
 		"--privileged",
 		"--add-host host.docker.internal:host-gateway",
 		"--env HTTP_PROXY=http://proxy.example.test:3128",
 		"--env HTTPS_PROXY=http://proxy.example.test:3128",
 		"--env NO_PROXY=localhost,127.0.0.1",
-		"--label epar.provider=docker-dind",
+		"--label epar.provider=docker-container",
 		"runner-image",
 	} {
 		if !strings.Contains(joined, want) {
@@ -79,14 +79,14 @@ func TestExecArgsPreserveEnvAndStdin(t *testing.T) {
 		gotStdin = stdin != nil
 		return provider.ExecResult{}, nil
 	}
-	_, err := p.Exec(context.Background(), "epar-dind-1", []string{"bash", "-lc", "echo ok"}, provider.ExecOptions{
+	_, err := p.Exec(context.Background(), "epar-docker-container-1", []string{"bash", "-lc", "echo ok"}, provider.ExecOptions{
 		Stdin: "input",
 		Env:   map[string]string{"A": "B"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"exec", "-i", "-e", "A=B", "epar-dind-1", "bash", "-lc", "echo ok"}
+	want := []string{"exec", "-i", "-e", "A=B", "epar-docker-container-1", "bash", "-lc", "echo ok"}
 	if !reflect.DeepEqual(gotArgs, want) {
 		t.Fatalf("exec args = %#v, want %#v", gotArgs, want)
 	}
@@ -135,16 +135,16 @@ func TestExecRedactsSecretAssignmentsWithoutSensitiveValues(t *testing.T) {
 func TestListParsesDockerPSOutput(t *testing.T) {
 	p := New("docker", "", false)
 	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
-		if strings.Join(args, " ") != "ps -a --filter label=epar.provider=docker-dind --format {{.Names}}\t{{.Image}}\t{{.Status}}" {
+		if strings.Join(args, " ") != "ps -a --filter label=epar.provider=docker-container --format {{.Names}}\t{{.Image}}\t{{.Status}}" {
 			t.Fatalf("unexpected list args: %#v", args)
 		}
-		return provider.ExecResult{Stdout: "epar-dind-1\trunner-image\tUp 2 minutes\n"}, nil
+		return provider.ExecResult{Stdout: "epar-docker-container-1\trunner-image\tUp 2 minutes\n"}, nil
 	}
 	instances, err := p.List(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []provider.Instance{{Name: "epar-dind-1", Source: "runner-image", State: "Up 2 minutes"}}
+	want := []provider.Instance{{Name: "epar-docker-container-1", Source: "runner-image", State: "Up 2 minutes"}}
 	if !reflect.DeepEqual(instances, want) {
 		t.Fatalf("instances = %#v, want %#v", instances, want)
 	}
@@ -152,7 +152,7 @@ func TestListParsesDockerPSOutput(t *testing.T) {
 
 func TestDryRunIPReturnsPlaceholder(t *testing.T) {
 	p := New("docker", "", true)
-	ip, err := p.IP(context.Background(), "epar-dind-1", 1)
+	ip, err := p.IP(context.Background(), "epar-docker-container-1", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

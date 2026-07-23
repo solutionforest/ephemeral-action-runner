@@ -95,20 +95,20 @@ func (m *Manager) BuildImage(ctx context.Context, opts ImageBuildOptions) error 
 		return m.buildTartImage(ctx, opts, upstreamDir)
 	case "wsl":
 		return m.buildWSLImage(ctx, opts, upstreamDir)
-	case "docker-dind":
-		return m.buildDockerDindImage(ctx, opts, upstreamDir)
+	case "docker-container":
+		return m.buildDockerContainerImage(ctx, opts, upstreamDir)
 	default:
 		return fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
 	}
 }
 
-func (m *Manager) buildDockerDindImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
-	return m.timeStartupStage("dind_image_build", func() error {
-		return m.buildDockerDindImageUntimed(ctx, opts, upstreamDir)
+func (m *Manager) buildDockerContainerImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	return m.timeStartupStage("docker_container_image_build", func() error {
+		return m.buildDockerContainerImageUntimed(ctx, opts, upstreamDir)
 	})
 }
 
-func (m *Manager) buildDockerDindImageUntimed(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+func (m *Manager) buildDockerContainerImageUntimed(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
 	buildLogPath := m.buildLogPath(imageLogStem(m.Config.Image.OutputImage) + ".docker-build.log")
 	defer m.releaseTranscript(buildLogPath)
 	if err := resetLogs(buildLogPath); err != nil {
@@ -140,7 +140,7 @@ func (m *Manager) buildDockerDindImageUntimed(ctx context.Context, opts ImageBui
 		if m.hostTrustEnabled() {
 			targetImage = temporaryDockerImageTag(targetImage, snapshot.Generation, attempt)
 		}
-		if err := m.buildDockerDindImageAttempt(ctx, upstreamDir, buildLogPath, targetImage, *manifest, snapshot); err != nil {
+		if err := m.buildDockerContainerImageAttempt(ctx, upstreamDir, buildLogPath, targetImage, *manifest, snapshot); err != nil {
 			return err
 		}
 		if m.DryRun || !m.hostTrustEnabled() {
@@ -167,20 +167,20 @@ func (m *Manager) buildDockerDindImageUntimed(ctx context.Context, opts ImageBui
 	return fmt.Errorf("host trust changed during all %d image build attempts; retry after the host trust store stabilizes", attempts)
 }
 
-func (m *Manager) buildDockerDindImageAttempt(ctx context.Context, upstreamDir, buildLogPath, targetImage string, manifest ImageManifest, snapshot hosttrust.Snapshot) error {
+func (m *Manager) buildDockerContainerImageAttempt(ctx context.Context, upstreamDir, buildLogPath, targetImage string, manifest ImageManifest, snapshot hosttrust.Snapshot) error {
 	manifestContent, manifestHash, err := storedImageManifestContent(manifest)
 	if err != nil {
 		return err
 	}
-	buildCtx, err := os.MkdirTemp("", "epar-docker-dind-build-*")
+	buildCtx, err := os.MkdirTemp("", "epar-docker-container-build-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(buildCtx)
-	if err := m.prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, snapshot); err != nil {
+	if err := m.prepareDockerContainerBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, snapshot); err != nil {
 		return err
 	}
-	m.infof("building Docker-DinD image %s from %s\n", targetImage, m.Config.Image.SourceImage)
+	m.infof("building Docker Container image %s from %s\n", targetImage, m.Config.Image.SourceImage)
 	m.infof("log: %s\n", buildLogPath)
 	args := []string{"build", "-t", targetImage}
 	if m.Config.Provider.Platform != "" {
@@ -708,8 +708,8 @@ func (m *Manager) RefreshScripts(ctx context.Context) error {
 		return m.refreshTartScripts(ctx)
 	case "wsl":
 		return m.refreshWSLScripts(ctx)
-	case "docker-dind":
-		return m.buildDockerDindImage(ctx, ImageBuildOptions{Replace: true}, config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir))
+	case "docker-container":
+		return m.buildDockerContainerImage(ctx, ImageBuildOptions{Replace: true}, config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir))
 	default:
 		return fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
 	}
@@ -972,11 +972,11 @@ func (m *Manager) runnerImagesCopyMode() runnerImagesCopyMode {
 	return runnerImagesCopyNone
 }
 
-func (m *Manager) prepareDockerDindBuildContext(buildCtx, upstreamDir, manifestContent string) error {
-	return m.prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, hosttrust.Snapshot{})
+func (m *Manager) prepareDockerContainerBuildContext(buildCtx, upstreamDir, manifestContent string) error {
+	return m.prepareDockerContainerBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, hosttrust.Snapshot{})
 }
 
-func (m *Manager) prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent string, snapshot hosttrust.Snapshot) error {
+func (m *Manager) prepareDockerContainerBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent string, snapshot hosttrust.Snapshot) error {
 	if err := copyDir(filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu"), filepath.Join(buildCtx, "scripts", "guest", "ubuntu")); err != nil {
 		return err
 	}
@@ -989,7 +989,7 @@ func (m *Manager) prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamD
 	}
 	switch m.runnerImagesCopyMode() {
 	case runnerImagesCopySubset:
-		m.infof("preparing Docker-DinD build context with runner-images script subset\n")
+		m.infof("preparing Docker Container build context with runner-images script subset\n")
 		if err := copyRunnerImagesSubsetToDir(upstreamDir, upstreamDest, m.runnerImageBuildScripts()); err != nil {
 			return err
 		}
@@ -997,7 +997,7 @@ func (m *Manager) prepareDockerDindBuildContextWithHostTrust(buildCtx, upstreamD
 			return err
 		}
 	case runnerImagesCopyNone:
-		m.infof("preparing Docker-DinD build context without runner-images resources\n")
+		m.infof("preparing Docker Container build context without runner-images resources\n")
 	}
 	customDir := filepath.Join(buildCtx, "custom-install")
 	if err := os.MkdirAll(customDir, 0755); err != nil {
@@ -1030,7 +1030,7 @@ USER root
 ARG RUNNER_VERSION=latest
 ARG EPAR_IMAGE_MANIFEST_SHA256
 ARG OCI_SOURCE=https://github.com/solutionforest/ephemeral-action-runner
-ARG OCI_DESCRIPTION="EPAR Docker-DinD runner image"
+ARG OCI_DESCRIPTION="EPAR Docker Container runner image"
 ARG OCI_LICENSES=MIT
 LABEL org.opencontainers.image.source="${OCI_SOURCE}"
 LABEL org.opencontainers.image.description="${OCI_DESCRIPTION}"

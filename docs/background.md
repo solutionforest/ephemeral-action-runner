@@ -10,11 +10,11 @@ runs-on: [self-hosted, linux, ARM64, m3-ubuntu-24.04-docker]
 
 Do not label these runners as `ubuntu-latest`. GitHub-hosted `ubuntu-latest` is a GitHub-managed image environment, and x64 assumptions may break on ARM64.
 
-For Docker-heavy Linux CI, Docker-DinD is the recommended first path when the host already has a Docker runtime that supports privileged containers. It keeps workflow Docker resources inside a private inner daemon per runner instance, so existing Compose stacks with fixed project names or ports usually need fewer repository changes.
+For Docker-heavy Linux CI, Docker Container is the recommended first path when the host already has a Docker runtime that supports privileged containers. It keeps workflow Docker resources inside a private inner daemon per runner instance, so existing Compose stacks with fixed project names or ports usually need fewer repository changes.
 
-WSL on Windows x64 remains a good EPAR provider for workflows that need native x64 Linux Docker images. Tart on Apple Silicon remains useful when you specifically want VM-based runners on a Mac host, but the VM is ARM64 unless you opt into and validate Rosetta support. Workflows that depend on amd64-only images should target a distinct label such as a Docker-DinD label with verified amd64 emulation, `epar-tart-rosetta-amd64`, a WSL x64 label, or another x64 Linux runner label.
+WSL on Windows x64 remains a good EPAR provider for workflows that need native x64 Linux Docker images. Tart on Apple Silicon remains useful when you specifically want VM-based runners on a Mac host, but the VM is ARM64 unless you opt into and validate Rosetta support. Workflows that depend on amd64-only images should target a distinct label such as a Docker Container label with verified amd64 emulation, `epar-tart-rosetta-amd64`, a WSL x64 label, or another x64 Linux runner label.
 
-On Apple Silicon hosts, amd64 containers inside Docker-DinD depend on the host runtime's emulation support; validate `docker run --platform linux/amd64 alpine:3.20 uname -m` inside a running EPAR instance before routing amd64-only workflows there.
+On Apple Silicon hosts, amd64 containers inside Docker Container depend on the host runtime's emulation support; validate `docker run --platform linux/amd64 alpine:3.20 uname -m` inside a running EPAR instance before routing amd64-only workflows there.
 
 ## OCI Clarification
 

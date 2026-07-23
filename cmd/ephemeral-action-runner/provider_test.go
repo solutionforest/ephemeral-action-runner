@@ -4,12 +4,12 @@ import (
 	"testing"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
-	dockerdindprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockerdind"
+	dockercontainerprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockercontainer"
 )
 
 func TestNewProviderWiresDockerDaemonProxy(t *testing.T) {
 	cfg := config.Default()
-	cfg.Provider.Type = "docker-dind"
+	cfg.Provider.Type = "docker-container"
 	cfg.Provider.Platform = "linux/amd64"
 	cfg.Docker.HTTPProxy = "http://host.docker.internal:3128"
 	cfg.Docker.HTTPSProxy = "http://host.docker.internal:3128"
@@ -19,11 +19,11 @@ func TestNewProviderWiresDockerDaemonProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dind, ok := created.(*dockerdindprovider.Provider)
+	dockerContainer, ok := created.(*dockercontainerprovider.Provider)
 	if !ok {
-		t.Fatalf("newProvider() type = %T, want Docker-DinD provider", created)
+		t.Fatalf("newProvider() type = %T, want Docker Container provider", created)
 	}
-	if !dind.HostGateway {
+	if !dockerContainer.HostGateway {
 		t.Fatal("host.docker.internal proxy did not enable host gateway")
 	}
 	for key, want := range map[string]string{
@@ -31,7 +31,7 @@ func TestNewProviderWiresDockerDaemonProxy(t *testing.T) {
 		"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
 		"NO_PROXY":    cfg.Docker.NoProxy,
 	} {
-		if got := dind.Environment[key]; got != want {
+		if got := dockerContainer.Environment[key]; got != want {
 			t.Errorf("provider environment %s = %q, want %q", key, got, want)
 		}
 	}

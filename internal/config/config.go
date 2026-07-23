@@ -670,7 +670,7 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
 			cfg.Pool.NamePrefix = "epar-wsl"
 		}
-	case "docker-dind":
+	case "docker-container":
 		if !explicit["image.sourceType"] {
 			cfg.Image.SourceType = ImageSourceDockerImage
 		}
@@ -678,16 +678,16 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
 		}
 		if !explicit["image.outputImage"] {
-			cfg.Image.OutputImage = "epar-docker-dind-catthehacker-ubuntu"
+			cfg.Image.OutputImage = "epar-docker-container-catthehacker-ubuntu"
 		}
 		if !explicit["provider.sourceImage"] {
 			cfg.Provider.SourceImage = cfg.Image.OutputImage
 		}
 		if !explicit["runner.labels"] {
-			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-catthehacker-ubuntu"}
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-container-catthehacker-ubuntu"}
 		}
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
-			cfg.Pool.NamePrefix = "epar-dind"
+			cfg.Pool.NamePrefix = "epar-docker-container"
 		}
 	}
 }
@@ -884,9 +884,9 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("provider.type is required")
 	}
 	switch cfg.Provider.Type {
-	case "tart", "wsl", "docker-dind":
+	case "tart", "wsl", "docker-container":
 	case "docker-socket":
-		return fmt.Errorf("provider.type docker-socket is intentionally unsupported; use provider.type=docker-dind for a private Docker daemon")
+		return fmt.Errorf("provider.type docker-socket is intentionally unsupported; use provider.type=docker-container for a private Docker daemon")
 	default:
 		return fmt.Errorf("unsupported provider.type %q", cfg.Provider.Type)
 	}
@@ -902,8 +902,8 @@ func Validate(cfg Config) error {
 		}
 	}
 	if cfg.Provider.Platform != "" {
-		if cfg.Provider.Type != "docker-dind" {
-			return fmt.Errorf("provider.platform is only supported with provider.type=docker-dind")
+		if cfg.Provider.Type != "docker-container" {
+			return fmt.Errorf("provider.platform is only supported with provider.type=docker-container")
 		}
 		if err := ValidateDockerPlatform(cfg.Provider.Platform); err != nil {
 			return err
@@ -1112,15 +1112,15 @@ func validateConsoleTextFormat(key, template, outputFormat string, allowed []str
 }
 
 // ValidateHostTrust keeps host trust inheritance deliberately limited to the
-// ephemeral Docker-in-Docker image path. Other providers do not have a
+// ephemeral private Docker daemon image path. Other providers do not have a
 // portable, unambiguous host trust boundary.
 func ValidateHostTrust(image ImageConfig, provider ProviderConfig, runner RunnerConfig) error {
 	switch image.HostTrustMode {
 	case "", HostTrustModeDisabled:
 		return nil
 	case HostTrustModeOverlay:
-		if provider.Type != "docker-dind" {
-			return fmt.Errorf("image.hostTrustMode %q is only supported with provider.type=docker-dind", HostTrustModeOverlay)
+		if provider.Type != "docker-container" {
+			return fmt.Errorf("image.hostTrustMode %q is only supported with provider.type=docker-container", HostTrustModeOverlay)
 		}
 		if !runner.Ephemeral {
 			return fmt.Errorf("image.hostTrustMode %q requires runner.ephemeral=true", HostTrustModeOverlay)

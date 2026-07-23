@@ -64,9 +64,9 @@ rewrite_links() {
       "docs/providers/wsl.md" => "WSL-Provider",
       "providers/wsl.md" => "WSL-Provider",
       "wsl.md" => "WSL-Provider",
-      "docs/providers/docker-dind.md" => "Docker-DinD-Provider",
-      "providers/docker-dind.md" => "Docker-DinD-Provider",
-      "docker-dind.md" => "Docker-DinD-Provider",
+      "docs/providers/docker-container.md" => "Docker-Container-Provider",
+      "providers/docker-container.md" => "Docker-Container-Provider",
+      "docker-container.md" => "Docker-Container-Provider",
       "docs/providers/adding-provider.md" => "Adding-A-Provider",
       "providers/adding-provider.md" => "Adding-A-Provider",
       "adding-provider.md" => "Adding-A-Provider",
@@ -111,7 +111,7 @@ copy_page "docs/security.md" "Security"
 copy_page "docs/background.md" "Background"
 copy_page "docs/providers/tart.md" "Tart-Provider"
 copy_page "docs/providers/wsl.md" "WSL-Provider"
-copy_page "docs/providers/docker-dind.md" "Docker-DinD-Provider"
+copy_page "docs/providers/docker-container.md" "Docker-Container-Provider"
 copy_page "docs/providers/adding-provider.md" "Adding-A-Provider"
 copy_page "docs/advanced/docker-registry-mirrors.md" "Docker-Registry-Mirrors"
 copy_page "docs/advanced/macos-startup.md" "macOS-Startup"
@@ -130,7 +130,7 @@ cat > "$out_dir/_Sidebar.md" <<'SIDEBAR'
 
 ## Providers
 
-- [Docker-DinD](Docker-DinD-Provider)
+- [Docker Container](Docker-Container-Provider)
 - [Tart](Tart-Provider)
 - [WSL](WSL-Provider)
 - [Adding A Provider](Adding-A-Provider)

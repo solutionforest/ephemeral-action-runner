@@ -84,6 +84,6 @@ Unregister-ScheduledTask -TaskName "EPAR" -Confirm:$false
 ## Notes
 
 - Stop the foreground EPAR process or scheduled task to trigger normal cleanup.
-- For Docker-DinD, the host Docker runtime must support privileged Linux containers.
+- For Docker Container, the host Docker runtime must support privileged Linux containers.
 - For WSL, make sure WSL2 is installed and the configured WSL image has been built or can be built by `start`.
 - If the selected provider needs Docker, use a logon trigger with a delay so Docker has time to become ready.

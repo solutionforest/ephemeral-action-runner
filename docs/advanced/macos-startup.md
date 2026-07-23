@@ -125,5 +125,5 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.example.epar.plist
 - `start` cleans up prefixed instances when it exits. Use `--keep-on-exit` only for debugging.
 - The first run can take a while because `start` may build or refresh the configured image before starting runners.
 - If Docker Desktop, OrbStack, or Docker Engine cannot start, the script exits before EPAR starts.
-- For Docker-DinD, the host Docker runtime must support privileged containers.
+- For Docker Container, the host Docker runtime must support privileged containers.
 - For Tart-only pools that do not use host Docker or a local registry mirror, disable the Docker wait in your local copy.

@@ -96,8 +96,8 @@ const (
 
 func (m *Manager) currentImageState(ctx context.Context, wantHash string) (imageState, error) {
 	switch m.Config.Provider.Type {
-	case "docker-dind":
-		got, exists, err := m.currentDockerDindManifestHash(ctx)
+	case "docker-container":
+		got, exists, err := m.currentDockerContainerManifestHash(ctx)
 		if err != nil {
 			return imageStateMissing, err
 		}
@@ -127,7 +127,7 @@ func (m *Manager) currentImageState(ctx context.Context, wantHash string) (image
 	}
 }
 
-func (m *Manager) currentDockerDindManifestHash(ctx context.Context) (string, bool, error) {
+func (m *Manager) currentDockerContainerManifestHash(ctx context.Context) (string, bool, error) {
 	output := strings.TrimSpace(m.Config.Image.OutputImage)
 	if output == "" {
 		return "", false, fmt.Errorf("image.outputImage is required")
@@ -189,7 +189,7 @@ func (m *Manager) desiredImageManifestWithHostTrust(ctx context.Context, snapsho
 	sourceType := m.Config.Image.SourceType
 	if sourceType == "" {
 		sourceType = config.ImageSourceRootFSTar
-		if m.Config.Provider.Type == "docker-dind" {
+		if m.Config.Provider.Type == "docker-container" {
 			sourceType = config.ImageSourceDockerImage
 		}
 	}
@@ -207,7 +207,7 @@ func (m *Manager) desiredImageManifestWithHostTrust(ctx context.Context, snapsho
 	}
 	switch sourceType {
 	case config.ImageSourceDockerImage:
-		if m.Config.Provider.Type == "docker-dind" || m.Config.Provider.Type == "wsl" {
+		if m.Config.Provider.Type == "docker-container" || m.Config.Provider.Type == "wsl" {
 			digest, err := m.refreshDockerSourceDigest(ctx)
 			if err != nil {
 				return manifest, err
@@ -307,7 +307,7 @@ func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string,
 func (m *Manager) eparScriptDigests() ([]fileDigest, error) {
 	var roots []string
 	switch m.Config.Provider.Type {
-	case "docker-dind":
+	case "docker-container":
 		roots = []string{
 			filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu"),
 			filepath.Join(m.ProjectRoot, "scripts", "container", "ubuntu"),

@@ -48,14 +48,14 @@ func TestNeedsRunnerImagesSubsetOnlyForBuiltInScripts(t *testing.T) {
 	}
 }
 
-func TestDockerDindBaseImageDoesNotRequireRunnerImages(t *testing.T) {
-	manager := Manager{Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}}}
+func TestDockerContainerBaseImageDoesNotRequireRunnerImages(t *testing.T) {
+	manager := Manager{Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}}}
 	if got := manager.runnerImagesCopyMode(); got != runnerImagesCopyNone {
 		t.Fatalf("runnerImagesCopyMode() = %v, want none", got)
 	}
 }
 
-func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
+func TestDockerContainerDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),
@@ -74,7 +74,7 @@ func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 		},
 		ProjectRoot: root,
 	}
-	if err := manager.prepareDockerDindBuildContext(buildCtx, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
+	if err := manager.prepareDockerContainerBuildContext(buildCtx, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
 	content, err := os.ReadFile(filepath.Join(buildCtx, "Dockerfile"))
@@ -95,7 +95,7 @@ func TestDockerDindDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 	}
 }
 
-func TestDockerDindBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
+func TestDockerContainerBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),
@@ -110,26 +110,26 @@ func TestDockerDindBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
 		Config: config.Config{
 			Image: config.ImageConfig{
 				SourceImage:   "ghcr.io/catthehacker/ubuntu:full-latest",
-				OutputImage:   "epar-docker-dind-catthehacker-ubuntu",
+				OutputImage:   "epar-docker-container-catthehacker-ubuntu",
 				RunnerVersion: "latest",
 			},
 			Logging:  config.LoggingConfig{Directory: "logs"},
-			Provider: config.ProviderConfig{Type: "docker-dind", Platform: "linux/amd64"},
+			Provider: config.ProviderConfig{Type: "docker-container", Platform: "linux/amd64"},
 		},
 		ProjectRoot: root,
 		DryRun:      true,
 	}
 	manifest := ImageManifest{
 		SchemaVersion: imageManifestSchemaVersion,
-		ProviderType:  "docker-dind",
+		ProviderType:  "docker-container",
 		SourceType:    config.ImageSourceDockerImage,
 		SourceImage:   "ghcr.io/catthehacker/ubuntu:full-latest",
-		OutputImage:   "epar-docker-dind-catthehacker-ubuntu",
+		OutputImage:   "epar-docker-container-catthehacker-ubuntu",
 		RunnerVersion: "latest",
 	}
 
 	out, err := capturePoolStdout(t, func() error {
-		return manager.buildDockerDindImage(context.Background(), ImageBuildOptions{Replace: true, Manifest: &manifest}, filepath.Join(root, "third_party", "runner-images"))
+		return manager.buildDockerContainerImage(context.Background(), ImageBuildOptions{Replace: true, Manifest: &manifest}, filepath.Join(root, "third_party", "runner-images"))
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestDockerDindBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
 	if strings.Contains(out, "--progress") {
 		t.Fatalf("docker build command should not require BuildKit progress support:\n%s", out)
 	}
-	if !strings.Contains(out, "docker build -t epar-docker-dind-catthehacker-ubuntu --platform linux/amd64") {
+	if !strings.Contains(out, "docker build -t epar-docker-container-catthehacker-ubuntu --platform linux/amd64") {
 		t.Fatalf("docker build command missing expected base args:\n%s", out)
 	}
 }

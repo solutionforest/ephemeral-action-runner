@@ -17,7 +17,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
-func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
+func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
 
@@ -50,13 +50,13 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if policy.Enforcement != config.RunnerGroupEnforcementEnforce || !policy.RequireExplicitGroup || !policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != config.RunnerGroupRepositoryAccessSelected || !policy.RequirePublicRepositoriesDisabled {
 		t.Fatalf("unexpected generated runner-group policy: %+v", policy)
 	}
-	if got, want := cfg.Provider.Type, "docker-dind"; got != want {
+	if got, want := cfg.Provider.Type, "docker-container"; got != want {
 		t.Fatalf("provider.type = %q, want %q", got, want)
 	}
 	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
+	if got, want := cfg.Image.OutputImage, "epar-docker-container-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Image.HostTrustMode, config.HostTrustModeOverlay; got != want {
@@ -97,7 +97,7 @@ func TestInitCreatesDefaultDockerDindConfig(t *testing.T) {
 	if !strings.Contains(string(configText), "replacementRetryInitialSeconds: 15\n  replacementRetryMaxSeconds: 1800\n  replacementRetryMultiplier: 2\n  replacementRetryJitterPercent: 20\n") {
 		t.Fatalf("generated config did not include replacement retry settings:\n%s", configText)
 	}
-	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-dind-catthehacker-ubuntu") {
+	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-container-catthehacker-ubuntu") {
 		t.Fatalf("runner labels = %q", got)
 	}
 	if !strings.Contains(out.String(), "start") || !strings.Contains(out.String(), "pool up --instances 2") {
@@ -652,7 +652,7 @@ func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestInitWSL2ChoiceDefaultsToDockerDindAndRepromptsInvalidValues(t *testing.T) {
+func TestInitWSL2ChoiceDefaultsToDockerContainerAndRepromptsInvalidValues(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubWSL2Available(t)
 
@@ -673,10 +673,10 @@ func TestInitWSL2ChoiceDefaultsToDockerDindAndRepromptsInvalidValues(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(configBytes), "type: docker-dind") {
-		t.Fatalf("config did not use the default Docker-DinD provider:\n%s", configBytes)
+	if !strings.Contains(string(configBytes), "type: docker-container") {
+		t.Fatalf("config did not use the default Docker Container provider:\n%s", configBytes)
 	}
-	if !strings.Contains(out.String(), "Runner provider must be 1 (Docker-DinD) or 2 (WSL2).") {
+	if !strings.Contains(out.String(), "Runner provider must be 1 (Docker Container — private daemon) or 2 (WSL2).") {
 		t.Fatalf("init output did not explain invalid provider input:\n%s", out.String())
 	}
 }

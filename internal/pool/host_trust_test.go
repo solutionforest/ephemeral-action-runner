@@ -16,7 +16,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
-func TestDockerDindBuildContextKeepsHostAndExplicitTrustSeparate(t *testing.T) {
+func TestDockerContainerBuildContextKeepsHostAndExplicitTrustSeparate(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),
@@ -40,7 +40,7 @@ func TestDockerDindBuildContextKeepsHostAndExplicitTrustSeparate(t *testing.T) {
 		ProjectRoot: root,
 	}
 	buildContext := t.TempDir()
-	if err := manager.prepareDockerDindBuildContextWithHostTrust(buildContext, t.TempDir(), `{"hash":"test"}`+"\n", snapshot); err != nil {
+	if err := manager.prepareDockerContainerBuildContextWithHostTrust(buildContext, t.TempDir(), `{"hash":"test"}`+"\n", snapshot); err != nil {
 		t.Fatal(err)
 	}
 	assertSingleCertificateFile(t, filepath.Join(buildContext, "trusted-ca-certificates"))
@@ -319,7 +319,7 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 				HostTrustMode:   config.HostTrustModeOverlay,
 				HostTrustScopes: []string{"system", "user"},
 			},
-			Provider: config.ProviderConfig{Type: "docker-dind"},
+			Provider: config.ProviderConfig{Type: "docker-container"},
 			Runner:   config.RunnerConfig{Ephemeral: true},
 			Logging:  config.LoggingConfig{Directory: "work/logs"},
 		},
@@ -366,7 +366,7 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 		}
 		return nil
 	}
-	if err := manager.buildDockerDindImage(context.Background(), ImageBuildOptions{Replace: true}, t.TempDir()); err != nil {
+	if err := manager.buildDockerContainerImage(context.Background(), ImageBuildOptions{Replace: true}, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	if builds != 2 {

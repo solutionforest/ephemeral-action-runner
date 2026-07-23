@@ -154,7 +154,7 @@ func runInitWithOptions(opts initOptions) error {
 	if err != nil {
 		return err
 	}
-	providerType := "docker-dind"
+	providerType := "docker-container"
 	if wsl2Available() {
 		providerType, err = promptProviderType(opts.Out, reader, "wsl")
 		if err != nil {
@@ -188,7 +188,7 @@ func runInitWithOptions(opts initOptions) error {
 
 	hostTrustMode := config.HostTrustModeDisabled
 	hostTrustScopes := []string{config.HostTrustScopeSystem}
-	if providerType == "docker-dind" {
+	if providerType == "docker-container" {
 		enabled, promptErr := promptYesNo(opts.Out, reader, "Inherit this host's trusted TLS roots into disposable runners?", true)
 		if promptErr != nil {
 			return promptErr
@@ -212,7 +212,7 @@ func runInitWithOptions(opts initOptions) error {
 		}
 	}
 
-	content := defaultDockerDindConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup)
+	content := defaultDockerContainerConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup)
 	switch providerType {
 	case "wsl":
 		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
@@ -602,7 +602,7 @@ func promptProviderType(out io.Writer, reader *bufio.Reader, alternative string)
 	alternativeLabel := providerDisplayName(alternative)
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Runner provider:")
-	fmt.Fprintln(out, "  1. Docker-DinD (default)")
+	fmt.Fprintln(out, "  1. Docker Container — private daemon (default)")
 	fmt.Fprintf(out, "  2. %s\n", alternativeLabel)
 	for {
 		value, hitEOF, err := promptDefault(out, reader, "Runner provider", "1")
@@ -610,8 +610,8 @@ func promptProviderType(out io.Writer, reader *bufio.Reader, alternative string)
 			return "", err
 		}
 		switch strings.ToLower(value) {
-		case "1", "docker", "docker-dind":
-			return "docker-dind", nil
+		case "1", "docker", "docker-container":
+			return "docker-container", nil
 		case "2", alternative:
 			return alternative, nil
 		case "wsl2":
@@ -621,7 +621,7 @@ func promptProviderType(out io.Writer, reader *bufio.Reader, alternative string)
 		default:
 			// Continue below so aliases that belong to an unavailable provider are rejected.
 		}
-		fmt.Fprintf(out, "Runner provider must be 1 (Docker-DinD) or 2 (%s).\n", alternativeLabel)
+		fmt.Fprintf(out, "Runner provider must be 1 (Docker Container — private daemon) or 2 (%s).\n", alternativeLabel)
 		if hitEOF {
 			return "", fmt.Errorf("invalid runner provider %q", value)
 		}
@@ -635,7 +635,7 @@ func providerDisplayName(providerType string) string {
 	case "tart":
 		return "Tart (experimental)"
 	default:
-		return "Docker-DinD"
+		return "Docker Container — private daemon"
 	}
 }
 
@@ -832,7 +832,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection) string {
+func defaultDockerContainerConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -843,7 +843,7 @@ func defaultDockerDindConfig(appID int64, organization, privateKeyPath string, p
 image:
   sourceType: docker-image
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
-  outputImage: epar-docker-dind-catthehacker-ubuntu
+  outputImage: epar-docker-container-catthehacker-ubuntu
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -880,7 +880,7 @@ logging:
 
 runner:
   group: %s
-  labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
+  labels: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
 
@@ -893,8 +893,8 @@ security:
     requirePublicRepositoriesDisabled: %t
 
 provider:
-  type: docker-dind
-  sourceImage: epar-docker-dind-catthehacker-ubuntu
+  type: docker-container
+  sourceImage: epar-docker-container-catthehacker-ubuntu
   network: default
 
 docker:

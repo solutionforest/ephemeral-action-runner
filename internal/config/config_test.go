@@ -425,7 +425,7 @@ image:
   hostTrustMode: overlay
   hostTrustScopes: [system, user]
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -452,12 +452,12 @@ func TestValidateRejectsInvalidHostTrustConfigurations(t *testing.T) {
 		provider  string
 		ephemeral bool
 	}{
-		{name: "unknown mode", mode: "mirror", scopes: []string{HostTrustScopeSystem}, provider: "docker-dind", ephemeral: true},
+		{name: "unknown mode", mode: "mirror", scopes: []string{HostTrustScopeSystem}, provider: "docker-container", ephemeral: true},
 		{name: "wrong provider", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "wsl", ephemeral: true},
-		{name: "non-ephemeral", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "docker-dind"},
-		{name: "empty scopes", mode: HostTrustModeOverlay, provider: "docker-dind", ephemeral: true},
-		{name: "unknown scope", mode: HostTrustModeOverlay, scopes: []string{"global"}, provider: "docker-dind", ephemeral: true},
-		{name: "duplicate scope", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem, HostTrustScopeSystem}, provider: "docker-dind", ephemeral: true},
+		{name: "non-ephemeral", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "docker-container"},
+		{name: "empty scopes", mode: HostTrustModeOverlay, provider: "docker-container", ephemeral: true},
+		{name: "unknown scope", mode: HostTrustModeOverlay, scopes: []string{"global"}, provider: "docker-container", ephemeral: true},
+		{name: "duplicate scope", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem, HostTrustScopeSystem}, provider: "docker-container", ephemeral: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := Default()
@@ -483,7 +483,7 @@ func TestRunnerHostLabelDefaultsToEnabled(t *testing.T) {
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +506,7 @@ func TestRunnerHostLabelPrefersHostNameEnv(t *testing.T) {
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +531,7 @@ func TestRunnerHostLabelCanBeDisabled(t *testing.T) {
 runner:
   includeHostLabel: false
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -558,7 +558,7 @@ func TestRunnerHostLabelDoesNotDuplicateExistingLabel(t *testing.T) {
 runner:
   labels: [self-hosted, linux, epar-host-build-box]
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -608,18 +608,18 @@ func TestSanitizeNamePart(t *testing.T) {
 	}
 }
 
-func TestLoadDockerDindPlatform(t *testing.T) {
+func TestLoadDockerContainerPlatform(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 pool:
   instances: 1
-  namePrefix: epar-dind
+  namePrefix: epar-docker-container
 runner:
-  labels: [self-hosted, linux, ARM64, epar-docker-dind]
+  labels: [self-hosted, linux, ARM64, epar-docker-container]
 provider:
-  type: docker-dind
-  sourceImage: epar-docker-dind-ubuntu-24
+  type: docker-container
+  sourceImage: epar-docker-container-ubuntu-24
   platform: linux/arm64
 docker:
   registryMirrors:
@@ -653,10 +653,10 @@ docker:
 		t.Fatal(err)
 	}
 	if !DockerRegistryMirrorsNeedHostGateway(cfg.Docker.RegistryMirrors) {
-		t.Fatal("host.docker.internal mirror should request docker-dind host gateway")
+		t.Fatal("host.docker.internal mirror should request docker-container host gateway")
 	}
 	if !DockerConfigNeedsHostGateway(cfg.Docker) {
-		t.Fatal("host.docker.internal Docker config should request docker-dind host gateway")
+		t.Fatal("host.docker.internal Docker config should request docker-container host gateway")
 	}
 }
 
@@ -793,12 +793,12 @@ provider:
 	}
 }
 
-func TestProviderDefaultsForMinimalDockerDindConfig(t *testing.T) {
+func TestProviderDefaultsForMinimalDockerContainerConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -812,16 +812,16 @@ provider:
 	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
+	if got, want := cfg.Image.OutputImage, "epar-docker-container-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
 		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Pool.NamePrefix, "epar-dind"; got != want {
+	if got, want := cfg.Pool.NamePrefix, "epar-docker-container"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
-	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-catthehacker-ubuntu"; got != want {
+	if got, want := cfg.Runner.Labels[2], "epar-docker-container-catthehacker-ubuntu"; got != want {
 		t.Fatalf("runner label = %q, want %q", got, want)
 	}
 	if err := Validate(cfg); err != nil {
@@ -881,7 +881,7 @@ func TestValidateRosettaTag(t *testing.T) {
 
 func TestValidateDockerPlatform(t *testing.T) {
 	cfg := Default()
-	cfg.Provider.Type = "docker-dind"
+	cfg.Provider.Type = "docker-container"
 	cfg.Provider.SourceImage = "runner-image"
 	cfg.Provider.Platform = "linux/amd64"
 	if err := Validate(cfg); err != nil {
@@ -890,7 +890,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 
 	for _, platform := range []string{"bad platform", "-linux/amd64", "linux/$bad"} {
 		cfg := Default()
-		cfg.Provider.Type = "docker-dind"
+		cfg.Provider.Type = "docker-container"
 		cfg.Provider.SourceImage = "runner-image"
 		cfg.Provider.Platform = platform
 		if err := Validate(cfg); err == nil {
@@ -965,7 +965,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 
 func TestDockerConfigNeedsHostGatewayForProxy(t *testing.T) {
 	if !DockerConfigNeedsHostGateway(DockerConfig{HTTPSProxy: "http://host.docker.internal:3128"}) {
-		t.Fatal("host.docker.internal proxy should request docker-dind host gateway")
+		t.Fatal("host.docker.internal proxy should request docker-container host gateway")
 	}
 	if DockerConfigNeedsHostGateway(DockerConfig{HTTPSProxy: "http://http.docker.internal:3128"}) {
 		t.Fatal("http.docker.internal proxy should not request host.docker.internal mapping")
@@ -980,7 +980,7 @@ func TestValidateRejectsDockerSocketProvider(t *testing.T) {
 	if err == nil {
 		t.Fatal("docker-socket provider accepted")
 	}
-	if got := err.Error(); got != "provider.type docker-socket is intentionally unsupported; use provider.type=docker-dind for a private Docker daemon" {
+	if got := err.Error(); got != "provider.type docker-socket is intentionally unsupported; use provider.type=docker-container for a private Docker daemon" {
 		t.Fatalf("error = %q", got)
 	}
 }

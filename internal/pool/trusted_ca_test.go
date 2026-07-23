@@ -18,7 +18,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 )
 
-func TestDockerDindBuildContextInstallsTrustedCABeforeNetworkSteps(t *testing.T) {
+func TestDockerContainerBuildContextInstallsTrustedCABeforeNetworkSteps(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),
@@ -38,7 +38,7 @@ func TestDockerDindBuildContextInstallsTrustedCABeforeNetworkSteps(t *testing.T)
 		ProjectRoot: root,
 	}
 	buildContext := t.TempDir()
-	if err := manager.prepareDockerDindBuildContext(buildContext, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
+	if err := manager.prepareDockerContainerBuildContext(buildContext, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
 

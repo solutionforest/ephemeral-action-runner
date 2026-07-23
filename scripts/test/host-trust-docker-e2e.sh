@@ -6,7 +6,7 @@ set -euo pipefail
 # MSYS leaves untouched; bind arguments still receive normal drive mapping.
 export MSYS2_ARG_CONV_EXCL='/CN='
 
-# Disposable Linux-container fixture for the Docker-DinD host-trust contract.
+# Disposable Linux-container fixture for the Docker Container host-trust contract.
 # It creates test-only CAs under a temporary directory and never reads or
 # modifies the host's real trust store.
 

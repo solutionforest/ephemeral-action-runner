@@ -48,7 +48,7 @@ The generated daemon config is equivalent to:
 }
 ```
 
-The same config surface works for Docker-DinD, Tart, and WSL when Docker is installed in the runner instance.
+The same config surface works for Docker Container, Tart, and WSL when Docker is installed in the runner instance.
 
 ## What EPAR Does Not Run
 
@@ -107,7 +107,7 @@ docker:
     - http://host.docker.internal:5050
 ```
 
-For Docker-DinD, EPAR adds Docker's `host.docker.internal:host-gateway` alias when any configured mirror uses `host.docker.internal`. On macOS Docker Desktop and OrbStack this name is usually already available; on Linux Docker Engine the alias helps runner containers reach a host-published mirror.
+For Docker Container, EPAR adds Docker's `host.docker.internal:host-gateway` alias when any configured mirror uses `host.docker.internal`. On macOS Docker Desktop and OrbStack this name is usually already available; on Linux Docker Engine the alias helps runner containers reach a host-published mirror.
 
 For Tart and WSL, `host.docker.internal` may not resolve the way it does in Docker containers. Use a LAN address, DNS name, or other route that is reachable from the guest.
 
@@ -117,7 +117,7 @@ The mirror URL must be valid from the runner instance's point of view:
 
 | Provider | Same-host mirror URL guidance |
 | --- | --- |
-| Docker-DinD | `http://host.docker.internal:5050` is a good one-machine choice when the local cache publishes host port `5050`. EPAR adds Docker's `host-gateway` alias for this name when needed. |
+| Docker Container | `http://host.docker.internal:5050` is a good one-machine choice when the local cache publishes host port `5050`. EPAR adds Docker's `host-gateway` alias for this name when needed. |
 | Tart | Use an IP address or DNS name reachable from inside the VM, such as the host's LAN IP or an intranet DNS name. `host.docker.internal` is not guaranteed. |
 | WSL | Use an address reachable from inside the WSL distro. Depending on Windows and WSL networking, this may be the Windows host address, a LAN IP, or an intranet DNS name. `host.docker.internal` is not guaranteed. |
 
@@ -129,7 +129,7 @@ docker:
     - http://docker-cache.office.example:5000
 ```
 
-For one-machine Docker-DinD development, a host-published local cache is usually enough:
+For one-machine Docker Container development, a host-published local cache is usually enough:
 
 ```yaml
 docker:
@@ -168,7 +168,7 @@ Start a runner instance with mirrors configured:
 ./bin/ephemeral-action-runner pool verify --instances 1 --cleanup
 ```
 
-For Docker-DinD, inspect the inner daemon:
+For Docker Container, inspect the inner daemon:
 
 ```bash
 docker exec <epar-instance> docker info

@@ -42,7 +42,7 @@ if ($args -contains 'init') {
     if ($env:FAKE_INIT_FAIL -eq '1') { exit 23 }
     $local = Join-Path $env:FAKE_PROJECT '.local'
     New-Item -ItemType Directory -Force -Path $local | Out-Null
-    $config = "provider:`n  type: docker-dind`nrunner:`n  ephemeral: true`nimage:`n  hostTrustMode: overlay`n  hostTrustScopes: [system, user]`n"
+    $config = "provider:`n  type: docker-container`nrunner:`n  ephemeral: true`nimage:`n  hostTrustMode: overlay`n  hostTrustScopes: [system, user]`n"
     [System.IO.File]::WriteAllText((Join-Path $local 'config.yml'), $config, [System.Text.UTF8Encoding]::new($false))
 }
 exit 0

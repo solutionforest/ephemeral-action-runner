@@ -72,7 +72,7 @@ func TestDefaultManagerTextFormatIsHumanReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime.Manager().Info("runner ready", "provider", "docker-dind", "attempt", 2)
+	runtime.Manager().Info("runner ready", "provider", "docker-container", "attempt", 2)
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -222,11 +222,11 @@ func TestTranscriptCoalescesRawWritesAndFlushesContextualPartialLines(t *testing
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
-	path, err := InstancePath(root, "runner-1", "docker-dind")
+	path, err := InstancePath(root, "runner-1", "docker-container")
 	if err != nil {
 		t.Fatalf("InstancePath: %v", err)
 	}
-	transcript, err := runtime.OpenTranscript(TranscriptMetadata{SessionID: "session-1", Category: CategoryInstances, Instance: "runner-1", Component: "provider", Provider: "docker-dind"}, path)
+	transcript, err := runtime.OpenTranscript(TranscriptMetadata{SessionID: "session-1", Category: CategoryInstances, Instance: "runner-1", Component: "provider", Provider: "docker-container"}, path)
 	if err != nil {
 		t.Fatalf("OpenTranscript: %v", err)
 	}

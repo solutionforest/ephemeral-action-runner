@@ -1,4 +1,4 @@
-package dockerdind
+package dockercontainer
 
 import (
 	"bytes"
@@ -14,7 +14,7 @@ import (
 
 const (
 	labelManaged  = "epar.managed=true"
-	labelProvider = "epar.provider=docker-dind"
+	labelProvider = "epar.provider=docker-container"
 )
 
 type Provider struct {
@@ -47,7 +47,7 @@ func (p *Provider) Clone(ctx context.Context, source, name string) error {
 
 func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOptions) (*provider.RunningProcess, error) {
 	if opts.Network != "" && opts.Network != "default" {
-		return nil, fmt.Errorf("unsupported docker-dind network mode %q", opts.Network)
+		return nil, fmt.Errorf("unsupported docker-container network mode %q", opts.Network)
 	}
 	if _, err := p.run(ctx, nil, "start", name); err != nil {
 		return nil, err
@@ -98,7 +98,7 @@ func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string
 			if lastErr != nil {
 				return "", lastErr
 			}
-			return "", fmt.Errorf("docker-dind container %q did not report an IP within %d seconds", name, waitSeconds)
+			return "", fmt.Errorf("Docker Container %q did not report an IP within %d seconds", name, waitSeconds)
 		}
 		select {
 		case <-ctx.Done():

@@ -14,7 +14,7 @@ If private reporting is unavailable, contact a repository maintainer privately t
 
 ## What EPAR Improves
 
-Disposable instances reduce host pollution, stale runner state, and accidental cross-job interference. After a job completes, EPAR retires the instance and creates a replacement. For Docker-DinD, job-created containers, networks, volumes, and inner image cache live inside the runner container's private Docker daemon and are removed with that runner instance.
+Disposable instances reduce host pollution, stale runner state, and accidental cross-job interference. After a job completes, EPAR retires the instance and creates a replacement. For Docker Container, job-created containers, networks, volumes, and inner image cache live inside the runner container's private Docker daemon and are removed with that runner instance.
 
 ## What EPAR Does Not Guarantee
 
@@ -28,9 +28,9 @@ Use GitHub runner groups, repository restrictions, environment protections, and 
 
 EPAR intentionally does not implement a Docker-socket provider. A runner that controls the host Docker socket can usually control the host.
 
-Docker-DinD uses a privileged outer container with a private inner Docker daemon. That gives good cleanup and Docker resource separation for each job, but it is still trusted-job infrastructure because `--privileged` weakens container isolation.
+Docker Container uses a privileged outer container with a private inner Docker daemon. That gives good cleanup and Docker resource separation for each job, but it is still trusted-job infrastructure because `--privileged` weakens container isolation.
 
-Tart runs jobs inside VMs on Apple Silicon macOS. That is a stronger host boundary than Docker-DinD, but workflows still control the guest and any secrets exposed to the job.
+Tart runs jobs inside VMs on Apple Silicon macOS. That is a stronger host boundary than Docker Container, but workflows still control the guest and any secrets exposed to the job.
 
 WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provider as trusted-job infrastructure unless your environment has reviewed and accepted that model.
 

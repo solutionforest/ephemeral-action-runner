@@ -7,8 +7,8 @@ github:
 
 image:
   sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
-  outputImage: epar-docker-dind-catthehacker-ubuntu
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  outputImage: epar-docker-container-catthehacker-ubuntu-web-e2e
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -17,6 +17,7 @@ image:
   hostTrustMode: disabled
   hostTrustScopes: [system]
   customInstallScripts:
+    - scripts/guest/ubuntu/install-web-e2e.sh
 
 pool:
   instances: 1
@@ -48,7 +49,7 @@ logging:
 
 runner:
   group: your-runner-group
-  labels: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
+  labels: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu-web-e2e]
   includeHostLabel: true
   ephemeral: true
 
@@ -61,8 +62,8 @@ security:
     requirePublicRepositoriesDisabled: true
 
 provider:
-  type: docker-dind
-  sourceImage: epar-docker-dind-catthehacker-ubuntu
+  type: docker-container
+  sourceImage: epar-docker-container-catthehacker-ubuntu-web-e2e
   network: default
 
 docker:

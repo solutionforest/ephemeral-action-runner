@@ -10,7 +10,7 @@ import (
 
 func TestPoolControllerLockConflictsForSameProviderAndPrefix(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	manager := Manager{ConfigPath: "config.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-same"}}}
+	manager := Manager{ConfigPath: "config.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-same"}}}
 	first, err := manager.AcquirePoolControllerLock()
 	if err != nil {
 		t.Fatal(err)
@@ -24,7 +24,7 @@ func TestPoolControllerLockConflictsForSameProviderAndPrefix(t *testing.T) {
 
 func TestVerifyRequiresPoolControllerLock(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	manager := Manager{ProjectRoot: t.TempDir(), ConfigPath: "verify.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind", SourceImage: "image"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-verify"}}, Provider: &fakeProvider{}}
+	manager := Manager{ProjectRoot: t.TempDir(), ConfigPath: "verify.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container", SourceImage: "image"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-verify"}}, Provider: &fakeProvider{}}
 	held, err := manager.AcquirePoolControllerLock()
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +38,7 @@ func TestVerifyRequiresPoolControllerLock(t *testing.T) {
 
 func TestCleanupRequiresPoolControllerLock(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	manager := Manager{ProjectRoot: t.TempDir(), ConfigPath: "cleanup.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-cleanup"}}, Provider: &fakeProvider{}}
+	manager := Manager{ProjectRoot: t.TempDir(), ConfigPath: "cleanup.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-cleanup"}}, Provider: &fakeProvider{}}
 	held, err := manager.AcquirePoolControllerLock()
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestCleanupRequiresPoolControllerLock(t *testing.T) {
 
 func TestProvisionPoolRequiresPoolControllerLock(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	manager := Manager{ProjectRoot: t.TempDir(), ConfigPath: "provision.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind", SourceImage: "image"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-provision"}}, Provider: &fakeProvider{}}
+	manager := Manager{ProjectRoot: t.TempDir(), ConfigPath: "provision.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container", SourceImage: "image"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-provision"}}, Provider: &fakeProvider{}}
 	held, err := manager.AcquirePoolControllerLock()
 	if err != nil {
 		t.Fatal(err)
@@ -66,8 +66,8 @@ func TestProvisionPoolRequiresPoolControllerLock(t *testing.T) {
 
 func TestPoolControllerLockIsIndependentAcrossPoolIdentity(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	firstManager := Manager{ConfigPath: "first.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-first"}}}
-	secondManager := Manager{ConfigPath: "second.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-second"}}}
+	firstManager := Manager{ConfigPath: "first.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-first"}}}
+	secondManager := Manager{ConfigPath: "second.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-second"}}}
 	first, err := firstManager.AcquirePoolControllerLock()
 	if err != nil {
 		t.Fatal(err)
@@ -82,8 +82,8 @@ func TestPoolControllerLockIsIndependentAcrossPoolIdentity(t *testing.T) {
 
 func TestPoolControllerLockIncludesCanonicalConfigIdentity(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	firstManager := Manager{ConfigPath: "first.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-shared-prefix"}}}
-	secondManager := Manager{ConfigPath: "second.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-shared-prefix"}}}
+	firstManager := Manager{ConfigPath: "first.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-shared-prefix"}}}
+	secondManager := Manager{ConfigPath: "second.yml", Config: config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-lock-shared-prefix"}}}
 	first, err := firstManager.AcquirePoolControllerLock()
 	if err != nil {
 		t.Fatal(err)

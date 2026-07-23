@@ -7,8 +7,8 @@ github:
 
 image:
   sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
-  outputImage: epar-docker-dind-catthehacker-act
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  outputImage: epar-docker-container-catthehacker-ubuntu
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
@@ -48,7 +48,7 @@ logging:
 
 runner:
   group: your-runner-group
-  labels: [self-hosted, linux, epar-docker-dind-catthehacker-act]
+  labels: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]
   includeHostLabel: true
   ephemeral: true
 
@@ -61,8 +61,8 @@ security:
     requirePublicRepositoriesDisabled: true
 
 provider:
-  type: docker-dind
-  sourceImage: epar-docker-dind-catthehacker-act
+  type: docker-container
+  sourceImage: epar-docker-container-catthehacker-ubuntu
   network: default
 
 docker:

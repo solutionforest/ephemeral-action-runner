@@ -17,7 +17,7 @@ work/logs/epar-last-error.log
 Image build logs use provider-specific names, for example:
 
 ```text
-work/logs/builds/epar-docker-dind-catthehacker-ubuntu.docker-build.log
+work/logs/builds/epar-docker-container-catthehacker-ubuntu.docker-build.log
 work/logs/builds/epar-wsl-catthehacker-ubuntu.wsl-build.log
 ```
 
@@ -32,7 +32,7 @@ If you are running without local Go, use `./start --help`; the wrapper will run 
 
 ### Docker-Backed Workflows
 
-Use these on any host when the provider is Docker-DinD, when WSL image preparation starts from a Docker image, or when the no-Go wrapper is in use:
+Use these on any host when the provider is Docker Container, when WSL image preparation starts from a Docker image, or when the no-Go wrapper is in use:
 
 ```bash
 docker version
@@ -182,9 +182,9 @@ The expected output is `aarch64`. Add only the platforms the workflow needs; emu
 
 Provider notes:
 
-- Docker-DinD: run the setup action inside the EPAR job before Docker Compose or other foreign-image commands. It configures the disposable runner's Docker execution environment; no EPAR configuration switch is required.
+- Docker Container: run the setup action inside the EPAR job before Docker Compose or other foreign-image commands. It configures the disposable runner's Docker execution environment; no EPAR configuration switch is required.
 - WSL: run the setup action inside the WSL runner when its Linux Docker daemon must execute a foreign image. An x64 WSL runner does not gain ARM64 container support merely by pulling or loading an ARM64 image.
-- Tart: Tart runs an ARM64 VM on Apple Silicon. Its optional Rosetta path is experimental and is not equivalent to QEMU/binfmt compatibility. Prefer Docker-DinD or a native matching architecture when a workload is not compatible.
+- Tart: Tart runs an ARM64 VM on Apple Silicon. Its optional Rosetta path is experimental and is not equivalent to QEMU/binfmt compatibility. Prefer Docker Container or a native matching architecture when a workload is not compatible.
 - GitHub-hosted Windows and macOS: GitHub documents Docker container actions and service containers as Linux-runner features. A Windows or macOS hardware label alone is therefore not a substitute for a Linux Docker daemon with emulation configured.
 
 Official references:
@@ -252,9 +252,9 @@ Antivirus, endpoint-security, firewall, or corporate-proxy software may be inspe
 
 ### How to Fix
 
-Do not disable certificate verification. Use EPAR's host trust overlay so the disposable Docker-DinD runners automatically inherit the host's trusted root CAs while retaining Ubuntu's standard roots.
+Do not disable certificate verification. Use EPAR's host trust overlay so the disposable Docker Container runners automatically inherit the host's trusted root CAs while retaining Ubuntu's standard roots.
 
-New interactive Docker-DinD configurations enable the overlay by default. For an older Windows or macOS configuration, add:
+New interactive Docker Container configurations enable the overlay by default. For an older Windows or macOS configuration, add:
 
 ```yaml
 image:
@@ -292,7 +292,7 @@ Explicit certificates are validated and added to the same Ubuntu trust bundle; t
 
 ### Host Trust Overlay Is Missing, Stale, Or Mismatched
 
-This section applies when a Docker-DinD config contains:
+This section applies when a Docker Container config contains:
 
 ```yaml
 image:
@@ -304,7 +304,7 @@ EPAR fails closed when host collection returns no roots, the official no-Go brid
 Check these boundaries:
 
 - Windows and macOS support `hostTrustScopes: [system, user]`; Linux supports `[system]` only.
-- Overlay mode requires `provider.type: docker-dind` and `runner.ephemeral: true`.
+- Overlay mode requires `provider.type: docker-container` and `runner.ephemeral: true`.
 - Use the official `./start`, `start.ps1`, or release launcher for the no-Go path. A bare Linux toolchain container cannot inspect Windows Certificate Stores or macOS Keychain and must not substitute its own CA bundle.
 - On an uncommon Linux distribution, set `EPAR_HOST_TRUST_BUNDLE` to the distribution-generated PEM CA bundle before launching EPAR.
 - Confirm host and guest clocks are correct; feed and lease expiry checks use timestamps and reject stale data.
@@ -351,11 +351,11 @@ For more background, see:
 - <https://learn.microsoft.com/windows/wsl/disk-space>
 - <https://docs.docker.com/desktop/features/wsl/>
 
-## Docker-DinD Build Fails With `unknown flag: --progress`
+## Docker Container Build Fails With `unknown flag: --progress`
 
 ### Symptom
 
-The Docker-DinD image build fails with:
+The Docker Container image build fails with:
 
 ```text
 unknown flag: --progress
@@ -373,11 +373,11 @@ docker build --help
 docker buildx version
 ```
 
-## Docker-DinD Startup Fails
+## Docker Container Startup Fails
 
 ### Privileged Containers
 
-Docker-DinD requires the host Docker runtime to allow privileged Linux containers. Confirm the Docker host supports:
+Docker Container requires the host Docker runtime to allow privileged Linux containers. Confirm the Docker host supports:
 
 ```bash
 docker run --rm --privileged alpine:3.20 true
@@ -385,7 +385,7 @@ docker run --rm --privileged alpine:3.20 true
 
 ### Nested Docker Storage Driver
 
-If Docker-DinD starts but nested Docker operations fail with overlay mount errors, keep the default inner daemon storage driver:
+If Docker Container starts but nested Docker operations fail with overlay mount errors, keep the default inner daemon storage driver:
 
 ```text
 EPAR_DOCKERD_STORAGE_DRIVER=vfs

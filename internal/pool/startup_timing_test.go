@@ -29,18 +29,18 @@ func TestStartupTimingWritesOneReadableConsoleSummaryAndStructuredRecord(t *test
 	logDirectory := filepath.Join(root, "logs")
 	var console bytes.Buffer
 	runtime, err := logging.NewRuntime(logging.Options{
-		Directory:            logDirectory,
-		ManagerSinks:         logging.SinkBoth,
-		ManagerFileFormat:    logging.FormatJSON,
-		TranscriptSinks:      logging.SinkNone,
-		Stdout:               &console,
-		Stderr:               &console,
+		Directory:         logDirectory,
+		ManagerSinks:      logging.SinkBoth,
+		ManagerFileFormat: logging.FormatJSON,
+		TranscriptSinks:   logging.SinkNone,
+		Stdout:            &console,
+		Stderr:            &console,
 	})
 	if err != nil {
 		t.Fatalf("create logging runtime: %v", err)
 	}
 	manager := Manager{
-		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-dind"}, Logging: config.LoggingConfig{Directory: "logs"}},
+		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Logging: config.LoggingConfig{Directory: "logs"}},
 		ProjectRoot: root,
 		Logging:     runtime,
 	}
@@ -62,7 +62,7 @@ func TestStartupTimingWritesOneReadableConsoleSummaryAndStructuredRecord(t *test
 	if count := strings.Count(output, "\n"); count != 1 {
 		t.Fatalf("console emitted %d timing records, want 1: %q", count, output)
 	}
-	for _, want := range []string{"DinD startup timing:", "source_image_pull=", "instance_container_create=", "total_startup=", "log: " + path} {
+	for _, want := range []string{"Docker Container startup timing:", "source_image_pull=", "instance_container_create=", "total_startup=", "log: " + path} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("console summary missing %q: %q", want, output)
 		}
@@ -77,10 +77,10 @@ func TestStartupTimingWritesOneReadableConsoleSummaryAndStructuredRecord(t *test
 		t.Fatalf("decode structured manager record: %v\n%s", err, content)
 	}
 	message, ok := record["msg"].(string)
-	if !ok || !strings.Contains(message, "DinD startup timing:") || !strings.Contains(message, "source_image_pull=") || !strings.Contains(message, "instance_container_create=") || !strings.Contains(message, "total_startup=") || !strings.Contains(message, "log: "+path) {
+	if !ok || !strings.Contains(message, "Docker Container startup timing:") || !strings.Contains(message, "source_image_pull=") || !strings.Contains(message, "instance_container_create=") || !strings.Contains(message, "total_startup=") || !strings.Contains(message, "log: "+path) {
 		t.Fatalf("unexpected structured message: %#v", record["msg"])
 	}
-	if record["provider"] != "docker-dind" || record["operation"] != "startup" || record["logPath"] != path {
+	if record["provider"] != "docker-container" || record["operation"] != "startup" || record["logPath"] != path {
 		t.Fatalf("structured record missing context: %#v", record)
 	}
 	stages, ok := record["stages"].(map[string]any)

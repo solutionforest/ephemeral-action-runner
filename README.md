@@ -25,13 +25,13 @@ A normal long-lived self-hosted runner can leave dependencies, files, containers
 
 - **Warm pool:** keep ready self-hosted runners online after setup.
 - **Disposable jobs:** each runner is cleaned up after one job.
-- **Great default image:** Docker-DinD and WSL use Catthehacker's full Ubuntu runner image by default.
-- **Docker-friendly isolation:** Docker-DinD gives each runner its own private Docker daemon.
+- **Great default image:** Docker Container and WSL use Catthehacker's full Ubuntu runner image by default.
+- **Docker-friendly isolation:** Docker Container gives each runner its own private Docker daemon.
 - **Simple host use:** run Linux GitHub Actions jobs from a Windows, macOS, Linux, or Docker-capable host.
 
 ## Quick Start
 
-The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
+The easiest path is the default **Docker Container** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
 
 ### 1. Install Docker
 
@@ -75,7 +75,7 @@ That's it.
 
 #### What Happens
 
-EPAR initializes `.local/config.yml` for you if it does not exist. The wizard reads your organization's runner groups, requires an explicit selection, and writes an enforced safety policy; see [Runner Group Security](docs/runner-groups.md). Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2. On macOS, it offers experimental Tart mode when `tart --version` succeeds. Press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
+EPAR initializes `.local/config.yml` for you if it does not exist. The wizard reads your organization's runner groups, requires an explicit selection, and writes an enforced safety policy; see [Runner Group Security](docs/runner-groups.md). Docker Container is the default. The wizard asks whether new Docker Container runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2. On macOS, it offers experimental Tart mode when `tart --version` succeeds. Press Enter to keep Docker Container. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
 
 Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
@@ -104,18 +104,18 @@ runs-on: [self-hosted]
 If you have multiple self-hosted runners and want this job to run on a specific kind of EPAR runner, add one of its extra labels to the list, e.g.:
 
 ```yaml
-runs-on: [self-hosted, epar-docker-dind-catthehacker-ubuntu]
+runs-on: [self-hosted, epar-docker-container-catthehacker-ubuntu]
 ```
 
 EPAR also adds an `epar-host-<machine>` label by default, so you can see which host registered each runner. You only need to include that label in `runs-on` when you intentionally want a job to target one machine.
 
 ## Other Modes
 
-Docker-DinD is the default first choice. Other providers are available when they fit your host better:
+Docker Container is the default first choice. Other providers are available when they fit your host better:
 
 | Provider | Use when |
 | --- | --- |
-| Docker-DinD | You have a Docker-compatible daemon on Windows, macOS, or Linux, and want a private Docker daemon per runner. |
+| Docker Container | You have a Docker-compatible daemon on Windows, macOS, or Linux, and want a private Docker daemon per runner. |
 | WSL2 | You are on Windows and want runners as disposable WSL distros. |
 | Tart (experimental) | You are on Apple Silicon macOS and want to experiment with native ARM64 Linux VMs. The default Tart image is a basic Ubuntu OS image and does not include the normal GitHub-hosted runner dependency set. |
 
@@ -141,7 +141,7 @@ Yes. EPAR registers disposable ephemeral runners. After a job finishes, EPAR del
 
 ### Can jobs use Docker, Docker Compose, and Buildx?
 
-Yes, with the default Docker-DinD mode. Each runner gets its own private Docker daemon, so job-created containers, networks, and volumes stay inside that disposable runner.
+Yes, with the default Docker Container mode. Each runner gets its own private Docker daemon, so job-created containers, networks, and volumes stay inside that disposable runner.
 
 ## Safety
 
@@ -155,7 +155,7 @@ GitHub also warns against using self-hosted runners with public repositories tha
 - [Configuration](docs/configuration.md): config file sections and common edits.
 - [GitHub App Setup](docs/github-app.md): required GitHub App permissions and fields.
 - [Runner Group Security](docs/runner-groups.md): repository access, wizard choices, and registration preflight policy.
-- [Docker-DinD Provider](docs/providers/docker-dind.md): default Docker runner mode.
+- [Docker Container Provider](docs/providers/docker-container.md): default Docker runner mode.
 - [WSL Provider](docs/providers/wsl.md): Windows WSL2 runners.
 - [Tart Provider (experimental)](docs/providers/tart.md): Apple Silicon ARM64 Linux VM runners and Rosetta compatibility limits.
 - [Image Build](docs/image-build.md): image internals and customization.

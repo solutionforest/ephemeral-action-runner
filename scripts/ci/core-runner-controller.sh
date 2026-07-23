@@ -298,7 +298,7 @@ security:
     requirePublicRepositoriesDisabled: false
 
 provider:
-  type: docker-dind
+  type: docker-container
   sourceImage: ${EPAR_OUTPUT_IMAGE}
   platform: linux/amd64
   network: default

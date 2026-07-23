@@ -1,9 +1,6 @@
 # Level 1 Core Runner Verification
 
-The `Core runner verification` GitHub Actions workflow proves EPAR's central
-contract against GitHub: create an isolated Docker-DinD runner, register it for
-one job, replace it after that job, run a second job on the replacement, and
-clean up the runner records and outer containers.
+The `Core runner verification` GitHub Actions workflow proves EPAR's central contract against GitHub: create an isolated Docker Container runner, register it for one job, replace it after that job, run a second job on the replacement, and clean up the runner records and outer containers.
 
 This is an infrastructure canary, not a language or framework compatibility
 matrix. The workload checks checkout and artifact transfer, then exercises the
@@ -88,12 +85,12 @@ the artifact, Buildx, Compose, container health, and HTTP checks.
 
 The controller performs cleanup before and after the canaries. It stops the
 pool supervisor, deletes GitHub runner registrations within the exact
-`epar-ci-core` prefix boundary, removes matching outer Docker-DinD containers,
+`epar-ci-core` prefix boundary, removes matching outer runner containers,
 and deletes its temporary key, generated config, and logs. Before failed-run
 cleanup deletes those logs, the controller prints a sanitized final 200 lines
 from the pool-supervisor log and each available runner log. Runner launch or
 online readiness failures first append bounded process state, `run.log`,
-latest `Runner_*.log`, and Docker-DinD daemon tails to the host guest log, so
+latest `Runner_*.log`, and private Docker daemon tails to the host guest log, so
 those diagnostics pass through the same sanitizer before cleanup. A controller
 failure then attempts cleanup before canceling the workflow so queued canary
 jobs do not remain indefinitely. The next run also pre-cleans the same boundary.
@@ -129,8 +126,7 @@ runner registrations within the same prefix boundary.
 
 - Check controller disk space and Docker health.
 - Confirm outbound access to the pinned Catthehacker and BusyBox images.
-- For nested-Docker startup failures, inspect the grouped Docker-DinD runner-log
-  tail in the controller output.
+- For nested-Docker startup failures, inspect the grouped Docker Container runner-log tail in the controller output.
 
 ### Workflow is canceled after a controller error
 
@@ -142,7 +138,7 @@ cancellation itself as the root cause.
 ## Manual Cleanup
 
 Use a local, untracked config based on
-`configs/docker-dind.core.example.yml`, with the same organization, GitHub App
+`configs/docker-container.core.example.yml`, with the same organization, GitHub App
 key path, and `pool.namePrefix: epar-ci-core`, then run:
 
 ```bash

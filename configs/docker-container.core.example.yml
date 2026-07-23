@@ -62,7 +62,7 @@ security:
     requirePublicRepositoriesDisabled: false
 
 provider:
-  type: docker-dind
+  type: docker-container
   sourceImage: epar-ci-core
   network: default
   platform: linux/amd64

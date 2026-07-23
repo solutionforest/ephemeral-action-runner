@@ -1,6 +1,20 @@
 # Configuration
 
-EPAR stores local settings in `.local/config.yml` by default. The first run creates that file for the default Docker-DinD setup when it does not exist.
+EPAR stores local settings in `.local/config.yml` by default. The first run creates that file for the default Docker Container setup when it does not exist.
+
+## Pre-release provider rename
+
+The Docker Container provider has an intentional pre-release naming migration. EPAR does not retain a compatibility alias for the pre-rename provider identifier.
+
+Before editing an existing configuration:
+
+1. Stop the current controller.
+2. Use the previous release to remove its managed runners and runner containers.
+3. Verify that no prior managed GitHub runner records or host containers remain.
+4. Update `provider.type`, `image.outputImage`, `provider.sourceImage`, the runner label, and pool prefix to the `docker-container` values in the current example configuration.
+5. Rebuild the renamed image, then start the renamed provider.
+
+The old and renamed controllers must not overlap: their provider labels and controller-lock identity differ, so concurrent operation can create duplicate runners or leave resources outside the active controller's ownership boundary.
 
 Use `.local/config.yml` for real GitHub App values, local paths, labels, and runner counts. Tracked files under `configs/` are examples.
 
@@ -18,13 +32,13 @@ EPAR looks for config in this order:
 | Section | Purpose |
 | --- | --- |
 | `github` | GitHub App ID, organization, private key path, and optional GitHub API/web URLs. |
-| `provider` | How EPAR creates disposable runners: `docker-dind`, `wsl`, or `tart`. |
+| `provider` | How EPAR creates disposable runners: `docker-container`, `wsl`, or `tart`. |
 | `image` | Source image/rootfs, output image, runner version, and optional install scripts. |
 | `pool` | Runner count, instance name prefix, and replacement retry policy. |
 | `logging` | Manager and transcript sinks, formats, rotation, retention, and log directory. |
 | `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
 | `security` | Runner-group policy requirements checked before runner registration. |
-| `docker` | Optional Docker registry mirrors and Docker-DinD daemon proxy settings. |
+| `docker` | Optional Docker registry mirrors and private Docker daemon proxy settings. |
 | `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
 
 ## Common Edits
@@ -68,7 +82,7 @@ runner:
   labels:
     - self-hosted
     - linux
-    - epar-docker-dind-catthehacker-ubuntu
+    - epar-docker-container-catthehacker-ubuntu
 ```
 
 Disable the automatic host-machine label:
@@ -110,7 +124,7 @@ Configure logging and retention in the top-level `logging` section. The complete
 
 ### Host trust inheritance
 
-Docker-DinD runners can inherit the host's trusted TLS root anchors:
+Docker Container runners can inherit the host's trusted TLS root anchors:
 
 ```yaml
 image:
@@ -118,11 +132,7 @@ image:
   hostTrustScopes: [system, user]
 ```
 
-`image.hostTrustMode` accepts `disabled` or `overlay`. Existing configs default
-to `disabled`. A new interactive Docker-DinD initialization asks whether to
-enable host trust inheritance; pressing Enter accepts the displayed `yes`
-default. Enabling the policy is the one-time consent for EPAR to follow later
-host root additions, removals, and rotations automatically.
+`image.hostTrustMode` accepts `disabled` or `overlay`. Existing configs default to `disabled`. A new interactive Docker Container initialization asks whether to enable host trust inheritance; pressing Enter accepts the displayed `yes` default. Enabling the policy is the one-time consent for EPAR to follow later host root additions, removals, and rotations automatically.
 
 The supported scopes are:
 
@@ -134,7 +144,7 @@ The supported scopes are:
 
 Use `[system, user]` on Windows or macOS when the runner should inherit the
 same two trust scopes as the account running EPAR. Linux configs must use
-`[system]`. Overlay mode is supported only for `provider.type: docker-dind` and
+`[system]`. Overlay mode is supported only for `provider.type: docker-container` and
 requires `runner.ephemeral: true`.
 If macOS has disabled user-level Trust Settings, the `user` scope contributes
 no certificates until that host policy is enabled again.
@@ -169,7 +179,7 @@ or DER X.509 CA certificates before building, normalizes them to deterministic
 independent of host trust inheritance and remain trusted until removed from the
 config.
 
-Route the private Docker-DinD daemon through an enterprise network proxy:
+Route the private Docker daemon through an enterprise network proxy:
 
 ```yaml
 docker:
@@ -179,13 +189,13 @@ docker:
 ```
 
 These optional values become `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` on the
-outer Docker-DinD container, so its inner `dockerd` inherits them at first
+outer runner container, so its inner `dockerd` inherits them at first
 startup. Proxy URLs must not contain credentials. Keep machine-specific proxy
 addresses in ignored `.local/config.yml`, not tracked example files.
 
 ## Provider Defaults
 
-For `provider.type: docker-dind`, EPAR defaults to Catthehacker's full Ubuntu runner image and creates a Docker-DinD image named `epar-docker-dind-catthehacker-ubuntu`.
+For `provider.type: docker-container`, EPAR defaults to Catthehacker's full Ubuntu runner image and creates a Docker Container image named `epar-docker-container-catthehacker-ubuntu`.
 
 For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
 
@@ -193,6 +203,6 @@ For the experimental `provider.type: tart`, EPAR defaults to `ghcr.io/cirruslabs
 
 See the provider docs for details:
 
-- [Docker-DinD Provider](providers/docker-dind.md)
+- [Docker Container Provider](providers/docker-container.md)
 - [WSL Provider](providers/wsl.md)
 - [Tart Provider](providers/tart.md)

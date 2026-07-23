@@ -3,7 +3,7 @@ package provider
 import "fmt"
 
 func SupportedTypes() []string {
-	return []string{"tart", "wsl", "docker-dind"}
+	return []string{"tart", "wsl", "docker-container"}
 }
 
 func UnsupportedTypeError(providerType string) error {

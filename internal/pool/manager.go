@@ -1212,7 +1212,7 @@ func (m *Manager) PreflightRunnerGroup(ctx context.Context) error {
 }
 
 func (m *Manager) startupInstanceStartStage() string {
-	if m.Config.Provider.Type == "docker-dind" {
+	if m.Config.Provider.Type == "docker-container" {
 		return "instance_start_and_inner_docker_ready"
 	}
 	return "instance_start_and_provider_ready"

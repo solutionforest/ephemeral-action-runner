@@ -21,13 +21,13 @@ For WSL, the image build produces a rootfs tar. It can start from either a Docke
 
 For `docker-image` sources, EPAR pulls the source image, creates a temporary container, exports that container filesystem to an intermediate rootfs tar, and captures the image environment metadata. Later builds reuse the intermediate rootfs only when the cached source manifest still matches the source image, platform, and digest. The WSL build then imports the rootfs into a temporary distro, enables systemd, installs the runner runtime, writes the captured image env under `/opt/epar`, validates it, exports the reusable tar, and unregisters the temporary distro. Pool instances import from `provider.sourceImage`, which should point at the built reusable tar.
 
-For Docker-DinD, the image build uses Docker images:
+For Docker Container, the image build uses Docker images:
 
 - `image.sourceType`: `docker-image`.
 - `image.sourceImage`: maintained Catthehacker Ubuntu runner image, default `ghcr.io/catthehacker/ubuntu:full-latest`.
-- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-dind-catthehacker-ubuntu`.
+- `image.outputImage`: reusable EPAR runner container image tag, default `epar-docker-container-catthehacker-ubuntu`.
 
-Docker-DinD builds a thin wrapper over the source image, installs the GitHub Actions runner, reuses Docker Engine/CLI/Compose/Buildx from the base image when they are already present, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
+Docker Container builds a thin wrapper over the source image, installs the GitHub Actions runner, reuses Docker Engine/CLI/Compose/Buildx from the base image when they are already present, adds a container entrypoint that starts `dockerd`, then runs configured install scripts and validation. Pool instances are privileged containers created from `provider.sourceImage`, which should match the built reusable Docker image tag.
 
 Every build writes an EPAR image manifest. The `start` command compares that manifest with the current config and source image identity before creating runners. If the image is missing, has no manifest, or no longer matches, `start` rebuilds it with replace enabled. The lower-level `image build` command keeps its explicit safety behavior and still requires `--replace` when the output already exists.
 
@@ -37,8 +37,8 @@ flowchart TD
   Build --> Scripts["EPAR guest scripts"]
   Scripts --> Runner["GitHub Actions runner"]
   Runner --> WSLFull["WSL Docker-source env and Docker validation"]
-  WSLFull --> DockerDind["Docker-DinD-only private daemon layer"]
-  DockerDind --> Rosetta["Optional Tart Rosetta layer"]
+  WSLFull --> DockerContainer["Docker Container private-daemon runtime"]
+  DockerContainer --> Rosetta["Optional Tart Rosetta layer"]
   Rosetta --> Custom["Optional custom install scripts"]
   Custom --> Validate["Runtime validation"]
   Validate --> Output["Reusable runner image"]
@@ -49,13 +49,13 @@ flowchart TD
 
 Several layers control what is pre-installed in the Ubuntu image:
 
-1. `image.hostTrustMode: overlay`, when enabled for Docker-DinD, snapshots and installs the controller host's trusted root anchors.
+1. `image.hostTrustMode: overlay`, when enabled for Docker Container, snapshots and installs the controller host's trusted root anchors.
 2. `image.trustedCaCertificatePaths`, when configured, installs additional explicitly trusted enterprise CA certificates.
 3. EPAR installs both CA sources before guest install steps access the network.
 4. `/opt/epar/install-base.sh` is intentionally lean. It does not install Docker, browsers, language runtimes, or project tools.
 5. `/opt/epar/install-runner.sh` always installs the GitHub Actions runner.
 6. WSL builds from Docker-image sources validate Docker Engine from the base image and preserve source image environment metadata for runner jobs.
-7. Docker-DinD builds validate or install Docker Engine and add the private `dockerd` entrypoint.
+7. Docker Container builds validate or install Docker Engine and add the private `dockerd` entrypoint.
 8. Tart builds with `provider.rosettaTag` install the optional Rosetta amd64 container layer.
 9. `image.customInstallScripts` adds optional tool layers.
 
@@ -63,15 +63,15 @@ Several layers control what is pre-installed in the Ubuntu image:
 flowchart LR
   Base["Runner-only base"] --> Runner["GitHub Actions runner"]
   Runner --> WSLFull["WSL Docker-source env and Docker validation"]
-  WSLFull --> DinD["Docker-DinD-only daemon layer"]
-  DinD --> Rosetta["Optional Tart Rosetta layer"]
+  WSLFull --> DockerContainer["Docker Container private-daemon runtime"]
+  DockerContainer --> Rosetta["Optional Tart Rosetta layer"]
   Rosetta --> Optional["customInstallScripts"]
   Optional --> Docker["Docker/browser layer"]
   Optional --> Web["web/E2E layer"]
   Optional --> Yours["your scripts"]
 ```
 
-The public WSL and Docker-DinD default examples start from `ghcr.io/catthehacker/ubuntu:full-latest`, so they inherit Docker plus the broader Catthehacker runner tool stack. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker-DinD always needs Docker Engine because the provider depends on a private inner Docker daemon.
+The public WSL and Docker Container default examples start from `ghcr.io/catthehacker/ubuntu:full-latest`, so they inherit Docker plus the broader Catthehacker runner tool stack. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker Container always needs Docker Engine because the provider depends on a private inner Docker daemon.
 
 EPAR ships reusable install scripts for common cases:
 
@@ -82,8 +82,7 @@ Built-in install scripts call `scripts/guest/ubuntu/wait-apt-ready.sh` before pa
 
 ### Host trust overlay
 
-Docker-DinD can snapshot all trusted root anchors visible in configured host
-scopes and add them to Ubuntu's default CA store:
+Docker Container can snapshot all trusted root anchors visible in configured host scopes and add them to Ubuntu's default CA store:
 
 ```yaml
 image:
@@ -112,7 +111,7 @@ mounted into job containers. EPAR does not alter a running job's CA store.
 
 This is an additive Ubuntu overlay. It does not reproduce every Windows or
 macOS trust-policy constraint and does not remove an independently bundled
-Ubuntu root. See [Docker-DinD Host Trust Inheritance](providers/docker-dind.md#host-trust-inheritance).
+Ubuntu root. See [Docker Container Host Trust Inheritance](providers/docker-container.md#host-trust-inheritance).
 
 ### Enterprise CA certificates
 
@@ -181,7 +180,7 @@ apt-get install -y --no-install-recommends \
   shellcheck
 ```
 
-The same script can be used by Tart, WSL, and Docker-DinD because it runs inside Ubuntu. If the customized image changes workflow capabilities, give it distinct image names and labels so workflows can opt into it explicitly:
+The same script can be used by Tart, WSL, and Docker Container because it runs inside Ubuntu. If the customized image changes workflow capabilities, give it distinct image names and labels so workflows can opt into it explicitly:
 
 ```yaml
 image:
@@ -203,7 +202,7 @@ Docker registry mirrors are runtime configuration, not image content. Keep them 
 
 ## Upstream Runner Images
 
-Runner-only Tart images and the default WSL and Docker-DinD images do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker-DinD images start from `ghcr.io/catthehacker/ubuntu:full-latest`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Catthehacker runner tool stack.
+Runner-only Tart images and the default WSL and Docker Container images do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker Container images start from `ghcr.io/catthehacker/ubuntu:full-latest`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Catthehacker runner tool stack.
 
 The built-in Docker/browser and web/E2E scripts require a pinned checkout of `actions/runner-images`:
 
@@ -221,21 +220,21 @@ When one of those built-in scripts is selected, the build copies only the requir
 - `images/ubuntu/scripts/build/install-nodejs.sh`
 - `images/ubuntu/toolsets`
 
-## Docker-DinD Images
+## Docker Container Images
 
-Use `configs/docker-dind.example.yml` for the default full Catthehacker runner container with a private Docker daemon. For smaller Docker-focused workloads, use `configs/docker-dind.act.example.yml`, which starts from `ghcr.io/catthehacker/ubuntu:act-latest` without custom install scripts. It includes Node plus Docker Engine/CLI/Compose/Buildx, but does not guarantee browser dependencies. Use `configs/docker-dind.web-e2e.example.yml` when workflows need Playwright or another browser workload; it starts from the same Act base and layers the web/E2E add-on.
+Use `configs/docker-container.example.yml` for the default full Catthehacker runner container with a private Docker daemon. For smaller Docker-focused workloads, use `configs/docker-container.act.example.yml`, which starts from `ghcr.io/catthehacker/ubuntu:act-latest` without custom install scripts. It includes Node plus Docker Engine/CLI/Compose/Buildx, but does not guarantee browser dependencies. Use `configs/docker-container.web-e2e.example.yml` when workflows need Playwright or another browser workload; it starts from the same Act base and layers the web/E2E add-on.
 
 ```bash
-cp configs/docker-dind.example.yml .local/config.yml
+cp configs/docker-container.example.yml .local/config.yml
 ./bin/ephemeral-action-runner image build --replace
 ```
 
-Run `image update-upstream` first when using `configs/docker-dind.web-e2e.example.yml`, because that optional layer installs browser and Node.js pieces from the pinned upstream runner-images scripts.
+Run `image update-upstream` first when using `configs/docker-container.web-e2e.example.yml`, because that optional layer installs browser and Node.js pieces from the pinned upstream runner-images scripts.
 
 The output image is a Docker image tag:
 
 ```bash
-docker image ls epar-docker-dind-catthehacker-ubuntu
+docker image ls epar-docker-container-catthehacker-ubuntu
 ```
 
 The provider creates each runner instance with `docker create --privileged` and no host socket mount. The image entrypoint starts a private `dockerd`, waits for `docker info`, and keeps the container alive while EPAR configures and monitors the GitHub runner process. Workflow Docker resources live inside that inner daemon. The inner daemon defaults to the `vfs` storage driver because it is reliable for nested Docker across Docker Desktop, OrbStack, and Linux Docker hosts; users can bake a different `EPAR_DOCKERD_STORAGE_DRIVER` into a derived image after validating the host.
@@ -268,13 +267,13 @@ work/images/epar-wsl-catthehacker-ubuntu.tar.epar-manifest.json
 
 Later builds reuse that source cache when its source manifest still matches. Delete those files when you intentionally want to reconvert the Docker image.
 
-WSL runner startup sources `/opt/epar/source-image.env` before launching the GitHub Actions runner. That preserves image metadata such as `ImageOS`, `ImageVersion`, runner tool cache paths, browser paths, and Java paths from the Docker image source. WSL does not use Docker-DinD's container entrypoint; it keeps the systemd and keepalive model used by other WSL images.
+WSL runner startup sources `/opt/epar/source-image.env` before launching the GitHub Actions runner. That preserves image metadata such as `ImageOS`, `ImageVersion`, runner tool cache paths, browser paths, and Java paths from the Docker image source. WSL does not use the Docker Container entrypoint; it keeps the systemd and keepalive model used by other WSL images.
 
 Use `configs/wsl.lean.example.yml` when you want the old smaller rootfs-tar path. That config expects you to export a clean Ubuntu 24.04 WSL distro to `work/images/ubuntu-24.04-clean.rootfs.tar`.
 
 ## Installed Runtime
 
-The default WSL and Docker-DinD builds use `ghcr.io/catthehacker/ubuntu:full-latest` as the source image. It is larger than the medium Catthehacker act image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
+The default WSL and Docker Container builds use `ghcr.io/catthehacker/ubuntu:full-latest` as the source image. It is larger than the medium Catthehacker act image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
 
 Catthehacker's `full-latest` and `act-latest` tags are rolling references. EPAR records the resolved source digest in its image manifest so a built image remains auditable, but a later `image build --replace` can consume a newer upstream digest. Pin `image.sourceImage` to a tested digest when rebuild reproducibility is required.
 
@@ -290,7 +289,7 @@ The optional `install-docker-browser.sh` layer installs:
 - upstream Google Chrome on x64
 - Playwright-managed Chromium on ARM64, exposed as `epar-browser`, `chromium`, and `chromium-browser`
 
-The WSL default and Docker-DinD provider validate Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`. Docker-DinD then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`; WSL starts Docker through systemd inside the distro. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside non-WSL-default image builds only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
+The WSL default and Docker Container provider validate Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`. Docker Container then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`; WSL starts Docker through systemd inside the distro. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside non-WSL-default image builds only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
 
 The ARM64 Docker harness prefers upstream `toolset-2404-arm64.json`. If an older upstream checkout does not contain that file, EPAR falls back to a minimal ARM-aware Docker toolset.
 

@@ -9,7 +9,7 @@ param(
 # instead of on the host. No binary is built or left on disk.
 #
 # Docker is still required (both for this wrapper and for EPAR's own
-# Docker-DinD provider, reached here via the mounted host socket).
+# Docker Container provider, reached here via the mounted host socket).
 #
 # Usage: scripts\run-with-docker.ps1 [epar-args...]
 

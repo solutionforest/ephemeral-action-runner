@@ -24,7 +24,7 @@ if [[ " $* " == *" go run ./cmd/ephemeral-action-runner init "* ]]; then
   mkdir -p "$FAKE_PROJECT/.local"
   cat >"$FAKE_PROJECT/.local/config.yml" <<'YAML'
 provider:
-  type: docker-dind
+  type: docker-container
 runner:
   ephemeral: true
 image:

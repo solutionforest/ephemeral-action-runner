@@ -16,11 +16,11 @@ func TestDockerPullProgressUsesManagerLoggerAndPreservesSourceTranscript(t *test
 	root := t.TempDir()
 	var console bytes.Buffer
 	runtime, err := logging.NewRuntime(logging.Options{
-		Directory:        root,
-		ManagerSinks:     logging.SinkConsole,
-		TranscriptSinks:  logging.SinkFile,
-		Stdout:           &console,
-		Stderr:           &console,
+		Directory:       root,
+		ManagerSinks:    logging.SinkConsole,
+		TranscriptSinks: logging.SinkFile,
+		Stdout:          &console,
+		Stderr:          &console,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -71,12 +71,12 @@ func TestDockerPullProgressHonorsManagerJSONConsoleFormat(t *testing.T) {
 	root := t.TempDir()
 	var console bytes.Buffer
 	runtime, err := logging.NewRuntime(logging.Options{
-		Directory:             root,
-		ManagerSinks:          logging.SinkConsole,
-		ManagerConsoleFormat:  logging.FormatJSON,
-		TranscriptSinks:       logging.SinkFile,
-		Stdout:                &console,
-		Stderr:                &console,
+		Directory:            root,
+		ManagerSinks:         logging.SinkConsole,
+		ManagerConsoleFormat: logging.FormatJSON,
+		TranscriptSinks:      logging.SinkFile,
+		Stdout:               &console,
+		Stderr:               &console,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestDockerPullProgressHonorsManagerJSONConsoleFormat(t *testing.T) {
 	cfg := config.Default()
 	cfg.Logging.Directory = root
 	cfg.Logging.ManagerConsoleFormat = "json"
-	cfg.Provider.Type = "docker-dind"
+	cfg.Provider.Type = "docker-container"
 	manager := Manager{Config: cfg, Logging: runtime}
 	previousTerminal := dockerPullProgressTerminal
 	dockerPullProgressTerminal = func() bool { return true }
@@ -98,7 +98,7 @@ func TestDockerPullProgressHonorsManagerJSONConsoleFormat(t *testing.T) {
 	if err := json.Unmarshal(console.Bytes(), &record); err != nil {
 		t.Fatalf("decode manager JSON console: %v: %q", err, console.String())
 	}
-	if record["msg"] != "Docker source pull: 0/1 layers complete; 1 B/2 B (50%)" || record["provider"] != "docker-dind" || record["operation"] != "docker-pull" || record["logPath"] != logPath {
+	if record["msg"] != "Docker source pull: 0/1 layers complete; 1 B/2 B (50%)" || record["provider"] != "docker-container" || record["operation"] != "docker-pull" || record["logPath"] != logPath {
 		t.Fatalf("manager JSON console missing pull context: %#v", record)
 	}
 }

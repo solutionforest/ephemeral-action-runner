@@ -9,8 +9,8 @@ import (
 var (
 	lumberjackSuffixPattern = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}[Tt]\d{2}-\d{2}-\d{2}\.\d{3}(\.log|\.jsonl)$`)
 	errorNamePattern        = regexp.MustCompile(`^epar-\d{8}-\d{6}-error\.log$`)
-	instanceNamePattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\.(guest|docker-dind|wsl|tart)\.log$`)
-	legacyInstancePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*-\d{8}-\d{6}-\d{3}\.(guest|docker-dind|wsl|tart)\.log$`)
+	instanceNamePattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\.(guest|docker-container|wsl|tart)\.log$`)
+	legacyInstancePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*-\d{8}-\d{6}-\d{3}\.(guest|docker-container|wsl|tart)\.log$`)
 	buildNamePattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\.(docker-build|wsl-build|build|source|refresh|wsl-refresh|guest)\.log$`)
 	legacyBuildNamePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\.(docker-build|wsl-build|build|source|refresh|wsl-refresh)\.log$`)
 	benchmarkNamePattern    = regexp.MustCompile(`^\d{8}[Tt]\d{6}\.\d{9}[Zz]-[A-Za-z0-9][A-Za-z0-9_-]*\.jsonl$`)

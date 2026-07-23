@@ -2,7 +2,7 @@
 
 This page is the operational walkthrough. Start with the supported host you already have:
 
-- Docker-DinD on a Docker-capable host
+- Docker Container on a Docker-capable host
 - WSL2 on Windows
 - Tart on Apple Silicon macOS
 
@@ -17,7 +17,7 @@ Install the host tools you need:
 | macOS provider | Tart |
 | Windows provider | WSL2 |
 | Windows WSL2 default image build | Docker Desktop, Docker Engine, or another working Docker daemon for the one-time Docker image export |
-| Docker-DinD provider | Docker Engine, OrbStack, or Docker Desktop with privileged container support |
+| Docker Container provider | Docker Engine, OrbStack, or Docker Desktop with privileged container support |
 | Optional Docker registry mirrors | A running mirror service on the host, LAN, intranet, or cloud registry cache |
 | Runner registration | GitHub App with organization self-hosted runner read/write permission |
 
@@ -40,7 +40,7 @@ Don't want to install Go at all? See [Running EPAR Without Installing Go](advanc
 
 ## One-Command Start
 
-For the default Docker-DinD setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, without creating a standalone EPAR executable (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
+For the default Docker Container setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, without creating a standalone EPAR executable (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
 
 ```bash
 ./start
@@ -52,7 +52,7 @@ Equivalent without the wrapper:
 go run ./cmd/ephemeral-action-runner
 ```
 
-If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then lists the organization's live runner groups. The group choice is explicit and has no Enter-for-default or offline fallback. Default and broad-access groups require warning confirmation; public-enabled groups are blocked by the generated safety policy. See [Runner Group Security](runner-groups.md). Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker-DinD. The Docker preflight applies to Docker-DinD and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks runner-group policy and the configured image, builds or replaces the image when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then lists the organization's live runner groups. The group choice is explicit and has no Enter-for-default or offline fallback. Default and broad-access groups require warning confirmation; public-enabled groups are blocked by the generated safety policy. See [Runner Group Security](runner-groups.md). Docker Container is the default. For a new Docker Container config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker Container. The Docker preflight applies to Docker Container and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks runner-group policy and the configured image, builds or replaces the image when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
 Pass flags through `./start` to choose a config or runner count:
 
@@ -84,7 +84,7 @@ If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.ins
 
 ## Configure Only
 
-Use `init` when you only want to create a config without building an image or starting runners. It creates Docker-DinD by default, with the same conditional native-Windows WSL2 and macOS Tart choices described above:
+Use `init` when you only want to create a config without building an image or starting runners. It creates Docker Container by default, with the same conditional native-Windows WSL2 and macOS Tart choices described above:
 
 ```bash
 go run ./cmd/ephemeral-action-runner init
@@ -105,9 +105,9 @@ For other WSL or Tart variants, or for custom labels, copy one example config in
 | Windows WSL2, default full Catthehacker runner image | `configs/wsl.example.yml` |
 | Windows WSL2, lean runner-only tar | `configs/wsl.lean.example.yml` |
 | Windows WSL2, lean web/E2E tar | `configs/wsl.web-e2e.example.yml` |
-| Docker-DinD, default full Catthehacker runner image | `configs/docker-dind.example.yml` |
-| Docker-DinD, Docker-focused Catthehacker Act image | `configs/docker-dind.act.example.yml` |
-| Docker-DinD, smaller web/E2E custom image | `configs/docker-dind.web-e2e.example.yml` |
+| Docker Container, default full Catthehacker runner image | `configs/docker-container.example.yml` |
+| Docker Container, Docker-focused Catthehacker Act image | `configs/docker-container.act.example.yml` |
+| Docker Container, smaller web/E2E custom image | `configs/docker-container.web-e2e.example.yml` |
 
 Tart is experimental. Its default image is a basic Ubuntu ARM64 OS image with the EPAR runner lifecycle, not the dependency-rich environment described by [`actions/runner-images`](https://github.com/actions/runner-images). If your workflows depend on that environment, adapt the upstream build scripts to create and maintain your own bootable Tart image and point `image.sourceImage` at it; EPAR does not automatically create one.
 
@@ -125,11 +125,11 @@ New-Item -ItemType Directory -Force .local
 Copy-Item configs/wsl.example.yml .local/config.yml
 ```
 
-Default Docker-DinD manually:
+Default Docker Container manually:
 
 ```bash
 mkdir -p .local
-cp configs/docker-dind.example.yml .local/config.yml
+cp configs/docker-container.example.yml .local/config.yml
 ```
 
 EPAR looks for config in this order:
@@ -157,7 +157,7 @@ EPAR only configures runner-side Docker daemons; it does not run or secure the m
 
 ## Prepare A WSL Source
 
-Skip this section for Tart and Docker-DinD.
+Skip this section for Tart and Docker Container.
 
 The default WSL config starts from `ghcr.io/catthehacker/ubuntu:full-latest`. During `image build`, EPAR runs Docker on the Windows host to pull that image, create a temporary container, export its filesystem into a rootfs tar, and then import that tar into WSL for EPAR's normal runner bootstrap. Docker is needed for this preparation step. Running WSL runner instances afterward does not require Docker Desktop unless your jobs need it.
 
@@ -175,7 +175,7 @@ After that, EPAR imports disposable temporary distros for image builds and pool 
 
 The `start` command builds or replaces the configured image automatically. Use this section when developing from source, debugging image builds, or intentionally separating image preparation from runner startup.
 
-Default WSL and Docker-DinD builds and runner-only Tart builds do not need the upstream `actions/runner-images` checkout:
+Default WSL and Docker Container builds and runner-only Tart builds do not need the upstream `actions/runner-images` checkout:
 
 ```bash
 go run ./cmd/ephemeral-action-runner image build --replace
@@ -204,19 +204,19 @@ work/images/epar-wsl-catthehacker-ubuntu.tar
 
 When the WSL source is a Docker image, EPAR also writes an intermediate source rootfs tar and env cache next to the output image, for example `work/images/epar-wsl-catthehacker-ubuntu.source.rootfs.tar` and `.env`. Later builds reuse that source cache; delete those files when you intentionally want to reconvert the Docker image.
 
-EPAR also writes image manifests so `start` can tell whether the local image still matches the config. Docker-DinD stores the manifest hash as a Docker image label and stores the manifest at `/opt/epar/image-manifest.json`. WSL stores `/opt/epar/image-manifest.json` inside the exported image and writes a sidecar next to the tar.
+EPAR also writes image manifests so `start` can tell whether the local image still matches the config. Docker Container stores the manifest hash as a Docker image label and stores the manifest at `/opt/epar/image-manifest.json`. WSL stores `/opt/epar/image-manifest.json` inside the exported image and writes a sidecar next to the tar.
 
-Docker-DinD output is a Docker image tag, such as `epar-docker-dind-catthehacker-ubuntu`. Confirm it with:
+Docker Container output is a Docker image tag, such as `epar-docker-container-catthehacker-ubuntu`. Confirm it with:
 
 ```bash
-docker image ls epar-docker-dind-catthehacker-ubuntu
+docker image ls epar-docker-container-catthehacker-ubuntu
 ```
 
 Build logs are written under `work/logs/builds` by default. Run `ephemeral-action-runner logs path` to resolve a customized logging root and see [Logging](logging.md) for rotation and retention.
 
 ## Customize The Image
 
-WSL and Docker-DinD use the full Catthehacker runner image by default. For Docker-focused jobs, `configs/docker-dind.act.example.yml` uses the smaller Catthehacker Act image, which includes Node and the Docker Engine/CLI/Compose/Buildx stack EPAR needs. It does not guarantee browser dependencies; use `configs/docker-dind.web-e2e.example.yml` for Playwright or other browser tests. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker-DinD web/E2E examples:
+WSL and Docker Container use the full Catthehacker runner image by default. For Docker-focused jobs, `configs/docker-container.act.example.yml` uses the smaller Catthehacker Act image, which includes Node and the Docker Engine/CLI/Compose/Buildx stack EPAR needs. It does not guarantee browser dependencies; use `configs/docker-container.web-e2e.example.yml` for Playwright or other browser tests. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker Container web/E2E examples:
 
 ```yaml
 image:
@@ -253,13 +253,13 @@ Runtime validation always checks the base runner files and runner user. Images w
 
 - Docker/browser images validate Docker, Compose v2, Buildx, `hello-world`, and a headless browser.
 - Default WSL full images validate Docker, Compose v2, Buildx, and `hello-world`.
-- Docker-DinD images validate the private inner Docker daemon inside each runner container.
+- Docker Container images validate the private inner Docker daemon inside each runner container.
 - Tart Rosetta images validate `docker run --platform linux/amd64 alpine:3.20` and expect `uname -m` to return `x86_64`.
 - Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
 
 When `docker.registryMirrors` is configured, EPAR applies the mirror configuration before runtime validation.
 
-If a Docker-DinD workflow depends on amd64-only images while the host is ARM64, validate host emulation inside a running EPAR instance:
+If a Docker Container workflow depends on amd64-only images while the host is ARM64, validate host emulation inside a running EPAR instance:
 
 ```bash
 docker exec <epar-instance> docker run --rm --platform linux/amd64 alpine:3.20 uname -m
@@ -313,25 +313,25 @@ For the default WSL image, target the default WSL label:
 runs-on: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
 ```
 
-For the default Docker-DinD image, target the default Docker-DinD label:
+For the default Docker Container image, target the default Docker Container label:
 
 ```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
+runs-on: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]
 ```
 
 For the Docker-focused Act image, target its dedicated label:
 
 ```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-act]
+runs-on: [self-hosted, linux, epar-docker-container-catthehacker-act]
 ```
 
-For Docker-DinD web/E2E images, target the custom web/E2E label:
+For Docker Container web/E2E images, target the custom web/E2E label:
 
 ```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu-web-e2e]
+runs-on: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu-web-e2e]
 ```
 
-When that Docker-DinD runner is used for amd64-only runtime images, keep the workflow's Docker platform explicit, for example `DOCKER_PLATFORM=linux/amd64` or the equivalent variable used by your compose scripts, and verify the host runtime supports amd64 emulation as described above.
+When that Docker Container runner is used for amd64-only runtime images, keep the workflow's Docker platform explicit, for example `DOCKER_PLATFORM=linux/amd64` or the equivalent variable used by your compose scripts, and verify the host runtime supports amd64 emulation as described above.
 
 Do not use `ubuntu-latest` for these self-hosted runners.
 

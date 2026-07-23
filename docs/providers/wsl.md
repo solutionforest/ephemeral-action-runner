@@ -82,7 +82,7 @@ sudo -u runner -H chromium --headless --no-sandbox --dump-dom file:///tmp/epar-b
 
 The provider does not mount the Windows Docker Desktop socket. Docker-enabled jobs run against Docker Engine inside the WSL distro.
 
-Runner startup sources `/opt/epar/source-image.env` before launching `/opt/actions-runner/run.sh`. This lets GitHub Actions jobs inherit source image variables such as `ImageOS`, `ImageVersion`, `RUNNER_TOOL_CACHE`, browser paths, and Java paths. WSL keeps its own systemd and host keepalive model; it does not reuse Docker-DinD's container entrypoint.
+Runner startup sources `/opt/epar/source-image.env` before launching `/opt/actions-runner/run.sh`. This lets GitHub Actions jobs inherit source image variables such as `ImageOS`, `ImageVersion`, `RUNNER_TOOL_CACHE`, browser paths, and Java paths. WSL keeps its own systemd and host keepalive model; it does not reuse Docker Container entrypoint.
 
 WSL x64 is the preferred EPAR target for workflows that pull amd64-only Docker runtime images.
 

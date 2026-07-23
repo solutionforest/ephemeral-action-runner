@@ -16,7 +16,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
-	dockerdindprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockerdind"
+	dockercontainerprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockercontainer"
 	tartprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
 	wslprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
 )
@@ -528,14 +528,14 @@ func newProvider(cfg config.Config, projectRoot string, dryRun bool) (provider.P
 		return tartprovider.New("", dryRun), nil
 	case "wsl":
 		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.Provider.InstallRoot), projectRoot, dryRun), nil
-	case "docker-dind":
+	case "docker-container":
 		hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
 		environment := map[string]string{
 			"HTTP_PROXY":  cfg.Docker.HTTPProxy,
 			"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
 			"NO_PROXY":    cfg.Docker.NoProxy,
 		}
-		return dockerdindprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), nil
+		return dockercontainerprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), nil
 	default:
 		return nil, provider.UnsupportedTypeError(cfg.Provider.Type)
 	}
