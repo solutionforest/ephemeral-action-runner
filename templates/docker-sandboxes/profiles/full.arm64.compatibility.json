@@ -4,7 +4,6 @@
   "profile": "full",
   "validationStatus": "unvalidated",
   "platform": "linux/arm64",
-  "supportedSbxVersions": ["0.35.0"],
   "source": {
     "reference": "ghcr.io/catthehacker/ubuntu@sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
     "indexDigest": "sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",

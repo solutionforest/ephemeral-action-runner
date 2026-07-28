@@ -27,7 +27,6 @@ func TestValidateRejectsEveryNonWaivableGate(t *testing.T) {
 		mutate func(*Record)
 	}{
 		{name: "unknown platform", mutate: func(record *Record) { record.Platform = "plan9/amd64" }},
-		{name: "wrong sbx", mutate: func(record *Record) { record.SBXVersion = "0.36.0" }},
 		{name: "unknown EPAR revision", mutate: func(record *Record) { record.EPARRevision = "unknown" }},
 		{name: "wrong template cache ID", mutate: func(record *Record) { record.TemplateCacheID = "bbbbbbbbbbbb" }},
 		{name: "unverified", mutate: func(record *Record) { record.Verifier = "" }},
@@ -57,7 +56,6 @@ func validRecord() Record {
 	return Record{
 		Platform:                WindowsAMD64,
 		EPARRevision:            digest,
-		SBXVersion:              "0.35.0",
 		Template:                "epar-docker-sandboxes-catthehacker-full:version",
 		TemplateDigest:          digest,
 		TemplateCacheID:         strings.Repeat("a", 12),

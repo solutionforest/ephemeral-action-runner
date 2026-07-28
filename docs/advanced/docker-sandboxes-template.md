@@ -4,14 +4,13 @@ Docker Sandboxes requires an EPAR Candidate A template that has been built, revi
 
 ## Before You Start
 
-Use a native Docker server that matches the template platform. An amd64 server builds `linux/amd64`; an ARM64 server builds `linux/arm64`. The pinned build intentionally does not use emulation. Confirm the exact supported Docker Sandboxes version and diagnostics before loading a template:
+Use a native Docker server that matches the template platform. An amd64 server builds `linux/amd64`; an ARM64 server builds `linux/arm64`. The pinned build intentionally does not use emulation. Confirm Docker Sandboxes readiness before loading a template:
 
 ```bash
-sbx version
 sbx diagnose --output json
 ```
 
-EPAR currently requires `sbx v0.35.0`, at least one diagnostic pass, and no diagnostic failures. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) identifies the allowed source profiles and exact build inputs. It is an approved snapshot, not an automatic update channel.
+EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) identifies the allowed source profiles and exact build inputs. It is an approved snapshot, not an automatic update channel.
 
 ## Build And Review
 
@@ -33,7 +32,7 @@ After reviewing the evidence, load the archive:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/docker-sandboxes/load-template.ps1 -ArtifactDirectory work/template-builds/docker-sandboxes/full -ExpectedMetadataSha256 sha256:<recorded-metadata-digest> -Execute
 ```
 
-The loader validates the archive, metadata, provenance, SPDX SBOM, inventory, helper hashes, compatibility record, source lock, exact local Docker image identity, and the supported `sbx` version before it invokes `sbx template load`. It reads the tag and cache inventory back afterward and never runs `sbx reset`.
+The loader validates the archive, metadata, provenance, SPDX SBOM, inventory, helper hashes, compatibility record, source lock, exact local Docker image identity, and `sbx diagnose --output json` result before it invokes `sbx template load`. It reads the tag and cache inventory back afterward and never runs `sbx reset`.
 
 Keep the archive and its evidence while the template is in service or may require independent review. The Docker Sandboxes cache ID is only 12 hexadecimal characters; it is not the full template identity. EPAR records the full local Docker image identity as `dockerSandboxes.templateDigest` and checks it independently.
 

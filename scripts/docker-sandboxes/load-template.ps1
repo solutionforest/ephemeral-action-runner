@@ -77,8 +77,8 @@ if ($actualMetadataSha256 -ne $ExpectedMetadataSha256) {
     throw "Template metadata trust-anchor mismatch: operator expected $ExpectedMetadataSha256, got $actualMetadataSha256"
 }
 $metadata = Get-Content -Raw -LiteralPath $metadataPath | ConvertFrom-Json
-if ($metadata.schemaVersion -ne 2 -or @($metadata.compatibility.supportedSbxVersions).Count -ne 1 -or $metadata.compatibility.supportedSbxVersions[0] -ne '0.35.0') {
-    throw 'Artifact compatibility metadata must use schema 2 and allow exactly sbx v0.35.0'
+if ($metadata.schemaVersion -ne 2) {
+    throw 'Artifact metadata must use schema 2'
 }
 if ($metadata.platform -ne 'linux/amd64' -and $metadata.platform -ne 'linux/arm64') {
     throw "Artifact metadata contains an unsupported platform: $($metadata.platform)"
@@ -176,7 +176,7 @@ if ($LASTEXITCODE -ne 0 -or $localTemplateDigest -ne $metadata.template.template
 Write-Host "Verified operator-anchored metadata: $actualMetadataSha256"
 Write-Host "Verified archive: $archivePath"
 Write-Host "Full local Docker image identity: $($metadata.template.tag)@$($metadata.template.templateDigest)"
-Write-Host "Expected sbx v0.35.0 cache ID: $($metadata.template.cacheID)"
+Write-Host "Expected Docker Sandboxes template cache ID: $($metadata.template.cacheID)"
 if (-not $Execute) {
     Write-Host 'Plan only. All evidence was verified without invoking sbx. Re-run with -Execute and the same expected metadata digest to invoke sbx template load at most once.'
     exit 0
@@ -209,9 +209,40 @@ if ($metadata.platform -ne $expectedPlatform) {
     throw "Template platform $($metadata.platform) cannot be loaded for Docker Sandboxes on $hostOS/$hostArchitecture; expected $expectedPlatform"
 }
 
-$sbxVersionOutput = ((& sbx version) -join [Environment]::NewLine).Trim()
-if ($LASTEXITCODE -ne 0 -or $sbxVersionOutput -notmatch '^(?:Docker Sandboxes|docker sandboxes|sbx) version:? v?0\.35\.0(?: [a-f0-9]{40})?$') {
-    throw "Exactly sbx v0.35.0 is required; version output was: $sbxVersionOutput"
+$diagnosticText = ((& sbx diagnose --output json) -join [Environment]::NewLine).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker Sandboxes diagnostics failed. Run 'sbx diagnose --output json' and review the hints for each failed check."
+}
+try {
+    $diagnostics = $diagnosticText | ConvertFrom-Json
+}
+catch {
+    throw "Docker Sandboxes diagnostics returned invalid JSON. Run 'sbx diagnose --output json' and review its output."
+}
+$diagnosticChecks = @($diagnostics.checks)
+$knownStatuses = @('pass', 'warn', 'fail', 'skip')
+$actualCounts = @{ pass = 0; warn = 0; fail = 0; skip = 0 }
+foreach ($check in $diagnosticChecks) {
+    $status = ([string]$check.status).ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace([string]$check.name) -or -not $knownStatuses.Contains($status)) {
+        throw "Docker Sandboxes diagnostics returned an unsupported check. Run 'sbx diagnose --output json' and review its output."
+    }
+    $actualCounts[$status]++
+}
+$summaryValid = $diagnosticChecks.Count -gt 0 -and $null -ne $diagnostics.summary
+foreach ($status in $knownStatuses) {
+    $property = if ($summaryValid) { $diagnostics.summary.PSObject.Properties[$status] } else { $null }
+    $summaryCount = 0
+    if ($null -eq $property -or -not [int]::TryParse([string]$property.Value, [ref]$summaryCount) -or $summaryCount -ne $actualCounts[$status]) {
+        $summaryValid = $false
+        break
+    }
+}
+if (-not $summaryValid) {
+    throw "Docker Sandboxes diagnostics returned an unsupported summary. Run 'sbx diagnose --output json' and review its output."
+}
+if ($actualCounts['fail'] -ne 0 -or $actualCounts['pass'] -lt 1) {
+    throw "Docker Sandboxes diagnostics reported $($actualCounts['pass']) passing and $($actualCounts['fail']) failed checks. Run 'sbx diagnose --output json' and review the hints for each failed check."
 }
 
 function Get-TemplateInventory {
@@ -268,5 +299,5 @@ if ($matchingTemplates[0].id -ne $metadata.template.cacheID) {
     throw "Loaded template cache ID mismatch: expected $($metadata.template.cacheID), got $($matchingTemplates[0].id)"
 }
 Write-Host "Template load readback completed with cache ID $($metadata.template.cacheID)."
-Write-Host 'The 12-hex cache ID is the complete identity exposed by sbx v0.35.0; it is not a full digest. Full identity is anchored independently by the operator-verified metadata and local Docker image readback.'
+Write-Host 'The 12-hex cache ID is the complete identity exposed by the local template inventory; it is not a full digest. Full identity is anchored independently by the operator-verified metadata and local Docker image readback.'
 Write-Host 'The script does not preload /var/lib/docker and will not invoke sbx template load again.'

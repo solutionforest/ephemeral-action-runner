@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 )
 
@@ -108,7 +110,8 @@ func runStartWithOptions(opts startOptions) (err error) {
 	if err != nil {
 		return err
 	}
-	configPath, err := ensureConfigForStart(startOptions{
+	configPath, startNow, err := ensureConfigForStart(startOptions{
+		Context:     opts.Context,
 		ProjectRoot: projectRoot,
 		ConfigPath:  opts.ConfigPath,
 		In:          opts.In,
@@ -116,6 +119,9 @@ func runStartWithOptions(opts startOptions) (err error) {
 	})
 	if err != nil {
 		return err
+	}
+	if !startNow {
+		return nil
 	}
 	manager, err := opts.ManagerFactory(configPath, projectRoot, opts.DryRun, opts.Register)
 	if err != nil {
@@ -185,32 +191,44 @@ func runStartWithOptions(opts startOptions) (err error) {
 	return err
 }
 
-func ensureConfigForStart(opts startOptions) (string, error) {
+func ensureConfigForStart(opts startOptions) (string, bool, error) {
 	path, exists, err := resolveStartConfigPath(opts.ProjectRoot, opts.ConfigPath)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if exists {
-		return path, nil
+		return path, true, nil
 	}
 	if path == "" {
 		path = filepath.Join(opts.ProjectRoot, ".local", "config.yml")
 	}
 	if !stdinIsInteractive() {
-		return "", fmt.Errorf("no EPAR config found; run %s init from the EPAR directory, or pass --config <path> after creating a config. See README.md and docs/github-app.md for GitHub App setup", binaryName)
+		return "", false, fmt.Errorf("no EPAR config found; run %s init from the EPAR directory, or pass --config <path> after creating a config. See README.md and docs/github-app.md for GitHub App setup", binaryName)
 	}
 	fmt.Fprintf(opts.Out, "No EPAR config found. Starting first-run setup.\n\n")
+	reader := bufio.NewReader(opts.In)
 	if err := runInitWithOptions(initOptions{
-		Context:     opts.Context,
-		ProjectRoot: projectRootOrCwd(opts.ProjectRoot),
-		ConfigPath:  path,
-		In:          opts.In,
-		Out:         opts.Out,
+		Context:         opts.Context,
+		ProjectRoot:     projectRootOrCwd(opts.ProjectRoot),
+		ConfigPath:      path,
+		EmbeddedInStart: true,
+		In:              opts.In,
+		Reader:          reader,
+		Out:             opts.Out,
 	}); err != nil {
-		return "", err
+		return "", false, err
+	}
+	fmt.Fprintln(opts.Out, "")
+	startNow, err := promptYesNo(opts.Out, reader, fmt.Sprintf("Start runners now? Choose No to exit and review %s", path), true)
+	if err != nil {
+		return "", false, err
+	}
+	if !startNow {
+		fmt.Fprintf(opts.Out, "\nConfig saved at %s. Exiting before runner startup.\nReview the config, then run %s when ready.\n", path, invocation.Command())
+		return path, false, nil
 	}
 	fmt.Fprintf(opts.Out, "\nContinuing with %s\n", path)
-	return path, nil
+	return path, true, nil
 }
 
 func resolveStartConfigPath(projectRoot, explicit string) (string, bool, error) {

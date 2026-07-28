@@ -26,8 +26,7 @@ const (
 )
 
 var (
-	versionOutputPattern = regexp.MustCompile(`^(?:Docker Sandboxes|docker sandboxes|sbx) version:? v?([0-9]+\.[0-9]+\.[0-9]+)(?: [a-f0-9]{40})?\r?\n?$`)
-	sandboxScopePattern  = regexp.MustCompile(`^sandbox:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	sandboxScopePattern = regexp.MustCompile(`^sandbox:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
 type Failure struct {
@@ -131,15 +130,8 @@ func RunPreflight(ctx context.Context, record Record, opts PreflightOptions) Pre
 		}
 	}
 	if opts.RunSBX == nil {
-		add("sbx command", "the Docker Sandboxes command runner is unavailable", "Install exactly sbx v0.35.0 on the native host, then rerun setup.")
+		add("sbx command", "the Docker Sandboxes command runner is unavailable", "Install sbx on the native host, then run sbx diagnose --output json and review the hints for any failed checks.")
 		return result
-	}
-
-	versionOutput, versionErr := opts.RunSBX(ctx, []string{"version"})
-	if versionErr != nil {
-		add("sbx version", versionErr.Error(), "Install exactly sbx v0.35.0 on the native host, then rerun setup.")
-	} else if !isExactVersion(versionOutput, record.SBXVersion) {
-		add("sbx version", fmt.Sprintf("installed version output does not prove exactly v%s", record.SBXVersion), "Install exactly sbx v0.35.0 on the native host, then rerun setup.")
 	}
 
 	daemonOutput, daemonErr := opts.RunSBX(ctx, []string{"daemon", "status", "--json"})
@@ -151,19 +143,17 @@ func RunPreflight(ctx context.Context, record Record, opts PreflightOptions) Pre
 
 	diagnoseOutput, diagnoseErr := opts.RunSBX(ctx, []string{"diagnose", "--output", "json"})
 	if diagnoseErr != nil {
-		add("daemon diagnostics", diagnoseErr.Error(), "Resolve every sbx diagnostic warning, failure, and skipped check, then rerun setup.")
-		add("authentication", "Docker authentication could not be verified because sbx diagnostics failed", "Run sbx login on the native host, confirm the Authentication diagnostic passes, then rerun setup.")
+		add("daemon diagnostics", diagnoseErr.Error(), "Run sbx diagnose --output json and review the hints for any failed checks, then rerun setup.")
 	} else {
 		checks, err := parseDiagnostics(diagnoseOutput)
 		if err != nil {
-			add("daemon diagnostics", err.Error(), "Use exactly sbx v0.35.0 and resolve its diagnostics before rerunning setup.")
-			add("authentication", "Docker authentication could not be verified from the diagnostic result", "Run sbx login on the native host, confirm the Authentication diagnostic passes, then rerun setup.")
+			add("daemon diagnostics", err.Error(), "Run sbx diagnose --output json and review the hints for any failed checks, then rerun setup.")
 		} else {
-			if failed := nonPassingChecks(checks); len(failed) != 0 {
-				add("daemon diagnostics", "non-passing checks: "+strings.Join(failed, ", "), "Resolve every sbx diagnostic warning, failure, and skipped check, then rerun setup.")
-			}
-			if err := verifyAuthenticationDiagnostic(checks); err != nil {
-				add("authentication", err.Error(), "Run sbx login on the native host, confirm the Authentication diagnostic passes, then rerun setup.")
+			passed, failed := diagnosticPassAndFailureCounts(checks)
+			if failed != 0 {
+				add("daemon diagnostics", fmt.Sprintf("diagnostics reported %d failed check(s)", failed), "Run sbx diagnose --output json and review the hints for each failed check, then rerun setup.")
+			} else if passed == 0 {
+				add("daemon diagnostics", "diagnostics reported no passing checks", "Run sbx diagnose --output json and review its check details, then rerun setup.")
 			}
 		}
 	}
@@ -291,11 +281,6 @@ func (buffer *preflightBuffer) Write(data []byte) (int, error) {
 	return buffer.Buffer.Write(data)
 }
 
-func isExactVersion(output []byte, expected string) bool {
-	matches := versionOutputPattern.FindSubmatch(output)
-	return len(matches) == 2 && string(matches[1]) == expected
-}
-
 func decodeStrictJSON(data []byte, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
@@ -377,26 +362,16 @@ func parseDiagnostics(data []byte) ([]diagnosticCheck, error) {
 	return checks, nil
 }
 
-func nonPassingChecks(checks []diagnosticCheck) []string {
-	var failed []string
+func diagnosticPassAndFailureCounts(checks []diagnosticCheck) (passed, failed int) {
 	for _, check := range checks {
-		if check.Status != "pass" {
-			failed = append(failed, check.Name+"="+check.Status)
+		switch check.Status {
+		case "pass":
+			passed++
+		case "fail":
+			failed++
 		}
 	}
-	return failed
-}
-
-func verifyAuthenticationDiagnostic(checks []diagnosticCheck) error {
-	for _, check := range checks {
-		if strings.EqualFold(strings.TrimSpace(check.Name), "Authentication") {
-			if check.Status != "pass" {
-				return fmt.Errorf("Docker Sandboxes Authentication diagnostic is %s", check.Status)
-			}
-			return nil
-		}
-	}
-	return errors.New("Docker Sandboxes diagnostics omitted the Authentication check")
+	return passed, failed
 }
 
 func verifyPromotedTemplate(data []byte, reference, cacheID string) error {

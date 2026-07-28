@@ -29,12 +29,12 @@ Choose Docker Sandboxes when its local checks pass and you want a microVM bounda
 
 ## Support Status
 
-EPAR selects this provider by capability, not by an operating-system allowlist: Docker must work, the exact supported `sbx` version must pass machine-readable diagnostics, the controller architecture must have a matching native guest template, and capacity/template admission must pass. Windows x86_64 has the recorded real-host lifecycle evidence. The ARM64 implementation is architecture-complete, but equivalent real-host build, load, lifecycle, and independent-certification evidence has not yet been recorded. macOS and Linux also lack equivalent EPAR real-host evidence in this repository.
+EPAR selects this provider by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, the controller architecture must have a matching native guest template, and capacity/template admission must pass. Windows x86_64 has the recorded real-host lifecycle evidence. The ARM64 implementation is architecture-complete, but equivalent real-host build, load, lifecycle, and independent-certification evidence has not yet been recorded. macOS and Linux also lack equivalent EPAR real-host evidence in this repository.
 
 ## Prerequisites
 
 - A working Docker CLI and daemon.
-- Docker Sandboxes CLI exactly `v0.35.0`; `sbx diagnose --output json` must report at least one passing check and no failed checks.
+- Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Warnings and skipped checks do not make the provider unavailable.
 - A native `amd64` or `arm64` controller with the matching `linux/amd64` or `linux/arm64` EPAR template. EPAR does not use emulation to admit a mismatched template.
 - A locally built and loaded, lock-selected Candidate A template whose full local identity matches configuration.
 - Enough Docker Sandboxes backing storage for the configured root disk, Docker disk, existing reservations, and host-free watermark.

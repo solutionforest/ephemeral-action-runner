@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,11 +20,8 @@ import (
 )
 
 const (
-	SupportedVersion      = "0.35.0"
 	defaultOutputLimit    = 8 << 20
 	diagnosticOutputLimit = 256 << 10
-	versionCheckAttempts  = 2
-	versionRetryDelay     = 200 * time.Millisecond
 	commandWaitDelay      = 5 * time.Second
 	keepaliveStartupDelay = 500 * time.Millisecond
 )
@@ -56,8 +52,6 @@ docker info --format '{{json .ServerVersion}}'`
 type Provider struct {
 	Binary string
 
-	versionMu       sync.Mutex
-	versionVerified bool
 	runCommand      runCommandFunc
 	inspectImage    inspectImageFunc
 	inspectTemplate inspectLocalTemplateFunc
@@ -128,29 +122,19 @@ func (*Provider) EnsureArtifacts(_ context.Context, dryRun bool) (bool, error) {
 	return true, nil
 }
 
-// VerifyVersion checks that the installed Docker Sandboxes CLI is the exact
-// version supported by this EPAR build without performing any lifecycle action.
-func (p *Provider) VerifyVersion(ctx context.Context) error {
-	return p.ensureVersion(ctx)
-}
-
-// VerifyHostReadiness checks the exact supported CLI version and requires
-// machine-readable Docker Sandboxes diagnostics to contain at least one
-// passing check and no failed checks. Warnings such as an available update do
-// not make an otherwise healthy installation unavailable.
+// VerifyHostReadiness requires machine-readable Docker Sandboxes diagnostics
+// to contain at least one passing check and no failed checks. Warnings and
+// skipped checks do not make an otherwise healthy installation unavailable.
 func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, error) {
-	if err := p.ensureVersion(ctx); err != nil {
-		return HostReadiness{}, err
-	}
 	readiness, err := p.readHostReadiness(ctx)
 	if err != nil {
-		return HostReadiness{}, err
+		return HostReadiness{}, fmt.Errorf("%w; run 'sbx diagnose --output json' and review its output", err)
 	}
 	if readiness.ChecksFailed != 0 {
-		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported %d failed check(s)", readiness.ChecksFailed)
+		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported %d failed check(s); run 'sbx diagnose --output json' and review the hints for each failed check", readiness.ChecksFailed)
 	}
 	if readiness.ChecksPassed == 0 {
-		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported no passing checks")
+		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported no passing checks; run 'sbx diagnose --output json' and review its check details")
 	}
 	return readiness, nil
 }
@@ -253,10 +237,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 // inject into every sandbox. EPAR deliberately does not consume global secrets;
 // repository and workflow input can never opt out of this check.
 func (p *Provider) VerifyAdmission(ctx context.Context) error {
-	p.versionMu.Lock()
-	err := p.verifyVersionLocked(ctx)
-	p.versionMu.Unlock()
-	if err != nil {
+	if _, err := p.VerifyHostReadiness(ctx); err != nil {
 		return err
 	}
 	return p.verifyNoGlobalSecrets(ctx)
@@ -289,7 +270,7 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if err := decodeStrictJSON([]byte(result.Stdout), &inspection); err != nil {
 		return fmt.Errorf("docker sandbox inspection returned an unsupported JSON schema")
 	}
-	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || stringValue(inspection["daemon_version"]) != "v"+SupportedVersion {
+	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
 	var mcpGateway bool
@@ -542,7 +523,7 @@ func (p *Provider) Diagnostics(ctx context.Context, instance provider.Instance) 
 		return provider.Diagnostics{}, err
 	}
 	return provider.Diagnostics{
-		Healthy:       daemonHealthy && readiness.ChecksWarned == 0 && readiness.ChecksFailed == 0 && readiness.ChecksSkipped == 0,
+		Healthy:       daemonHealthy && readiness.ChecksPassed > 0 && readiness.ChecksFailed == 0,
 		DaemonState:   daemonState,
 		ChecksPassed:  readiness.ChecksPassed,
 		ChecksWarned:  readiness.ChecksWarned,
@@ -618,9 +599,6 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 }
 
 func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, error) {
-	if err := p.ensureVersion(ctx); err != nil {
-		return nil, err
-	}
 	return p.inventoryVerified(ctx)
 }
 
@@ -636,9 +614,6 @@ func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryI
 // template cache inventory. It does not create, load, or otherwise mutate a
 // template.
 func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error) {
-	if err := p.ensureVersion(ctx); err != nil {
-		return nil, err
-	}
 	result, err := p.run(ctx, commandRequest{
 		args:        []string{"template", "ls", "--json"},
 		operation:   "read docker sandbox template cache",
@@ -782,9 +757,6 @@ func (p *Provider) assertIdentity(ctx context.Context, instance provider.Instanc
 	if err := validateInstance(instance, true); err != nil {
 		return false, err
 	}
-	if err := p.ensureVersion(ctx); err != nil {
-		return false, err
-	}
 	items, err := p.inventoryVerified(ctx)
 	if err != nil {
 		return false, err
@@ -799,38 +771,6 @@ func (p *Provider) assertIdentity(ctx context.Context, instance provider.Instanc
 		return true, nil
 	}
 	return false, nil
-}
-
-func (p *Provider) ensureVersion(ctx context.Context) error {
-	p.versionMu.Lock()
-	defer p.versionMu.Unlock()
-	if p.versionVerified {
-		return nil
-	}
-	return p.verifyVersionLocked(ctx)
-}
-
-func (p *Provider) verifyVersionLocked(ctx context.Context) error {
-	for attempt := 1; attempt <= versionCheckAttempts; attempt++ {
-		result, err := p.run(ctx, commandRequest{args: []string{"version"}, operation: "check docker sandboxes version"})
-		if err != nil {
-			return err
-		}
-		if isSupportedVersion(result.Stdout) {
-			p.versionVerified = true
-			return nil
-		}
-		if attempt < versionCheckAttempts {
-			timer := time.NewTimer(versionRetryDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-	}
-	return fmt.Errorf("unsupported docker sandboxes version after %d checks; exactly v%s is required", versionCheckAttempts, SupportedVersion)
 }
 
 func (p *Provider) run(ctx context.Context, request commandRequest) (provider.ExecResult, error) {

@@ -247,6 +247,11 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/test/no-go-first-run-smoke.sh
 
+      - name: Verify start command forwarding
+        shell: bash
+        if: runner.os != 'Windows'
+        run: bash scripts/test/start-command-forwarding.sh
+
       - name: Verify native-controller cache retention
         shell: bash
         if: runner.os != 'Windows'
@@ -265,6 +270,7 @@ jobs:
             scripts/test/host-trust-wrapper-smoke.sh \
             scripts/test/native-controller-cache-retention.sh \
             scripts/test/no-go-first-run-smoke.sh \
+            scripts/test/start-command-forwarding.sh \
             scripts/guest/ubuntu/apply-trusted-ca-runtime.sh \
             scripts/guest/ubuntu/check-host-trust-generation.sh
 

@@ -63,7 +63,6 @@ ENV HOME=/home/agent \
     LOGNAME=agent \
     EPAR_ACTIONS_RUNNER_DIR=/opt/actions-runner \
     EPAR_RUNNER_WORK_DIR=/opt/actions-runner \
-    EPAR_TEMPLATE_SBX_VERSION=0.35.0 \
     EPAR_TEMPLATE_PLATFORM=${TEMPLATE_PLATFORM} \
     DEBIAN_FRONTEND=dialog
 
@@ -71,7 +70,6 @@ LABEL com.docker.sandboxes.start-docker=true \
     io.solutionforest.epar.template.candidate="A" \
     io.solutionforest.epar.template.profile="${SOURCE_PROFILE}" \
     io.solutionforest.epar.template.platform="${TEMPLATE_PLATFORM}" \
-    io.solutionforest.epar.template.sbx-version="0.35.0" \
     io.solutionforest.epar.template.runner-version="2.332.0" \
     io.solutionforest.epar.template.source-index-digest="${SOURCE_INDEX_DIGEST}" \
     io.solutionforest.epar.template.source-manifest-digest="${SOURCE_MANIFEST_DIGEST}" \

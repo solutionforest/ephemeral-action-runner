@@ -188,8 +188,8 @@ var dockerSandboxesOpenDefaultDenyResources = []string{
 }
 
 // DockerSandboxesOpenDefaultDenyResources returns host aliases that EPAR denies
-// in every sandbox-scoped Open policy. Docker Sandboxes v0.35.0 can proxy an
-// allowed host.docker.internal request to a native-host loopback service, so
+// in every sandbox-scoped Open policy. Docker Sandboxes can proxy an allowed
+// host.docker.internal request to a native-host loopback service, so
 // public egress must not implicitly enable these host-service aliases.
 func DockerSandboxesOpenDefaultDenyResources() []string {
 	return append([]string(nil), dockerSandboxesOpenDefaultDenyResources...)

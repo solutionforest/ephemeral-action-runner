@@ -155,7 +155,9 @@ type initOptions struct {
 	Force              bool
 	SkipDockerCheck    bool
 	SkipHostTrustCheck bool
+	EmbeddedInStart    bool
 	In                 io.Reader
+	Reader             *bufio.Reader
 	Out                io.Writer
 }
 
@@ -219,7 +221,10 @@ func runInitWithOptions(opts initOptions) error {
 	fmt.Fprintln(opts.Out, "See README.md and docs/github-app.md for the GitHub App steps.")
 	fmt.Fprintln(opts.Out, "")
 
-	reader := bufio.NewReader(opts.In)
+	reader := opts.Reader
+	if reader == nil {
+		reader = bufio.NewReader(opts.In)
+	}
 	appID, err := promptRequiredInt64(opts.Out, reader, "GitHub App ID")
 	if err != nil {
 		return err
@@ -313,9 +318,11 @@ func runInitWithOptions(opts initOptions) error {
 		return err
 	}
 
+	fmt.Fprintf(opts.Out, "\nCreated %s\n", opts.ConfigPath)
+	if opts.EmbeddedInStart {
+		return nil
+	}
 	fmt.Fprintf(opts.Out, `
-Created %s
-
 Next:
   %s start
 
@@ -323,7 +330,7 @@ Manual/advanced:
   %s image build --replace
   %s pool verify --instances 2 --register-only --cleanup
   %s pool up --instances 2
-`, opts.ConfigPath, binaryName, binaryName, binaryName, binaryName)
+`, binaryName, binaryName, binaryName, binaryName)
 	return nil
 }
 
@@ -709,6 +716,38 @@ type initProviderPrerequisites struct {
 func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, sandboxpromotion.Record, *initDockerSandboxesProfile, error) {
 	hostPlatform := initSandboxPromotionPlatform()
 	record, promoted := initSandboxPromotionLookup(hostPlatform)
+	for {
+		providerType, promotionPassed, refresh, err := promptInitProviderChoice(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck)
+		if err != nil {
+			return "", sandboxpromotion.Record{}, nil, err
+		}
+		if refresh {
+			fmt.Fprintln(out, "Refreshing provider prerequisites...")
+			continue
+		}
+		if providerType != "docker-sandboxes" {
+			return providerType, sandboxpromotion.Record{}, nil, nil
+		}
+		if promotionPassed {
+			return providerType, record, nil, nil
+		}
+		if !promoted {
+			if _, _, err := dockerSandboxesPlatform(hostPlatform); err == nil {
+				profile, accepted, profileErr := promptDockerSandboxesProfile(ctx, projectRoot, hostPlatform, out, reader)
+				if profileErr != nil {
+					return "", sandboxpromotion.Record{}, nil, profileErr
+				}
+				if !accepted {
+					return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes setup did not complete; no config was written")
+				}
+				return providerType, sandboxpromotion.Record{}, profile, nil
+			}
+		}
+		return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes selection is unavailable")
+	}
+}
+
+func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, bool, bool, error) {
 	prerequisites := detectInitProviderPrerequisites(ctx, hostPlatform, skipDockerCheck)
 	operationalDefault := !promoted && prerequisites.DockerSandboxesAvailable
 	promotionPassed := false
@@ -757,29 +796,11 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 	} else if promoted || !prerequisites.DockerAvailable {
 		defaultProvider = ""
 	}
-	providerType, err := promptProviderOptions(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider)
+	providerType, refresh, err := promptProviderOptions(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider)
 	if err != nil {
-		return "", sandboxpromotion.Record{}, nil, err
+		return "", false, false, err
 	}
-	if providerType != "docker-sandboxes" {
-		return providerType, sandboxpromotion.Record{}, nil, nil
-	}
-	if promotionPassed {
-		return providerType, record, nil, nil
-	}
-	if !promoted {
-		if _, _, err := dockerSandboxesPlatform(hostPlatform); err == nil {
-			profile, accepted, profileErr := promptDockerSandboxesProfile(ctx, projectRoot, hostPlatform, out, reader)
-			if profileErr != nil {
-				return "", sandboxpromotion.Record{}, nil, profileErr
-			}
-			if !accepted {
-				return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes setup did not complete; no config was written")
-			}
-			return providerType, sandboxpromotion.Record{}, profile, nil
-		}
-	}
-	return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes selection is unavailable")
+	return providerType, promotionPassed, refresh, nil
 }
 
 func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
@@ -1059,16 +1080,13 @@ func formatInitUintByteCount(value uint64) string {
 }
 
 func dockerSandboxesRootMeasurement(hostPlatform sandboxpromotion.Platform, template initDockerSandboxesTemplate) (initDockerSandboxesRootMeasurement, bool) {
-	const (
-		evidenceSBXVersion = "0.35.0"
-		fullTemplateDigest = "sha256:00303a3e249a1baf8b0585d20273af408c27182dcfc827a98aa25ffe66b1f67f"
-	)
-	if dockersandboxes.SupportedVersion != evidenceSBXVersion || hostPlatform != sandboxpromotion.WindowsAMD64 || template.Digest != fullTemplateDigest || template.Platform != "linux/amd64" {
+	const fullTemplateDigest = "sha256:00303a3e249a1baf8b0585d20273af408c27182dcfc827a98aa25ffe66b1f67f"
+	if hostPlatform != sandboxpromotion.WindowsAMD64 || template.Digest != fullTemplateDigest || template.Platform != "linux/amd64" {
 		return initDockerSandboxesRootMeasurement{}, false
 	}
 	return initDockerSandboxesRootMeasurement{
 		PeakBytes: 324_780_032,
-		Evidence:  "exact full-template Buildx and Compose validation probe on Docker Sandboxes v0.35.0",
+		Evidence:  "exact full-template Buildx and Compose validation probe on Docker Sandboxes",
 	}, true
 }
 
@@ -1240,10 +1258,13 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 				result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — provider storage %s has %s available; the minimum valid sandbox and host reserve require %s (shortfall %s)", capacityResult.StorageRoot, formatInitUintByteCount(capacityResult.AvailableBytes), formatInitUintByteCount(capacityResult.RequiredBytes), formatInitUintByteCount(capacityResult.DeficitBytes))
 			default:
 				result.DockerSandboxesAvailable = true
-				result.DockerSandboxesStatus = fmt.Sprintf("READY — Docker and sbx v%s diagnostics passed (%d pass, %d warn, %d fail, %d skip); minimum storage admission passed", dockersandboxes.SupportedVersion, readiness.ChecksPassed, readiness.ChecksWarned, readiness.ChecksFailed, readiness.ChecksSkipped)
+				result.DockerSandboxesStatus = fmt.Sprintf("READY — Docker and sbx diagnostics passed (%d pass, %d warn, %d fail, %d skip); minimum storage admission passed", readiness.ChecksPassed, readiness.ChecksWarned, readiness.ChecksFailed, readiness.ChecksSkipped)
 			}
 		} else {
-			result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — sbx v%s readiness failed: %v", dockersandboxes.SupportedVersion, err)
+			result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — sbx readiness failed: %v", err)
+			if !strings.Contains(err.Error(), "sbx diagnose --output json") {
+				result.DockerSandboxesStatus += ". Run 'sbx diagnose --output json' and review the hints for each failed check."
+			}
 		}
 	}
 
@@ -1271,7 +1292,7 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 	return result
 }
 
-func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string) (string, error) {
+func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string) (string, bool, error) {
 	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
 	for _, descriptor := range providerregistry.Descriptors() {
 		option := initProviderOption{
@@ -1299,12 +1320,12 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			option.Available = prerequisites.TartAvailable
 			option.Status = prerequisites.TartStatus
 		default:
-			return "", fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
+			return "", false, fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
 		}
 		options = append(options, option)
 	}
 	if err := validateWizardProviderOptions(options); err != nil {
-		return "", err
+		return "", false, err
 	}
 	defaultNumber := prioritizeDefaultProviderOption(options, defaultProvider)
 
@@ -1322,6 +1343,7 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 		fmt.Fprintf(out, "  %s. %s%s\n", option.Number, option.Label, defaultLabel)
 		fmt.Fprintf(out, "     Prerequisites: %s\n", option.Status)
 	}
+	fmt.Fprintln(out, "  R. Refresh provider prerequisites")
 	for {
 		var value string
 		var hitEOF bool
@@ -1330,7 +1352,7 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			fmt.Fprint(out, "Runner provider: ")
 			value, err = reader.ReadString('\n')
 			if err != nil && !errors.Is(err, io.EOF) {
-				return "", err
+				return "", false, err
 			}
 			hitEOF = errors.Is(err, io.EOF)
 			if hitEOF {
@@ -1341,9 +1363,12 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			value, hitEOF, err = promptDefault(out, reader, "Runner provider", defaultNumber)
 		}
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		normalized := strings.ToLower(value)
+		if normalized == "r" || normalized == "refresh" {
+			return "", true, nil
+		}
 		var selected *initProviderOption
 		for index := range options {
 			option := &options[index]
@@ -1362,18 +1387,18 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			}
 		}
 		if selected != nil && selected.Available {
-			return selected.Type, nil
+			return selected.Type, false, nil
 		}
 		if selected != nil {
 			fmt.Fprintf(out, "%s is unavailable: %s\n", selected.Label, selected.Status)
 		} else {
-			fmt.Fprintln(out, "Choose an available provider number or name shown above.")
+			fmt.Fprintln(out, "Choose an available provider number or name shown above, or R to refresh.")
 		}
 		if hitEOF {
 			if selected != nil {
-				return "", fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
+				return "", false, fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
 			}
-			return "", fmt.Errorf("invalid runner provider %q", value)
+			return "", false, fmt.Errorf("invalid runner provider %q", value)
 		}
 	}
 }

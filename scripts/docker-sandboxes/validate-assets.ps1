@@ -218,7 +218,7 @@ if ($guestText -match '(?im)\btail\s+(?:-[^\s]+\s+)*["'']?\$\{?(?:log_file|runne
     throw 'Guest helpers must not copy runner or job log content into controller-visible output'
 }
 
-Write-Host '[4/6] Parsing compatibility metadata and enforcing sbx v0.35.0 only.'
+Write-Host '[4/6] Parsing compatibility metadata.'
 foreach ($profileName in $expectedProfiles.Keys) {
     $profile = $lock.profiles.PSObject.Properties[$profileName].Value
     foreach ($platformName in $expectedPlatforms.Keys) {
@@ -233,8 +233,6 @@ foreach ($profileName in $expectedProfiles.Keys) {
         Assert-Equal "$profileName $platformName source reference" $compatibility.source.reference $profile.immutableReference
         Assert-Equal "$profileName $platformName source index" $compatibility.source.indexDigest $profile.indexDigest
         Assert-Equal "$profileName $platformName source manifest" $compatibility.source.manifestDigest $profilePlatform.manifestDigest
-        Assert-Equal "$profileName $platformName supported sbx count" @($compatibility.supportedSbxVersions).Count 1
-        Assert-Equal "$profileName $platformName supported sbx version" $compatibility.supportedSbxVersions[0] '0.35.0'
         Assert-Equal "$profileName $platformName daemon count" $compatibility.docker.expectedDaemonCount 1
         Assert-Equal "$profileName $platformName daemon owner" $compatibility.docker.daemonOwner 'docker-sandboxes-runtime'
         Assert-Equal "$profileName $platformName /var/lib/docker preload" $compatibility.docker.imagePreloadsVarLibDocker $false

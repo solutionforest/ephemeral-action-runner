@@ -67,9 +67,9 @@ func Fingerprint(rules []provider.NetworkPolicyRule) (string, error) {
 }
 
 // VerifyBaseline requires a complete active global baseline plus only the
-// exact built-in rule that Docker Sandboxes v0.35.0 may attach to a shell
-// sandbox. The global content fingerprint remains stable across sandbox names
-// and provider-generated rule IDs; the built-in rule is verified structurally.
+// exact built-in rule that Docker Sandboxes may attach to a shell sandbox. The
+// global content fingerprint remains stable across sandbox names and
+// provider-generated rule IDs; the built-in rule is verified structurally.
 func VerifyBaseline(expectedFingerprint, sandboxName string, rules []provider.NetworkPolicyRule) error {
 	global, scoped, err := partition(sandboxName, rules)
 	if err != nil {
@@ -237,8 +237,8 @@ func isExactSandboxScope(rule provider.NetworkPolicyRule, sandboxName string) bo
 }
 
 // IsExpectedBuiltinRule identifies the exact non-editable shell-kit egress
-// rule observed in Docker Sandboxes v0.35.0. It deliberately checks every
-// stable semantic field while allowing provider-generated IDs to vary.
+// rule observed in Docker Sandboxes. It deliberately checks every stable
+// semantic field while allowing provider-generated IDs to vary.
 func IsExpectedBuiltinRule(sandboxName string, rule provider.NetworkPolicyRule) bool {
 	return isExactSandboxScope(rule, sandboxName) &&
 		rule.Name == "kit:"+sandboxName &&

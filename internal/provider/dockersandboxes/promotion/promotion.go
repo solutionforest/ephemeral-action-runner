@@ -20,7 +20,6 @@ const (
 type Record struct {
 	Platform                 Platform
 	EPARRevision             string
-	SBXVersion               string
 	Template                 string
 	TemplateDigest           string
 	TemplateCacheID          string
@@ -81,7 +80,6 @@ func Validate(record Record) error {
 	}
 	for key, value := range map[string]string{
 		"EPAR revision":      record.EPARRevision,
-		"sbx version":        record.SBXVersion,
 		"template":           record.Template,
 		"template digest":    record.TemplateDigest,
 		"template cache ID":  record.TemplateCacheID,
@@ -97,9 +95,6 @@ func Validate(record Record) error {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("Docker Sandboxes promotion record %s is required", key)
 		}
-	}
-	if record.SBXVersion != "0.35.0" {
-		return fmt.Errorf("Docker Sandboxes promotion record requires sbx version 0.35.0")
 	}
 	if !validSHA256(record.EPARRevision) {
 		return fmt.Errorf("Docker Sandboxes promotion record EPAR revision must be an exact clean source/build sha256 identity")

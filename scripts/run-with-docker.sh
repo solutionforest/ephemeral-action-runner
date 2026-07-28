@@ -89,7 +89,9 @@ run_controller() {
     -v "${repo_root}:/app" -w /app
     -v "${docker_sock}:/var/run/docker.sock"
   )
-  docker_args+=("${go_cache_docker_flags[@]}")
+  if ((${#go_cache_docker_flags[@]})); then
+    docker_args+=("${go_cache_docker_flags[@]}")
+  fi
   docker_args+=("$dev_image" go run ./cmd/ephemeral-action-runner "$@")
   docker "${docker_args[@]}"
 }

@@ -17,15 +17,16 @@ import (
 )
 
 const (
-	testName         = "epar-sandbox-1"
-	testID           = "9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b"
-	testWorkspace    = "/var/lib/epar/staging/job-1"
-	testTemplate     = "docker.io/docker/sandbox-templates:shell-docker"
-	testDigest       = "sha256:39cf20eca8610000000000000000000000000000000000000000000000000000"
-	readyListJSON    = `{"sandboxes":[{"id":"9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b","name":"epar-sandbox-1","status":"running","workspaces":["/var/lib/epar/staging/job-1"],"agent":"shell","additive_field":true}]}`
-	emptyPortsJSON   = `[]`
-	templateListJSON = `{"images":[{"id":"39cf20eca861","repository":"docker.io/docker/sandbox-templates","tag":"shell-docker","flavor":"shell-docker","created_at":"2026-07-22T07:13:19Z","size":599103243}]}`
-	inspectionJSON   = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":"/var/lib/epar/staging/job-1","network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","mcp_gateway":false,"sessions":0,"daemon_version":"v0.35.0","daemon_uptime":"1h"}`
+	testName            = "epar-sandbox-1"
+	testID              = "9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b"
+	testWorkspace       = "/var/lib/epar/staging/job-1"
+	testTemplate        = "docker.io/docker/sandbox-templates:shell-docker"
+	testDigest          = "sha256:39cf20eca8610000000000000000000000000000000000000000000000000000"
+	readyListJSON       = `{"sandboxes":[{"id":"9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b","name":"epar-sandbox-1","status":"running","workspaces":["/var/lib/epar/staging/job-1"],"agent":"shell","additive_field":true}]}`
+	emptyPortsJSON      = `[]`
+	templateListJSON    = `{"images":[{"id":"39cf20eca861","repository":"docker.io/docker/sandbox-templates","tag":"shell-docker","flavor":"shell-docker","created_at":"2026-07-22T07:13:19Z","size":599103243}]}`
+	inspectionJSON      = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":"/var/lib/epar/staging/job-1","network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","mcp_gateway":false,"sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
+	healthyDiagnoseJSON = `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""}],"summary":{"pass":1,"warn":0,"fail":0,"skip":0}}`
 )
 
 var testInstance = provider.Instance{Name: testName, ProviderID: testID, Source: "shell", State: "running"}
@@ -101,7 +102,7 @@ func scriptedProvider(t *testing.T, steps ...commandStep) (*Provider, func()) {
 	}
 }
 
-func TestCreateUsesOnlyPinnedVersionAndExactArgv(t *testing.T) {
+func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	wantCreate := []string{
 		"create", "--name", testName,
 		"--cpus", "4",
@@ -110,7 +111,7 @@ func TestCreateUsesOnlyPinnedVersionAndExactArgv(t *testing.T) {
 		"shell", testWorkspace,
 	}
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
@@ -167,7 +168,7 @@ func TestSplitTemplateReferenceCanonicalizesDockerHubNames(t *testing.T) {
 func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 	mismatch := strings.Replace(templateListJSON, "39cf20eca861", "aaaaaaaaaaaa", 1)
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}},
 	)
@@ -179,7 +180,7 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 
 func TestCreateFailsClosedWhenFullLocalImageIdentityDiffersDespiteMatchingCacheID(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 	)
 	p.inspectImage = func(context.Context, string) (string, error) {
@@ -193,7 +194,7 @@ func TestCreateFailsClosedWhenFullLocalImageIdentityDiffersDespiteMatchingCacheI
 
 func TestCreateFailsClosedWhenFullLocalImageIdentityCannotBeRead(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 	)
 	p.inspectImage = func(context.Context, string) (string, error) {
@@ -208,7 +209,7 @@ func TestCreateFailsClosedWhenFullLocalImageIdentityCannotBeRead(t *testing.T) {
 func TestCreateFailsClosedWithoutEchoingGlobalSecretMetadata(t *testing.T) {
 	const listedMetadata = "github registry masked-prefix masked-suffix"
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: listedMetadata}},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
@@ -221,6 +222,14 @@ func TestCreateFailsClosedWithoutEchoingGlobalSecretMetadata(t *testing.T) {
 func TestInstanceAdmissionUsesExactInspectionAndRejectsAttachedCapabilities(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
 		p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}})
+		if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err != nil {
+			t.Fatal(err)
+		}
+		done()
+	})
+	t.Run("different daemon version", func(t *testing.T) {
+		fixture := strings.Replace(inspectionJSON, `"daemon_version":"fixture-current"`, `"daemon_version":"fixture-next"`, 1)
+		p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
 		if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err != nil {
 			t.Fatal(err)
 		}
@@ -264,7 +273,6 @@ func TestInstanceAdmissionRejectsPublishedPortInventory(t *testing.T) {
 				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 				commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: test.fixture}},
 			)
-			p.versionVerified = true
 			if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err == nil || !strings.Contains(err.Error(), test.message) {
 				t.Fatalf("published port admission error = %v", err)
 			}
@@ -309,9 +317,8 @@ func TestParseTemplateInventoryAcceptsCustomTemplateWithoutFlavor(t *testing.T) 
 	}
 }
 
-func TestCachedTemplatesUsesExactVersionAndMachineReadableInventory(t *testing.T) {
+func TestCachedTemplatesUsesMachineReadableInventoryWithoutVersionGate(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 	)
 	templates, err := p.CachedTemplates(context.Background())
@@ -330,7 +337,6 @@ func TestCachedTemplatesUsesExactVersionAndMachineReadableInventory(t *testing.T
 
 func TestCachedTemplatesFailsClosedOnMalformedInventory(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"not-a-cache-id"}]}`}},
 	)
 	if _, err := p.CachedTemplates(context.Background()); err == nil {
@@ -345,7 +351,6 @@ func TestReadGlobalNetworkPolicyUsesGlobalOnlyReadback(t *testing.T) {
 		{"id":"sandbox-1","name":"sandbox","policy_id":"local","scope":"sandbox:epar-sandbox-1","applies_to":"sandbox:epar-sandbox-1","resource_type":"network","decision":"deny","resources":["**"],"origin":"scoped","status":"inactive","editable":true,"sandbox_id":"epar-sandbox-1"}
 	]`)
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
 		commandStep{args: []string{"policy", "ls", "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: fixture}},
 	)
 	rules, err := p.ReadGlobalNetworkPolicy(context.Background())
@@ -360,7 +365,6 @@ func TestReadGlobalNetworkPolicyUsesGlobalOnlyReadback(t *testing.T) {
 
 func TestReadGlobalNetworkPolicyFailsClosedOnMalformedJSON(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
 		commandStep{args: []string{"policy", "ls", "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: `{"rules":null}`}},
 	)
 	if _, err := p.ReadGlobalNetworkPolicy(context.Background()); err == nil {
@@ -435,22 +439,20 @@ func TestInspectLocalTemplatePreservesValidatedIdentityAndPlatform(t *testing.T)
 	}
 }
 
-func TestVersionGateFailsClosedBeforeMutation(t *testing.T) {
+func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.36.0\n"}},
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.36.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
-	if err == nil || !strings.Contains(err.Error(), "exactly v0.35.0") {
+	if err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --output json") || !strings.Contains(err.Error(), "hints for each failed check") {
 		t.Fatalf("err = %v", err)
 	}
 	done()
 }
 
-func TestVersionGateRetriesOneTransientUnsupportedRead(t *testing.T) {
+func TestAdmissionUsesDiagnosticsWithoutReadingVersion(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: ""}},
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
@@ -459,38 +461,22 @@ func TestVersionGateRetriesOneTransientUnsupportedRead(t *testing.T) {
 	done()
 }
 
-func TestVersionGateAcceptsExactInstalledV035Output(t *testing.T) {
-	if !isSupportedVersion("sbx version: v0.35.0 01e01520456e4126a9653471e7072e4d9b280321\r\n") {
-		t.Fatal("installed v0.35.0 output was rejected")
-	}
-	for _, output := range []string{
-		"sbx version: v0.35.0 untrusted-suffix\n",
-		"sbx version: v0.35.1 01e01520456e4126a9653471e7072e4d9b280321\n",
-		"v0.35.0\n",
-	} {
-		if isSupportedVersion(output) {
-			t.Fatalf("unsupported version output was accepted: %q", output)
-		}
-	}
-}
-
-func TestAdmissionRechecksVersionAfterSuccessfulCache(t *testing.T) {
+func TestAdmissionRechecksDiagnostics(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.36.0\n"}},
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.36.0\n"}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.VerifyAdmission(context.Background()); err == nil || !strings.Contains(err.Error(), "exactly v0.35.0") {
-		t.Fatalf("in-place sbx version drift was accepted: %v", err)
+	if err := p.VerifyAdmission(context.Background()); err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --output json") || !strings.Contains(err.Error(), "hints for each failed check") {
+		t.Fatalf("failed diagnostics were accepted: %v", err)
 	}
 	done()
 }
 
-func TestInventoryParsesV035WrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
+func TestInventoryParsesWrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
 	items, err := parseInventory([]byte(readyListJSON))
 	if err != nil {
 		t.Fatal(err)
@@ -590,7 +576,6 @@ func TestExecPreservesGuestArgvStdinAndRedactsAllSurfaces(t *testing.T) {
 
 func TestExecCancellationPropagatesWithoutRealSbx(t *testing.T) {
 	p := New("sbx-test-double")
-	p.versionVerified = true
 	call := 0
 	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
 		call++
@@ -675,7 +660,6 @@ func TestStopAndDeleteAreIdempotentWhenInventorySaysMissing(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t, commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}})
-			p.versionVerified = true
 			if err := test.call(p); err != nil {
 				t.Fatal(err)
 			}
@@ -687,7 +671,6 @@ func TestStopAndDeleteAreIdempotentWhenInventorySaysMissing(t *testing.T) {
 func TestIdentityMismatchFailsBeforeStateMutation(t *testing.T) {
 	mismatch := strings.Replace(readyListJSON, testID, "different-id", 1)
 	p, done := scriptedProvider(t, commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}})
-	p.versionVerified = true
 	if err := p.Delete(context.Background(), testInstance); err == nil || !strings.Contains(err.Error(), "identity changed") {
 		t.Fatalf("err = %v", err)
 	}
@@ -698,11 +681,10 @@ func TestDiagnosticsUsesBoundedMachineReadableCommands(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"running","socket":"\\\\.\\pipe\\docker_kaname_sandboxd","logs":"C:\\logs\\daemon.log"}`}},
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"ok","detail":"","hint":""}],"summary":{"pass":1,"warn":0,"fail":0,"skip":0}}`}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"ok","detail":"","hint":""},{"name":"optional update","status":"warn","message":"available","detail":"","hint":""},{"name":"optional integration","status":"skip","message":"not configured","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":1}}`}},
 	)
-	p.versionVerified = true
 	diagnostics, err := p.Diagnostics(context.Background(), testInstance)
-	if err != nil || !diagnostics.Healthy || diagnostics.ChecksPassed != 1 {
+	if err != nil || !diagnostics.Healthy || diagnostics.ChecksPassed != 1 || diagnostics.ChecksWarned != 1 || diagnostics.ChecksSkipped != 1 {
 		t.Fatalf("diagnostics = %#v, err = %v", diagnostics, err)
 	}
 	done()
@@ -710,8 +692,7 @@ func TestDiagnosticsUsesBoundedMachineReadableCommands(t *testing.T) {
 
 func TestVerifyHostReadinessAcceptsWarningsWithPassingChecksAndNoFailures(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""},{"name":"binary version","status":"warn","message":"update available","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":0}}`}},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""},{"name":"optional update","status":"warn","message":"available","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":0}}`}},
 	)
 	readiness, err := p.VerifyHostReadiness(context.Background())
 	if err != nil {
@@ -743,11 +724,38 @@ func TestVerifyHostReadinessRejectsFailedOrEmptyDiagnostics(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t,
-				commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: "sbx version v0.35.0\n"}},
 				commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: test.fixture}},
 			)
-			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("VerifyHostReadiness() error = %v, want %q", err, test.want)
+			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "sbx diagnose --output json") {
+				t.Fatalf("VerifyHostReadiness() error = %v, want %q and diagnostic command", err, test.want)
+			}
+			done()
+		})
+	}
+}
+
+func TestVerifyHostReadinessRejectsCommandAndSchemaFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		step commandStep
+		want string
+	}{
+		{
+			name: "command failure",
+			step: commandStep{args: []string{"diagnose", "--output", "json"}, err: errors.New("diagnose unavailable")},
+			want: "diagnose unavailable",
+		},
+		{
+			name: "malformed json",
+			step: commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"summary":`}},
+			want: "unsupported json schema",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p, done := scriptedProvider(t, test.step)
+			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "sbx diagnose --output json") {
+				t.Fatalf("VerifyHostReadiness() error = %v, want %q and diagnostic command", err, test.want)
 			}
 			done()
 		})
@@ -766,7 +774,6 @@ func TestDiagnosticsRejectsOversizedOutput(t *testing.T) {
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: strings.Repeat("x", diagnosticOutputLimit+1)}},
 	)
-	p.versionVerified = true
 	if _, err := p.Diagnostics(context.Background(), testInstance); err == nil || !strings.Contains(err.Error(), "output limit") {
 		t.Fatalf("err = %v", err)
 	}
@@ -784,7 +791,6 @@ func TestPolicyCommandsAreSandboxScopedAndReadBackExactRules(t *testing.T) {
 			commandStep{args: []string{"policy", "allow", "network", "--sandbox", testName, "api.example.com,*.packages.example.com:443"}},
 			commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: policyJSON}},
 		)
-		p.versionVerified = true
 		if err := p.ApplyNetworkPolicy(context.Background(), testInstance, []provider.NetworkPolicyRule{rule}); err != nil {
 			t.Fatal(err)
 		}
@@ -797,7 +803,6 @@ func TestPolicyCommandsAreSandboxScopedAndReadBackExactRules(t *testing.T) {
 			commandStep{args: []string{"policy", "allow", "network", "--sandbox", testName, "**"}},
 			commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: policyFixture(`[` + globalRule + `,` + openRule + `]`)}},
 		)
-		p.versionVerified = true
 		if err := p.ApplyNetworkPolicy(context.Background(), testInstance, []provider.NetworkPolicyRule{{
 			Decision:  provider.NetworkPolicyAllow,
 			Resources: []string{"**"},
@@ -813,7 +818,6 @@ func TestPolicyCommandsAreSandboxScopedAndReadBackExactRules(t *testing.T) {
 			commandStep{args: []string{"policy", "rm", "network", "--sandbox", testName, "--id", "rule-1"}},
 			commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: policyFixture(`[` + globalRule + `]`)}},
 		)
-		p.versionVerified = true
 		remove := provider.NetworkPolicyRule{
 			ID:           "rule-1",
 			PolicyID:     "local",
@@ -838,7 +842,6 @@ func TestPolicyRemovalRefusesChangedStableIdentity(t *testing.T) {
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: fixture}},
 	)
-	p.versionVerified = true
 	changed := provider.NetworkPolicyRule{
 		ID:           "rule-1",
 		PolicyID:     "local",
@@ -884,7 +887,7 @@ func TestPolicyReadPreservesGlobalAndSandboxAttribution(t *testing.T) {
 	}
 }
 
-func TestPolicyReadPreservesExactV035KitAttribution(t *testing.T) {
+func TestPolicyReadPreservesExactKitAttribution(t *testing.T) {
 	fixture := policyFixture(`[{"id":"kit-rule-1","name":"kit:epar-sandbox-1","policy_id":"kit-policy-1","scope":"sandbox:epar-sandbox-1","applies_to":"sandbox:epar-sandbox-1","resource_type":"network","decision":"allow","resources":["openrouter.ai"],"origin":"scoped","status":"active","editable":false,"sandbox_id":"epar-sandbox-1"}]`)
 	rules, err := parseNetworkPolicy([]byte(fixture), testName)
 	if err != nil {
@@ -895,13 +898,13 @@ func TestPolicyReadPreservesExactV035KitAttribution(t *testing.T) {
 	}
 }
 
-func TestPolicyReadRejectsMismatchedV035SandboxAttribution(t *testing.T) {
+func TestPolicyReadRejectsMismatchedSandboxAttribution(t *testing.T) {
 	for _, fixture := range []string{
 		policyFixture(`[{"id":"rule-1","name":"rule","policy_id":"local","scope":"sandbox:epar-sandbox-1","applies_to":"sandbox:other-sandbox","resource_type":"network","decision":"allow","resources":["api.example.com"],"origin":"scoped","status":"active","editable":true,"sandbox_id":"epar-sandbox-1"}]`),
 		policyFixture(`[{"id":"rule-1","name":"rule","policy_id":"local","scope":"sandbox:epar-sandbox-1","applies_to":"sandbox:epar-sandbox-1","resource_type":"network","decision":"allow","resources":["api.example.com"],"origin":"scoped","status":"active","editable":true,"sandbox_id":"other-sandbox"}]`),
 	} {
 		if _, err := parseNetworkPolicy([]byte(fixture), testName); err == nil {
-			t.Fatalf("mismatched v0.35.0 sandbox attribution was accepted: %s", fixture)
+			t.Fatalf("mismatched sandbox attribution was accepted: %s", fixture)
 		}
 	}
 }
@@ -913,7 +916,6 @@ func TestPolicyRemovalRefusesGlobalRule(t *testing.T) {
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: fixture}},
 	)
-	p.versionVerified = true
 	if err := p.RemoveNetworkPolicy(context.Background(), testInstance, []provider.NetworkPolicyRule{global}); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
 		t.Fatalf("err = %v", err)
 	}
@@ -927,7 +929,6 @@ func TestPolicyRemovalRefusesFilesystemRule(t *testing.T) {
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: fixture}},
 	)
-	p.versionVerified = true
 	if err := p.RemoveNetworkPolicy(context.Background(), testInstance, []provider.NetworkPolicyRule{filesystem}); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
 		t.Fatalf("err = %v", err)
 	}
@@ -1019,7 +1020,6 @@ func identityScript(t *testing.T, operation commandStep) (*Provider, func()) {
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		operation,
 	)
-	p.versionVerified = true
 	return p, done
 }
 
@@ -1030,7 +1030,6 @@ func identityAdmissionScript(t *testing.T, inspection commandStep) (*Provider, f
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
 		inspection,
 	)
-	p.versionVerified = true
 	return p, done
 }
 

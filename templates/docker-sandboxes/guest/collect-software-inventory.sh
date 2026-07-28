@@ -3,7 +3,6 @@ set -euo pipefail
 
 printf 'schemaVersion\t1\n'
 printf 'platform\t%s\n' "${EPAR_TEMPLATE_PLATFORM:?EPAR_TEMPLATE_PLATFORM is required}"
-printf 'templateSbxVersion\t%s\n' "${EPAR_TEMPLATE_SBX_VERSION:-unknown}"
 printf '\n[os-release]\n'
 LC_ALL=C sort /etc/os-release
 printf '\n[dpkg]\n'

@@ -60,9 +60,6 @@ func (p *Provider) ReadNetworkPolicy(ctx context.Context, instance provider.Inst
 // never changes policy and preserves the attribution supplied by Docker
 // Sandboxes for every returned rule.
 func (p *Provider) ReadGlobalNetworkPolicy(ctx context.Context) ([]provider.NetworkPolicyRule, error) {
-	if err := p.ensureVersion(ctx); err != nil {
-		return nil, err
-	}
 	result, err := p.run(ctx, commandRequest{
 		args:        []string{"policy", "ls", "--include-inactive", "--json"},
 		operation:   "read docker sandboxes global network policy",

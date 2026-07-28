@@ -42,7 +42,7 @@ func TestVerifyBaselineRejectsUnexpectedOrInactiveRules(t *testing.T) {
 	}
 	withBuiltin := append(append([]provider.NetworkPolicyRule(nil), rules...), builtinRule("epar-1"))
 	if err := VerifyBaseline(fingerprint, "epar-1", withBuiltin); err != nil {
-		t.Fatalf("exact v0.35.0 shell-kit baseline rejected: %v", err)
+		t.Fatalf("exact shell-kit baseline rejected: %v", err)
 	}
 	unexpected := append(append([]provider.NetworkPolicyRule(nil), rules...), scopedRule("epar-1", "rule-1", provider.NetworkPolicyAllow, "example.test"))
 	if err := VerifyBaseline(fingerprint, "epar-1", unexpected); err == nil {

@@ -4,7 +4,6 @@
   "profile": "act-22.04",
   "validationStatus": "planned",
   "platform": "linux/amd64",
-  "supportedSbxVersions": ["0.35.0"],
   "source": {
     "reference": "ghcr.io/catthehacker/ubuntu@sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",
     "indexDigest": "sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",

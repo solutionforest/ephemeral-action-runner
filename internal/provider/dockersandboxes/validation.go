@@ -19,7 +19,6 @@ var (
 	templateDigestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 	profilePattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	hostLabelPattern      = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
-	versionOutputPattern  = regexp.MustCompile(`^(?:Docker Sandboxes|docker sandboxes|sbx) version:? v?([0-9]+\.[0-9]+\.[0-9]+)(?: [a-f0-9]{40})?\r?\n?$`)
 )
 
 func validateCreateRequest(request provider.CreateRequest) error {
@@ -210,9 +209,4 @@ func validateNetworkResource(resource string) error {
 func validPort(value string) bool {
 	port, err := strconv.Atoi(value)
 	return err == nil && port >= 1 && port <= 65535
-}
-
-func isSupportedVersion(output string) bool {
-	matches := versionOutputPattern.FindStringSubmatch(output)
-	return len(matches) == 2 && matches[1] == SupportedVersion
 }

@@ -9,7 +9,7 @@ Use this page for normal EPAR tasks. Start with the host and provider you alread
 | Run a source archive | Go 1.25 or newer, or Docker for the no-Go controller builder |
 | Register or inspect GitHub runners | A GitHub App with organization self-hosted runner read/write permission |
 | Docker Container | Docker Engine, Docker Desktop, or OrbStack with privileged Linux-container support |
-| Docker Sandboxes | Docker, the supported `sbx` CLI, healthy `sbx diagnose --output json`, and an approved EPAR template already built and loaded |
+| Docker Sandboxes | Docker, the `sbx` CLI with at least one diagnostic pass and zero failures, and an approved EPAR template already built and loaded |
 | WSL | Native Windows, WSL2, and Docker when preparing the default WSL image |
 | Tart | Native Apple Silicon macOS and Tart |
 
@@ -35,7 +35,7 @@ The wrapper uses local Go when available, otherwise it uses Docker to build and 
 go run ./cmd/ephemeral-action-runner start
 ```
 
-When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group, shows every provider with its current prerequisite result, and refuses unavailable selections. Docker Sandboxes becomes the Enter default only when Docker, the supported `sbx` version, its diagnostics, the host platform, and the exact locally built-and-loaded template pass admission. The wizard does not build or load a template, and it never falls back from a selected provider.
+When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group, shows every provider with its current prerequisite result, and refuses unavailable selections. Docker Sandboxes becomes the Enter default only when Docker, `sbx diagnose --output json`, the host platform, and the exact locally built-and-loaded template pass admission. The wizard does not build or load a template, and it never falls back from a selected provider.
 
 Before choosing Docker Sandboxes, follow [Docker Sandboxes](providers/docker-sandboxes.md) to build, review, and load the approved template for the host platform. The wizard verifies the template cache entry and its full local image identity before it writes configuration.
 

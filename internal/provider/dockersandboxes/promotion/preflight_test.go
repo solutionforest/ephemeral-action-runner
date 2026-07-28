@@ -51,7 +51,6 @@ func TestRunPreflightPassesEveryIndependentGateWithExactReadOnlyArgv(t *testing.
 		t.Fatalf("preflight failures = %+v", result.Failures)
 	}
 	want := [][]string{
-		{"version"},
 		{"daemon", "status", "--json"},
 		{"diagnose", "--output", "json"},
 		{"template", "ls", "--json"},
@@ -114,13 +113,6 @@ func TestRunPreflightFailsClosedForEveryAdmissionGate(t *testing.T) {
 			},
 		},
 		{
-			name: "version",
-			gate: "sbx version",
-			edit: func(_ *Record, outputs map[string][]byte, _ *PreflightOptions) {
-				outputs["version"] = []byte("sbx version: v0.35.1 01e01520456e4126a9653471e7072e4d9b280321\n")
-			},
-		},
-		{
 			name: "daemon",
 			gate: "daemon health",
 			edit: func(_ *Record, outputs map[string][]byte, _ *PreflightOptions) {
@@ -129,16 +121,16 @@ func TestRunPreflightFailsClosedForEveryAdmissionGate(t *testing.T) {
 		},
 		{
 			name: "authentication",
-			gate: "authentication",
+			gate: "daemon diagnostics",
 			edit: func(_ *Record, outputs map[string][]byte, _ *PreflightOptions) {
 				outputs["diagnose\x00--output\x00json"] = []byte(diagnosticsFixture("Authentication", "fail"))
 			},
 		},
 		{
-			name: "diagnostics warning",
+			name: "diagnostics without a pass",
 			gate: "daemon diagnostics",
 			edit: func(_ *Record, outputs map[string][]byte, _ *PreflightOptions) {
-				outputs["diagnose\x00--output\x00json"] = []byte(diagnosticsFixture("Storage directories", "warn"))
+				outputs["diagnose\x00--output\x00json"] = []byte(`{"version":"1.0","checks":[{"name":"Optional integration","status":"skip","message":"","detail":"","hint":""}],"summary":{"pass":0,"warn":0,"fail":0,"skip":1}}`)
 			},
 		},
 		{
@@ -203,6 +195,59 @@ func TestRunPreflightFailsClosedForEveryAdmissionGate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunPreflightAcceptsDiagnosticWarningsAndSkips(t *testing.T) {
+	for _, status := range []string{"warn", "skip"} {
+		t.Run(status, func(t *testing.T) {
+			record, outputs := validPreflightFixture(t)
+			outputs["diagnose\x00--output\x00json"] = []byte(diagnosticsFixture("Storage directories", status))
+			required, _ := requiredHostFreeBytes(record, 500<<30)
+			result := RunPreflight(context.Background(), record, PreflightOptions{
+				ProjectRoot:        t.TempDir(),
+				StorageRoot:        t.TempDir(),
+				NativeController:   true,
+				ControllerRevision: record.EPARRevision,
+				RunSBX:             fixtureCommandRunner(outputs),
+				InspectTemplate: func(context.Context, string) (string, error) {
+					return record.TemplateDigest, nil
+				},
+				HostSpace: func(string) (HostSpace, error) {
+					return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
+				},
+				CheckVirtualization: func() error { return nil },
+			})
+			if !result.Passed() {
+				t.Fatalf("preflight rejected diagnostic %s: %+v", status, result.Failures)
+			}
+		})
+	}
+}
+
+func TestRunPreflightDiagnosticFailureExplainsHowToInspectHints(t *testing.T) {
+	record, outputs := validPreflightFixture(t)
+	outputs["diagnose\x00--output\x00json"] = []byte(diagnosticsFixture("Daemon", "fail"))
+	required, _ := requiredHostFreeBytes(record, 500<<30)
+	result := RunPreflight(context.Background(), record, PreflightOptions{
+		ProjectRoot:        t.TempDir(),
+		StorageRoot:        t.TempDir(),
+		NativeController:   true,
+		ControllerRevision: record.EPARRevision,
+		RunSBX:             fixtureCommandRunner(outputs),
+		InspectTemplate: func(context.Context, string) (string, error) {
+			return record.TemplateDigest, nil
+		},
+		HostSpace: func(string) (HostSpace, error) {
+			return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
+		},
+		CheckVirtualization: func() error { return nil },
+	})
+	for _, failure := range result.Failures {
+		if failure.Gate == "daemon diagnostics" && strings.Contains(failure.Resolution, "sbx diagnose --output json") && strings.Contains(failure.Resolution, "hints") {
+			return
+		}
+	}
+	t.Fatalf("preflight diagnostic failure omitted command and hint remediation: %+v", result.Failures)
 }
 
 func TestRunPreflightDoesNotInferVirtualizationFromDiagnostics(t *testing.T) {
@@ -279,7 +324,6 @@ func validPreflightFixture(t *testing.T) (Record, map[string][]byte) {
 	record := Record{
 		Platform:                 WindowsAMD64,
 		EPARRevision:             digest("1"),
-		SBXVersion:               "0.35.0",
 		Template:                 "epar-template:promoted",
 		TemplateDigest:           digest("a"),
 		TemplateCacheID:          strings.Repeat("a", 12),
@@ -304,7 +348,6 @@ func validPreflightFixture(t *testing.T) (Record, map[string][]byte) {
 		BuildxComposeSlowdownPct: 10,
 	}
 	outputs := map[string][]byte{
-		"version":                                      []byte("sbx version: v0.35.0 01e01520456e4126a9653471e7072e4d9b280321\n"),
 		"daemon\x00status\x00--json":                   []byte(`{"status":"running","socket":"test","logs":"test"}`),
 		"diagnose\x00--output\x00json":                 []byte(diagnosticsFixture("", "")),
 		"template\x00ls\x00--json":                     []byte(`{"images":[{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"promoted","flavor":"shell","created_at":"2026-07-23T00:00:00Z","size":1024}]}`),
@@ -314,7 +357,7 @@ func validPreflightFixture(t *testing.T) (Record, map[string][]byte) {
 }
 
 func diagnosticsFixture(changedCheck, changedStatus string) string {
-	names := []string{"CLI binary", "Binary version", "Daemon", "Daemon diagnostics", "Version match", "Storage directories", "Directory permissions", "Socket", "Authentication"}
+	names := []string{"CLI binary", "CLI invocation", "Daemon", "Daemon diagnostics", "Runtime compatibility", "Storage directories", "Directory permissions", "Socket", "Authentication"}
 	checks := make([]string, 0, len(names))
 	passed := 0
 	failed := 0

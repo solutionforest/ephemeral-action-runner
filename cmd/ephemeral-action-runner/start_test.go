@@ -81,6 +81,9 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	if !strings.Contains(out.String(), "Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.") {
 		t.Fatalf("start guidance = %q", out.String())
 	}
+	if strings.Contains(out.String(), "Start runners now?") {
+		t.Fatalf("existing config unexpectedly triggered the new-config start prompt:\n%s", out.String())
+	}
 }
 
 func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
@@ -121,11 +124,59 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, ".local", "config.yml")); err != nil {
 		t.Fatalf("config was not created: %v", err)
 	}
-	if !strings.Contains(out.String(), "Continuing with") {
-		t.Fatalf("output missing continuation message:\n%s", out.String())
+	for _, want := range []string{"Start runners now?", "Continuing with"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
 	}
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
+	}
+}
+
+func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
+	dir := t.TempDir()
+	stubNoWSL2(t)
+	stubInitRunnerGroupClient(t)
+	oldInteractive := stdinIsInteractive
+	oldDocker := dockerAvailable
+	oldResolveHostTrust := initResolveHostTrust
+	t.Cleanup(func() {
+		stdinIsInteractive = oldInteractive
+		dockerAvailable = oldDocker
+		initResolveHostTrust = oldResolveHostTrust
+	})
+	stdinIsInteractive = func() bool { return true }
+	dockerAvailable = func(context.Context) error { return nil }
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, nil
+	}
+
+	var out bytes.Buffer
+	err := runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\nn\n"),
+		Out:         &out,
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			t.Fatal("manager factory should not run after choosing to review the new config")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, ".local", "config.yml")
+	if _, err := os.Stat(configPath); err != nil {
+		t.Fatalf("config was not created: %v", err)
+	}
+	for _, want := range []string{"Start runners now?", "Config saved at " + configPath, "Exiting before runner startup", "Review the config"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("review exit output omitted %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "Continuing with") {
+		t.Fatalf("review exit unexpectedly continued startup:\n%s", out.String())
 	}
 }
 
@@ -191,12 +242,17 @@ func TestStartInteractiveMissingConfigCanSelectDockerSandboxes(t *testing.T) {
 	}, nil)
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
+	oldResolveHostTrust := initResolveHostTrust
 	t.Cleanup(func() {
 		stdinIsInteractive = oldInteractive
 		dockerAvailable = oldDocker
+		initResolveHostTrust = oldResolveHostTrust
 	})
 	stdinIsInteractive = func() bool { return true }
 	dockerAvailable = func(context.Context) error { return nil }
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, nil
+	}
 
 	fake := &fakeStarterManager{}
 	var out bytes.Buffer

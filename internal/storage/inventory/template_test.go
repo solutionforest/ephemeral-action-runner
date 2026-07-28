@@ -202,7 +202,6 @@ func validTemplateMetadata(profile, platform, suffix, archive string, archiveSHA
 			"archiveBytes":   archiveBytes,
 		},
 		"compatibility": map[string]any{
-			"supportedSbxVersions":      []string{"0.35.0"},
 			"candidate":                 "A",
 			"dockerDaemonOwner":         "docker-sandboxes-runtime",
 			"expectedDockerDaemonCount": 1,

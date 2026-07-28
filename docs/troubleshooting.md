@@ -92,14 +92,13 @@ The wizard marks Docker Sandboxes unavailable, or `sbx diagnose --output json` r
 
 ### Diagnosis and remediation
 
-Check the installed CLI and the diagnostic result before editing configuration:
+Check the diagnostic result before editing configuration:
 
 ```bash
-sbx version
 sbx diagnose --output json
 ```
 
-EPAR requires the exact supported `sbx` version, a controller architecture with an available Linux guest template, and at least one diagnostic pass with zero failures. Diagnostic warnings remain visible but do not by themselves disable the provider. Fix the failed prerequisite, rerun the diagnostic, then restart `./start`; do not manually force a provider selection or substitute Docker Container for a configured Docker Sandboxes pool.
+EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose Refresh in the provider menu to recheck availability; do not manually force a provider selection or substitute Docker Container for a configured Docker Sandboxes pool.
 
 ## Docker Sandboxes rejects template, policy, or capacity
 

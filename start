@@ -26,7 +26,9 @@ EPAR_HOST_TRUST_HELPER="${script_dir}/scripts/host-trust/host-trust-feed.sh"
 GO_BIN="${EPAR_GO_BIN:-go}"
 USE_DOCKER_RUN="${EPAR_USE_DOCKER_RUN:-auto}"
 epar_args=("$@")
-if ((${#epar_args[@]} == 0)) || [[ "${epar_args[0]}" == -* ]]; then
+if ((${#epar_args[@]} == 0)); then
+  epar_args=(start)
+elif [[ "${epar_args[0]}" == -* ]]; then
   epar_args=(start "${epar_args[@]}")
 fi
 controller_command="${epar_args[0]}"

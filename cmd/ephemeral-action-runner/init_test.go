@@ -764,8 +764,11 @@ func TestInitWSL2ChoiceDefaultsToDockerContainerAndRepromptsInvalidValues(t *tes
 	if !strings.Contains(string(configBytes), "type: docker-container") {
 		t.Fatalf("config did not use the default Docker Container provider:\n%s", configBytes)
 	}
-	if !strings.Contains(out.String(), "Choose an available provider number or name shown above.") {
+	if !strings.Contains(out.String(), "Choose an available provider number or name shown above, or R to refresh.") {
 		t.Fatalf("init output did not explain invalid provider input:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "Start runners now?") {
+		t.Fatalf("standalone init unexpectedly asked whether to start runners:\n%s", out.String())
 	}
 }
 
@@ -868,6 +871,75 @@ func TestDockerSandboxesPrerequisitesRejectInsufficientMinimumCapacity(t *testin
 		if !strings.Contains(got.DockerSandboxesStatus, want) {
 			t.Fatalf("Docker Sandboxes status omitted %q: %s", want, got.DockerSandboxesStatus)
 		}
+	}
+}
+
+func TestDockerSandboxesPrerequisitesExplainHowToInspectFailedDiagnosticHints(t *testing.T) {
+	stubNoWSL2(t)
+	oldReadiness := initDockerSandboxesReadiness
+	oldCapacityCheck := initDockerSandboxesCapacityCheck
+	initDockerSandboxesReadiness = func(context.Context) (dockersandboxes.HostReadiness, error) {
+		return dockersandboxes.HostReadiness{}, errors.New("docker sandboxes diagnostics reported 1 failed check")
+	}
+	initDockerSandboxesCapacityCheck = func(uint64, uint64, uint64) (initDockerSandboxesCapacityResult, error) {
+		t.Fatal("capacity check must not run after failed diagnostics")
+		return initDockerSandboxesCapacityResult{}, nil
+	}
+	t.Cleanup(func() {
+		initDockerSandboxesReadiness = oldReadiness
+		initDockerSandboxesCapacityCheck = oldCapacityCheck
+	})
+
+	got := detectInitProviderPrerequisites(context.Background(), sandboxpromotion.WindowsAMD64, true)
+	if got.DockerSandboxesAvailable {
+		t.Fatal("Docker Sandboxes was available despite failed diagnostics")
+	}
+	for _, want := range []string{"1 failed check", "sbx diagnose --output json", "hints for each failed check"} {
+		if !strings.Contains(got.DockerSandboxesStatus, want) {
+			t.Fatalf("Docker Sandboxes status omitted %q: %s", want, got.DockerSandboxesStatus)
+		}
+	}
+}
+
+func TestInitProviderRefreshRechecksAvailabilityAndRedrawsMenu(t *testing.T) {
+	record := validInitPromotionRecord()
+	stubInitSandboxPromotion(t, record, sandboxpromotion.PreflightResult{})
+	oldReadiness := initDockerSandboxesReadiness
+	readinessCalls := 0
+	initDockerSandboxesReadiness = func(context.Context) (dockersandboxes.HostReadiness, error) {
+		readinessCalls++
+		if readinessCalls == 1 {
+			return dockersandboxes.HostReadiness{}, errors.New("docker sandboxes diagnostics reported 1 failed check")
+		}
+		return dockersandboxes.HostReadiness{ChecksPassed: 8, ChecksWarned: 1}, nil
+	}
+	t.Cleanup(func() {
+		initDockerSandboxesReadiness = oldReadiness
+	})
+
+	var out bytes.Buffer
+	providerType, selectedRecord, profile, err := promptInitProvider(context.Background(), t.TempDir(), &out, bufio.NewReader(strings.NewReader("2\nr\n1\n")), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providerType != "docker-sandboxes" || selectedRecord.Template != record.Template || profile != nil {
+		t.Fatalf("refreshed selection = provider %q, record template %q, profile %+v", providerType, selectedRecord.Template, profile)
+	}
+	if readinessCalls != 2 {
+		t.Fatalf("Docker Sandboxes readiness calls = %d, want 2", readinessCalls)
+	}
+	for _, want := range []string{
+		"R. Refresh provider prerequisites",
+		"Docker Sandboxes (independently certified for this exact platform) is unavailable",
+		"Refreshing provider prerequisites...",
+		"PASS: the exact promoted platform, host, sbx, template, policy, and resource gates passed.",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("provider refresh output omitted %q:\n%s", want, out.String())
+		}
+	}
+	if got := strings.Count(out.String(), "R. Refresh provider prerequisites"); got != 2 {
+		t.Fatalf("provider menu render count = %d, want 2:\n%s", got, out.String())
 	}
 }
 
@@ -1421,9 +1493,7 @@ func TestInitPromotionGateFailuresRequireExplicitProviderAndExplainAction(t *tes
 	}{
 		{name: "kill switch", gate: "operator kill switch", detail: sandboxpromotion.DisableEnvironment, disable: true},
 		{name: "native controller", gate: "native controller", detail: "native controller is unavailable"},
-		{name: "authentication", gate: "authentication", detail: "authentication is not valid"},
 		{name: "daemon", gate: "daemon health", detail: "daemon is not running"},
-		{name: "version", gate: "sbx version", detail: "version is not exactly v0.35.0"},
 		{name: "virtualization", gate: "virtualization", detail: "virtualization is unavailable"},
 		{name: "template", gate: "promoted template", detail: "template identity differs"},
 		{name: "policy", gate: "promoted policy", detail: "policy fingerprint differs"},
@@ -1740,6 +1810,7 @@ func utf16LE(text string, includeBOM bool) []byte {
 
 func stubNoWSL2(t *testing.T) {
 	t.Helper()
+	stubDockerSandboxesUnavailable(t)
 	oldGOOS := initGOOS
 	oldWSLStatus := initWSLStatus
 	initGOOS = "linux"
@@ -1755,6 +1826,7 @@ func stubNoWSL2(t *testing.T) {
 
 func stubWSL2Available(t *testing.T) {
 	t.Helper()
+	stubDockerSandboxesUnavailable(t)
 	oldGOOS := initGOOS
 	oldWSLStatus := initWSLStatus
 	initGOOS = "windows"
@@ -1764,6 +1836,17 @@ func stubWSL2Available(t *testing.T) {
 	t.Cleanup(func() {
 		initGOOS = oldGOOS
 		initWSLStatus = oldWSLStatus
+	})
+}
+
+func stubDockerSandboxesUnavailable(t *testing.T) {
+	t.Helper()
+	oldReadiness := initDockerSandboxesReadiness
+	initDockerSandboxesReadiness = func(context.Context) (dockersandboxes.HostReadiness, error) {
+		return dockersandboxes.HostReadiness{}, errors.New("Docker Sandboxes unavailable in provider-neutral wizard test")
+	}
+	t.Cleanup(func() {
+		initDockerSandboxesReadiness = oldReadiness
 	})
 }
 
@@ -1874,7 +1957,6 @@ func validInitPromotionRecord() sandboxpromotion.Record {
 	return sandboxpromotion.Record{
 		Platform:                 sandboxpromotion.WindowsAMD64,
 		EPARRevision:             digest("1"),
-		SBXVersion:               "0.35.0",
 		Template:                 "epar-docker-sandboxes-catthehacker-full:promoted",
 		TemplateDigest:           digest("a"),
 		TemplateCacheID:          strings.Repeat("a", 12),

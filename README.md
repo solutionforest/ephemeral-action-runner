@@ -24,7 +24,7 @@ The normal path is a source archive plus Docker. EPAR's first run opens a guided
 
 ### 1. Install the host tools
 
-Install a Docker-compatible daemon: [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows or macOS, [OrbStack](https://orbstack.dev/) on macOS, or [Docker Engine](https://docs.docker.com/engine/) on Linux. Docker Sandboxes also needs the supported `sbx` CLI and a prepared EPAR template; see [Docker Sandboxes](docs/providers/docker-sandboxes.md).
+Install a Docker-compatible daemon: [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows or macOS, [OrbStack](https://orbstack.dev/) on macOS, or [Docker Engine](https://docs.docker.com/engine/) on Linux. Docker Sandboxes also needs the `sbx` CLI to pass its diagnostics and a prepared EPAR template; see [Docker Sandboxes](docs/providers/docker-sandboxes.md).
 
 ### 2. Download EPAR
 
@@ -50,7 +50,7 @@ Choose a provider based on your host OS, available prerequisites, and isolation 
 
 | Provider | Host OS | Prerequisites | Isolation and compatibility |
 | --- | --- | --- | --- |
-| [Docker Sandboxes](docs/providers/docker-sandboxes.md) | Linux, macOS, Windows | Docker and the supported `sbx` CLI | Highest isolation level — each runner uses a dedicated microVM with a private Docker daemon. Recommended when capability checks pass. |
+| [Docker Sandboxes](docs/providers/docker-sandboxes.md) | Linux, macOS, Windows | Docker, the `sbx` CLI, and healthy `sbx diagnose --output json` results | Highest isolation level — each runner uses a dedicated microVM with a private Docker daemon. Recommended when capability checks pass. |
 | [Docker Container](docs/providers/docker-container.md) | Linux, macOS, Windows | Docker | Standard isolation level — each disposable runner container has a private Docker daemon. |
 | [WSL](docs/providers/wsl.md) | Windows | WSL2 and Docker | Standard isolation level — each runner uses a disposable WSL2 Linux environment. |
 | [Tart](docs/providers/tart.md) | Apple Silicon macOS | Tart | Experimental — ARM64 Linux VM with limited compatibility for CI jobs that require non-ARM64 Docker images. |

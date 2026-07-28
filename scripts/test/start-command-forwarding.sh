@@ -23,6 +23,22 @@ export EPAR_GO_BIN=go
 export EPAR_USE_DOCKER_RUN=0
 export EPAR_START_FORWARD_LOG="$test_root/arguments"
 
+"$repo_root/start"
+actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
+expected="run ./cmd/ephemeral-action-runner start "
+if [[ "$actual" != "$expected" ]]; then
+  echo "default start forwarding mismatch: got '$actual', want '$expected'" >&2
+  exit 1
+fi
+
+"$repo_root/start" --config .local/custom-config.yml --instances 2
+actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
+expected="run ./cmd/ephemeral-action-runner start --config .local/custom-config.yml --instances 2 "
+if [[ "$actual" != "$expected" ]]; then
+  echo "start flag forwarding mismatch: got '$actual', want '$expected'" >&2
+  exit 1
+fi
+
 "$repo_root/start" storage prune --provider docker-sandboxes
 actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
 expected="run ./cmd/ephemeral-action-runner storage prune --provider docker-sandboxes "

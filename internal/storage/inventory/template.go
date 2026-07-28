@@ -45,10 +45,9 @@ type templateMetadata struct {
 		ArchiveBytes   uint64 `json:"archiveBytes"`
 	} `json:"template"`
 	Compatibility struct {
-		SupportedSbxVersions      []string `json:"supportedSbxVersions"`
-		Candidate                 string   `json:"candidate"`
-		DockerDaemonOwner         string   `json:"dockerDaemonOwner"`
-		ExpectedDockerDaemonCount int      `json:"expectedDockerDaemonCount"`
+		Candidate                 string `json:"candidate"`
+		DockerDaemonOwner         string `json:"dockerDaemonOwner"`
+		ExpectedDockerDaemonCount int    `json:"expectedDockerDaemonCount"`
 	} `json:"compatibility"`
 }
 
@@ -211,8 +210,8 @@ func validateTemplateMetadata(metadata templateMetadata) error {
 	if !templateDigestPattern.MatchString(metadata.Template.ArchiveSHA256) || metadata.Template.ArchiveBytes == 0 {
 		return fmt.Errorf("template metadata archive digest or size is invalid")
 	}
-	if len(metadata.Compatibility.SupportedSbxVersions) != 1 || metadata.Compatibility.SupportedSbxVersions[0] != "0.35.0" || metadata.Compatibility.Candidate != "A" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 {
-		return fmt.Errorf("template metadata compatibility is not Candidate A for sbx v0.35.0")
+	if metadata.Compatibility.Candidate != "A" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 {
+		return fmt.Errorf("template metadata compatibility does not preserve the Candidate A runtime contract")
 	}
 	return nil
 }

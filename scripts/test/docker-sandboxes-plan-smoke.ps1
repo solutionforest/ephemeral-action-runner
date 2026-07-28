@@ -113,7 +113,7 @@ try {
             sourceLockSha256 = Get-Sha256File -Path $lockPath
             templateContextDigest = Get-TemplateContextDigest
         }
-        compatibility = [ordered]@{ supportedSbxVersions = @('0.35.0'); candidate = 'A'; dockerDaemonOwner = 'docker-sandboxes-runtime'; expectedDockerDaemonCount = 1 }
+        compatibility = [ordered]@{ candidate = 'A'; dockerDaemonOwner = 'docker-sandboxes-runtime'; expectedDockerDaemonCount = 1 }
         artifacts = $artifactRecords
     }
     Write-Json -Path $paths.metadata -Value $metadata
@@ -142,6 +142,10 @@ try {
     }
     if ($LASTEXITCODE -ne 0 -or ($loadPlan -join "`n") -notmatch 'All evidence was verified without invoking sbx' -or (Test-Path -LiteralPath $sbxMarker)) {
         throw 'load-template.ps1 plan-only smoke test failed or invoked sbx'
+    }
+    $loaderSource = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'scripts\docker-sandboxes\load-template.ps1')
+    if ($loaderSource -match '&\s+sbx\s+version' -or $loaderSource -notmatch 'sbx diagnose --output json' -or $loaderSource -notmatch 'hints for each failed check') {
+        throw 'load-template.ps1 must use diagnostic readiness without an installed-version gate and explain how to inspect failed-check hints'
     }
     Write-Host 'Docker Sandboxes build/load plan-only smoke tests passed.'
 }

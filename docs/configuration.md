@@ -24,11 +24,11 @@ EPAR chooses the first available configuration path in this order: `--config <pa
 | Provider | Host and artifact model | Image defaults | Provider-only configuration |
 | --- | --- | --- | --- |
 | `docker-container` | A Docker-compatible host creates an outer disposable runner with its own inner Docker daemon. | `docker-image`, `ghcr.io/catthehacker/ubuntu:full-latest`, output `epar-docker-container-catthehacker-ubuntu`. | Optional `provider.platform`; `docker` proxy and mirror settings apply to its private daemon. |
-| `docker-sandboxes` | A supported `sbx` host creates a pinned Linux sandbox template. It is preview-only until the exact host/platform combination has independent live evidence. | No source image or build artifact is accepted; the wizard selects and pins a local Candidate A template. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. |
+| `docker-sandboxes` | A host with healthy `sbx diagnose --output json` results creates a pinned Linux sandbox template. It is preview-only until the exact host/platform combination has independent live evidence. | No source image or build artifact is accepted; the wizard selects and pins a local Candidate A template. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. |
 | `wsl` | Windows WSL2 imports a Docker image or rootfs tar into disposable Linux distros. | Docker source defaults to Catthehacker full Ubuntu, x64, with output under `work/images/`. | `provider.installRoot` controls WSL storage. |
 | `tart` | Experimental Apple Silicon Linux VM path. | `ghcr.io/cirruslabs/ubuntu:latest`, output `epar-ubuntu-24-arm64`. | `provider.network` and optional `provider.rosettaTag`. Validate the exact workload before relying on Rosetta. |
 
-Docker Sandboxes never falls back to Docker Container. Its wizard is available only when the supported `sbx` version, host mapping, local template identity, policy fingerprint, capacity evidence, and `sbx diagnose --output json` prerequisite checks pass. Warnings remain visible; failures prevent selection.
+Docker Sandboxes never falls back to Docker Container. Its wizard is available only when `sbx diagnose --output json` reports at least one passing check and no failed checks and the host mapping, local template identity, policy fingerprint, and capacity evidence pass. Warnings and skipped checks remain visible; failures prevent selection.
 
 ## Configuration reference
 

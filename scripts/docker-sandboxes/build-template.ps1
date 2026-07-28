@@ -116,7 +116,6 @@ $buildPlan = [ordered]@{
     sourceIndexDigest = $profileLock.indexDigest
     sourceManifestDigest = $profilePlatformLock.manifestDigest
     templateTag = $profilePlatformLock.templateTag
-    sbxCompatibility = '0.35.0 only'
     outputDirectory = $OutputDirectory
     storage = [ordered]@{
         surface = [System.IO.Path]::GetPathRoot($OutputDirectory)
@@ -336,7 +335,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'docker image save failed'
 }
 
-Write-Host '[6/7] Copying helper hashes and sbx v0.35.0-only compatibility metadata.'
+Write-Host '[6/7] Copying helper hashes and compatibility metadata.'
 [System.IO.File]::WriteAllBytes($artifactPaths.helpers, $helperManifestBytes)
 [System.IO.File]::WriteAllBytes($artifactPaths.compatibility, $compatibilityInputBytes)
 
@@ -383,7 +382,6 @@ $templateMetadata = [ordered]@{
         templateContextDigest = $templateContextDigest
     }
     compatibility = [ordered]@{
-        supportedSbxVersions = @('0.35.0')
         candidate = 'A'
         dockerDaemonOwner = 'docker-sandboxes-runtime'
         expectedDockerDaemonCount = 1
