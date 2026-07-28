@@ -11,7 +11,7 @@ Thanks for taking the time to contribute.
 ## Development Workflow
 
 1. Fork the repository and create a focused branch from `develop`.
-2. Read and preserve the [Development and Extension Principles](docs/development-principles.md).
+2. Read and preserve the [Development and Extension Principles](docs/development/principles.md).
 3. Keep the change small and document any operational or security behavior that it changes.
 4. Run the relevant tests locally. The baseline Go test suite is `go test ./...`.
 5. Open a pull request targeting `develop` and complete the pull-request template.
@@ -27,3 +27,5 @@ Fork pull requests run the safe hosted verification workflow. The live EPAR cana
 - Document and test every intentional platform or security exception.
 
 By contributing, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+See the [development documentation](docs/development/) for the architecture, provider extension checklist, verification infrastructure, and release process.

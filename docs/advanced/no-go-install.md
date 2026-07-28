@@ -1,6 +1,6 @@
 # Running EPAR Without Installing Go
 
-The standard path is to download GitHub's automatic **Source code (zip)** or **Source code (tar.gz)** from the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases) and run `go run ./cmd/ephemeral-action-runner` from the extracted source folder. If you do not want Go installed on the host, use EPAR's Docker-based native-controller builder instead. Docker remains required for that build toolchain.
+The standard path is to download GitHub's automatic **Source code (zip)** or **Source code (tar.gz)** from the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases) and run `./start` from the extracted source folder. The wrapper uses local Go when it works; if you do not want Go installed on the host, it uses EPAR's Docker-based native-controller builder instead. Docker remains required for that build toolchain.
 
 ## Run With Docker
 

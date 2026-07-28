@@ -40,4 +40,4 @@ Each provider reports the storage surfaces and temporary expansion required by b
 
 Artifacts are classified as active, current reusable, superseded EPAR-owned, incomplete temporary, or shared/unknown. Conservative housekeeping may remove only expired, unleased, exactly owned local artifacts and bounded dedicated caches. Removing Docker images, volumes, imported templates, WSL distributions, or Tart images requires an explicit previewed storage-prune operation.
 
-See [Adding a Provider](providers/adding-provider.md) for the extension checklist.
+See [Adding a Provider](adding-provider.md) for the extension checklist.

@@ -1,6 +1,6 @@
 # Adding A Provider
 
-Read [Development and Extension Principles](../development-principles.md) and [Design](../design.md).
+Read [Development and Extension Principles](principles.md) and [Design](design.md).
 
 Put provider commands and host integration in `internal/provider/<provider>`. Shared onboarding, naming, image, pool lifecycle, GitHub, state, capacity, and retention behavior stays in its common package.
 

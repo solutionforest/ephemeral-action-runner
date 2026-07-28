@@ -1,122 +1,220 @@
 # Configuration
 
-EPAR stores local settings in `.local/config.yml` by default. When the file does not exist, the first-run wizard always displays Docker Container, Docker Sandboxes, WSL2, and experimental Tart with a prerequisite result, while refusing unavailable selections. Docker Sandboxes is the recommended Enter default without an operating-system allowlist when Docker is ready, the exact supported `sbx` version is installed, the host architecture maps to an available Linux guest template, and `sbx diagnose --output json` reports at least one pass and zero failures. Diagnostic warnings remain visible but do not disable the choice. The wizard performs read-only local discovery of an active lock-selected EPAR template, its full local image identity and platform, and the current host-global Balanced-policy fingerprint before writing configuration. New Docker Sandboxes configs set `networkBaseline: open`, which adds an EPAR-owned sandbox-scoped `allow **` rule for public HTTP/HTTPS compatibility plus deny-wins host-alias guardrails without changing the host-global policy. The rolling Catthehacker source-channel labels do not refresh automatically; the source lock is an approved snapshot.
+EPAR reads a small, strict YAML subset: indentation uses spaces, unknown sections and keys fail, comments outside quotes are ignored, and list values may use either `[one, two]` or an indented list. Put real credentials and machine-specific paths in `.local/config.yml`; tracked configuration files are examples.
 
-## Pre-release provider rename
+## Contents
 
-The Docker Container provider has an intentional pre-release naming migration. EPAR does not retain a compatibility alias for the pre-rename provider identifier.
+- [Lookup and parser rules](#lookup-and-parser-rules)
+- [Provider matrix](#provider-matrix)
+- [Configuration reference](#configuration-reference)
+- [Cross-field rules](#cross-field-rules)
+- [Provider defaults](#provider-defaults)
+- [Short recipes](#short-recipes)
 
-Before editing an existing configuration:
+## Lookup and parser rules
 
-1. Stop the current controller.
-2. Use the previous release to remove its managed runners and runner containers.
-3. Verify that no prior managed GitHub runner records or host containers remain.
-4. Update `provider.type`, `image.outputImage`, `provider.sourceImage`, the runner label, and pool prefix to the `docker-container` values in the current example configuration.
-5. Rebuild the renamed image, then start the renamed provider.
+EPAR chooses the first available configuration path in this order: `--config <path>`, `EPAR_CONFIG`, `./.local/config.yml`, then `~/.config/ephemeral-action-runner/config.yml`. A relative file path in configuration is resolved from the project root when EPAR consumes it. `~` and `~/...` are expanded for the configuration path, `github.privateKeyPath`, and each `image.trustedCaCertificatePaths` entry; do not assume they expand in other configuration properties.
 
-The old and renamed controllers must not overlap: their provider labels and controller-lock identity differ, so concurrent operation can create duplicate runners or leave resources outside the active controller's ownership boundary.
+`github`, `image`, `pool`, `storage`, `logging`, `runner`, `security`, `provider`, `docker`, `dockerSandboxes`, and `timeouts` are the only accepted top-level sections. `security` contains only the `runnerGroup` subsection. Values are strings unless this reference says integer, number, boolean, or list. Quote a value when it needs YAML-like punctuation; EPAR removes one matching pair of single or double quotes.
 
-Use `.local/config.yml` for real GitHub App values, local paths, labels, and runner counts. Tracked files under `configs/` are examples.
+`pool.logDir` is a deprecated compatibility input. If `logging.directory` is absent, EPAR uses it and emits a warning; using both is rejected. `pool.vmPrefix` is an accepted alias for `pool.namePrefix`. `image.profile` and the old `docker-socket` provider are rejected rather than silently migrated.
 
-## Config Lookup
+## Provider matrix
 
-EPAR looks for config in this order:
+| Provider | Host and artifact model | Image defaults | Provider-only configuration |
+| --- | --- | --- | --- |
+| `docker-container` | A Docker-compatible host creates an outer disposable runner with its own inner Docker daemon. | `docker-image`, `ghcr.io/catthehacker/ubuntu:full-latest`, output `epar-docker-container-catthehacker-ubuntu`. | Optional `provider.platform`; `docker` proxy and mirror settings apply to its private daemon. |
+| `docker-sandboxes` | A supported `sbx` host creates a pinned Linux sandbox template. It is preview-only until the exact host/platform combination has independent live evidence. | No source image or build artifact is accepted; the wizard selects and pins a local Candidate A template. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. |
+| `wsl` | Windows WSL2 imports a Docker image or rootfs tar into disposable Linux distros. | Docker source defaults to Catthehacker full Ubuntu, x64, with output under `work/images/`. | `provider.installRoot` controls WSL storage. |
+| `tart` | Experimental Apple Silicon Linux VM path. | `ghcr.io/cirruslabs/ubuntu:latest`, output `epar-ubuntu-24-arm64`. | `provider.network` and optional `provider.rosettaTag`. Validate the exact workload before relying on Rosetta. |
 
-1. `--config <path>`
-2. `EPAR_CONFIG`
-3. `./.local/config.yml`
-4. `~/.config/ephemeral-action-runner/config.yml`
+Docker Sandboxes never falls back to Docker Container. Its wizard is available only when the supported `sbx` version, host mapping, local template identity, policy fingerprint, capacity evidence, and `sbx diagnose --output json` prerequisite checks pass. Warnings remain visible; failures prevent selection.
 
-## Sections
+## Configuration reference
 
-| Section | Purpose |
-| --- | --- |
-| `github` | GitHub App ID, organization, private key path, and optional GitHub API/web URLs. |
-| `provider` | How EPAR creates disposable runners: `docker-container`, `docker-sandboxes`, `wsl`, or `tart`. |
-| `image` | Source image/rootfs, output image, runner version, and optional install scripts. |
-| `pool` | Runner count, instance name prefix, and replacement retry policy. |
-| `storage` | Provider-neutral free-space reserve, grace period, retained generations, and cache limits. |
-| `logging` | Manager and transcript sinks, formats, rotation, retention, and log directory. |
-| `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
-| `security` | Runner-group policy requirements checked before runner registration. |
-| `docker` | Optional Docker registry mirrors and private Docker daemon proxy settings. |
-| `dockerSandboxes` | Pinned template, policy, staging, capacity, and resource settings for Docker Sandboxes. |
-| `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
+### `github`
 
-## Common Edits
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `appId` | integer; no default | Required for GitHub operations. | GitHub App ID used to request short-lived runner registration tokens. |
+| `organization` | string; no default | Required for GitHub operations. | GitHub organization that owns the runner group and runner records. |
+| `privateKeyPath` | string; no default | Required for GitHub operations. | Private-key file readable by the EPAR process. Keep it under ignored `.local/` storage. |
+| `apiBaseUrl` | string; `https://api.github.com` | Optional, for GitHub Enterprise Server API endpoints. | Trailing `/` is removed. |
+| `webBaseUrl` | string; `https://github.com` | Optional, for GitHub Enterprise Server web endpoints. | Trailing `/` is removed. |
 
-Change how many runners stay online:
+### `image`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `sourceImage` | string; provider default | Image-building providers. | Docker image reference or WSL rootfs-tar path, selected by `sourceType`. |
+| `sourceType` | `docker-image` or `rootfs-tar`; provider default | `rootfs-tar` is WSL-only in normal use. | A rootfs tar cannot use `sourcePlatform`. |
+| `sourcePlatform` | Docker platform string; empty except WSL Docker source default `linux/amd64` | Only with `sourceType: docker-image`. | Requests the source image platform; pulling an image does not prove it can execute. See [Cross-architecture containers](advanced/cross-architecture-containers.md). |
+| `outputImage` | string; provider default | Image-building providers. | EPAR-owned reusable runner artifact name or path. |
+| `upstreamDir` | string; `third_party/runner-images` | Image builds that adapt upstream scripts. | Local checkout/cache location for the pinned upstream runner-image scripts. |
+| `upstreamLock` | string; `third_party/runner-images.lock` | Image builds that adapt upstream scripts. | Lock file identifying the approved upstream revision. |
+| `runnerVersion` | string; `latest` | Runner image builds. | Runner release selector. Pin a version when repeatability matters. |
+| `customInstallScripts` | list of non-empty paths; empty | Optional image customization. | Scripts run while creating the runner image; treat them as trusted build input. |
+| `trustedCaCertificatePaths` | list of non-empty paths; empty | Optional additional TLS roots. | PEM or DER CA files are validated and installed in the Ubuntu trust bundle. They supplement, not replace, host trust. |
+| `hostTrustMode` | `disabled` or `overlay`; `disabled` | Optional host-root inheritance for ephemeral runners. | `overlay` requires `runner.ephemeral: true`; it collects a current host-trust generation before registration and fails closed on an invalid or stale result. |
+| `hostTrustScopes` | list of `system`, `user`; `[system]` | Required and non-empty with `hostTrustMode: overlay`. | Windows/macOS may use `[system, user]`; Linux supports `[system]` only. This is root-anchor inheritance, not exact host TLS-policy emulation. |
+
+Host trust is a common ephemeral-runner contract, not a Docker Container-only configuration rule. The interactive Docker Container and Docker Sandboxes paths offer it, while the configuration validator applies the same overlay and ephemeral requirements independently of provider type. A host Docker daemon must separately trust a private registry before EPAR can pull an image; the guest overlay cannot repair a failed source-image pull.
+
+### `pool`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `instances` | integer; `1` | All providers. Must be at least `1`. | Strict cap for provisioning, ready, draining, quarantined, and cleanup-pending local instances. |
+| `namePrefix` | 2-40 character name; provider default or wizard-derived machine name plus random suffix | All providers. | Literal prefix for local and GitHub identities. Keep it unique per machine/config and organization. Docker Sandboxes additionally permits only lowercase letters, digits, `-`, and `.`. |
+| `vmPrefix` | deprecated alias for `namePrefix` | Existing configs only. | Do not set both aliases with conflicting intent; use `namePrefix` for new configs. |
+| `logDir` | deprecated string path; no default | Existing configs only. | Used as `logging.directory` with a warning only when `logging.directory` is absent; using both is rejected. |
+| `replacementRetryInitialSeconds` | integer; `15` | All providers. Greater than `0`. | Initial retry delay for transient replacement allocation failures. |
+| `replacementRetryMaxSeconds` | integer; `1800` | All providers. At least the initial delay. | Upper retry-delay cap. |
+| `replacementRetryMultiplier` | number; `2` | All providers. At least `1`. | Backoff multiplier. |
+| `replacementRetryJitterPercent` | integer; `20` | All providers. `0` through `100`. | Randomizes retry delay to avoid synchronized retries. |
+
+GitHub `429` and `5xx` responses and transient network failures back off replacement allocation; a longer `Retry-After` wins. Invalid configuration, authentication failures, and initial startup remain fail-fast after compensating rollback.
+
+### `storage`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `minimumFree` | positive byte size; `20GiB` | All providers. | Provider-neutral admission reserve. Docker Sandboxes raises it to `minHostFreeSpace` when that is larger. |
+| `gracePeriod` | positive Go duration; `168h` | Conservative housekeeping. | Minimum age before eligible EPAR-owned artifacts can be considered for removal. |
+| `keepPrevious` | integer; `0` | Conservative housekeeping. Must be non-negative. | Number of prior reusable artifact generations to retain. |
+| `automaticHousekeeping` | `conservative` or `disabled`; `conservative` | All providers. | Conservative mode touches only expired, unleased, exactly owned artifacts; it does not run a broad Docker or WSL prune. |
+| `buildCacheLimit` | positive byte size; `64GiB` | Image-building cache. | Bounded EPAR build cache target. |
+| `goCacheLimit` | positive byte size; `10GiB` | Native/no-Go Go build cache. | Bounded EPAR Go cache target. |
+
+### `logging`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `directory` | string; `work/logs` | All providers. Non-empty. | Root for manager, instance, build, error, and benchmark logs. |
+| `managerSinks` | non-empty list of `console`, `file`; `[console]` | Manager events. | Choose user-facing manager event destinations. |
+| `managerConsoleFormat` | `text` or `json`; `text` | Manager console sink. | Console encoding. |
+| `managerConsoleTextFormat` | one-line template; empty | Only when manager console format is `text`. | May use `{time}`, `{level}`, `{message}`, `{attributes}` and must contain `{message}`. |
+| `managerFileFormat` | `text` or `json`; `json` | Manager file sink. | File encoding. |
+| `transcriptSinks` | non-empty list of `console`, `file`; `[file]` | Raw instance/build transcripts. | Default keeps verbose transcript events out of the console. |
+| `transcriptConsoleFormat` | `text` or `json`; `text` | Transcript console sink. | Console encoding. |
+| `transcriptConsoleTextFormat` | one-line template; empty | Only when transcript console format is `text`. | May use `{time}`, `{instance}`, `{component}`, `{stream}`, `{message}`, `{session}`, `{category}`, `{provider}`, `{attributes}` and must contain `{message}`. |
+| `maxFileSizeMiB` | integer at least `1`; `100` | Rotated logs. | Per-file rotation threshold. |
+| `maxBackups` | integer at least `1`; `3` | Rotated logs. | Number of rotated files to retain per stream. |
+| `compressBackups` | boolean; `true` | Rotated logs. | Compresses rotated backups. |
+| `retentionEnabled` | boolean; `true` | Log retention. | Enables periodic age and total-size retention. |
+| `retentionMaxTotalMiB` | integer at least `1`; `1024` | Log retention. | Maximum retained logging size. |
+| `managerMaxAgeDays` | integer at least `1`; `14` | Log retention. | Manager-log age limit. |
+| `instanceMaxAgeDays` | integer at least `1`; `14` | Log retention. | Instance-transcript age limit. |
+| `buildMaxAgeDays` | integer at least `1`; `14` | Log retention. | Build-transcript age limit. |
+| `errorMaxAgeDays` | integer at least `1`; `30` | Log retention. | Error-report age limit. |
+| `benchmarkMaxAgeDays` | integer at least `1`; `90` | Log retention. | Startup-benchmark age limit. |
+| `retentionIntervalMinutes` | integer at least `1`; `60` | Log retention. | Periodic retention interval. |
+
+### `runner`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `labels` | non-empty list; provider default | All providers. Each label is at most 256 characters. | GitHub Actions routing labels. Keep architecture-sensitive workflows on an explicitly compatible label. |
+| `group` | string; empty | Optional organization runner group. | Group must exist and pass the configured runner-group policy. |
+| `includeHostLabel` | boolean; `true` | All providers. | Adds sanitized `epar-host-<machine>` unless already listed. Set false when workflows must not route by host. |
+| `ephemeral` | boolean; `true` | All providers. | Required by Docker Sandboxes and host-trust overlay; each runner accepts one job. |
+| `noDefaultLabels` | boolean; `false` | Optional GitHub registration behavior. | Omits GitHub's default self-hosted, OS, and architecture labels, so workflows must use explicitly configured labels. |
+
+### `security.runnerGroup`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `enforcement` | `warn` or `enforce`; `warn` | All providers; Docker Sandboxes requires `enforce`. | `warn` records a policy failure and continues; `enforce` blocks registration. |
+| `requireExplicitGroup` | boolean; `true` | Runner-group preflight. | Requires `runner.group` rather than an implicit default group. |
+| `requireNonDefaultGroup` | boolean; `true` | Runner-group preflight. | Rejects the organization default group when enforcement applies. |
+| `requiredRepositoryAccess` | `selected`, `private`, or `all`; `selected` | Runner-group preflight. | Maximum allowed repository breadth: selected only, all-private or narrower, or any visibility. |
+| `requirePublicRepositoriesDisabled` | boolean; `true` | Runner-group preflight. | Requires the group not to be usable by public repositories. |
+
+If the complete subsection is absent, EPAR warns and uses the strict recommended checks in `warn` mode. New wizard configurations write an explicit policy. See [Runner Group Security](runner-groups.md).
+
+### `provider`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `type` | `tart`, `wsl`, `docker-container`, or `docker-sandboxes`; `tart` before provider defaults | Required. | Selects the provider. `docker-socket` is intentionally rejected because EPAR uses a private daemon for Docker Container. |
+| `sourceImage` | string; image output for image-building providers, empty for Docker Sandboxes | Required except Docker Sandboxes. | Reusable artifact cloned by Tart, WSL, or Docker Container. Docker Sandboxes rejects it. |
+| `network` | string; `default` | Tart image build and runtime. | Tart network mode. Do not assume this configures Docker or Docker Sandboxes networking. |
+| `rosettaTag` | simple virtiofs tag; empty | Tart only. | Enables the experimental Tart Rosetta path. Validate each amd64 workload and label it distinctly. |
+| `installRoot` | string; `work/wsl` | WSL. | Project-relative WSL distribution storage root. |
+| `platform` | Docker platform string; empty except Docker Sandboxes default `linux/amd64` | Docker Container or Docker Sandboxes only. | Docker Sandboxes accepts only `linux/amd64` or `linux/arm64`; it also determines the default architecture label. |
+
+### `docker`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `registryMirrors` | list of root `http`/`https` URLs; empty | Private Docker daemon users. | Mirrors must not include credentials, query, fragment, or a non-root path. See [Docker Registry Mirrors](advanced/docker-registry-mirrors.md). |
+| `httpProxy` | root `http`/`https` URL; empty | Private Docker daemon users. | Becomes `HTTP_PROXY` for the outer Docker Container runner and its inner daemon. Credentials are rejected. |
+| `httpsProxy` | root `http`/`https` URL; empty | Private Docker daemon users. | Becomes `HTTPS_PROXY`; credentials are rejected. |
+| `noProxy` | comma-separated host/domain/IP/CIDR/`*`; empty | Private Docker daemon users. | Becomes `NO_PROXY`; whitespace, URLs, credentials, empty entries, and invalid CIDRs are rejected. |
+
+### `dockerSandboxes`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `template` | immutable local template identity; no default | Required with Docker Sandboxes. | Exact Candidate A template selected by the wizard; raw Catthehacker images are not runnable templates. |
+| `templateDigest` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Full local OCI configuration digest for the template identity. |
+| `policyGeneration` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Fingerprint of the verified host-global Balanced policy. Policy drift blocks admission. |
+| `networkBaseline` | `open` or `balanced`; `open` | Docker Sandboxes. | `open` adds a sandbox-scoped public-egress rule while denying host aliases; it does not change the host-global policy. |
+| `additionalAllow` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped allow resources. With `open`, it cannot re-allow EPAR's host-alias deny guardrails. |
+| `additionalDeny` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped deny resources. A resource cannot be in both allow and deny lists. |
+| `stagingRoot` | canonical project-relative `.local/...` path; `.local/docker-sandboxes-staging` | Docker Sandboxes. | Per-create staging root; cannot be absolute, escape `.local`, or overlap `.local/bin` or `.local/state`. |
+| `cpus` | positive integer; `4` | Docker Sandboxes. | CPU allocation for each sandbox. |
+| `memory` | positive byte size; `8GiB` | Docker Sandboxes. | Per-sandbox memory allocation written by the wizard. |
+| `rootDisk` | byte size at least `20GiB`; no schema default | Docker Sandboxes. | Guest root capacity. Wizard sizing uses measured guest use plus margin/headroom when evidence exists. |
+| `dockerDisk` | byte size at least `100GiB`; no schema default | Docker Sandboxes. | Inner Docker disk capacity. |
+| `minHostFreeSpace` | byte size at least `50GiB`; no schema default | Docker Sandboxes. | Host admission floor; effective reserve is the larger of this and `storage.minimumFree`. Runtime may require a stricter backing-volume percentage. |
+| `maxConcurrentCreates` | positive integer; `2` | Docker Sandboxes. | Limits concurrent sandbox creation to control capacity pressure. |
+
+### `timeouts`
+
+| Property | Type and default | Required or applies when | Effect and caution |
+| --- | --- | --- | --- |
+| `bootSeconds` | integer; `180` | All providers. | Time allowed for instance boot/readiness. |
+| `githubOnlineSeconds` | integer; `180` | All providers. | Time allowed for GitHub runner online readiness. |
+| `commandSeconds` | integer; `900` | All providers. | Default bound for provider command execution. |
+
+## Cross-field rules
+
+- `provider.sourceImage` is required for Tart, WSL, and Docker Container, and forbidden for Docker Sandboxes.
+- `provider.rosettaTag` is accepted only for Tart. `provider.platform` is accepted only for Docker Container or Docker Sandboxes. Docker Sandboxes accepts only `linux/amd64` and `linux/arm64`.
+- Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, a valid pinned template/digest/policy generation, resource values, and a lowercase-compatible pool prefix.
+- `image.sourcePlatform` requires `image.sourceType: docker-image`; all byte-size fields require a positive `B`, `KiB`, `MiB`, `GiB`, or `TiB` value.
+- Host-trust overlay requires a non-empty, duplicate-free scope list and `runner.ephemeral: true`; `user` is not supported on Linux.
+- `pool.namePrefix` is an ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses its durable ledger of exact owned identities. Do not share a prefix between controllers or assume broad prefix cleanup is safe.
+- `runner.labels` must never be empty, even when `runner.noDefaultLabels` is false.
+
+## Provider defaults
+
+The configuration loader starts with Tart defaults, then applies provider-specific defaults for WSL, Docker Container, and Docker Sandboxes only when the corresponding key was not set explicitly. The first-run wizard writes a concrete configuration and derives a machine-based pool prefix; use its generated values as the normal starting point.
+
+| Provider | Source and output | Default labels and prefix |
+| --- | --- | --- |
+| Docker Container | Catthehacker full Ubuntu to `epar-docker-container-catthehacker-ubuntu`. | `self-hosted`, `linux`, `epar-docker-container-catthehacker-ubuntu`; prefix `epar-docker-container`. |
+| Docker Sandboxes | Pinned Candidate A template, digest, and policy generation; no `provider.sourceImage`. | `self-hosted`, `linux`, matching `X64`/`ARM64`, `epar-docker-sandboxes`; prefix `epar-docker-sandboxes`. |
+| WSL Docker source | Catthehacker full Ubuntu, `linux/amd64`, output `work/images/epar-wsl-catthehacker-ubuntu.tar`. | `self-hosted`, `linux`, `X64`, `epar-wsl-catthehacker-ubuntu`; prefix `epar-wsl`. |
+| WSL rootfs tar | `work/images/ubuntu-24.04-clean.rootfs.tar`, output `work/images/epar-ubuntu-24-wsl.tar`. | `self-hosted`, `linux`, `X64`, `epar-wsl-ubuntu-24.04-base`; prefix `epar-wsl`. |
+| Tart | `ghcr.io/cirruslabs/ubuntu:latest` to `epar-ubuntu-24-arm64`. | `self-hosted`, `linux`, `ARM64`, `epar-tart-ubuntu-24.04-base`; prefix `epar`. |
+
+## Short recipes
+
+Keep two Docker Container runners warm:
 
 ```yaml
 pool:
   instances: 2
-```
-
-Set a unique instance name prefix for each machine/config in the same GitHub organization:
-
-```yaml
-pool:
   namePrefix: buildbox01-a4f9c2
 ```
 
-The first-run wizard derives `pool.namePrefix` from the sanitized machine name and a six-character cryptographically random hexadecimal suffix, making it recognizable while reducing collision risk when multiple EPAR configurations are created on the same host. `pool.namePrefix` is the literal beginning of every generated local instance and GitHub runner name. It must be 2-40 characters; the shared name generator appends `-YYYYMMDD-HHMMSS-###`, so a generated name is at most 60 characters and remains within GitHub's runner-name limit and the Docker Sandboxes 63-character limit. Do not reuse the same prefix on different machines or for separate EPAR supervisors in the same organization. Legacy-provider cleanup uses this boundary, while Docker Sandboxes binds and removes exact identities through its ledger. A shared prefix can therefore let one legacy supervisor delete another machine's GitHub runner record and makes every provider's ownership ambiguous.
-
-Configure replacement retry behavior after a transient GitHub or network outage:
-
-```yaml
-pool:
-  replacementRetryInitialSeconds: 15
-  replacementRetryMaxSeconds: 1800
-  replacementRetryMultiplier: 2
-  replacementRetryJitterPercent: 20
-```
-
-These values default to `15`, `1800`, `2`, and `20`, so existing configurations remain valid without changes. `replacementRetryInitialSeconds` must be positive, `replacementRetryMaxSeconds` must be at least the initial delay, `replacementRetryMultiplier` must be at least `1`, and `replacementRetryJitterPercent` must be from `0` through `100`.
-
-Configure capacity and bounded retention:
-
-```yaml
-storage:
-  minimumFree: 20GiB
-  gracePeriod: 168h
-  keepPrevious: 0
-  automaticHousekeeping: conservative
-  buildCacheLimit: 64GiB
-  goCacheLimit: 10GiB
-```
-
-Existing configurations use these defaults without requiring a new section. See [Storage](storage.md) for reporting and exact cleanup behavior.
-
-The supervisor backs off only replacement allocation after transient network errors and GitHub HTTP `429` or `5xx` responses. The nominal delay doubles from 15 seconds to a 30-minute cap with the configured jitter; a longer GitHub `Retry-After` response takes precedence. Authentication and deterministic configuration failures remain fail-fast after safe rollback. Initial `pool up` startup also remains fail-fast rather than entering an unattended retry loop.
-
-`pool.instances` is an absolute local physical-instance cap, not only an online-runner target. Provisioning, ready, draining, quarantined, and cleanup-pending instances all count toward it. Host-trust generation rotation does not receive surge capacity: an old busy runner keeps its slot until it exits or is safely removed.
-
-Add or change workflow labels:
+Use an explicit runner group with enforced least-breadth access:
 
 ```yaml
 runner:
-  labels:
-    - self-hosted
-    - linux
-    - epar-docker-container-catthehacker-ubuntu
-```
-
-Disable the automatic host-machine label:
-
-```yaml
-runner:
-  includeHostLabel: false
-```
-
-Register runners in an organization runner group and omit GitHub's automatic `self-hosted`, operating-system, and architecture labels:
-
-```yaml
-runner:
-  group: your-runner-group
-  labels: [epar-core-unique-label]
-  includeHostLabel: false
-  noDefaultLabels: true
-
+  group: trusted-ci
 security:
   runnerGroup:
     enforcement: enforce
@@ -126,102 +224,25 @@ security:
     requirePublicRepositoriesDisabled: true
 ```
 
-The group must already exist and allow the target repository to use it. `requiredRepositoryAccess` is a maximum breadth: `selected` allows only selected-repository groups, `private` also allows all-private groups, and `all` accepts any repository visibility. The public-repository requirement remains independent. Existing configs without `security.runnerGroup` use strict recommended requirements in `warn` mode; new wizard configs use `enforce`. See [Runner Group Security](runner-groups.md) for default-group choices, enterprise inheritance, overrides, and failure behavior.
-
-`runner.noDefaultLabels` defaults to `false`; when it is `true`, workflows must target labels explicitly configured under `runner.labels` and may also target the runner group.
-
-Use a different config file:
-
-```bash
-go run ./cmd/ephemeral-action-runner start --config .local/wsl.yml
-```
-
-Configure logging and retention in the top-level `logging` section. The complete schema and local/Kubernetes examples are in [Logging](logging.md). Unknown configuration keys are rejected. For compatibility, a legacy `pool.logDir` value is used as `logging.directory` with a migration warning when the new key is absent; the file is not rewritten automatically. A configuration containing both keys is rejected as ambiguous.
-
-### Host trust inheritance
-
-Docker Container runners can inherit the host's trusted TLS root anchors:
+Add a host and explicit enterprise root without weakening TLS verification:
 
 ```yaml
 image:
   hostTrustMode: overlay
   hostTrustScopes: [system, user]
+  trustedCaCertificatePaths: [.local/enterprise-root.pem]
 ```
 
-`image.hostTrustMode` accepts `disabled` or `overlay`. Existing configs default to `disabled`. A new interactive Docker Container initialization asks whether to enable host trust inheritance; pressing Enter accepts the displayed `yes` default. Enabling the policy is the one-time consent for EPAR to follow later host root additions, removals, and rotations automatically.
+On Linux, use `hostTrustScopes: [system]`. Do not disable certificate verification to work around a private CA.
 
-The supported scopes are:
-
-| Controller host | `system` | `user` |
-| --- | --- | --- |
-| Windows | Local-machine trusted roots, excluding Windows-disallowed certificates | Current-user trusted roots, excluding Windows-disallowed certificates |
-| macOS | System Roots plus CA certificates explicitly trusted for TLS server use in the administrator domain, excluding explicit deny | CA certificates in the user's keychain search list explicitly trusted for TLS server use, excluding explicit deny |
-| Linux | The distribution's generated system CA bundle | Not supported |
-
-Use `[system, user]` on Windows or macOS when the runner should inherit the
-same two trust scopes as the account running EPAR. Linux configs must use
-`[system]`. Overlay mode is supported only for `provider.type: docker-container` and
-requires `runner.ephemeral: true`.
-If macOS has disabled user-level Trust Settings, the `user` scope contributes
-no certificates until that host policy is enabled again.
-
-The resulting Ubuntu runner trust is additive:
-
-```text
-Ubuntu default roots
-+ host roots from the current EPAR generation
-+ image.trustedCaCertificatePaths
-```
-
-This is root-anchor inheritance, not exact emulation of Windows or macOS TLS
-policy. macOS positive trust settings constrained by hostname, application, or
-allowed error are not promoted into Ubuntu's unconstrained global root store.
-Removing a host root does not remove an independently bundled Ubuntu root or a
-certificate still listed under `trustedCaCertificatePaths`.
-
-### Explicit CA paths
-
-Trust an additional enterprise TLS inspection or private package-registry CA:
-
-```yaml
-image:
-  trustedCaCertificatePaths:
-    - .local/enterprise-root.pem
-```
-
-Paths may be repository-relative, absolute, or under `~/`. EPAR validates PEM
-or DER X.509 CA certificates before building, normalizes them to deterministic
-`.crt` files, and installs them before any `apt` or `curl` step. These paths are
-independent of host trust inheritance and remain trusted until removed from the
-config.
-
-Route the private Docker daemon through an enterprise network proxy:
+Configure a private Docker proxy and mirror without embedding credentials:
 
 ```yaml
 docker:
+  registryMirrors: [https://mirror.example.test]
   httpProxy: http://proxy.example.test:3128
   httpsProxy: http://proxy.example.test:3128
   noProxy: localhost,127.0.0.1,.example.test
 ```
 
-These optional values become `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` on the
-outer runner container, so its inner `dockerd` inherits them at first
-startup. Proxy URLs must not contain credentials. Keep machine-specific proxy
-addresses in ignored `.local/config.yml`, not tracked example files.
-
-## Provider Defaults
-
-For `provider.type: docker-container`, EPAR defaults to Catthehacker's full Ubuntu runner image and creates a Docker Container image named `epar-docker-container-catthehacker-ubuntu`.
-
-For `provider.type: docker-sandboxes`, EPAR rejects `provider.sourceImage` and requires an explicitly built and loaded Candidate A template plus its full OCI configuration digest, verified policy fingerprint, staging root, and resource limits. The missing-config wizard offers only the active lock-selected source channels for the host platform: Catthehacker `full-latest` (recommended) and `act-22.04` (current lean profile). Each source channel maps to one exact versioned EPAR template tag; raw Catthehacker images cannot be used directly. The wizard filters historical cached EPAR tags, writes the selected template tag and full local digest to configuration, and does not refresh the approved source-lock snapshot automatically. It reports the shared host template-cache size separately from per-sandbox storage and asks one capacity question. With matching capacity evidence, it derives the total `rootDisk` from measured guest `/` use, a 25% margin, and the recommended 20 GiB writable headroom, then asks for Docker-disk capacity. Without exact root evidence, it asks for provisional total root capacity and writes the Docker-disk default. It writes the 50 GiB host-free floor in both cases; runtime admission strengthens this to at least 10% of the backing volume. Configuration validation enforces a 20 GiB minimum root capacity independently from the 100 GiB Docker-disk minimum. A configured Docker Sandboxes pool never falls back to Docker Container. See the [Docker Sandboxes provider](providers/docker-sandboxes.md) and the tracked example.
-
-For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
-
-For the experimental `provider.type: tart`, EPAR defaults to `ghcr.io/cirruslabs/ubuntu:latest`, a basic Ubuntu ARM64 VM image. EPAR installs its runner lifecycle but does not add the broad tool and dependency set found in GitHub's hosted runner images. If you require a GitHub-runner-like environment, build and maintain a bootable Tart image yourself by adapting the scripts in [actions/runner-images](https://github.com/actions/runner-images), then set `image.sourceImage` to that Tart image. Rosetta-based amd64 execution also has compatibility limits and must be validated against the exact workflow.
-
-See the provider docs for details:
-
-- [Docker Container Provider](providers/docker-container.md)
-- [Docker Sandboxes Provider](providers/docker-sandboxes.md)
-- [WSL Provider](providers/wsl.md)
-- [Tart Provider](providers/tart.md)
+For Docker Sandboxes, run `./start` and let the wizard write the pinned template, digest, policy fingerprint, and capacity settings. Do not hand-copy a template tag from another host or replace its digest with a mutable tag.

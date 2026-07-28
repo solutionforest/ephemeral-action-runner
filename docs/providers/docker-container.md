@@ -1,20 +1,24 @@
 # Docker Container Provider
 
-The Docker Container provider creates one privileged Ubuntu-based runner container per EPAR instance. That outer container starts its own private Docker daemon, and the GitHub Actions runner executes inside the same container.
+Docker Container creates one privileged Ubuntu runner container per EPAR instance. The outer container starts a private inner Docker daemon, so workflow containers, networks, volumes, and image cache stay inside that disposable runner.
 
-This is useful when a host already has a reliable Docker runtime and you want disposable runner environments without creating full VMs. It is also useful for Docker Compose-heavy jobs because each runner instance has a separate inner Docker daemon. Deleting the EPAR container deletes that instance's job containers, networks, volumes, and inner image cache.
+## When To Use It
 
-EPAR does not support a host Docker socket provider.
+Choose Docker Container on a Docker-capable host when privileged containers are acceptable and you want strong per-runner Docker resource separation. It is a practical fit for Compose-heavy jobs, including jobs that reuse fixed Compose project names or ports. EPAR does not support a host-Docker-socket provider.
 
-## When To Choose It
+## Support Status
 
-Choose Docker Container first for Docker-heavy Linux workflows when privileged containers are acceptable on the host. It is especially useful when the target repository already has Compose scripts, fixed project names, fixed internal ports, or amd64-only runtime images. In those cases, selecting a compatible runner label and Docker platform is usually cleaner than changing application runtime settings for CI compatibility.
+This is a supported provider on hosts whose Docker runtime can run privileged Linux containers. It is trusted-job infrastructure: `--privileged` weakens the normal container boundary, so do not use it for arbitrary untrusted workflow code.
 
-Choose Tart or WSL instead when you specifically need their host model: Tart for VM-based Apple Silicon runners, WSL for Windows-hosted Linux runners, and x64 WSL/Linux hosts for native amd64 performance.
+## Prerequisites
 
-## Configuration
+- A working Docker-compatible daemon that permits `docker run --privileged`.
+- Enough host Docker storage for the reusable image and the requested disposable runners.
+- A GitHub App and runner group configured as described in [Runner Group Security](../runner-groups.md).
 
-Use `configs/docker-container.example.yml` for a base runner image:
+## Minimal Configuration
+
+Start with [`configs/docker-container.example.yml`](../../configs/docker-container.example.yml):
 
 ```yaml
 image:
@@ -28,189 +32,40 @@ provider:
   network: default
 ```
 
-Use `configs/docker-container.act.example.yml` for a smaller Docker-focused runner. Its Catthehacker Act base includes Node plus Docker Engine/CLI/Compose/Buildx, but does not guarantee a browser runtime:
+`provider.platform` is optional and maps to Docker's `--platform` for the reusable image and runner containers. Give cross-architecture configurations a distinct workflow label and verify actual execution on the intended host.
 
-```yaml
-image:
-  sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
-  outputImage: epar-docker-container-catthehacker-act
+Use `configs/docker-container.act.example.yml` for a smaller Docker-focused Catthehacker base, or `configs/docker-container.web-e2e.example.yml` when browser/E2E tooling is required. The full configuration, host-trust settings, proxies, and registry mirrors belong in [Configuration](../configuration.md).
 
-runner:
-  labels: [self-hosted, linux, epar-docker-container-catthehacker-act]
+## Normal Workflow
 
-provider:
-  sourceImage: epar-docker-container-catthehacker-act
-```
+1. Create a local configuration with the wizard or copy an example.
+2. Run `./start`. EPAR builds or refreshes the reusable image when its manifest no longer matches the configuration, then starts the pool.
+3. Target the configured label in a workflow, for example `runs-on: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]`.
 
-Use `configs/docker-container.web-e2e.example.yml` as a smaller customized-image example. It starts from `ghcr.io/catthehacker/ubuntu:act-latest` and layers only the web/E2E add-on:
+The outer container has no host Docker socket mount and does not publish host ports by default. The inner daemon defaults to the reliable nested-Docker `vfs` storage driver. Use a different `EPAR_DOCKERD_STORAGE_DRIVER` only in a derived image after validating the exact host runtime.
 
-```yaml
-image:
-  sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
-  outputImage: epar-docker-container-catthehacker-ubuntu-web-e2e
-  customInstallScripts:
-    - scripts/guest/ubuntu/install-web-e2e.sh
+## Limitations
 
-runner:
-  labels: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu-web-e2e]
-  includeHostLabel: true
+- The inner Docker daemon is private, but its CPU, memory, and disk use still comes from the host.
+- The runner's inner image cache disappears with the instance.
+- Docker Desktop, OrbStack, and Linux Docker Engine can differ in privileged-container and foreign-architecture behavior.
+- Registry mirrors and proxy services are external infrastructure; EPAR configures the runner daemon but does not operate or secure those services.
 
-provider:
-  sourceImage: epar-docker-container-catthehacker-ubuntu-web-e2e
-```
-
-`provider.platform` is optional and maps to Docker's `--platform` flag for image builds and runner containers. Use a label that reflects the actual platform your workflows should target.
-
-Optional Docker registry mirrors are configured under the provider-neutral `docker` section:
-
-```yaml
-docker:
-  registryMirrors:
-    - http://host.docker.internal:5050
-```
-
-When a Docker Container mirror URL uses `host.docker.internal`, EPAR adds Docker's `host-gateway` alias to the outer runner container so the inner daemon can reach a host-published mirror on Linux Docker Engine. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
-
-If the inner daemon must use an enterprise HTTP proxy, configure its startup
-environment explicitly:
-
-```yaml
-docker:
-  httpProxy: http://proxy.example.test:3128
-  httpsProxy: http://proxy.example.test:3128
-  noProxy: localhost,127.0.0.1,.example.test
-```
-
-EPAR sets these values on the outer container before it starts, allowing
-`dockerd` to inherit them on its first launch. Empty values preserve direct
-networking. Proxy URLs are limited to credential-free HTTP(S) roots; use network
-controls rather than embedding proxy passwords. Put host-specific endpoints in
-ignored `.local/config.yml`. If the proxy performs TLS inspection, enable host
-trust inheritance or configure the authorized root under
-`image.trustedCaCertificatePaths` so verified HTTPS continues to work.
-
-## Host Trust Inheritance
-
-On Windows, macOS, and Linux controller hosts, Docker Container can add the host's trusted TLS root anchors to each disposable Ubuntu runner:
-
-```yaml
-image:
-  hostTrustMode: overlay
-  hostTrustScopes: [system, user]
-```
-
-Use `[system, user]` on Windows or macOS. Use `[system]` on Linux; Linux has no portable per-user TLS root store. Overlay mode requires ephemeral Docker Container runners. Existing configs remain disabled. New interactive Docker Container setup shows a yes/no prompt and defaults to enabling inheritance.
-
-EPAR treats the host's root set as a versioned generation. It installs that
-generation alongside Ubuntu's default roots and any certificates from
-`image.trustedCaCertificatePaths`. The pool keeps its normal 15-second liveness
-interval. A native controller recollects host trust every 15 seconds; a
-containerized controller checks its read-only feed and refreshes idle-runner
-leases every 5 seconds. Official no-Go launchers keep collection outside the
-Linux toolchain container: their host-side watcher refreshes a read-only feed
-every 10 seconds. The wrapper fails rather than use
-the toolchain container's unrelated CA bundle when the configured feed is
-missing, empty, invalid, or older than 30 seconds.
-
-When a generation changes, EPAR stops leasing old idle runners, removes them,
-builds the replacement image, and registers replacement capacity. A busy runner
-finishes its current job without having its trust changed. A synchronous
-`ACTIONS_RUNNER_HOOK_JOB_STARTED` gate requires a current 20-second controller
-lease and matching image generation. If GitHub assigns an old runner while it
-is being retired, the gate fails before repository workflow steps run; the job
-can still appear failed because GitHub assignment has already happened.
-
-The host trust snapshot and no-Go feed are controller inputs only. They are not
-mounted into runner containers, and workflow code cannot use the feed as a host
-filesystem channel.
-
-This feature inherits root anchors, not every host TLS-policy rule. The overlay
-is additive, so removing a host root does not remove a matching root already in
-Ubuntu or explicitly configured by path. Host Docker daemon trust is also
-separate: a source-image pull can fail before EPAR can build the guest overlay.
-Applications with private trust stores, including Java keystores, can require
-additional configuration.
-
-## Image Build
-
-Docker Container images are Docker image tags, not Tart images or rootfs tar files:
+## Verification
 
 ```bash
-./bin/ephemeral-action-runner image build --replace
-docker image ls epar-docker-container-catthehacker-ubuntu
+ephemeral-action-runner pool verify --instances 1 --cleanup
+ephemeral-action-runner pool verify --instances 1 --register-only --cleanup
 ```
 
-The default build starts from `ghcr.io/catthehacker/ubuntu:full-latest`, installs the GitHub Actions runner and EPAR helper scripts, and reuses the base image's Docker Engine/CLI/Compose/Buildx. The generated image also includes `/opt/epar/container-entrypoint.sh`, which starts the private inner `dockerd` when the runner container starts.
-
-Run `image update-upstream` only when selected install scripts need EPAR's pinned `actions/runner-images` checkout, such as the web/E2E script.
-
-## Runtime Behavior
-
-EPAR maps provider operations to Docker commands:
-
-- clone/create: `docker create --privileged --label epar.provider=docker-container ...`
-- start: `docker start`, then wait for inner `docker info`
-- exec: `docker exec`
-- address: `docker inspect`
-- stop: `docker stop`
-- delete: `docker rm -f -v`
-- list: `docker ps -a --filter label=epar.provider=docker-container`
-
-The provider does not mount `/var/run/docker.sock`, an OrbStack socket, or any host Docker socket into the runner container. It also does not publish host ports by default. If two jobs use the same Docker Compose project name or container ports, they are separated by their private inner Docker daemons.
-
-The inner daemon starts with `EPAR_DOCKERD_STORAGE_DRIVER=vfs` by default. `vfs` is slower than `overlay2`, but it is the most reliable default for nested Docker on Docker Desktop, OrbStack, and other privileged-container hosts where overlay mounts can fail inside the runner container. Advanced users can bake `EPAR_DOCKERD_STORAGE_DRIVER=overlay2` or `EPAR_DOCKERD_STORAGE_DRIVER=auto` into a derived image after validating that the exact host runtime supports it.
-
-On Apple Silicon hosts using Docker Desktop or OrbStack, the inner daemon may be able to run `linux/amd64` containers through the host runtime's emulation support. Validate this on the exact host before routing amd64-only workflows to Docker Container:
+For an ARM64 host that must run amd64 Docker images, verify execution inside a live EPAR runner rather than relying on image pull success:
 
 ```bash
 docker exec <epar-instance> docker run --rm --platform linux/amd64 alpine:3.20 uname -m
 ```
 
-Expected output:
+Expected output is `x86_64`.
 
-```text
-x86_64
-```
+## Troubleshooting
 
-The runner process uses EPAR's non-systemd fallback:
-
-- `/opt/epar/run-runner.sh` starts `/opt/actions-runner/run.sh` in the background.
-- `/var/run/actions-runner.pid` records the runner PID.
-- `/opt/epar/check-runner.sh` reports liveness.
-- `/var/log/actions-runner/run.log` records runner output.
-
-## Verification
-
-Local runtime check without GitHub registration:
-
-```bash
-./bin/ephemeral-action-runner pool verify --instances 1 --cleanup
-```
-
-Full registration check:
-
-```bash
-./bin/ephemeral-action-runner pool verify --instances 2 --register-only --cleanup
-```
-
-Dry-run command construction:
-
-```bash
-./bin/ephemeral-action-runner pool verify --dry-run --instances 1
-```
-
-The dry run should show `docker create` with `--privileged` and no host socket mount.
-
-For Docker Compose-heavy jobs that use fixed project names or ports, a useful isolation smoke test is to start two unregistered Docker Container instances, run the same compose stack in both with the same project name, and confirm the host Docker daemon only shows the two outer EPAR containers. The job-created containers should appear only when you run `docker exec <epar-instance> docker ps` against each instance.
-
-## Caveats
-
-- Docker Container requires privileged containers. Treat it as trusted-job infrastructure.
-- It is not a security boundary for hostile code.
-- Inner Docker image cache is per runner instance and disappears on cleanup.
-- Optional registry mirrors can reduce repeated pull time, but they are external services that must be secured and monitored separately.
-- Cross-architecture containers, for example `linux/amd64` images on an ARM64 host, depend on the host Docker runtime's emulation support.
-- Host Docker resource usage still matters because each runner container and inner daemon consumes CPU, memory, and disk on the same host.
-- Docker Desktop, OrbStack, and Linux Docker Engine can have different privileged-container behavior. Validate on the exact host runtime you plan to use.
+See [Troubleshooting](../troubleshooting.md) for privileged-container checks, nested-Docker storage-driver failures, architecture emulation, disk pressure, and TLS errors.
