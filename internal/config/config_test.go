@@ -112,6 +112,64 @@ func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	}
 }
 
+func TestStorageDefaultsAreBoundedAndConservative(t *testing.T) {
+	storage := Default().Storage
+	if storage.MinimumFree != "20GiB" ||
+		storage.GracePeriod != "168h" ||
+		storage.KeepPrevious != 0 ||
+		storage.AutomaticHousekeeping != StorageHousekeepingConservative ||
+		storage.BuildCacheLimit != "64GiB" ||
+		storage.GoCacheLimit != "10GiB" {
+		t.Fatalf("unexpected storage defaults: %+v", storage)
+	}
+	if err := ValidateStorage(storage); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadStoragePolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "storage:\n  minimumFree: 30GiB\n  gracePeriod: 72h\n  keepPrevious: 1\n  automaticHousekeeping: disabled\n  buildCacheLimit: 80GiB\n  goCacheLimit: 12GiB\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Storage.MinimumFree, "30GiB"; got != want {
+		t.Fatalf("storage.minimumFree = %q, want %q", got, want)
+	}
+	if got, want := cfg.Storage.GracePeriod, "72h"; got != want {
+		t.Fatalf("storage.gracePeriod = %q, want %q", got, want)
+	}
+	if cfg.Storage.KeepPrevious != 1 || cfg.Storage.AutomaticHousekeeping != StorageHousekeepingDisabled {
+		t.Fatalf("unexpected loaded storage policy: %+v", cfg.Storage)
+	}
+	if err := ValidateStorage(cfg.Storage); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateStorageRejectsUnboundedOrUnknownPolicy(t *testing.T) {
+	tests := []func(*StorageConfig){
+		func(storage *StorageConfig) { storage.MinimumFree = "0GiB" },
+		func(storage *StorageConfig) { storage.GracePeriod = "0h" },
+		func(storage *StorageConfig) { storage.KeepPrevious = -1 },
+		func(storage *StorageConfig) { storage.AutomaticHousekeeping = "aggressive" },
+		func(storage *StorageConfig) { storage.BuildCacheLimit = "64GB" },
+		func(storage *StorageConfig) { storage.GoCacheLimit = "" },
+	}
+	for _, mutate := range tests {
+		storage := Default().Storage
+		mutate(&storage)
+		if err := ValidateStorage(storage); err == nil {
+			t.Fatalf("ValidateStorage accepted invalid policy: %+v", storage)
+		}
+	}
+}
+
 func TestRunnerGroupSecurityDefaultsToStrictWarnings(t *testing.T) {
 	policy := Default().Security.RunnerGroup
 	if policy.Enforcement != RunnerGroupEnforcementWarn ||
@@ -344,6 +402,7 @@ func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
 		"github:\n  unknown: value\n",
 		"image:\n  unknown: value\n",
 		"pool:\n  unknown: value\n",
+		"storage:\n  unknown: value\n",
 		"logging:\n  unknown: value\n",
 		"runner:\n  unknown: value\n",
 		"security:\n  runnerGroup:\n    unknown: value\n",
@@ -453,7 +512,6 @@ func TestValidateRejectsInvalidHostTrustConfigurations(t *testing.T) {
 		ephemeral bool
 	}{
 		{name: "unknown mode", mode: "mirror", scopes: []string{HostTrustScopeSystem}, provider: "docker-container", ephemeral: true},
-		{name: "wrong provider", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "wsl", ephemeral: true},
 		{name: "non-ephemeral", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "docker-container"},
 		{name: "empty scopes", mode: HostTrustModeOverlay, provider: "docker-container", ephemeral: true},
 		{name: "unknown scope", mode: HostTrustModeOverlay, scopes: []string{"global"}, provider: "docker-container", ephemeral: true},
@@ -470,6 +528,28 @@ func TestValidateRejectsInvalidHostTrustConfigurations(t *testing.T) {
 				t.Fatal("Validate accepted invalid host trust configuration")
 			}
 		})
+	}
+}
+
+func TestValidateHostTrustAllowsDockerSandboxesOverlay(t *testing.T) {
+	cfg := validDockerSandboxesConfig()
+	cfg.Image.HostTrustMode = HostTrustModeOverlay
+	cfg.Image.HostTrustScopes = []string{HostTrustScopeSystem}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Docker Sandboxes host trust overlay rejected: %v", err)
+	}
+}
+
+func TestValidateHostTrustAllowsWSLOverlay(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "wsl"
+	cfg.Provider.SourceImage = "runner-image.tar"
+	cfg.Provider.InstallRoot = "work/wsl"
+	cfg.Runner.Ephemeral = true
+	cfg.Image.HostTrustMode = HostTrustModeOverlay
+	cfg.Image.HostTrustScopes = []string{HostTrustScopeSystem}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("WSL host trust overlay rejected: %v", err)
 	}
 }
 
@@ -1137,4 +1217,305 @@ image:
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load accepted image.profile")
 	}
+}
+
+func TestDockerSandboxesRejectsNamePrefixOutsideProviderGrammar(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Provider.Platform = "linux/amd64"
+	cfg.Provider.SourceImage = ""
+	cfg.Pool.NamePrefix = "EPAR_sandbox"
+	cfg.Runner.Ephemeral = true
+	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
+	cfg.DockerSandboxes.Template = "epar-template:v1"
+	cfg.DockerSandboxes.TemplateDigest = "sha256:" + strings.Repeat("a", 64)
+	cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("b", 64)
+	cfg.DockerSandboxes.RootDisk = "120GiB"
+	cfg.DockerSandboxes.DockerDisk = "100GiB"
+	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "lowercase") {
+		t.Fatalf("Validate() error = %v, want Docker Sandboxes prefix grammar rejection", err)
+	}
+}
+
+func TestLoadDockerSandboxesConfig(t *testing.T) {
+	t.Setenv(HostNameEnv, "sandbox-preview-host")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-sandboxes.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-sandboxes
+runner:
+  ephemeral: true
+security:
+  runnerGroup:
+    enforcement: enforce
+dockerSandboxes:
+  template: registry.example.invalid/epar/runner-template:preview
+  templateDigest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+  networkBaseline: balanced
+  additionalAllow: [api.github.com, '*.githubusercontent.com:443']
+  additionalDeny:
+    - telemetry.example.invalid
+  stagingRoot: .local/docker-sandboxes
+  cpus: 2
+  memory: 4GiB
+  rootDisk: 20GiB
+  dockerDisk: 100GiB
+  maxConcurrentCreates: 1
+  minHostFreeSpace: 50GiB
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider.SourceImage, ""; got != want {
+		t.Fatalf("provider.sourceImage = %q, want empty for docker-sandboxes", got)
+	}
+	if got, want := cfg.Provider.Platform, "linux/amd64"; got != want {
+		t.Fatalf("provider.platform = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.NamePrefix, "epar-docker-sandboxes"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels, []string{"self-hosted", "linux", "X64", "epar-docker-sandboxes", "epar-host-sandbox-preview-host"}; !slices.Equal(got, want) {
+		t.Fatalf("runner.labels = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
+		t.Fatalf("dockerSandboxes.memory = %q, want %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.AdditionalAllow, []string{"api.github.com", "*.githubusercontent.com:443"}; !slices.Equal(got, want) {
+		t.Fatalf("dockerSandboxes.additionalAllow = %#v, want %#v", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "source image is unsupported",
+			mutate: func(cfg *Config) { cfg.Provider.SourceImage = "runner-image" },
+		},
+		{
+			name:   "platform is not a supported sandbox guest",
+			mutate: func(cfg *Config) { cfg.Provider.Platform = "linux/s390x" },
+		},
+		{
+			name:   "runner is persistent",
+			mutate: func(cfg *Config) { cfg.Runner.Ephemeral = false },
+		},
+		{
+			name:   "runner group enforcement is not fail closed",
+			mutate: func(cfg *Config) { cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementWarn },
+		},
+		{
+			name:   "template is empty",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.Template = "" },
+		},
+		{
+			name:   "template digest is not pinned",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.TemplateDigest = "sha256:ABCDEF" },
+		},
+		{
+			name:   "policy generation is not content addressed",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.PolicyGeneration = "verified-balanced-policy-fingerprint" },
+		},
+		{
+			name:   "network baseline is unsupported",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.NetworkBaseline = "locked-down" },
+		},
+		{
+			name:   "allowlist wildcard is unsafe",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalAllow = []string{"**.example.test"} },
+		},
+		{
+			name:   "allowlist contains a URL",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalAllow = []string{"https://example.test"} },
+		},
+		{
+			name:   "allowlist overlaps denylist",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalDeny = []string{"api.github.com"} },
+		},
+		{
+			name:   "open allowlist overrides host boundary",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalAllow = []string{"host.docker.internal"} },
+		},
+		{
+			name:   "cpus are not positive",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.CPUs = 0 },
+		},
+		{
+			name:   "memory is not a positive byte size",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.Memory = "0GiB" },
+		},
+		{
+			name:   "root disk is below the hard minimum",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.RootDisk = "19GiB" },
+		},
+		{
+			name:   "docker disk is below the hard minimum",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.DockerDisk = "99GiB" },
+		},
+		{
+			name:   "host free space is below the hard minimum",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.MinHostFreeSpace = "49GiB" },
+		},
+		{
+			name:   "concurrency is not positive",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.MaxConcurrentCreates = 0 },
+		},
+		{
+			name:   "staging root is an absolute host path",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = `C:\epar-staging` },
+		},
+		{
+			name:   "staging root is an absolute Unix host path",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = "/tmp/epar-staging" },
+		},
+		{
+			name:   "staging root escapes project local state",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = "../epar-staging" },
+		},
+		{
+			name:   "staging root overlaps ledger",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = ".local/state/docker-sandboxes" },
+		},
+		{
+			name:   "staging root overlaps native binary cache",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = ".local/bin/staging" },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validDockerSandboxesConfig()
+			test.mutate(&cfg)
+			if err := Validate(cfg); err == nil {
+				t.Fatal("Validate accepted invalid docker-sandboxes configuration")
+			}
+		})
+	}
+}
+
+func TestValidateDockerSandboxesAcceptsARM64Configuration(t *testing.T) {
+	cfg := validDockerSandboxesConfig()
+	cfg.Provider.Platform = "linux/arm64"
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() rejected linux/arm64 Docker Sandboxes configuration: %v", err)
+	}
+}
+
+func TestDockerSandboxesGuestPlatform(t *testing.T) {
+	tests := []struct {
+		hostOS   string
+		hostArch string
+		want     string
+		wantErr  bool
+	}{
+		{hostOS: "windows", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "linux", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "darwin", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "windows", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "linux", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "darwin", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "futureos", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "futureos", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "futureos", hostArch: "386", wantErr: true},
+		{hostOS: "", hostArch: "amd64", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.hostOS+"_"+test.hostArch, func(t *testing.T) {
+			got, err := DockerSandboxesGuestPlatform(test.hostOS, test.hostArch)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("DockerSandboxesGuestPlatform(%q, %q) = %q, nil; want error", test.hostOS, test.hostArch, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DockerSandboxesGuestPlatform(%q, %q) error = %v", test.hostOS, test.hostArch, err)
+			}
+			if got != test.want {
+				t.Fatalf("DockerSandboxesGuestPlatform(%q, %q) = %q, want %q", test.hostOS, test.hostArch, got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateDockerSandboxHostname(t *testing.T) {
+	for _, hostname := range []string{"api.github.com", "api.github.com:443", "*.githubusercontent.com", "*.githubusercontent.com:443"} {
+		if err := ValidateDockerSandboxHostname(hostname); err != nil {
+			t.Fatalf("hostname %q rejected: %v", hostname, err)
+		}
+	}
+	for _, hostname := range []string{"**.githubusercontent.com", "api.*.github.com", "https://api.github.com", "api.github.com/path", "api.github.com:0", "api.github.com:65536", "127.0.0.1", "[::1]:443"} {
+		if err := ValidateDockerSandboxHostname(hostname); err == nil {
+			t.Fatalf("hostname %q accepted", hostname)
+		}
+	}
+}
+
+func TestParseByteSize(t *testing.T) {
+	if got, err := ParseByteSize("4GiB"); err != nil || got != 4*(1<<30) {
+		t.Fatalf("ParseByteSize(4GiB) = %d, %v", got, err)
+	}
+	for _, value := range []string{"", " 4GiB", "4GB", "0GiB", "-1GiB", "999999999999999999999TiB"} {
+		if _, err := ParseByteSize(value); err == nil {
+			t.Fatalf("ParseByteSize(%q) accepted invalid value", value)
+		}
+	}
+}
+
+func TestEffectiveMinimumFreeBytesUsesProviderReserve(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Storage.MinimumFree = "20GiB"
+	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
+
+	got, err := EffectiveMinimumFreeBytes(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(50 << 30); got != want {
+		t.Fatalf("EffectiveMinimumFreeBytes() = %d, want %d", got, want)
+	}
+}
+
+func TestEffectiveMinimumFreeBytesKeepsStricterCommonReserve(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Storage.MinimumFree = "60GiB"
+	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
+
+	got, err := EffectiveMinimumFreeBytes(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(60 << 30); got != want {
+		t.Fatalf("EffectiveMinimumFreeBytes() = %d, want %d", got, want)
+	}
+}
+
+func validDockerSandboxesConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Provider.SourceImage = ""
+	cfg.Provider.Platform = "linux/amd64"
+	cfg.Runner.Ephemeral = true
+	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
+	cfg.DockerSandboxes.Template = "registry.example.invalid/epar/runner-template:preview"
+	cfg.DockerSandboxes.TemplateDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	cfg.DockerSandboxes.PolicyGeneration = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	cfg.DockerSandboxes.AdditionalAllow = []string{"api.github.com"}
+	cfg.DockerSandboxes.RootDisk = "120GiB"
+	cfg.DockerSandboxes.DockerDisk = "100GiB"
+	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
+	return cfg
 }

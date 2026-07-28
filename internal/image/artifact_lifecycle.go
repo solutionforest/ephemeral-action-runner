@@ -1,4 +1,4 @@
-package pool
+package image
 
 import (
 	"context"
@@ -18,46 +18,38 @@ import (
 )
 
 const (
-	imageManifestSchemaVersion = 1
-	imageManifestGuestPath     = "/opt/epar/image-manifest.json"
-	imageManifestLabel         = "org.solutionforest.epar.manifest-sha256"
+	imageManifestSchemaVersion = ManifestSchemaVersion
+	imageManifestGuestPath     = ManifestGuestPath
+	imageManifestLabel         = ManifestLabel
 )
 
-type ImageManifest struct {
-	SchemaVersion         int                     `json:"schemaVersion"`
-	ProviderType          string                  `json:"providerType"`
-	ProviderPlatform      string                  `json:"providerPlatform,omitempty"`
-	ProviderRosettaTag    string                  `json:"providerRosettaTag,omitempty"`
-	SourceType            string                  `json:"sourceType,omitempty"`
-	SourceImage           string                  `json:"sourceImage"`
-	SourcePlatform        string                  `json:"sourcePlatform,omitempty"`
-	SourceDigest          string                  `json:"sourceDigest,omitempty"`
-	OutputImage           string                  `json:"outputImage"`
-	RunnerVersion         string                  `json:"runnerVersion"`
-	UpstreamCommit        string                  `json:"upstreamCommit,omitempty"`
-	EPARScripts           []fileDigest            `json:"eparScripts,omitempty"`
-	CustomInstallScripts  []fileDigest            `json:"customInstallScripts,omitempty"`
-	TrustedCACertificates []fileDigest            `json:"trustedCaCertificates,omitempty"`
-	HostTrust             *hostTrustImageMetadata `json:"hostTrust,omitempty"`
+type ImageManifest = Manifest
+type fileDigest = FileDigest
+type sourceCacheManifest = SourceCacheManifest
+
+func hostTrustMetadata(snapshot hosttrust.Snapshot) *HostTrustMetadata {
+	if snapshot.Generation == "" {
+		return nil
+	}
+	return &HostTrustMetadata{
+		Mode:             hosttrust.ModeOverlay,
+		HostOS:           snapshot.HostOS,
+		Scopes:           append([]string(nil), snapshot.Scopes...),
+		Generation:       snapshot.Generation,
+		CertificateCount: len(snapshot.Certificates),
+	}
 }
 
-type fileDigest struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-}
-
-type storedImageManifest struct {
-	Hash     string        `json:"hash"`
-	Manifest ImageManifest `json:"manifest"`
-}
-
-type sourceCacheManifest struct {
-	SourceImage    string `json:"sourceImage"`
-	SourcePlatform string `json:"sourcePlatform,omitempty"`
-	SourceDigest   string `json:"sourceDigest,omitempty"`
-}
-
-func (m *Manager) EnsureImage(ctx context.Context) error {
+func (m *Coordinator) EnsureImage(ctx context.Context) error {
+	if err := m.preflightStorage("image-pull", imagePullExpansionBytes); err != nil {
+		return err
+	}
+	if artifactManager, ok := m.Lifecycle.(provider.ArtifactManager); ok {
+		handled, err := artifactManager.EnsureArtifacts(ctx, m.DryRun)
+		if handled || err != nil {
+			return err
+		}
+	}
 	manifest, err := m.desiredImageManifest(ctx)
 	if err != nil {
 		return err
@@ -94,7 +86,7 @@ const (
 	imageStateCurrent
 )
 
-func (m *Manager) currentImageState(ctx context.Context, wantHash string) (imageState, error) {
+func (m *Coordinator) currentImageState(ctx context.Context, wantHash string) (imageState, error) {
 	switch m.Config.Provider.Type {
 	case "docker-container":
 		got, exists, err := m.currentDockerContainerManifestHash(ctx)
@@ -127,12 +119,12 @@ func (m *Manager) currentImageState(ctx context.Context, wantHash string) (image
 	}
 }
 
-func (m *Manager) currentDockerContainerManifestHash(ctx context.Context) (string, bool, error) {
+func (m *Coordinator) currentDockerContainerManifestHash(ctx context.Context) (string, bool, error) {
 	output := strings.TrimSpace(m.Config.Image.OutputImage)
 	if output == "" {
 		return "", false, fmt.Errorf("image.outputImage is required")
 	}
-	out, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{json .Config.Labels}}", output)
+	out, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{json .Config.Labels}}", output)
 	if err != nil {
 		if dockerInspectMeansMissing(err) {
 			return "", false, nil
@@ -146,7 +138,7 @@ func (m *Manager) currentDockerContainerManifestHash(ctx context.Context) (strin
 	return labels[imageManifestLabel], true, nil
 }
 
-func (m *Manager) currentWSLManifestHash() (string, bool, error) {
+func (m *Coordinator) currentWSLManifestHash() (string, bool, error) {
 	outputPath := config.ProjectPath(m.ProjectRoot, m.Config.Image.OutputImage)
 	if _, err := os.Stat(outputPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -164,7 +156,7 @@ func (m *Manager) currentWSLManifestHash() (string, bool, error) {
 	return stored.Hash, true, nil
 }
 
-func (m *Manager) currentTartImageState(ctx context.Context) (imageState, error) {
+func (m *Coordinator) currentTartImageState(ctx context.Context) (imageState, error) {
 	instances, err := m.Provider.List(ctx)
 	if err != nil {
 		return imageStateMissing, err
@@ -177,7 +169,7 @@ func (m *Manager) currentTartImageState(ctx context.Context) (imageState, error)
 	return imageStateMissing, nil
 }
 
-func (m *Manager) desiredImageManifest(ctx context.Context) (ImageManifest, error) {
+func (m *Coordinator) desiredImageManifest(ctx context.Context) (ImageManifest, error) {
 	snapshot, err := m.resolveHostTrust(ctx)
 	if err != nil {
 		return ImageManifest{}, err
@@ -185,7 +177,7 @@ func (m *Manager) desiredImageManifest(ctx context.Context) (ImageManifest, erro
 	return m.desiredImageManifestWithHostTrust(ctx, snapshot)
 }
 
-func (m *Manager) desiredImageManifestWithHostTrust(ctx context.Context, snapshot hosttrust.Snapshot) (ImageManifest, error) {
+func (m *Coordinator) desiredImageManifestWithHostTrust(ctx context.Context, snapshot hosttrust.Snapshot) (ImageManifest, error) {
 	sourceType := m.Config.Image.SourceType
 	if sourceType == "" {
 		sourceType = config.ImageSourceRootFSTar
@@ -251,7 +243,7 @@ func (m *Manager) desiredImageManifestWithHostTrust(ctx context.Context, snapsho
 	return manifest, nil
 }
 
-func (m *Manager) refreshDockerSourceDigest(ctx context.Context) (string, error) {
+func (m *Coordinator) refreshDockerSourceDigest(ctx context.Context) (string, error) {
 	var digest string
 	err := m.timeStartupStage("source_image_pull", func() error {
 		var err error
@@ -261,7 +253,7 @@ func (m *Manager) refreshDockerSourceDigest(ctx context.Context) (string, error)
 	return digest, err
 }
 
-func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string, error) {
+func (m *Coordinator) refreshDockerSourceDigestUntimed(ctx context.Context) (string, error) {
 	if m.DryRun {
 		return "dry-run", nil
 	}
@@ -273,7 +265,7 @@ func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string,
 	logPath := m.buildLogPath(imageLogStem(m.Config.Image.OutputImage) + ".source.log")
 	defer m.releaseTranscript(logPath)
 	m.infof("refreshing Docker source image %s\n", image)
-	if err := pullDockerSourceCommand(m, ctx, dockerSourcePullOptions{
+	if err := m.pullDockerSource(ctx, DockerSourcePullOptions{
 		Image:              image,
 		Platform:           platform,
 		LogPath:            logPath,
@@ -281,7 +273,7 @@ func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string,
 	}); err != nil {
 		return "", fmt.Errorf("refresh Docker source image %s: %w", image, err)
 	}
-	digestsJSON, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)
+	digestsJSON, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)
 	if err != nil {
 		return "", err
 	}
@@ -292,19 +284,19 @@ func (m *Manager) refreshDockerSourceDigestUntimed(ctx context.Context) (string,
 	sort.Strings(digests)
 	if len(digests) > 0 {
 		digest := digests[0]
-		m.writeDockerPullNotice(logPath, "Docker source image digest: "+digest)
+		m.WriteDockerPullNotice(logPath, "Docker source image digest: "+digest)
 		return digest, nil
 	}
-	imageID, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image)
+	imageID, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image)
 	if err != nil {
 		return "", err
 	}
 	digest := strings.TrimSpace(imageID)
-	m.writeDockerPullNotice(logPath, "Docker source image ID: "+digest)
+	m.WriteDockerPullNotice(logPath, "Docker source image ID: "+digest)
 	return digest, nil
 }
 
-func (m *Manager) eparScriptDigests() ([]fileDigest, error) {
+func (m *Coordinator) eparScriptDigests() ([]fileDigest, error) {
 	var roots []string
 	switch m.Config.Provider.Type {
 	case "docker-container":
@@ -329,7 +321,7 @@ func (m *Manager) eparScriptDigests() ([]fileDigest, error) {
 	return out, nil
 }
 
-func (m *Manager) customInstallScriptDigests() ([]fileDigest, error) {
+func (m *Coordinator) customInstallScriptDigests() ([]fileDigest, error) {
 	var out []fileDigest
 	for _, script := range m.Config.Image.CustomInstallScripts {
 		path, err := m.customInstallScriptHostPath(script)
@@ -346,8 +338,8 @@ func (m *Manager) customInstallScriptDigests() ([]fileDigest, error) {
 	return out, nil
 }
 
-func (m *Manager) trustedCACertificateDigests() ([]fileDigest, error) {
-	if _, err := m.trustedCACertificates(); err != nil {
+func (m *Coordinator) trustedCACertificateDigests() ([]fileDigest, error) {
+	if err := m.validateTrustedCACertificates(); err != nil {
 		return nil, err
 	}
 	var out []fileDigest
@@ -363,7 +355,7 @@ func (m *Manager) trustedCACertificateDigests() ([]fileDigest, error) {
 	return out, nil
 }
 
-func (m *Manager) fileDigestsUnder(root string) ([]fileDigest, error) {
+func (m *Coordinator) fileDigestsUnder(root string) ([]fileDigest, error) {
 	var out []fileDigest
 	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -385,7 +377,7 @@ func (m *Manager) fileDigestsUnder(root string) ([]fileDigest, error) {
 	return out, nil
 }
 
-func (m *Manager) fileDigest(path string) (fileDigest, error) {
+func (m *Coordinator) fileDigest(path string) (fileDigest, error) {
 	sha, err := m.fileSHA256(path)
 	if err != nil {
 		return fileDigest{}, err
@@ -397,7 +389,7 @@ func (m *Manager) fileDigest(path string) (fileDigest, error) {
 	return fileDigest{Path: filepath.ToSlash(filepath.Clean(rel)), SHA256: sha}, nil
 }
 
-func (m *Manager) fileSHA256(path string) (string, error) {
+func (m *Coordinator) fileSHA256(path string) (string, error) {
 	if m.DryRun {
 		return "dry-run", nil
 	}
@@ -416,50 +408,22 @@ func sortFileDigests(values []fileDigest) {
 }
 
 func imageManifestHash(manifest ImageManifest) (string, error) {
-	content, err := json.Marshal(manifest)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:]), nil
+	return ManifestHash(manifest)
 }
 
 func storedImageManifestContent(manifest ImageManifest) (string, string, error) {
-	hash, err := imageManifestHash(manifest)
-	if err != nil {
-		return "", "", err
-	}
-	content, err := json.MarshalIndent(storedImageManifest{Hash: hash, Manifest: manifest}, "", "  ")
-	if err != nil {
-		return "", "", err
-	}
-	return string(content) + "\n", hash, nil
+	return StoredManifestContent(manifest)
 }
 
-func readStoredImageManifest(path string) (storedImageManifest, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return storedImageManifest{}, err
-	}
-	var stored storedImageManifest
-	if err := json.Unmarshal(content, &stored); err != nil {
-		return storedImageManifest{}, err
-	}
-	return stored, nil
+func readStoredImageManifest(path string) (StoredManifest, error) {
+	return ReadStoredManifest(path)
 }
 
 func writeStoredImageManifest(path string, manifest ImageManifest) error {
-	content, _, err := storedImageManifestContent(manifest)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(content), 0644)
+	return WriteStoredManifest(path, manifest)
 }
 
-func (m *Manager) installImageManifest(ctx context.Context, vmName string, manifest ImageManifest) error {
+func (m *Coordinator) installImageManifest(ctx context.Context, vmName string, manifest ImageManifest) error {
 	content, _, err := storedImageManifestContent(manifest)
 	if err != nil {
 		return err
@@ -468,36 +432,21 @@ func (m *Manager) installImageManifest(ctx context.Context, vmName string, manif
 }
 
 func wslImageManifestSidecarPath(outputPath string) string {
-	return outputPath + ".epar-manifest.json"
+	return WSLImageManifestPath(outputPath)
 }
 
 func sourceCacheManifestPath(rootfsPath string) string {
-	return rootfsPath + ".source.json"
+	return SourceCacheManifestPath(rootfsPath)
 }
 
 func sourceCacheMatches(path string, want sourceCacheManifest) bool {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	var got sourceCacheManifest
-	if err := json.Unmarshal(content, &got); err != nil {
-		return false
-	}
-	return got == want
+	return SourceCacheMatches(path, want)
 }
 
 func writeSourceCacheManifest(path string, manifest sourceCacheManifest) error {
-	content, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(content, '\n'), 0644)
+	return WriteSourceCacheManifest(path, manifest)
 }
 
 func dockerInspectMeansMissing(err error) bool {
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "no such image") ||
-		strings.Contains(text, "no such object") ||
-		strings.Contains(text, "not found")
+	return DockerInspectMeansMissing(err)
 }

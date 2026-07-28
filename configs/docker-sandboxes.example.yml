@@ -1,0 +1,67 @@
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system]
+
+pool:
+  instances: 1
+  namePrefix: change-me-docker-sandboxes
+
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+
+runner:
+  group: your-runner-group
+  # On Apple Silicon, replace X64 with ARM64 when provider.platform is linux/arm64.
+  labels: [self-hosted, linux, X64, epar-docker-sandboxes]
+  includeHostLabel: true
+  ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    requirePublicRepositoriesDisabled: true
+
+provider:
+  type: docker-sandboxes
+  # Exact host mapping: Windows/Linux amd64 -> linux/amd64; macOS arm64 -> linux/arm64.
+  platform: linux/amd64
+
+# This sample tag is the repository's current linux/amd64 full-template lock. Replace template, templateDigest, and policyGeneration with the exact platform-specific identities printed by the wizard or approved for your environment. templateDigest is the full verified local template ID printed by build-template.ps1.
+dockerSandboxes:
+  template: epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64
+  templateDigest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+  networkBaseline: open
+  additionalAllow:
+    - api.github.com
+    - '*.githubusercontent.com:443'
+  additionalDeny:
+    - telemetry.example.invalid
+  stagingRoot: .local/docker-sandboxes-staging
+  cpus: 4
+  memory: 8GiB
+  # Current full-template recommendation: 309.73MiB measured guest root peak + 25% + 20GiB headroom, rounded up to 10GiB.
+  rootDisk: 30GiB
+  dockerDisk: 100GiB
+  maxConcurrentCreates: 2
+  minHostFreeSpace: 50GiB
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900

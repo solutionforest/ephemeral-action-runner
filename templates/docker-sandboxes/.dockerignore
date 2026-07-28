@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!helpers.sha256
+!guest/
+!guest/*.sh
+!hook-launcher/
+!hook-launcher/*.go
+!profiles/
+!profiles/*.compatibility.json

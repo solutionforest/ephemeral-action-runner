@@ -11,4 +11,5 @@
 - [ ] I kept credentials, private keys, tokens, and machine-specific configuration out of this pull request.
 - [ ] I added or updated tests where behavior changed.
 - [ ] I updated relevant documentation.
+- [ ] For provider or onboarding changes, I followed the Development and Extension Principles and documented and tested every intentional exception.
 - [ ] I read and followed the contributing guide and code of conduct.

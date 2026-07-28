@@ -95,7 +95,7 @@ func TestDockerContainerDockerfileRunsBuildStepsAsRoot(t *testing.T) {
 	}
 }
 
-func TestDockerContainerBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
+func TestDockerContainerBuildUsesDedicatedBuildxBuilder(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),
@@ -137,8 +137,8 @@ func TestDockerContainerBuildUsesLegacyBuilderCompatibleArgs(t *testing.T) {
 	if strings.Contains(out, "--progress") {
 		t.Fatalf("docker build command should not require BuildKit progress support:\n%s", out)
 	}
-	if !strings.Contains(out, "docker build -t epar-docker-container-catthehacker-ubuntu --platform linux/amd64") {
-		t.Fatalf("docker build command missing expected base args:\n%s", out)
+	if !strings.Contains(out, "docker buildx build --builder epar-") || !strings.Contains(out, " --load -t epar-docker-container-catthehacker-ubuntu --platform linux/amd64") {
+		t.Fatalf("dedicated Buildx command missing expected base args:\n%s", out)
 	}
 }
 

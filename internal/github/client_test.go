@@ -6,10 +6,13 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,6 +88,65 @@ func TestListRunnersUsesInstallationToken(t *testing.T) {
 	}
 	if !sawRunnerList || len(runners) != 1 {
 		t.Fatalf("unexpected runners: %+v", runners)
+	}
+}
+
+func TestInstallationTokenCacheIsConcurrentAndSingleFlight(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{
+		AppID:          123,
+		Organization:   "example",
+		PrivateKeyPath: keyPath,
+		APIBaseURL:     "https://api.github.test",
+		WebBaseURL:     "https://github.test",
+	})
+	var installationRequests atomic.Int32
+	var tokenRequests atomic.Int32
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body string
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			installationRequests.Add(1)
+			body = `{"id":42}`
+		case "/app/installations/42/access_tokens":
+			tokenRequests.Add(1)
+			body = `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`
+		default:
+			return nil, fmt.Errorf("unexpected path %s", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+
+	const callers = 32
+	errorsCh := make(chan error, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			token, err := client.installationToken(context.Background())
+			if err == nil && token != "installation-token" {
+				err = fmt.Errorf("installationToken() = %q", token)
+			}
+			errorsCh <- err
+		}()
+	}
+	wait.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := installationRequests.Load(); got != 1 {
+		t.Fatalf("installation lookup requests = %d, want 1", got)
+	}
+	if got := tokenRequests.Load(); got != 1 {
+		t.Fatalf("access-token requests = %d, want 1", got)
 	}
 }
 

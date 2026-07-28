@@ -1,0 +1,9 @@
+269b1431e6eb9ee6803be1ecfae6814a3cb120170466db16fa1b9ededcd4d39c  ./check-host-trust-generation.sh
+3f1cee32d05ffad64004377f0276ef8aa46a2848b32bca74ac35efb3d71fd1bf  ./check-runner.sh
+4fe8e512539f97d00db3c2856f452f017c4de6a04832f1c1af86f1994862df59  ./collect-runner-diagnostics.sh
+5d8c515c363ee54b0fabc0773bccefefdb1db18898a6d28f62c52522cbde0f21  ./collect-software-inventory.sh
+90a13d73f74e7628f1b7c4c768d300d2a4620387061c056dd67ca42692180e2b  ./configure-runner.sh
+a32f6bdb3b883272172e2d7318feb40d88e3ebfaffa909527ca57a3c06773ae1  ./prepare-template.sh
+208d6fa96472a53b1ae1a5903da65530f6b8811d556cf04e88b99a2dfd88ec73  ./run-runner.sh
+0746da2abc0a1033ecdad83ec6e432c7a006c83fefd2ce5424d3932c8f38d9aa  ./template-entrypoint.sh
+f78e7d9afbd627424cd32cfbab2acb094af8906d059a25df77bc6d5f0bad7849  ./verify-template.sh

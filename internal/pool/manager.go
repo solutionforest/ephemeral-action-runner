@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -21,20 +22,30 @@ import (
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
 type Manager struct {
-	Config        config.Config
-	Provider      provider.Provider
-	GitHub        GitHubClient
-	ProjectRoot   string
-	ConfigPath    string
-	DryRun        bool
-	Logging       *logging.Runtime
-	startupTiming *startupTiming
-	transcriptMu  sync.Mutex
-	transcripts   map[string]*logging.Transcript
+	Config         config.Config
+	Provider       provider.Provider
+	Lifecycle      provider.Lifecycle
+	PolicyManager  provider.PolicyManager
+	Storage        provider.StorageContribution
+	LifecycleState *poolstate.Store
+	GitHub         GitHubClient
+	ProjectRoot    string
+	ConfigPath     string
+	DryRun         bool
+	Logging        *logging.Runtime
+	// AcknowledgeFailedDiagnostics permits the explicit cleanup command to
+	// dispose an exact retained sandbox after the operator has captured the
+	// durable failed-diagnostics evidence. Normal startup and automatic cleanup
+	// never set this override.
+	AcknowledgeFailedDiagnostics bool
+	startupTiming                *startupTiming
+	transcriptMu                 sync.Mutex
+	transcripts                  map[string]*logging.Transcript
 
 	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
@@ -87,8 +98,10 @@ type ProvisionedInstance struct {
 	LogPath             string
 	GuestLogPath        string
 	RunnerID            int64
+	ProviderID          string
 	HostTrustGeneration string
 	Phase               LifecyclePhase
+	ProviderOwned       bool
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
@@ -112,6 +125,9 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 		return err
 	}
 	defer poolLock.Close()
+	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
+		return err
+	}
 	controllerLock, err := m.acquireHostTrustControllerLock()
 	if err != nil {
 		return err
@@ -192,6 +208,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		}
 		defer controllerLock.Close()
 	}
+	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
+		return err
+	}
 	if !opts.HostTrustLockHeld {
 		controllerLock, err := m.AcquireHostTrustControllerLock()
 		if err != nil {
@@ -207,9 +226,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	if ctx.Err() != nil {
 		if opts.KeepOnExit {
+			m.infof("Stopping EPAR pool. --keep-on-exit is enabled, so owned runner resources will remain running.\n")
 			return nil
 		}
-		return m.cleanupWithFreshContext()
+		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
 	active, err := m.reconcilePhysicalPool(ctx, nil, opts.Register)
 	if err != nil {
@@ -223,9 +243,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	poolTrustGeneration := ""
 	cleanup := func() error {
 		if opts.KeepOnExit {
+			m.infof("Stopping EPAR pool. --keep-on-exit is enabled, so owned runner resources will remain running.\n")
 			return nil
 		}
-		return m.cleanupWithFreshContext()
+		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
 	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for len(active) < opts.Instances {
@@ -257,7 +278,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	stopLeaseKeeper()
 	if !opts.Register || (!opts.ReplaceCompleted && !m.hostTrustEnabled()) {
-		m.infof("pool is running; press Ctrl-C to stop")
+		m.logPoolRunning("EPAR pool")
 		if !m.Config.Logging.RetentionEnabled {
 			<-ctx.Done()
 			return cleanup()
@@ -273,7 +294,8 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 		}
 	}
-	m.infof("pool supervisor is running; monitoring every %s; press Ctrl-C to stop\n", opts.MonitorInterval)
+	m.infof("Pool supervisor is monitoring every %s.\n", opts.MonitorInterval)
+	m.logPoolRunning("EPAR pool")
 	tickInterval := opts.MonitorInterval
 	if m.hostTrustEnabled() && tickInterval > hostTrustRefreshInterval {
 		tickInterval = hostTrustRefreshInterval
@@ -461,6 +483,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					poolTrustGeneration = vm.HostTrustGeneration
 				}
 				m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
+				m.logReplacementReady("EPAR pool", vm.Name)
 			}
 		}
 	}
@@ -497,7 +520,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 	}
 	if !register {
 		for name, vm := range reconciled {
-			if vm.Phase != LifecycleCleanupPending {
+			if vm.ProviderOwned && vm.Phase != LifecycleCleanupPending {
 				vm.Phase = LifecycleReady
 				reconciled[name] = vm
 			}
@@ -524,7 +547,17 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 		}
 	}
 	for name, vm := range reconciled {
+		if !vm.ProviderOwned {
+			delete(remoteByName, name)
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			continue
+		}
 		if vm.Phase == LifecycleCleanupPending {
+			// The local cleanup path already matched this exact lifecycle
+			// record. Keep its remote identity attached to the protected
+			// record instead of treating it as an orphan below.
+			delete(remoteByName, name)
 			continue
 		}
 		runner, found := remoteByName[name]
@@ -538,6 +571,11 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			}
 		}
 		if !found {
+			if err := m.recordLifecycleRemoteAbsence(ctx, name); err != nil {
+				vm.Phase = LifecycleQuarantined
+				reconciled[name] = vm
+				return reconciled, fmt.Errorf("record GitHub runner absence for %s: %w", name, err)
+			}
 			if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
 				vm.Phase = LifecycleCleanupPending
 				reconciled[name] = vm
@@ -549,6 +587,11 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 		}
 		delete(remoteByName, name)
 		vm.RunnerID = runner.ID
+		if err := m.recordLifecycleJobObservation(ctx, runner); err != nil {
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			return reconciled, fmt.Errorf("record GitHub job phase for %s: %w", name, err)
+		}
 		if runner.Status == "online" {
 			vm.Phase = LifecycleReady
 			reconciled[name] = vm
@@ -584,6 +627,14 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 		}
 	}
 	for _, runner := range remoteByName {
+		owned, ownershipErr := m.lifecycleOwnsRunner(ctx, runner.Name, runner.ID)
+		if ownershipErr != nil {
+			return reconciled, ownershipErr
+		}
+		if !owned {
+			m.warnf("reconciliation: quarantined unowned GitHub runner %s id=%d; prefix-only resources are report-only\n", runner.Name, runner.ID)
+			continue
+		}
 		if err := m.deleteRemoteRunner(context.Background(), runner); err != nil {
 			return reconciled, err
 		}
@@ -634,17 +685,36 @@ func (m *Manager) reconcileLocalInventory(known map[string]ProvisionedInstance) 
 }
 
 func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known map[string]ProvisionedInstance) (map[string]ProvisionedInstance, error) {
-	locals, err := m.Provider.List(ctx)
+	locals, err := m.inventoryProvider(ctx)
 	if err != nil {
 		return known, err
 	}
 	reconciled := make(map[string]ProvisionedInstance)
-	for _, local := range locals {
+	for _, item := range locals {
+		local := item.Instance
 		if !HasPrefix(local.Name, m.Config.Pool.NamePrefix) {
 			continue
 		}
 		vm := m.reconciledInstance(known, local.Name)
-		if !localInstanceStopped(local.State) {
+		vm.ProviderID = local.ProviderID
+		owned, ownershipErr := m.lifecycleOwns(ctx, local.Name, local.ProviderID)
+		if ownershipErr != nil {
+			return known, fmt.Errorf("verify lifecycle ownership for %s: %w", local.Name, ownershipErr)
+		}
+		vm.ProviderOwned = owned
+		if !owned {
+			providerID := local.ProviderID
+			if providerID == "" {
+				providerID = "unidentified:" + local.Name
+			}
+			if reportErr := m.reportUnknownLifecycle(ctx, local.Name, providerID, item.Source, item.State); reportErr != nil {
+				return known, fmt.Errorf("quarantine unowned provider instance %s: %w", local.Name, reportErr)
+			}
+			vm.Phase = LifecycleQuarantined
+			reconciled[local.Name] = vm
+			continue
+		}
+		if !localInstanceStopped(item.State) {
 			reconciled[local.Name] = vm
 			continue
 		}
@@ -662,10 +732,11 @@ func (m *Manager) reconciledInstance(known map[string]ProvisionedInstance, name 
 		return vm
 	}
 	return ProvisionedInstance{
-		Name:         name,
-		LogPath:      m.instanceLogPath(name, "."+m.Config.Provider.Type+".log"),
-		GuestLogPath: m.instanceLogPath(name, ".guest.log"),
-		Phase:        LifecycleQuarantined,
+		Name:          name,
+		LogPath:       m.instanceLogPath(name, "."+m.Config.Provider.Type+".log"),
+		GuestLogPath:  m.instanceLogPath(name, ".guest.log"),
+		Phase:         LifecycleQuarantined,
+		ProviderOwned: m.LifecycleState == nil,
 	}
 }
 
@@ -679,13 +750,40 @@ func localInstanceStopped(state string) bool {
 }
 
 func (m *Manager) deleteLocalInstance(ctx context.Context, vm ProvisionedInstance) error {
+	if m.LifecycleState != nil {
+		record, err := m.LifecycleState.Read(ctx, vm.Name)
+		if err != nil {
+			return err
+		}
+		inventory, err := m.inventoryProvider(ctx)
+		if err != nil {
+			return err
+		}
+		return m.cleanupLifecycleRecord(ctx, record, inventoryByName(inventory)[vm.Name])
+	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
+	if vm.ProviderID == "" && m.Lifecycle == nil && m.Provider != nil {
+		stopCtx, stopCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+		_ = m.Provider.Stop(stopCtx, vm.Name)
+		stopCancel()
+		deleteCtx, deleteCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
+		err := m.Provider.Delete(deleteCtx, vm.Name)
+		deleteCancel()
+		return err
+	}
+	instance, err := m.providerInstance(cleanupCtx, vm.Name)
+	if err != nil {
+		return err
+	}
+	if vm.ProviderID != "" && instance.ProviderID != vm.ProviderID {
+		return fmt.Errorf("same-name provider instance id=%s does not match expected id=%s; refusing deletion", instance.ProviderID, vm.ProviderID)
+	}
 	stopCtx, stopCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
-	_ = m.Provider.Stop(stopCtx, vm.Name)
+	_ = m.stopProviderInstance(stopCtx, instance)
 	stopCancel()
 	deleteCtx, deleteCancel := context.WithTimeout(cleanupCtx, 60*time.Second)
-	err := m.Provider.Delete(deleteCtx, vm.Name)
+	err = m.deleteProviderInstance(deleteCtx, instance)
 	deleteCancel()
 	if err != nil {
 		return err
@@ -864,6 +962,9 @@ func (m *Manager) ProvisionPool(ctx context.Context, instances int, register boo
 		return nil, err
 	}
 	defer poolLock.Close()
+	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
+		return nil, err
+	}
 	hostTrustLock, err := m.AcquireHostTrustControllerLock()
 	if err != nil {
 		return nil, err
@@ -900,25 +1001,43 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 		return err
 	}
 	defer poolLock.Close()
+	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
+		return err
+	}
 	return m.cleanupUnlocked(ctx)
 }
 
 func (m *Manager) cleanupUnlocked(ctx context.Context) error {
+	if m.LifecycleState != nil {
+		return m.cleanupOwnedLifecycle(ctx)
+	}
+	if m.Lifecycle == nil && m.Provider != nil {
+		return m.cleanupLegacyTestProvider(ctx)
+	}
 	var firstErr error
-	vms, err := m.Provider.List(ctx)
+	items, err := m.inventoryProvider(ctx)
 	if err != nil {
 		firstErr = err
 	}
-	for _, vm := range vms {
+	for _, item := range items {
+		vm := item.Instance
 		if !HasPrefix(vm.Name, m.Config.Pool.NamePrefix) {
+			continue
+		}
+		if vm.ProviderID == "" {
+			m.warnf("cleanup: provider instance %s has no immutable identity; leaving it report-only\n", vm.Name)
+			continue
+		}
+		if m.DryRun {
+			m.infof("[dry-run] cleanup would delete exact provider instance %s id=%s\n", vm.Name, vm.ProviderID)
 			continue
 		}
 		m.infof("cleanup: deleting instance %s\n", vm.Name)
 		stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
-		_ = m.Provider.Stop(stopCtx, vm.Name)
+		_ = m.stopProviderInstance(stopCtx, vm)
 		stopCancel()
 		deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
-		deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+		deleteErr := m.deleteProviderInstance(deleteCtx, vm)
 		if deleteErr != nil && firstErr == nil {
 			firstErr = deleteErr
 		}
@@ -948,16 +1067,52 @@ func (m *Manager) cleanupUnlocked(ctx context.Context) error {
 	return firstErr
 }
 
+// cleanupLegacyTestProvider keeps the old in-memory test seam isolated from
+// production. Every registry-constructed manager has Lifecycle and durable
+// state, so real cleanup always uses immutable provider and GitHub identities.
+func (m *Manager) cleanupLegacyTestProvider(ctx context.Context) error {
+	var firstErr error
+	vms, err := m.Provider.List(ctx)
+	if err != nil {
+		firstErr = err
+	}
+	for _, vm := range vms {
+		if !HasPrefix(vm.Name, m.Config.Pool.NamePrefix) {
+			continue
+		}
+		m.infof("cleanup: deleting instance %s\n", vm.Name)
+		stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
+		_ = m.Provider.Stop(stopCtx, vm.Name)
+		stopCancel()
+		deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
+		deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+		deleteCancel()
+		if deleteErr != nil && firstErr == nil {
+			firstErr = deleteErr
+		}
+	}
+	if m.GitHub != nil {
+		deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		_, err := m.GitHub.DeleteRunnersByPrefix(deleteCtx, m.Config.Pool.NamePrefix)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func (m *Manager) Status(ctx context.Context) (string, error) {
 	var b strings.Builder
-	vms, err := m.Provider.List(ctx)
+	items, err := m.inventoryProvider(ctx)
 	if err != nil {
 		return "", err
 	}
 	b.WriteString("Instances:\n")
-	for _, vm := range vms {
+	for _, item := range items {
+		vm := item.Instance
 		if HasPrefix(vm.Name, m.Config.Pool.NamePrefix) {
-			fmt.Fprintf(&b, "  %s\t%s\n", vm.Name, vm.State)
+			fmt.Fprintf(&b, "  %s\t%s\tid=%s\n", vm.Name, item.State, emptyDash(vm.ProviderID))
 		}
 	}
 	if m.GitHub != nil {
@@ -978,77 +1133,97 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 var errHostTrustImageMismatch = errors.New("runner image host trust generation does not match current host trust")
 
 func (m *Manager) provisionOne(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
-	const attempts = 3
-	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		vm, err := m.provisionOneAttempt(ctx, name, register, allowBusy)
-		if err == nil || !errors.Is(err, errHostTrustImageMismatch) {
-			return vm, err
-		}
-		lastErr = err
-		if isPhysicalPhase(vm.Phase) {
-			_ = m.retireInstance(context.Background(), vm, "discarding stale host-trust image generation")
-		}
-		if attempt == attempts {
-			break
-		}
-		m.infof("[%s] host trust changed before runner publication; rebuilding image (attempt %d/%d)\n", name, attempt+1, attempts)
-		if err := m.ensureHostTrustImage(ctx); err != nil {
-			return vm, fmt.Errorf("rebuild image after host trust changed during provisioning: %w", err)
-		}
-	}
-	return ProvisionedInstance{Name: name}, fmt.Errorf("provision runner after %d host trust image stabilization attempts: %w", attempts, lastErr)
-}
-
-func (m *Manager) deleteRemoteRunnerByNameBestEffort(name string) {
-	if m.GitHub == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	runner, found, err := m.GitHub.RunnerByName(ctx, name)
-	if err != nil {
-		m.warnf("[%s] deferred exact-name GitHub reconciliation after rollback: %v\n", name, err)
-		return
-	}
-	if !found {
-		return
-	}
-	if err := m.GitHub.DeleteRunnerIfExists(ctx, runner.ID); err != nil {
-		m.warnf("[%s] deferred exact-name GitHub runner deletion after rollback: %v\n", name, err)
-	}
+	return m.provisionOneAttempt(ctx, name, register, allowBusy)
 }
 
 func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (vm ProvisionedInstance, err error) {
 	logPath := m.instanceLogPath(name, "."+m.Config.Provider.Type+".log")
 	guestLogPath := m.instanceLogPath(name, ".guest.log")
-	vm = ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath, Phase: LifecycleProvisioning}
-	localMayExist := false
+	vm = ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath, ProviderOwned: true}
+	if register && m.GitHub != nil && !m.DryRun && m.LifecycleState != nil {
+		if runner, found, lookupErr := m.GitHub.RunnerByName(ctx, name); lookupErr != nil {
+			return vm, fmt.Errorf("verify exact GitHub runner name is unallocated: %w", lookupErr)
+		} else if found {
+			return vm, fmt.Errorf("GitHub runner name %q is already allocated to id=%d", name, runner.ID)
+		}
+	}
+	if err := m.preflightStorage("instance-create", m.instanceCreateExpansion()); err != nil {
+		return vm, err
+	}
+	if err := m.reserveLifecycle(ctx, name); err != nil {
+		return vm, err
+	}
+	vm.Phase = LifecycleProvisioning
+	if err := m.acquireLifecycleLease(ctx, name, "provision", "controller", 2*time.Hour); err != nil {
+		return vm, fmt.Errorf("acquire provisioning lifecycle lease: %w", err)
+	}
 	configureAttempted := false
 	listenerMayBeRunning := false
 	defer func() {
+		m.releaseLifecycleLease(context.Background(), name, "provision", "controller")
 		if err == nil {
 			vm.Phase = LifecycleReady
 			return
 		}
-		if !localMayExist {
-			vm.Phase = ""
-			return
-		}
 		if listenerMayBeRunning {
+			m.quarantineLifecycle(context.Background(), name, err)
 			vm.Phase = LifecycleQuarantined
 			return
 		}
-		cleanupErr := m.deleteLocalInstance(context.Background(), vm)
+		remoteKnownAbsent := !configureAttempted
+		if configureAttempted && m.GitHub != nil {
+			runner, found, lookupErr := m.GitHub.RunnerByName(context.Background(), name)
+			if lookupErr != nil {
+				m.quarantineLifecycle(context.Background(), name, fmt.Errorf("%w; exact GitHub registration lookup failed: %v", err, lookupErr))
+				vm.Phase = LifecycleQuarantined
+				return
+			}
+			remoteKnownAbsent = !found
+			if found {
+				vm.RunnerID = runner.ID
+				if recordErr := m.recordLifecycleRegistered(context.Background(), name, runner.ID); recordErr != nil {
+					m.quarantineLifecycle(context.Background(), name, fmt.Errorf("%w; exact GitHub runner id=%d could not be recorded: %v", err, runner.ID, recordErr))
+					vm.Phase = LifecycleQuarantined
+					return
+				}
+			}
+		}
+		if m.LifecycleState == nil {
+			if vm.RunnerID != 0 && m.GitHub != nil {
+				if deleteErr := m.GitHub.DeleteRunnerIfExists(context.Background(), vm.RunnerID); deleteErr != nil {
+					vm.Phase = LifecycleCleanupPending
+					err = errors.Join(err, fmt.Errorf("rollback exact GitHub runner id=%d: %w", vm.RunnerID, deleteErr))
+					return
+				}
+			}
+			cleanupErr := m.deleteLocalInstance(context.Background(), vm)
+			if cleanupErr != nil {
+				vm.Phase = LifecycleCleanupPending
+				err = errors.Join(err, fmt.Errorf("rollback local instance %s: %w", name, cleanupErr))
+			} else {
+				vm.Phase = ""
+			}
+			return
+		}
+		record, recordErr := m.LifecycleState.Read(context.Background(), name)
+		if recordErr != nil {
+			vm.Phase = LifecycleCleanupPending
+			err = errors.Join(err, fmt.Errorf("read lifecycle for rollback: %w", recordErr))
+			return
+		}
+		inventory, inventoryErr := m.inventoryProvider(context.Background())
+		if inventoryErr != nil {
+			m.quarantineLifecycle(context.Background(), name, errors.Join(err, inventoryErr))
+			vm.Phase = LifecycleQuarantined
+			return
+		}
+		cleanupErr := m.cleanupLifecycleRecordWithRemoteAbsence(context.Background(), record, inventoryByName(inventory)[name], remoteKnownAbsent)
 		if cleanupErr != nil {
 			vm.Phase = LifecycleCleanupPending
 			err = errors.Join(err, fmt.Errorf("rollback local instance %s: %w", name, cleanupErr))
 			return
 		}
 		vm.Phase = ""
-		if configureAttempted {
-			m.deleteRemoteRunnerByNameBestEffort(name)
-		}
 	}()
 	var trustSnapshot hosttrust.Snapshot
 	if m.hostTrustEnabled() {
@@ -1063,10 +1238,34 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		return vm, err
 	}
 	m.logger().Info("cloning instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "clone", "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
-	localMayExist = true
+	var created provider.Instance
 	if err := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
-		return m.Provider.Clone(ctx, m.Config.Provider.SourceImage, name)
+		var createErr error
+		created, createErr = m.createProviderInstance(ctx, name)
+		return createErr
 	}); err != nil {
+		return vm, err
+	}
+	if created.Name != name || created.ProviderID == "" {
+		return vm, fmt.Errorf("provider create returned no immutable identity for %q", name)
+	}
+	vm.ProviderID = created.ProviderID
+	if created.ReceiptVersion != "" && len(created.Receipt) != 0 {
+		var providerReceipt map[string]any
+		if json.Unmarshal(created.Receipt, &providerReceipt) != nil || providerReceipt == nil {
+			return vm, fmt.Errorf("provider create returned an invalid versioned receipt for %q", name)
+		}
+	}
+	if err := m.recordLifecycleCreated(ctx, created); err != nil {
+		return vm, err
+	}
+	if err := m.recordLifecycleValidationIntent(ctx, name); err != nil {
+		return vm, fmt.Errorf("record runtime validation intent: %w", err)
+	}
+	if err := m.applyProviderNetworkPolicy(ctx, created); err != nil {
+		return vm, fmt.Errorf("apply provider network policy: %w", err)
+	}
+	if err := m.verifyProviderAdmission(ctx, created); err != nil {
 		return vm, err
 	}
 	m.logger().Info("starting instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "start", "logPath", logPath)
@@ -1075,23 +1274,37 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if startOptionsErr != nil {
 			return startOptionsErr
 		}
-		_, err := m.Provider.Start(ctx, name, startOptions)
+		_, err := m.startProviderInstance(ctx, created, startOptions)
 		return err
 	}); err != nil {
 		return vm, err
 	}
-	ip, err := m.Provider.IP(ctx, name, m.Config.Timeouts.BootSeconds)
+	ip, available, err := m.providerAddress(ctx, created, m.Config.Timeouts.BootSeconds)
 	if err != nil {
 		return vm, err
 	}
 	vm.IP = ip
-	m.logger().Info("instance reachable", "provider", m.Config.Provider.Type, "instance", name, "operation", "wait-reachable", "address", ip)
+	if available {
+		m.logger().Info("instance reachable", "provider", m.Config.Provider.Type, "instance", name, "operation", "wait-reachable", "address", ip)
+	} else {
+		m.logger().Info("instance uses delegated provider execution", "provider", m.Config.Provider.Type, "instance", name, "operation", "wait-reachable")
+	}
+	if m.hostTrustEnabled() {
+		trustSnapshot, err = m.resolveHostTrust(ctx)
+		if err != nil {
+			return vm, fmt.Errorf("refresh host trust before runtime installation: %w", err)
+		}
+		if err := m.installHostTrustRuntime(ctx, name, trustSnapshot); err != nil {
+			return vm, err
+		}
+		vm.HostTrustGeneration = trustSnapshot.Generation
+	}
 	m.logger().Info("validating runner runtime", "provider", m.Config.Provider.Type, "instance", name, "operation", "validate-runtime", "stage", "start")
 	if err := m.timeFirstInstanceStage(name, "runtime_validation", func() error {
 		if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
 			return err
 		}
-		return m.validateRuntimeWithRetry(ctx, name, guestLogPath)
+		return m.verifyProviderRuntimeWithRetry(ctx, created, guestLogPath)
 	}); err != nil {
 		return vm, err
 	}
@@ -1106,7 +1319,16 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			return vm, fmt.Errorf("%w: refresh host trust after runtime validation: %v", errHostTrustImageMismatch, err)
 		}
 		if err := validateHostTrustMarkerAgainstSnapshot(marker, currentTrust); err != nil {
-			return vm, fmt.Errorf("%w: %v", errHostTrustImageMismatch, err)
+			if installErr := m.installHostTrustRuntime(ctx, name, currentTrust); installErr != nil {
+				return vm, fmt.Errorf("%w: %v; runtime refresh failed: %v", errHostTrustImageMismatch, err, installErr)
+			}
+			marker, err = m.readInstanceHostTrustMarker(ctx, name)
+			if err != nil {
+				return vm, fmt.Errorf("%w: read refreshed marker: %v", errHostTrustImageMismatch, err)
+			}
+			if err := validateHostTrustMarkerAgainstSnapshot(marker, currentTrust); err != nil {
+				return vm, fmt.Errorf("%w: refreshed runtime marker: %v", errHostTrustImageMismatch, err)
+			}
 		}
 		// Track the immutable generation read from the cloned image, not merely
 		// the pre-clone snapshot. This prevents a trust-store change racing image
@@ -1114,9 +1336,18 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		vm.HostTrustGeneration = marker.Generation
 		trustSnapshot = currentTrust
 	}
+	if err := m.recordLifecycleValidated(ctx, name); err != nil {
+		return vm, fmt.Errorf("record validated runtime: %w", err)
+	}
 	if register {
+		if err := m.recordLifecycleRegistrationIntent(ctx, name); err != nil {
+			return vm, fmt.Errorf("record GitHub registration intent: %w", err)
+		}
 		if err := m.issueHostTrustLease(ctx, name, trustSnapshot); err != nil {
 			return vm, fmt.Errorf("issue host trust lease: %w", err)
+		}
+		if err := m.verifyProviderAdmission(ctx, created); err != nil {
+			return vm, err
 		}
 		if m.GitHub == nil {
 			if m.DryRun {
@@ -1168,6 +1399,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
+		if err := m.recordLifecycleRegistered(ctx, name, runner.ID); err != nil {
+			return vm, fmt.Errorf("record exact GitHub runner identity: %w", err)
+		}
 		m.infof("[%s] GitHub runner %s id=%d busy=%t\n", name, readiness, runner.ID, runner.Busy)
 		m.finishFirstRunnerReady(name)
 	} else {
@@ -1254,6 +1488,15 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 		case result := <-resultCh:
 			return result.runner, result.err
 		case <-ticker.C:
+			instance, instanceErr := m.providerInstance(waitCtx, vm.Name)
+			if instanceErr != nil {
+				cancel()
+				return gh.Runner{}, instanceErr
+			}
+			if err := m.verifyProviderAdmission(waitCtx, instance); err != nil {
+				cancel()
+				return gh.Runner{}, err
+			}
 			if m.hostTrustEnabled() && !time.Now().Before(nextLeaseRefresh) {
 				current, err := m.resolveHostTrust(waitCtx)
 				if err != nil {
@@ -1317,6 +1560,15 @@ func (m *Manager) captureRunnerReadinessDiagnostics(name, guestLogPath string) {
 }
 
 func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
+	if _, globalAdmission := m.Lifecycle.(provider.AdmissionVerifier); globalAdmission {
+		instance, err := m.providerInstance(ctx, vm.Name)
+		if err != nil {
+			return false, "provider instance identity is unavailable", err
+		}
+		if err := m.verifyProviderAdmission(ctx, instance); err != nil {
+			return false, "provider admission changed", err
+		}
+	}
 	if m.GitHub != nil {
 		runner, found, err := m.GitHub.RunnerByName(ctx, vm.Name)
 		if err != nil {
@@ -1325,6 +1577,9 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 			}
 		} else {
 			if !found {
+				if err := m.recordLifecycleRemoteAbsence(ctx, vm.Name); err != nil {
+					return false, "GitHub runner record is gone", fmt.Errorf("record GitHub runner absence: %w", err)
+				}
 				return false, "GitHub runner record is gone", nil
 			}
 			if runner.Busy {
@@ -1358,7 +1613,21 @@ func isTransientGitHubLivenessError(err error) bool {
 }
 
 func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, reason string) error {
+	if m.LifecycleState != nil && !vm.ProviderOwned {
+		return fmt.Errorf("refusing to retire unowned provider instance %q; prefix-only resources are report-only", vm.Name)
+	}
 	m.infof("[%s] retiring instance: %s\n", vm.Name, reason)
+	if m.LifecycleState != nil {
+		record, err := m.LifecycleState.Read(ctx, vm.Name)
+		if err != nil {
+			return err
+		}
+		inventory, err := m.inventoryProvider(ctx)
+		if err != nil {
+			return err
+		}
+		return m.cleanupLifecycleRecord(ctx, record, inventoryByName(inventory)[vm.Name])
+	}
 	var firstErr error
 	if m.GitHub != nil && vm.RunnerID != 0 {
 		deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -1368,11 +1637,32 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 		}
 		cancel()
 	}
+	if vm.ProviderID == "" && m.Lifecycle == nil && m.Provider != nil {
+		stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
+		_ = m.Provider.Stop(stopCtx, vm.Name)
+		stopCancel()
+		deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
+		deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+		deleteCancel()
+		if deleteErr == nil {
+			if releaseErr := m.releaseInstanceTranscripts(vm); releaseErr != nil {
+				m.logger().Warn("instance transcript close failed after retirement", "provider", m.Config.Provider.Type, "instance", vm.Name, "operation", "retire", "error", releaseErr)
+			}
+		}
+		return deleteErr
+	}
+	instance, err := m.providerInstance(ctx, vm.Name)
+	if err != nil {
+		return err
+	}
+	if vm.ProviderID != "" && instance.ProviderID != vm.ProviderID {
+		return fmt.Errorf("same-name provider instance id=%s does not match expected id=%s; refusing retirement", instance.ProviderID, vm.ProviderID)
+	}
 	stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
-	_ = m.Provider.Stop(stopCtx, vm.Name)
+	_ = m.stopProviderInstance(stopCtx, instance)
 	stopCancel()
 	deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
-	deleteErr := m.Provider.Delete(deleteCtx, vm.Name)
+	deleteErr := m.deleteProviderInstance(deleteCtx, instance)
 	if deleteErr != nil && firstErr == nil {
 		firstErr = deleteErr
 	}
@@ -1390,11 +1680,11 @@ func (m *Manager) validateRuntime(ctx context.Context, name string) error {
 	return err
 }
 
-func (m *Manager) validateRuntimeWithRetry(ctx context.Context, name, guestLogPath string) error {
+func (m *Manager) verifyProviderRuntimeWithRetry(ctx context.Context, instance provider.Instance, guestLogPath string) error {
 	const attempts = 2
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		err := m.validateRuntime(ctx, name)
+		err := m.verifyProviderRuntime(ctx, instance)
 		if err == nil {
 			return nil
 		}
@@ -1405,8 +1695,8 @@ func (m *Manager) validateRuntimeWithRetry(ctx context.Context, name, guestLogPa
 		if attempt == attempts {
 			break
 		}
-		m.warnf("[%s] runtime validation attempt %d/%d failed: %v\n", name, attempt, attempts, err)
-		m.infof("[%s] retrying runtime validation in %s; guest log: %s\n", name, runtimeValidationRetryDelay, guestLogPath)
+		m.warnf("[%s] runtime validation attempt %d/%d failed: %v\n", instance.Name, attempt, attempts, err)
+		m.infof("[%s] retrying runtime validation in %s; guest log: %s\n", instance.Name, runtimeValidationRetryDelay, guestLogPath)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1426,7 +1716,7 @@ func (m *Manager) configureDockerRegistryMirrors(ctx context.Context, name strin
 	if err != nil {
 		return fmt.Errorf("read Docker daemon configuration script %s: %w", hostPath, err)
 	}
-	if err := provider.CopyText(ctx, m.Provider, name, "/opt/epar/configure-docker-daemon.sh", "0755", guestText(content)); err != nil {
+	if err := m.copyTextGuest(ctx, name, "/opt/epar/configure-docker-daemon.sh", "0755", guestText(content), false); err != nil {
 		return err
 	}
 	_, err = m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-docker-daemon.sh"}, provider.ExecOptions{
@@ -1453,6 +1743,19 @@ func (m *Manager) execGuest(ctx context.Context, name string, cmd []string, opts
 	opts.Stderr = transcript.Stderr
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if m.Lifecycle != nil {
+		instance, err := m.providerInstance(cctx, name)
+		if err != nil {
+			return provider.ExecResult{}, err
+		}
+		providerOpts := opts
+		providerOpts.LogPath = ""
+		providerOpts.Env = nil
+		return m.Lifecycle.Exec(cctx, instance, provider.EnvCommand(opts.Env, cmd), providerOpts)
+	}
+	if m.Provider == nil {
+		return provider.ExecResult{}, fmt.Errorf("provider lifecycle is required")
+	}
 	return m.Provider.Exec(cctx, name, cmd, opts)
 }
 

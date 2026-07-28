@@ -30,6 +30,8 @@ EPAR intentionally does not implement a Docker-socket provider. A runner that co
 
 Docker Container uses a privileged outer container with a private inner Docker daemon. That gives good cleanup and Docker resource separation for each job, but it is still trusted-job infrastructure because `--privileged` weakens container isolation.
 
+Docker Sandboxes places the listener, guest filesystem, network boundary, and private Docker daemon inside a dedicated microVM. It provides EPAR's strongest current host boundary and materially strengthens host isolation relative to Docker Container. The first-run wizard makes it the capability-driven default on any OS when Docker and the supported `sbx` diagnostics are healthy; this selection rule is separate from independent platform certification and does not claim that every host combination has received the same real-host validation. EPAR does not market any provider as universally safe for arbitrary hostile workflows.
+
 Tart runs jobs inside VMs on Apple Silicon macOS. That is a stronger host boundary than Docker Container, but workflows still control the guest and any secrets exposed to the job.
 
 WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provider as trusted-job infrastructure unless your environment has reviewed and accepted that model.

@@ -14,6 +14,7 @@ func TestPathHelpersAndRecognition(t *testing.T) {
 		category Category
 	}{
 		{mustPath(InstancePath(root, "runner-1", "docker-container")), CategoryInstances},
+		{mustPath(InstancePath(root, "runner-1", "docker-sandboxes")), CategoryInstances},
 		{mustPath(InstancePath(root, "runner-1", "guest")), CategoryInstances},
 		{mustPath(BuildPath(root, "ubuntu-24.04", "docker-build")), CategoryBuilds},
 		{mustPath(BuildPath(root, "ubuntu-24.04", "guest")), CategoryBuilds},

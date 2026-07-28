@@ -71,7 +71,7 @@ flowchart LR
   Optional --> Yours["your scripts"]
 ```
 
-The public WSL and Docker Container default examples start from `ghcr.io/catthehacker/ubuntu:full-latest`, so they inherit Docker plus the broader Catthehacker runner tool stack. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker Container always needs Docker Engine because the provider depends on a private inner Docker daemon.
+The public WSL and Docker Container default examples start from `ghcr.io/catthehacker/ubuntu:full-latest`, so they inherit Docker plus the broader Catthehacker runner tool stack. The recommended Docker Sandboxes template uses its separate pinned Candidate A adaptation of the same full Catthehacker source; it is built and loaded with `scripts/docker-sandboxes/build-template.ps1` and `scripts/docker-sandboxes/load-template.ps1`, not the normal `image build` command. Tart and the WSL lean examples leave `image.customInstallScripts` empty, producing a runner-only Ubuntu image. Docker Container always needs Docker Engine because the provider depends on a private inner Docker daemon.
 
 EPAR ships reusable install scripts for common cases:
 
@@ -202,7 +202,7 @@ Docker registry mirrors are runtime configuration, not image content. Keep them 
 
 ## Upstream Runner Images
 
-Runner-only Tart images and the default WSL and Docker Container images do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker Container images start from `ghcr.io/catthehacker/ubuntu:full-latest`, which already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Catthehacker runner tool stack.
+Runner-only Tart images, the default WSL and Docker Container images, and the Docker Sandboxes Catthehacker templates do not require EPAR's pinned `actions/runner-images` checkout. The default WSL and Docker Container images start from `ghcr.io/catthehacker/ubuntu:full-latest`; Docker Sandboxes adapts an approved digest-pinned snapshot of that full source. It already includes Docker Engine, Compose, Buildx, Node/npm, and the broader Catthehacker runner tool stack.
 
 The built-in Docker/browser and web/E2E scripts require a pinned checkout of `actions/runner-images`:
 
@@ -273,7 +273,7 @@ Use `configs/wsl.lean.example.yml` when you want the old smaller rootfs-tar path
 
 ## Installed Runtime
 
-The default WSL and Docker Container builds use `ghcr.io/catthehacker/ubuntu:full-latest` as the source image. It is larger than the medium Catthehacker act image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
+The default WSL and Docker Container builds use `ghcr.io/catthehacker/ubuntu:full-latest` as the source image, and the recommended Docker Sandboxes template adapts a digest-pinned snapshot from that full channel. It is larger than the medium Catthehacker act image, but it is the recommended default for public users because common tools such as Node/npm are already present. The WSL lean and web/E2E examples keep demonstrating smaller custom paths that layer only selected dependencies.
 
 Catthehacker's `full-latest` and `act-latest` tags are rolling references. EPAR records the resolved source digest in its image manifest so a built image remains auditable, but a later `image build --replace` can consume a newer upstream digest. Pin `image.sourceImage` to a tested digest when rebuild reproducibility is required.
 
@@ -289,7 +289,7 @@ The optional `install-docker-browser.sh` layer installs:
 - upstream Google Chrome on x64
 - Playwright-managed Chromium on ARM64, exposed as `epar-browser`, `chromium`, and `chromium-browser`
 
-The WSL default and Docker Container provider validate Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`. Docker Container then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`; WSL starts Docker through systemd inside the distro. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside non-WSL-default image builds only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
+The WSL default and Docker Container provider validate Docker Engine/CLI/Compose/Buildx through `scripts/guest/ubuntu/install-docker-engine.sh`. Docker Container then starts the daemon at container runtime from `/opt/epar/container-entrypoint.sh`; WSL starts Docker through systemd inside the distro. Docker Sandboxes instead validates the private daemon and toolchain as part of its Candidate A template admission and runtime verification. Set `EPAR_FORCE_UPSTREAM_DOCKER_INSTALL=true` inside non-WSL-default image builds only if you intentionally want to replace the base image's Docker packages with the pinned upstream `actions/runner-images` Docker install harness.
 
 The ARM64 Docker harness prefers upstream `toolset-2404-arm64.json`. If an older upstream checkout does not contain that file, EPAR falls back to a minimal ARM-aware Docker toolset.
 

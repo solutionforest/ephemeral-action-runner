@@ -27,6 +27,15 @@ pool:
   replacementRetryMaxSeconds: 1800
   replacementRetryMultiplier: 2
   replacementRetryJitterPercent: 20
+
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+
 logging:
   directory: work/logs
   managerSinks: [console]

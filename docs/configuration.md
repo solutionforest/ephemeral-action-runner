@@ -1,6 +1,6 @@
 # Configuration
 
-EPAR stores local settings in `.local/config.yml` by default. The first run creates that file for the default Docker Container setup when it does not exist.
+EPAR stores local settings in `.local/config.yml` by default. When the file does not exist, the first-run wizard always displays Docker Container, Docker Sandboxes, WSL2, and experimental Tart with a prerequisite result, while refusing unavailable selections. Docker Sandboxes is the recommended Enter default without an operating-system allowlist when Docker is ready, the exact supported `sbx` version is installed, the host architecture maps to an available Linux guest template, and `sbx diagnose --output json` reports at least one pass and zero failures. Diagnostic warnings remain visible but do not disable the choice. The wizard performs read-only local discovery of an active lock-selected EPAR template, its full local image identity and platform, and the current host-global Balanced-policy fingerprint before writing configuration. New Docker Sandboxes configs set `networkBaseline: open`, which adds an EPAR-owned sandbox-scoped `allow **` rule for public HTTP/HTTPS compatibility plus deny-wins host-alias guardrails without changing the host-global policy. The rolling Catthehacker source-channel labels do not refresh automatically; the source lock is an approved snapshot.
 
 ## Pre-release provider rename
 
@@ -32,13 +32,15 @@ EPAR looks for config in this order:
 | Section | Purpose |
 | --- | --- |
 | `github` | GitHub App ID, organization, private key path, and optional GitHub API/web URLs. |
-| `provider` | How EPAR creates disposable runners: `docker-container`, `wsl`, or `tart`. |
+| `provider` | How EPAR creates disposable runners: `docker-container`, `docker-sandboxes`, `wsl`, or `tart`. |
 | `image` | Source image/rootfs, output image, runner version, and optional install scripts. |
 | `pool` | Runner count, instance name prefix, and replacement retry policy. |
+| `storage` | Provider-neutral free-space reserve, grace period, retained generations, and cache limits. |
 | `logging` | Manager and transcript sinks, formats, rotation, retention, and log directory. |
 | `runner` | GitHub Actions labels, runner group, default-label policy, and whether to add the host-machine label. |
 | `security` | Runner-group policy requirements checked before runner registration. |
 | `docker` | Optional Docker registry mirrors and private Docker daemon proxy settings. |
+| `dockerSandboxes` | Pinned template, policy, staging, capacity, and resource settings for Docker Sandboxes. |
 | `timeouts` | Boot, GitHub online, and command timeout values in seconds. |
 
 ## Common Edits
@@ -57,7 +59,7 @@ pool:
   namePrefix: buildbox01-a4f9c2
 ```
 
-`pool.namePrefix` is both the prefix for generated GitHub runner names and the cleanup boundary for GitHub runner records. It must be 2-40 characters and should leave room for EPAR's generated `-YYYYMMDD-HHMMSS-###` suffix. Do not reuse the same prefix on different machines or for separate EPAR supervisors in the same organization. If two machines share a prefix, one machine's cleanup can delete the other machine's GitHub runner record, causing the other supervisor to report that the runner record is gone and replace a healthy runner.
+The first-run wizard derives `pool.namePrefix` from the sanitized machine name and a six-character cryptographically random hexadecimal suffix, making it recognizable while reducing collision risk when multiple EPAR configurations are created on the same host. `pool.namePrefix` is the literal beginning of every generated local instance and GitHub runner name. It must be 2-40 characters; the shared name generator appends `-YYYYMMDD-HHMMSS-###`, so a generated name is at most 60 characters and remains within GitHub's runner-name limit and the Docker Sandboxes 63-character limit. Do not reuse the same prefix on different machines or for separate EPAR supervisors in the same organization. Legacy-provider cleanup uses this boundary, while Docker Sandboxes binds and removes exact identities through its ledger. A shared prefix can therefore let one legacy supervisor delete another machine's GitHub runner record and makes every provider's ownership ambiguous.
 
 Configure replacement retry behavior after a transient GitHub or network outage:
 
@@ -70,6 +72,20 @@ pool:
 ```
 
 These values default to `15`, `1800`, `2`, and `20`, so existing configurations remain valid without changes. `replacementRetryInitialSeconds` must be positive, `replacementRetryMaxSeconds` must be at least the initial delay, `replacementRetryMultiplier` must be at least `1`, and `replacementRetryJitterPercent` must be from `0` through `100`.
+
+Configure capacity and bounded retention:
+
+```yaml
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+```
+
+Existing configurations use these defaults without requiring a new section. See [Storage](storage.md) for reporting and exact cleanup behavior.
 
 The supervisor backs off only replacement allocation after transient network errors and GitHub HTTP `429` or `5xx` responses. The nominal delay doubles from 15 seconds to a 30-minute cap with the configured jitter; a longer GitHub `Retry-After` response takes precedence. Authentication and deterministic configuration failures remain fail-fast after safe rollback. Initial `pool up` startup also remains fail-fast rather than entering an unattended retry loop.
 
@@ -197,6 +213,8 @@ addresses in ignored `.local/config.yml`, not tracked example files.
 
 For `provider.type: docker-container`, EPAR defaults to Catthehacker's full Ubuntu runner image and creates a Docker Container image named `epar-docker-container-catthehacker-ubuntu`.
 
+For `provider.type: docker-sandboxes`, EPAR rejects `provider.sourceImage` and requires an explicitly built and loaded Candidate A template plus its full OCI configuration digest, verified policy fingerprint, staging root, and resource limits. The missing-config wizard offers only the active lock-selected source channels for the host platform: Catthehacker `full-latest` (recommended) and `act-22.04` (current lean profile). Each source channel maps to one exact versioned EPAR template tag; raw Catthehacker images cannot be used directly. The wizard filters historical cached EPAR tags, writes the selected template tag and full local digest to configuration, and does not refresh the approved source-lock snapshot automatically. It reports the shared host template-cache size separately from per-sandbox storage and asks one capacity question. With matching capacity evidence, it derives the total `rootDisk` from measured guest `/` use, a 25% margin, and the recommended 20 GiB writable headroom, then asks for Docker-disk capacity. Without exact root evidence, it asks for provisional total root capacity and writes the Docker-disk default. It writes the 50 GiB host-free floor in both cases; runtime admission strengthens this to at least 10% of the backing volume. Configuration validation enforces a 20 GiB minimum root capacity independently from the 100 GiB Docker-disk minimum. A configured Docker Sandboxes pool never falls back to Docker Container. See the [Docker Sandboxes provider](providers/docker-sandboxes.md) and the tracked example.
+
 For `provider.type: wsl`, EPAR defaults to Catthehacker's full Ubuntu runner image, converts it into a WSL rootfs, and stores the output under `work/images/`.
 
 For the experimental `provider.type: tart`, EPAR defaults to `ghcr.io/cirruslabs/ubuntu:latest`, a basic Ubuntu ARM64 VM image. EPAR installs its runner lifecycle but does not add the broad tool and dependency set found in GitHub's hosted runner images. If you require a GitHub-runner-like environment, build and maintain a bootable Tart image yourself by adapting the scripts in [actions/runner-images](https://github.com/actions/runner-images), then set `image.sourceImage` to that Tart image. Rosetta-based amd64 execution also has compatibility limits and must be validated against the exact workflow.
@@ -204,5 +222,6 @@ For the experimental `provider.type: tart`, EPAR defaults to `ghcr.io/cirruslabs
 See the provider docs for details:
 
 - [Docker Container Provider](providers/docker-container.md)
+- [Docker Sandboxes Provider](providers/docker-sandboxes.md)
 - [WSL Provider](providers/wsl.md)
 - [Tart Provider](providers/tart.md)

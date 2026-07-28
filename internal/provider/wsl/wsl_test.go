@@ -212,3 +212,21 @@ func TestDeleteReturnsUnregisterFailureWhenDistroStillExists(t *testing.T) {
 		t.Fatal("Delete() error = nil, want unregister error")
 	}
 }
+
+func TestParseRegistryIdentities(t *testing.T) {
+	identities, err := parseRegistryIdentities(`
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{2A6C842D-6F31-45D8-86A2-66A35D210B42}
+    DistributionName    REG_SZ    epar-wsl-runner
+    BasePath    REG_SZ    C:\repos\ephemeral-action-runner\work\wsl\epar-wsl-runner
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := identities["epar-wsl-runner"]
+	if identity.ID != "2A6C842D-6F31-45D8-86A2-66A35D210B42" {
+		t.Fatalf("identity = %#v", identity)
+	}
+	if !sameWindowsPath(identity.BasePath, `c:\repos\ephemeral-action-runner\work\wsl\epar-wsl-runner`) {
+		t.Fatalf("base path did not compare case-insensitively: %#v", identity)
+	}
+}

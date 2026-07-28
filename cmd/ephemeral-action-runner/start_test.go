@@ -12,6 +12,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
+	sandboxpromotion "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/promotion"
 )
 
 func TestNoArgsRoutesToStart(t *testing.T) {
@@ -56,12 +57,13 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	}
 	fake := &fakeStarterManager{}
 	var gotPath string
+	var out bytes.Buffer
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
 		ConfigPath:  "custom.yml",
 		Instances:   3,
-		Out:         &bytes.Buffer{},
+		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			gotPath = path
 			return fake, nil
@@ -75,6 +77,9 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	}
 	if fake.runOptions.Instances != 3 {
 		t.Fatalf("instances = %d, want 3", fake.runOptions.Instances)
+	}
+	if !strings.Contains(out.String(), "Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.") {
+		t.Fatalf("start guidance = %q", out.String())
 	}
 }
 
@@ -142,7 +147,7 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -169,6 +174,65 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	}
 }
 
+func TestStartInteractiveMissingConfigCanSelectDockerSandboxes(t *testing.T) {
+	dir := t.TempDir()
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+		Templates: []initDockerSandboxesTemplate{{
+			Reference: "docker.io/library/epar-docker-sandboxes-catthehacker-full:preview",
+			Digest:    "sha256:" + strings.Repeat("a", 64),
+			CacheID:   strings.Repeat("a", 12),
+			Platform:  "linux/amd64",
+			Size:      8 << 30,
+		}},
+		PolicyFingerprint: policyFingerprint,
+	}, nil)
+	oldInteractive := stdinIsInteractive
+	oldDocker := dockerAvailable
+	t.Cleanup(func() {
+		stdinIsInteractive = oldInteractive
+		dockerAvailable = oldDocker
+	})
+	stdinIsInteractive = func() bool { return true }
+	dockerAvailable = func(context.Context) error { return nil }
+
+	fake := &fakeStarterManager{}
+	var out bytes.Buffer
+	err := runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n\n\nn\n"),
+		Out:         &out,
+		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
+			if path != filepath.Join(dir, ".local", "config.yml") {
+				t.Fatalf("config path = %q", path)
+			}
+			return fake, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(dir, ".local", "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider.Type, "docker-sandboxes"; got != want {
+		t.Fatalf("provider.type = %q, want %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.PolicyGeneration, policyFingerprint; got != want {
+		t.Fatalf("dockerSandboxes.policyGeneration = %q, want %q", got, want)
+	}
+	if !strings.Contains(out.String(), "Docker Sandboxes — recommended") || !strings.Contains(out.String(), "Continuing with") {
+		t.Fatalf("output did not include capability-ready Docker Sandboxes selection and start continuation:\n%s", out.String())
+	}
+	if fake.ensureCalls != 1 || fake.runCalls != 1 {
+		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
+	}
+}
+
 func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	dir := t.TempDir()
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
@@ -181,8 +245,7 @@ func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	})
 	stdinIsInteractive = func() bool { return true }
 	dockerAvailable = func(context.Context) error {
-		t.Fatal("Docker availability should not be checked for Tart")
-		return nil
+		return errors.New("Docker is unavailable on this Mac")
 	}
 
 	fake := &fakeStarterManager{}
@@ -190,7 +253,7 @@ func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n4\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {

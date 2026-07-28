@@ -441,6 +441,54 @@ func TestHostTrustGenerationHookAcceptsCurrentLease(t *testing.T) {
 	}
 }
 
+func TestHostTrustGenerationHookProductionPathsCannotBeRedirectedByWorkflowEnvironment(t *testing.T) {
+	paths := []string{
+		filepath.Join("..", "..", "scripts", "guest", "ubuntu", "check-host-trust-generation.sh"),
+		filepath.Join("..", "..", "templates", "docker-sandboxes", "guest", "check-host-trust-generation.sh"),
+	}
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"EPAR_HOST_TRUST_MARKER", "EPAR_HOST_TRUST_LEASE"} {
+			if strings.Contains(string(content), forbidden) {
+				t.Fatalf("%s permits workflow-controlled path override %q", path, forbidden)
+			}
+		}
+		for _, required := range []string{
+			"marker=\"/opt/epar/host-trust-generation.json\"",
+			"lease=\"/run/epar/host-trust-lease.json\"",
+			"/usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3 -I -S -",
+		} {
+			if !strings.Contains(string(content), required) {
+				t.Fatalf("%s omitted fixed production invariant %q", path, required)
+			}
+		}
+	}
+}
+
+func TestDockerSandboxesRunnerAlwaysRequiresAdmissionHook(t *testing.T) {
+	path := filepath.Join("..", "..", "templates", "docker-sandboxes", "guest", "run-runner.sh")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	for _, required := range []string{
+		"[[ -s /opt/epar/host-trust-generation.json ]]",
+		"ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/check-host-trust-generation.sh",
+		"PATH=/opt/epar/hook-bin:",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Docker Sandboxes runner omitted always-on admission invariant %q", required)
+		}
+	}
+	if strings.Contains(text, "if [[ -s /opt/epar/host-trust-generation.json ]]") {
+		t.Fatal("Docker Sandboxes runner made its admission hook conditional")
+	}
+}
+
 func TestHostTrustGenerationHookRejectsMismatchAndExpiry(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the guest hook requires the Linux image's python3 runtime")
@@ -479,8 +527,8 @@ func runHostTrustGenerationHook(t *testing.T, marker, lease string) (string, err
 	if err := os.WriteFile(leasePath, []byte(lease), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(gitBashForRunnerScriptTest(t), bashPath(hookPath))
-	cmd.Env = append(os.Environ(), "EPAR_HOST_TRUST_MARKER="+bashPath(markerPath), "EPAR_HOST_TRUST_LEASE="+bashPath(leasePath))
+	cmd := exec.Command(gitBashForRunnerScriptTest(t), bashPath(hookPath), bashPath(markerPath), bashPath(leasePath))
+	cmd.Env = append(os.Environ(), "EPAR_HOST_TRUST_MARKER=/workflow/forged-marker.json", "EPAR_HOST_TRUST_LEASE=/workflow/forged-lease.json")
 	output, runErr := cmd.CombinedOutput()
 	return string(output), runErr
 }

@@ -6,10 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +25,13 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes"
+	sandboxcapacity "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/capacity"
+	sandboxpolicy "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/policy"
+	sandboxpromotion "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/promotion"
+	providerregistry "github.com/solutionforest/ephemeral-action-runner/internal/provider/registry"
+	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
 var dockerAvailable = func(ctx context.Context) error {
@@ -42,6 +51,86 @@ var initWSLStatus = wslStatus
 var initTartVersion = tartVersion
 
 var initResolveHostTrust = hosttrust.Resolve
+
+var initSandboxPromotionPlatform = sandboxpromotion.CurrentPlatform
+
+var initSandboxPromotionLookup = sandboxpromotion.Lookup
+
+var initDockerSandboxesPreflight = func(ctx context.Context, record sandboxpromotion.Record, projectRoot string) sandboxpromotion.PreflightResult {
+	return sandboxpromotion.LocalPreflight(ctx, record, projectRoot, os.Getenv("EPAR_CONTROLLER_IN_DOCKER") != "1", sourceRevision)
+}
+
+var initDockerSandboxesReadiness = func(ctx context.Context) (dockersandboxes.HostReadiness, error) {
+	return dockersandboxes.New("sbx").VerifyHostReadiness(ctx)
+}
+
+type initDockerSandboxesTemplate struct {
+	Reference     string
+	Digest        string
+	CacheID       string
+	Platform      string
+	Size          int64
+	Label         string
+	SourceChannel string
+}
+
+type dockerSandboxesSourceLock struct {
+	SchemaVersion int                                   `json:"schemaVersion"`
+	Profiles      map[string]dockerSandboxesLockProfile `json:"profiles"`
+}
+
+type dockerSandboxesLockProfile struct {
+	ObservedTagReference string                                        `json:"observedTagReference"`
+	Platforms            map[string]dockerSandboxesLockProfilePlatform `json:"platforms"`
+}
+
+type dockerSandboxesLockProfilePlatform struct {
+	TemplateTag string `json:"templateTag"`
+}
+
+type dockerSandboxesActiveProfile struct {
+	Name              string
+	ObservedTag       string
+	TemplateReference string
+	DisplayLabel      string
+}
+
+type initDockerSandboxesDiscovery struct {
+	Templates         []initDockerSandboxesTemplate
+	PolicyFingerprint string
+}
+
+type initDockerSandboxesRootMeasurement struct {
+	PeakBytes int64
+	Evidence  string
+}
+
+type initDockerSandboxesCapacityResult struct {
+	StorageRoot    string
+	AvailableBytes uint64
+	TotalBytes     uint64
+	Reservation    uint64
+	HostWatermark  uint64
+	RequiredBytes  uint64
+	DeficitBytes   uint64
+	CapacityStatus storage.CapacityStatus
+}
+
+type initDockerSandboxesProfile struct {
+	HostPlatform      sandboxpromotion.Platform
+	Template          string
+	TemplateDigest    string
+	PolicyFingerprint string
+	RootDisk          string
+	DockerDisk        string
+	MinHostFreeSpace  string
+}
+
+var initDiscoverDockerSandboxes = discoverDockerSandboxes
+
+var initDockerSandboxesRootMeasurementFor = dockerSandboxesRootMeasurement
+
+var initDockerSandboxesCapacityCheck = checkInitDockerSandboxesCapacity
 
 type initRunnerGroupClient interface {
 	ListRunnerGroups(context.Context) ([]gh.RunnerGroup, error)
@@ -154,25 +243,9 @@ func runInitWithOptions(opts initOptions) error {
 	if err != nil {
 		return err
 	}
-	providerType := "docker-container"
-	if wsl2Available() {
-		providerType, err = promptProviderType(opts.Out, reader, "wsl")
-		if err != nil {
-			return err
-		}
-	} else if tartAvailable() {
-		providerType, err = promptProviderType(opts.Out, reader, "tart")
-		if err != nil {
-			return err
-		}
-	}
-	if !opts.SkipDockerCheck && providerType != "tart" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		dockerErr := dockerAvailable(ctx)
-		cancel()
-		if dockerErr != nil {
-			return fmt.Errorf("Docker is required for the selected %s setup. Install Docker Desktop, Docker Engine, or a compatible Docker host, then rerun %s init", providerDisplayName(providerType), binaryName)
-		}
+	providerType, promotionRecord, selectedProfile, err := promptInitProvider(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck)
+	if err != nil {
+		return err
 	}
 	defaultPrefix, err := generatedPoolNamePrefix()
 	if err != nil {
@@ -188,7 +261,7 @@ func runInitWithOptions(opts initOptions) error {
 
 	hostTrustMode := config.HostTrustModeDisabled
 	hostTrustScopes := []string{config.HostTrustScopeSystem}
-	if providerType == "docker-container" {
+	if providerType == "docker-container" || providerType == "docker-sandboxes" {
 		enabled, promptErr := promptYesNo(opts.Out, reader, "Inherit this host's trusted TLS roots into disposable runners?", true)
 		if promptErr != nil {
 			return promptErr
@@ -218,6 +291,20 @@ func runInitWithOptions(opts initOptions) error {
 		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
 	case "tart":
 		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
+	case "docker-sandboxes":
+		profile := selectedProfile
+		if profile == nil {
+			var profileErr error
+			profile, profileErr = promotedDockerSandboxesProfile(promotionRecord)
+			if profileErr != nil {
+				return profileErr
+			}
+		}
+		guestPlatform, runnerArchitectureLabel, platformErr := dockerSandboxesPlatform(profile.HostPlatform)
+		if platformErr != nil {
+			return platformErr
+		}
+		content = defaultDockerSandboxesConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, guestPlatform, runnerArchitectureLabel)
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.ConfigPath), 0755); err != nil {
 		return err
@@ -598,45 +685,756 @@ func promptPoolNamePrefix(out io.Writer, reader *bufio.Reader, defaultValue stri
 	}
 }
 
-func promptProviderType(out io.Writer, reader *bufio.Reader, alternative string) (string, error) {
-	alternativeLabel := providerDisplayName(alternative)
+type initProviderOption struct {
+	Number    string
+	Type      string
+	Label     string
+	Available bool
+	Status    string
+	Default   bool
+	Aliases   []string
+}
+
+type initProviderPrerequisites struct {
+	DockerAvailable          bool
+	DockerStatus             string
+	DockerSandboxesAvailable bool
+	DockerSandboxesStatus    string
+	WSLAvailable             bool
+	WSLStatus                string
+	TartAvailable            bool
+	TartStatus               string
+}
+
+func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, sandboxpromotion.Record, *initDockerSandboxesProfile, error) {
+	hostPlatform := initSandboxPromotionPlatform()
+	record, promoted := initSandboxPromotionLookup(hostPlatform)
+	prerequisites := detectInitProviderPrerequisites(ctx, hostPlatform, skipDockerCheck)
+	operationalDefault := !promoted && prerequisites.DockerSandboxesAvailable
+	promotionPassed := false
+	var promotionFailures []sandboxpromotion.Failure
+	if promoted {
+		var preflight sandboxpromotion.PreflightResult
+		if os.Getenv(sandboxpromotion.DisableEnvironment) == "1" {
+			preflight.Failures = append(preflight.Failures, sandboxpromotion.Failure{
+				Gate:       "operator kill switch",
+				Detail:     sandboxpromotion.DisableEnvironment + "=1 disables Docker Sandboxes admission and automatic selection",
+				Resolution: "Unset the kill switch only after the Docker Sandboxes issue is resolved, or explicitly choose another provider.",
+			})
+		} else if err := sandboxpromotion.Validate(record); err != nil {
+			preflight.Failures = append(preflight.Failures, sandboxpromotion.Failure{
+				Gate:       "promotion record",
+				Detail:     err.Error(),
+				Resolution: "Explicitly choose Docker Container or another provider and report the invalid embedded promotion record.",
+			})
+		} else if prerequisites.DockerSandboxesAvailable {
+			preflightContext, cancel := context.WithTimeout(ctx, 45*time.Second)
+			preflight = initDockerSandboxesPreflight(preflightContext, record, projectRoot)
+			cancel()
+		}
+		promotionPassed = preflight.Passed() && prerequisites.DockerSandboxesAvailable
+		promotionFailures = preflight.Failures
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "Docker Sandboxes automatic-default preflight:")
+		if promotionPassed {
+			fmt.Fprintln(out, "  PASS: the exact promoted platform, host, sbx, template, policy, and resource gates passed.")
+		} else {
+			for _, failure := range promotionFailures {
+				fmt.Fprintf(out, "  FAIL [%s]: %s\n", failure.Gate, failure.Detail)
+				fmt.Fprintf(out, "    Action: %s\n", failure.Resolution)
+			}
+			if len(promotionFailures) == 0 {
+				fmt.Fprintf(out, "  FAIL [prerequisites]: %s\n", prerequisites.DockerSandboxesStatus)
+			}
+			prerequisites.DockerSandboxesAvailable = false
+			prerequisites.DockerSandboxesStatus = "UNAVAILABLE — promoted admission did not pass; review the failures above"
+		}
+	}
+
+	defaultProvider := "docker-container"
+	if promotionPassed || operationalDefault {
+		defaultProvider = "docker-sandboxes"
+	} else if promoted || !prerequisites.DockerAvailable {
+		defaultProvider = ""
+	}
+	providerType, err := promptProviderOptions(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider)
+	if err != nil {
+		return "", sandboxpromotion.Record{}, nil, err
+	}
+	if providerType != "docker-sandboxes" {
+		return providerType, sandboxpromotion.Record{}, nil, nil
+	}
+	if promotionPassed {
+		return providerType, record, nil, nil
+	}
+	if !promoted {
+		if _, _, err := dockerSandboxesPlatform(hostPlatform); err == nil {
+			profile, accepted, profileErr := promptDockerSandboxesProfile(ctx, projectRoot, hostPlatform, out, reader)
+			if profileErr != nil {
+				return "", sandboxpromotion.Record{}, nil, profileErr
+			}
+			if !accepted {
+				return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes setup did not complete; no config was written")
+			}
+			return providerType, sandboxpromotion.Record{}, profile, nil
+		}
+	}
+	return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes selection is unavailable")
+}
+
+func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
 	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Runner provider:")
-	fmt.Fprintln(out, "  1. Docker Container — private daemon (default)")
-	fmt.Fprintf(out, "  2. %s\n", alternativeLabel)
+	fmt.Fprintln(out, "Docker Sandboxes setup:")
+	fmt.Fprintln(out, "  Docker Sandboxes is the recommended default because Docker and sbx diagnostics passed on this machine.")
+	fmt.Fprintln(out, "  Docker Sandboxes provides EPAR's strongest current host boundary, but it is not a guarantee that arbitrary hostile workflows are safe.")
+	fmt.Fprintln(out, "  Setup performs read-only checks for an exact locally built and loaded EPAR template and the current host-global Balanced policy.")
+	fmt.Fprintln(out, "  New EPAR sandboxes default to open public HTTP/HTTPS egress with owned deny-wins host-alias guardrails; Docker Sandboxes' private-network isolation remains in force.")
+	if os.Getenv(sandboxpromotion.DisableEnvironment) == "1" {
+		fmt.Fprintf(out, "  Unavailable: %s=1 disables Docker Sandboxes admission.\n", sandboxpromotion.DisableEnvironment)
+		return nil, false, fmt.Errorf("Docker Sandboxes setup is disabled by %s; no config was written", sandboxpromotion.DisableEnvironment)
+	}
+
+	guestPlatform, _, err := dockerSandboxesPlatform(hostPlatform)
+	if err != nil {
+		fmt.Fprintf(out, "  Docker Sandboxes is unavailable: %v\n", err)
+		return nil, false, fmt.Errorf("Docker Sandboxes setup is unavailable: %w", err)
+	}
+	var discovery initDockerSandboxesDiscovery
 	for {
-		value, hitEOF, err := promptDefault(out, reader, "Runner provider", "1")
+		discoveryContext, cancel := context.WithTimeout(ctx, 45*time.Second)
+		discovery, err = initDiscoverDockerSandboxes(discoveryContext, projectRoot, guestPlatform)
+		cancel()
+		if err == nil && len(discovery.Templates) > 0 {
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(out, "  Docker Sandboxes setup preparation failed: %v\n", err)
+			fmt.Fprintln(out, "  Action: repair the reported local admission check. For template or cache failures, build and load a Candidate A template using docs/providers/docker-sandboxes.md.")
+		} else {
+			fmt.Fprintln(out, "  Docker Sandboxes setup found no exact locally built and loaded EPAR template for this platform.")
+			fmt.Fprintln(out, "  Action: build and load a Candidate A template using docs/providers/docker-sandboxes.md.")
+		}
+		retry, promptErr := promptYesNo(out, reader, "Retry Docker Sandboxes setup checks?", false)
+		if promptErr != nil {
+			return nil, false, promptErr
+		}
+		if !retry {
+			return nil, false, errors.New("Docker Sandboxes setup checks did not pass; no config was written")
+		}
+	}
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Verified local Docker Sandboxes source profiles:")
+	for index, template := range discovery.Templates {
+		suffix := ""
+		if index == 0 {
+			if _, measured := initDockerSandboxesRootMeasurementFor(hostPlatform, template); measured {
+				suffix = " (recommended measured default)"
+			} else {
+				suffix = " (default selection; capacity unmeasured)"
+			}
+		}
+		fmt.Fprintf(out, "  %d. %s — %s [%s, cache %s, %s on host]%s\n", index+1, template.Label, template.SourceChannel, template.Platform, template.CacheID, formatInitByteCount(template.Size), suffix)
+	}
+	fmt.Fprintln(out, "  This wizard saves the exact verified EPAR template tag and full local digest in configuration.")
+	fmt.Fprintln(out, "  Automatic Docker Sandboxes source refresh is not implemented yet; build and load a new locked EPAR template manually before running setup.")
+	var selected initDockerSandboxesTemplate
+	for {
+		value, hitEOF, promptErr := promptDefault(out, reader, "Docker Sandboxes source profile", "1")
+		if promptErr != nil {
+			return nil, false, promptErr
+		}
+		index, parseErr := strconv.Atoi(value)
+		if parseErr == nil && index >= 1 && index <= len(discovery.Templates) {
+			selected = discovery.Templates[index-1]
+			break
+		}
+		fmt.Fprintf(out, "Docker Sandboxes source profile must be a number from 1 to %d.\n", len(discovery.Templates))
+		if hitEOF {
+			return nil, false, fmt.Errorf("invalid Docker Sandboxes source profile %q", value)
+		}
+	}
+	fmt.Fprintf(out, "  Resolved exact EPAR template tag: %s\n", selected.Reference)
+	fmt.Fprintf(out, "  Resolved full local template digest: %s\n", selected.Digest)
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Selected template capacity:")
+	fmt.Fprintf(out, "  Shared host template cache: %s (already present; do not add this byte count arithmetically to each sandbox root disk).\n", formatInitByteCount(selected.Size))
+	fmt.Fprintln(out, "  Source-image virtual or unpacked-size figures are not guest root-disk requirements.")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Default resource reservations are recommended starting values and can be adjusted in the generated config.")
+	var rootDisk string
+	var dockerDisk string
+	if measurement, ok := initDockerSandboxesRootMeasurementFor(hostPlatform, selected); ok {
+		fmt.Fprintf(out, "  Measured guest root peak: %s (%s).\n", formatInitByteCount(measurement.PeakBytes), measurement.Evidence)
+		fmt.Fprintln(out, "  Root formula: measured peak + 25% safety margin + the recommended 20GiB writable headroom, rounded up to 10GiB.")
+		derivedRootDisk, deriveErr := sandboxcapacity.DeriveRootDisk(uint64(measurement.PeakBytes), sandboxcapacity.RootWritableHeadroom)
+		if deriveErr != nil {
+			return nil, false, fmt.Errorf("derive sandbox root filesystem capacity: %w", deriveErr)
+		}
+		if derivedRootDisk > math.MaxInt64 {
+			return nil, false, errors.New("derived sandbox root filesystem capacity exceeds the supported size")
+		}
+		rootDisk = formatInitByteCount(int64(derivedRootDisk))
+		fmt.Fprintf(out, "  Automatically selected sandbox root filesystem total capacity: %s.\n", rootDisk)
+		fmt.Fprintln(out, "  Docker storage is the most workload-dependent reservation and is the only capacity question asked.")
+		dockerDisk, err = promptInitByteSize(out, reader, "Sandbox Docker disk", "100GiB", config.DockerSandboxesMinimumDockerDiskBytes)
+		if err != nil {
+			return nil, false, err
+		}
+	} else {
+		fmt.Fprintln(out, "  Measured guest root peak: unavailable for this exact template digest.")
+		fmt.Fprintln(out, "  Root capacity is the least certain reservation and is the only capacity question asked; the 30GiB default is provisional and is not derived from the template cache size.")
+		var promptErr error
+		rootDisk, promptErr = promptInitByteSize(out, reader, "Sandbox root filesystem total capacity", "30GiB", int64(sandboxcapacity.MinimumRootDisk))
+		if promptErr != nil {
+			return nil, false, promptErr
+		}
+		dockerDisk = "100GiB"
+		fmt.Fprintln(out, "  Automatically selected sandbox Docker disk: 100GiB.")
+	}
+	minHostFreeSpace := "50GiB"
+	fmt.Fprintln(out, "  Automatically selected minimum host free space: 50GiB.")
+	fmt.Fprintln(out, "  EPAR rechecks current Docker Sandboxes storage free space, existing and uncertain reservations, and raises the effective host watermark to at least 10% of the backing volume before every sandbox create.")
+	rootDiskBytes, err := config.ParseByteSize(rootDisk)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse sandbox root filesystem capacity: %w", err)
+	}
+	dockerDiskBytes, err := config.ParseByteSize(dockerDisk)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse sandbox Docker disk capacity: %w", err)
+	}
+	minHostFreeSpaceBytes, err := config.ParseByteSize(minHostFreeSpace)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse minimum host free space: %w", err)
+	}
+	capacityResult, err := initDockerSandboxesCapacityCheck(uint64(rootDiskBytes), uint64(dockerDiskBytes), uint64(minHostFreeSpaceBytes))
+	if err != nil {
+		return nil, false, fmt.Errorf("Docker Sandboxes setup cannot measure provider storage capacity: %w; no config was written", err)
+	}
+	if capacityResult.CapacityStatus != storage.CapacityReady {
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "Docker Sandboxes capacity admission failed:")
+		fmt.Fprintf(out, "  Provider storage: %s\n", capacityResult.StorageRoot)
+		fmt.Fprintf(out, "  Available: %s\n", formatInitUintByteCount(capacityResult.AvailableBytes))
+		fmt.Fprintf(out, "  Sandbox reservation: %s\n", formatInitUintByteCount(capacityResult.Reservation))
+		fmt.Fprintf(out, "  Required host reserve: %s\n", formatInitUintByteCount(capacityResult.HostWatermark))
+		fmt.Fprintf(out, "  Required before creation: %s\n", formatInitUintByteCount(capacityResult.RequiredBytes))
+		fmt.Fprintf(out, "  Shortfall: %s\n", formatInitUintByteCount(capacityResult.DeficitBytes))
+		fmt.Fprintf(out, "  Preview exact policy-selected cleanup with: %s\n", invocation.Command("storage", "prune", "--provider", "docker-sandboxes"))
+		return nil, false, errors.New("Docker Sandboxes storage is insufficient for the selected profile; no config was written")
+	}
+	fmt.Fprintf(out, "  Verified Docker Sandboxes storage admission on %s: %s available; %s required before creation.\n", capacityResult.StorageRoot, formatInitUintByteCount(capacityResult.AvailableBytes), formatInitUintByteCount(capacityResult.RequiredBytes))
+	profile := &initDockerSandboxesProfile{
+		HostPlatform:      hostPlatform,
+		Template:          selected.Reference,
+		TemplateDigest:    selected.Digest,
+		PolicyFingerprint: discovery.PolicyFingerprint,
+		RootDisk:          rootDisk,
+		DockerDisk:        dockerDisk,
+		MinHostFreeSpace:  minHostFreeSpace,
+	}
+	if err := config.ValidateDockerSandboxes(config.DockerSandboxesConfig{
+		Template:             profile.Template,
+		TemplateDigest:       profile.TemplateDigest,
+		PolicyGeneration:     profile.PolicyFingerprint,
+		NetworkBaseline:      config.DockerSandboxesNetworkBaselineOpen,
+		StagingRoot:          ".local/docker-sandboxes-staging",
+		CPUs:                 4,
+		Memory:               "8GiB",
+		RootDisk:             profile.RootDisk,
+		DockerDisk:           profile.DockerDisk,
+		MaxConcurrentCreates: 2,
+		MinHostFreeSpace:     profile.MinHostFreeSpace,
+	}); err != nil {
+		return nil, false, fmt.Errorf("validate discovered Docker Sandboxes profile: %w", err)
+	}
+	fmt.Fprintf(out, "  Verified policy fingerprint: %s\n", discovery.PolicyFingerprint)
+	return profile, true, nil
+}
+
+func checkInitDockerSandboxesCapacity(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {
+	storageRoot, err := sandboxcapacity.DockerSandboxesStorageRoot()
+	if err != nil {
+		return initDockerSandboxesCapacityResult{}, err
+	}
+	probePath := storageRoot
+	for {
+		if _, statErr := os.Lstat(probePath); statErr == nil {
+			break
+		} else if !os.IsNotExist(statErr) {
+			return initDockerSandboxesCapacityResult{}, fmt.Errorf("inspect %s: %w", probePath, statErr)
+		}
+		parent := filepath.Dir(probePath)
+		if parent == probePath {
+			return initDockerSandboxesCapacityResult{}, fmt.Errorf("find existing filesystem ancestor for %s", storageRoot)
+		}
+		probePath = parent
+	}
+	capacity, err := storage.ProbeFilesystemCapacity(probePath, time.Now())
+	if err != nil {
+		return initDockerSandboxesCapacityResult{}, fmt.Errorf("probe %s for %s: %w", probePath, storageRoot, err)
+	}
+	if rootDisk > math.MaxUint64-dockerDisk {
+		return initDockerSandboxesCapacityResult{}, errors.New("sandbox root and Docker disk reservation overflows")
+	}
+	reservation := rootDisk + dockerDisk
+	hostWatermark, err := sandboxcapacity.HostWatermark(minHostFreeSpace, capacity.TotalBytes)
+	if err != nil {
+		return initDockerSandboxesCapacityResult{}, err
+	}
+	check, err := storage.EvaluateCapacity(storage.Surface{
+		ID:       "docker-sandboxes-backing",
+		Provider: "docker-sandboxes",
+		Kind:     storage.SurfaceSandboxCache,
+		Location: storageRoot,
+		Capacity: capacity,
+	}, storage.Requirement{
+		ID:               "docker-sandboxes-instance-create",
+		Provider:         "docker-sandboxes",
+		SurfaceID:        "docker-sandboxes-backing",
+		PeakBytes:        reservation,
+		MinimumFreeBytes: hostWatermark,
+	})
+	if err != nil {
+		return initDockerSandboxesCapacityResult{}, err
+	}
+	return initDockerSandboxesCapacityResult{
+		StorageRoot:    storageRoot,
+		AvailableBytes: capacity.AvailableBytes,
+		TotalBytes:     capacity.TotalBytes,
+		Reservation:    reservation,
+		HostWatermark:  hostWatermark,
+		RequiredBytes:  check.RequiredAvailableBytes,
+		DeficitBytes:   check.DeficitBytes,
+		CapacityStatus: check.Status,
+	}, nil
+}
+
+func promptInitByteSize(out io.Writer, reader *bufio.Reader, label, defaultValue string, minimum int64) (string, error) {
+	for {
+		value, hitEOF, err := promptDefault(out, reader, label, defaultValue)
 		if err != nil {
 			return "", err
 		}
-		switch strings.ToLower(value) {
-		case "1", "docker", "docker-container":
-			return "docker-container", nil
-		case "2", alternative:
-			return alternative, nil
-		case "wsl2":
-			if alternative == "wsl" {
-				return alternative, nil
-			}
-		default:
-			// Continue below so aliases that belong to an unavailable provider are rejected.
+		parsed, parseErr := config.ParseByteSize(value)
+		if parseErr == nil && parsed >= minimum {
+			return value, nil
 		}
-		fmt.Fprintf(out, "Runner provider must be 1 (Docker Container — private daemon) or 2 (%s).\n", alternativeLabel)
+		if parseErr != nil {
+			fmt.Fprintf(out, "%s is invalid: %v\n", label, parseErr)
+		} else {
+			fmt.Fprintf(out, "%s must be at least %s.\n", label, formatInitByteCount(minimum))
+		}
 		if hitEOF {
+			return "", fmt.Errorf("invalid %s %q", strings.ToLower(label), value)
+		}
+	}
+}
+
+func formatInitByteCount(value int64) string {
+	const (
+		gib = int64(1 << 30)
+		mib = int64(1 << 20)
+	)
+	if value >= gib {
+		if value%gib == 0 {
+			return strconv.FormatInt(value/gib, 10) + "GiB"
+		}
+		return strconv.FormatFloat(float64(value)/float64(gib), 'f', 2, 64) + "GiB"
+	}
+	if value >= mib {
+		if value%mib == 0 {
+			return strconv.FormatInt(value/mib, 10) + "MiB"
+		}
+		return strconv.FormatFloat(float64(value)/float64(mib), 'f', 2, 64) + "MiB"
+	}
+	return strconv.FormatInt(value, 10) + "B"
+}
+
+func formatInitUintByteCount(value uint64) string {
+	if value <= math.MaxInt64 {
+		return formatInitByteCount(int64(value))
+	}
+	return strconv.FormatFloat(float64(value)/float64(uint64(1)<<30), 'f', 2, 64) + "GiB"
+}
+
+func dockerSandboxesRootMeasurement(hostPlatform sandboxpromotion.Platform, template initDockerSandboxesTemplate) (initDockerSandboxesRootMeasurement, bool) {
+	const (
+		evidenceSBXVersion = "0.35.0"
+		fullTemplateDigest = "sha256:00303a3e249a1baf8b0585d20273af408c27182dcfc827a98aa25ffe66b1f67f"
+	)
+	if dockersandboxes.SupportedVersion != evidenceSBXVersion || hostPlatform != sandboxpromotion.WindowsAMD64 || template.Digest != fullTemplateDigest || template.Platform != "linux/amd64" {
+		return initDockerSandboxesRootMeasurement{}, false
+	}
+	return initDockerSandboxesRootMeasurement{
+		PeakBytes: 324_780_032,
+		Evidence:  "exact full-template Buildx and Compose validation probe on Docker Sandboxes v0.35.0",
+	}, true
+}
+
+func discoverDockerSandboxes(ctx context.Context, projectRoot, guestPlatform string) (initDockerSandboxesDiscovery, error) {
+	profiles, err := readDockerSandboxesActiveProfiles(projectRoot, guestPlatform)
+	if err != nil {
+		return initDockerSandboxesDiscovery{}, err
+	}
+	adapter := dockersandboxes.New("")
+	if err := adapter.VerifyAdmission(ctx); err != nil {
+		return initDockerSandboxesDiscovery{}, fmt.Errorf("Docker Sandboxes admission check failed: %w", err)
+	}
+	cached, err := adapter.CachedTemplates(ctx)
+	if err != nil {
+		return initDockerSandboxesDiscovery{}, fmt.Errorf("read Docker Sandboxes template inventory: %w", err)
+	}
+	cachedByReference := make(map[string]dockersandboxes.CachedTemplate, len(cached))
+	for _, template := range cached {
+		reference, canonicalErr := canonicalDockerSandboxesTemplateReference(template.Reference)
+		if canonicalErr != nil {
+			continue
+		}
+		cachedByReference[reference] = template
+	}
+	var templates []initDockerSandboxesTemplate
+	for _, profile := range profiles {
+		template, found := cachedByReference[profile.TemplateReference]
+		if !found {
+			continue
+		}
+		identity, inspectErr := adapter.InspectLocalTemplate(ctx, template.Reference)
+		if inspectErr != nil || identity.Platform != guestPlatform {
+			continue
+		}
+		if !strings.HasPrefix(identity.Digest, "sha256:") || len(identity.Digest) != len("sha256:")+64 || template.CacheID != strings.TrimPrefix(identity.Digest, "sha256:")[:12] {
+			continue
+		}
+		templates = append(templates, initDockerSandboxesTemplate{
+			Reference:     template.Reference,
+			Digest:        identity.Digest,
+			CacheID:       template.CacheID,
+			Platform:      identity.Platform,
+			Size:          template.SizeBytes,
+			Label:         profile.DisplayLabel,
+			SourceChannel: profile.ObservedTag,
+		})
+	}
+	rules, err := adapter.ReadGlobalNetworkPolicy(ctx)
+	if err != nil {
+		return initDockerSandboxesDiscovery{}, fmt.Errorf("read Docker Sandboxes global policy: %w", err)
+	}
+	fingerprint, err := sandboxpolicy.Fingerprint(rules)
+	if err != nil {
+		return initDockerSandboxesDiscovery{}, fmt.Errorf("fingerprint Docker Sandboxes global policy: %w", err)
+	}
+	if err := sandboxpolicy.VerifyBaseline(fingerprint, "epar-preview-policy-probe", rules); err != nil {
+		return initDockerSandboxesDiscovery{}, fmt.Errorf("verify Docker Sandboxes global policy: %w", err)
+	}
+	return initDockerSandboxesDiscovery{Templates: templates, PolicyFingerprint: fingerprint}, nil
+}
+
+func readDockerSandboxesActiveProfiles(projectRoot, guestPlatform string) ([]dockerSandboxesActiveProfile, error) {
+	if projectRoot == "" {
+		return nil, errors.New("read Docker Sandboxes source lock: project root is empty")
+	}
+	lockPath := filepath.Join(projectRoot, "templates", "docker-sandboxes", "sources.lock.json")
+	contents, err := os.ReadFile(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: %w", lockPath, err)
+	}
+	var lock dockerSandboxesSourceLock
+	if err := json.Unmarshal(contents, &lock); err != nil {
+		return nil, fmt.Errorf("parse Docker Sandboxes source lock %q: %w", lockPath, err)
+	}
+	if lock.SchemaVersion != 2 {
+		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: unsupported schemaVersion %d", lockPath, lock.SchemaVersion)
+	}
+	if len(lock.Profiles) == 0 {
+		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: no active profiles", lockPath)
+	}
+	profileOrder := []string{"full", "act-22.04"}
+	expectedSourceChannels := map[string]string{
+		"full":      "ghcr.io/catthehacker/ubuntu:full-latest",
+		"act-22.04": "ghcr.io/catthehacker/ubuntu:act-22.04",
+	}
+	profiles := make([]dockerSandboxesActiveProfile, 0, len(profileOrder))
+	for _, name := range profileOrder {
+		profile, found := lock.Profiles[name]
+		if !found {
+			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q is missing", lockPath, name)
+		}
+		platform, found := profile.Platforms[guestPlatform]
+		if !found || platform.TemplateTag == "" {
+			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q has no templateTag for %s", lockPath, name, guestPlatform)
+		}
+		reference, err := canonicalDockerSandboxesTemplateReference(platform.TemplateTag)
+		if err != nil {
+			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q has invalid templateTag: %w", lockPath, name, err)
+		}
+		if profile.ObservedTagReference != expectedSourceChannels[name] {
+			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q has unexpected observedTagReference %q", lockPath, name, profile.ObservedTagReference)
+		}
+		label := "Catthehacker Ubuntu Act 22.04"
+		if name == "full" {
+			label = "Catthehacker Ubuntu Full"
+		}
+		profiles = append(profiles, dockerSandboxesActiveProfile{
+			Name:              name,
+			ObservedTag:       profile.ObservedTagReference,
+			TemplateReference: reference,
+			DisplayLabel:      label,
+		})
+	}
+	if len(lock.Profiles) != len(profiles) {
+		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profiles must be exactly full and act-22.04", lockPath)
+	}
+	profiles[0].DisplayLabel += " (recommended)"
+	profiles[1].DisplayLabel += " (current lean profile)"
+	return profiles, nil
+}
+
+func canonicalDockerSandboxesTemplateReference(reference string) (string, error) {
+	if strings.HasPrefix(reference, "docker.io/library/") {
+		reference = strings.TrimPrefix(reference, "docker.io/library/")
+	}
+	if strings.ContainsAny(reference, "@/ \t\r\n") || !strings.HasPrefix(reference, "epar-docker-sandboxes-catthehacker-") || strings.Count(reference, ":") != 1 {
+		return "", fmt.Errorf("must be an EPAR repository:tag reference, got %q", reference)
+	}
+	parts := strings.SplitN(reference, ":", 2)
+	if parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("must include a repository and tag, got %q", reference)
+	}
+	return "docker.io/library/" + reference, nil
+}
+
+func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpromotion.Platform, skipDockerCheck bool) initProviderPrerequisites {
+	result := initProviderPrerequisites{}
+	if skipDockerCheck {
+		result.DockerAvailable = true
+		result.DockerStatus = "AVAILABLE — Docker check skipped by --skip-docker-check"
+	} else {
+		dockerContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := dockerAvailable(dockerContext)
+		cancel()
+		if err == nil {
+			result.DockerAvailable = true
+			result.DockerStatus = "READY — Docker CLI and daemon are available"
+		} else {
+			result.DockerStatus = fmt.Sprintf("UNAVAILABLE — Docker CLI or daemon check failed: %v", err)
+		}
+	}
+
+	if _, _, err := dockerSandboxesPlatform(hostPlatform); err != nil {
+		result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — %v", err)
+	} else if os.Getenv(sandboxpromotion.DisableEnvironment) == "1" {
+		result.DockerSandboxesStatus = "UNAVAILABLE — " + sandboxpromotion.DisableEnvironment + "=1 disables admission"
+	} else if !result.DockerAvailable {
+		result.DockerSandboxesStatus = "UNAVAILABLE — Docker CLI and daemon are required"
+	} else {
+		readinessContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+		readiness, err := initDockerSandboxesReadiness(readinessContext)
+		cancel()
+		if err == nil {
+			capacityResult, capacityErr := initDockerSandboxesCapacityCheck(sandboxcapacity.MinimumRootDisk, sandboxcapacity.MinimumDockerDisk, sandboxcapacity.MinimumHostFreeSpace)
+			switch {
+			case capacityErr != nil:
+				result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — provider storage capacity cannot be measured: %v", capacityErr)
+			case capacityResult.CapacityStatus != storage.CapacityReady:
+				result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — provider storage %s has %s available; the minimum valid sandbox and host reserve require %s (shortfall %s)", capacityResult.StorageRoot, formatInitUintByteCount(capacityResult.AvailableBytes), formatInitUintByteCount(capacityResult.RequiredBytes), formatInitUintByteCount(capacityResult.DeficitBytes))
+			default:
+				result.DockerSandboxesAvailable = true
+				result.DockerSandboxesStatus = fmt.Sprintf("READY — Docker and sbx v%s diagnostics passed (%d pass, %d warn, %d fail, %d skip); minimum storage admission passed", dockersandboxes.SupportedVersion, readiness.ChecksPassed, readiness.ChecksWarned, readiness.ChecksFailed, readiness.ChecksSkipped)
+			}
+		} else {
+			result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — sbx v%s readiness failed: %v", dockersandboxes.SupportedVersion, err)
+		}
+	}
+
+	switch {
+	case initGOOS != "windows":
+		result.WSLStatus = "UNAVAILABLE — native Windows, WSL2, and Docker are required"
+	case !result.DockerAvailable:
+		result.WSLStatus = "UNAVAILABLE — Docker CLI and daemon are required"
+	case !wsl2Available():
+		result.WSLStatus = "UNAVAILABLE — wsl.exe must report Default Version: 2"
+	default:
+		result.WSLAvailable = true
+		result.WSLStatus = "READY — Docker and WSL2 are available"
+	}
+
+	switch {
+	case initGOOS != "darwin":
+		result.TartStatus = "UNAVAILABLE — native macOS and tart are required"
+	case !tartAvailable():
+		result.TartStatus = "UNAVAILABLE — tart --version failed"
+	default:
+		result.TartAvailable = true
+		result.TartStatus = "READY — tart is available"
+	}
+	return result
+}
+
+func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string) (string, error) {
+	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
+	for _, descriptor := range providerregistry.Descriptors() {
+		option := initProviderOption{
+			Number:  descriptor.WizardNumber,
+			Type:    descriptor.Type,
+			Label:   descriptor.WizardLabel,
+			Aliases: append([]string(nil), descriptor.WizardAliases...),
+		}
+		switch descriptor.Type {
+		case "docker-container":
+			option.Available = prerequisites.DockerAvailable
+			option.Status = prerequisites.DockerStatus
+		case "docker-sandboxes":
+			option.Available = prerequisites.DockerSandboxesAvailable && (!promoted || promotionPassed)
+			option.Status = prerequisites.DockerSandboxesStatus
+			if operationalDefault {
+				option.Label = "Docker Sandboxes — recommended"
+			} else if promoted {
+				option.Label = "Docker Sandboxes (independently certified for this exact platform)"
+			}
+		case "wsl":
+			option.Available = prerequisites.WSLAvailable
+			option.Status = prerequisites.WSLStatus
+		case "tart":
+			option.Available = prerequisites.TartAvailable
+			option.Status = prerequisites.TartStatus
+		default:
+			return "", fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
+		}
+		options = append(options, option)
+	}
+	if err := validateWizardProviderOptions(options); err != nil {
+		return "", err
+	}
+	defaultNumber := prioritizeDefaultProviderOption(options, defaultProvider)
+
+	fmt.Fprintln(out, "")
+	if defaultNumber == "" {
+		fmt.Fprintln(out, "Runner provider (explicit choice required):")
+	} else {
+		fmt.Fprintln(out, "Runner provider:")
+	}
+	for _, option := range options {
+		defaultLabel := ""
+		if option.Default {
+			defaultLabel = " (default)"
+		}
+		fmt.Fprintf(out, "  %s. %s%s\n", option.Number, option.Label, defaultLabel)
+		fmt.Fprintf(out, "     Prerequisites: %s\n", option.Status)
+	}
+	for {
+		var value string
+		var hitEOF bool
+		var err error
+		if defaultNumber == "" {
+			fmt.Fprint(out, "Runner provider: ")
+			value, err = reader.ReadString('\n')
+			if err != nil && !errors.Is(err, io.EOF) {
+				return "", err
+			}
+			hitEOF = errors.Is(err, io.EOF)
+			if hitEOF {
+				err = nil
+			}
+			value = strings.TrimSpace(value)
+		} else {
+			value, hitEOF, err = promptDefault(out, reader, "Runner provider", defaultNumber)
+		}
+		if err != nil {
+			return "", err
+		}
+		normalized := strings.ToLower(value)
+		var selected *initProviderOption
+		for index := range options {
+			option := &options[index]
+			if normalized == option.Number || normalized == option.Type {
+				selected = option
+				break
+			}
+			for _, alias := range option.Aliases {
+				if normalized == alias {
+					selected = option
+					break
+				}
+			}
+			if selected != nil {
+				break
+			}
+		}
+		if selected != nil && selected.Available {
+			return selected.Type, nil
+		}
+		if selected != nil {
+			fmt.Fprintf(out, "%s is unavailable: %s\n", selected.Label, selected.Status)
+		} else {
+			fmt.Fprintln(out, "Choose an available provider number or name shown above.")
+		}
+		if hitEOF {
+			if selected != nil {
+				return "", fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
+			}
 			return "", fmt.Errorf("invalid runner provider %q", value)
 		}
 	}
 }
 
-func providerDisplayName(providerType string) string {
-	switch providerType {
-	case "wsl":
-		return "WSL2"
-	case "tart":
-		return "Tart (experimental)"
-	default:
-		return "Docker Container — private daemon"
+func prioritizeDefaultProviderOption(options []initProviderOption, defaultProvider string) string {
+	defaultIndex := -1
+	for index := range options {
+		options[index].Default = false
+		if options[index].Type == defaultProvider && options[index].Available {
+			defaultIndex = index
+		}
 	}
+	if defaultIndex > 0 {
+		selected := options[defaultIndex]
+		copy(options[1:defaultIndex+1], options[:defaultIndex])
+		options[0] = selected
+		defaultIndex = 0
+	}
+	for index := range options {
+		options[index].Number = strconv.Itoa(index + 1)
+	}
+	if defaultIndex < 0 {
+		return ""
+	}
+	options[defaultIndex].Default = true
+	return options[defaultIndex].Number
+}
+
+func validateWizardProviderOptions(options []initProviderOption) error {
+	registered := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		descriptor, found := providerregistry.DescriptorFor(option.Type)
+		if !found {
+			return fmt.Errorf("wizard provider %q has no registry entry", option.Type)
+		}
+		if !descriptor.WizardSupported {
+			return fmt.Errorf("wizard provider %q is not registered for onboarding", option.Type)
+		}
+		if option.Number != descriptor.WizardNumber || option.Label == "" || len(option.Aliases) == 0 {
+			return fmt.Errorf("wizard provider %q does not use its complete registry contribution", option.Type)
+		}
+		if _, duplicate := registered[option.Type]; duplicate {
+			return fmt.Errorf("wizard provider %q is duplicated", option.Type)
+		}
+		registered[option.Type] = struct{}{}
+	}
+	for _, descriptor := range providerregistry.Descriptors() {
+		if descriptor.WizardSupported {
+			if _, found := registered[descriptor.Type]; !found {
+				return fmt.Errorf("registered provider %q has no ./start wizard option", descriptor.Type)
+			}
+		}
+	}
+	return nil
+}
+
+func providerDisplayName(providerType string) string {
+	if descriptor, found := providerregistry.DescriptorFor(providerType); found {
+		return descriptor.DisplayName
+	}
+	return providerType
 }
 
 func promptDefault(out io.Writer, reader *bufio.Reader, label string, defaultValue string) (string, bool, error) {
@@ -858,6 +1656,15 @@ pool:
   replacementRetryMaxSeconds: 1800
   replacementRetryMultiplier: 2
   replacementRetryJitterPercent: 20
+
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+
 logging:
   directory: work/logs
   managerSinks: [console]
@@ -908,6 +1715,138 @@ timeouts:
 `, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
+func promotedDockerSandboxesPlatform(record sandboxpromotion.Record) (string, string, error) {
+	return dockerSandboxesPlatform(record.Platform)
+}
+
+func dockerSandboxesPlatform(platform sandboxpromotion.Platform) (string, string, error) {
+	hostOS, hostArch, found := strings.Cut(string(platform), "/")
+	if !found || hostOS == "" || hostArch == "" || strings.Contains(hostArch, "/") {
+		return "", "", fmt.Errorf("unsupported Docker Sandboxes controller platform %q", platform)
+	}
+	guestPlatform, err := config.DockerSandboxesGuestPlatform(hostOS, hostArch)
+	if err != nil {
+		return "", "", err
+	}
+	switch guestPlatform {
+	case "linux/amd64":
+		return guestPlatform, "X64", nil
+	case "linux/arm64":
+		return guestPlatform, "ARM64", nil
+	default:
+		return "", "", fmt.Errorf("Docker Sandboxes guest platform %q has no GitHub runner architecture label", guestPlatform)
+	}
+}
+
+func promotedDockerSandboxesProfile(record sandboxpromotion.Record) (*initDockerSandboxesProfile, error) {
+	if _, _, err := promotedDockerSandboxesPlatform(record); err != nil {
+		return nil, err
+	}
+	return &initDockerSandboxesProfile{
+		HostPlatform:      record.Platform,
+		Template:          record.Template,
+		TemplateDigest:    record.TemplateDigest,
+		PolicyFingerprint: record.PolicyFingerprint,
+		RootDisk:          formatPromotionBytes(record.RootDiskBytes),
+		DockerDisk:        formatPromotionBytes(record.DockerDiskBytes),
+		MinHostFreeSpace:  formatPromotionBytes(record.MinHostFreeSpaceBytes),
+	}, nil
+}
+
+func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, guestPlatform, runnerArchitectureLabel string) string {
+	return fmt.Sprintf(`github:
+  appId: %d
+  organization: %s
+  privateKeyPath: %s
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  hostTrustMode: %s
+  hostTrustScopes: [%s]
+
+pool:
+  instances: 1
+  namePrefix: %s
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
+
+runner:
+  group: %s
+  labels: [self-hosted, linux, %s, epar-docker-sandboxes]
+  includeHostLabel: true
+  ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: %s
+    requireExplicitGroup: %t
+    requireNonDefaultGroup: %t
+    requiredRepositoryAccess: %s
+    requirePublicRepositoriesDisabled: %t
+
+provider:
+  type: docker-sandboxes
+  platform: %s
+
+dockerSandboxes:
+  template: %s
+  templateDigest: %s
+  policyGeneration: %s
+  networkBaseline: open
+  stagingRoot: .local/docker-sandboxes-staging
+  cpus: 4
+  memory: 8GiB
+  rootDisk: %s
+  dockerDisk: %s
+  maxConcurrentCreates: 2
+  minHostFreeSpace: %s
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900
+`, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.Template, profile.TemplateDigest, profile.PolicyFingerprint, profile.RootDisk, profile.DockerDisk, profile.MinHostFreeSpace)
+}
+
+func formatPromotionBytes(value uint64) string {
+	const gib = uint64(1 << 30)
+	if value != 0 && value%gib == 0 {
+		return strconv.FormatUint(value/gib, 10) + "GiB"
+	}
+	return strconv.FormatUint(value, 10) + "B"
+}
+
 func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection) string {
 	return fmt.Sprintf(`github:
   appId: %d
@@ -935,6 +1874,15 @@ pool:
   replacementRetryMaxSeconds: 1800
   replacementRetryMultiplier: 2
   replacementRetryJitterPercent: 20
+
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+
 logging:
   directory: work/logs
   managerSinks: [console]
@@ -1013,6 +1961,15 @@ pool:
   replacementRetryMaxSeconds: 1800
   replacementRetryMultiplier: 2
   replacementRetryJitterPercent: 20
+
+storage:
+  minimumFree: 20GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 64GiB
+  goCacheLimit: 10GiB
+
 logging:
   directory: work/logs
   managerSinks: [console]

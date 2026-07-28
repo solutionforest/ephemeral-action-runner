@@ -160,14 +160,18 @@ func runStartWithOptions(opts startOptions) (err error) {
 			hostTrustLockHeld = true
 		}
 	}
-	fmt.Fprintf(opts.Out, "Ensuring runner image is current for %s\n", configPath)
+	fmt.Fprintf(opts.Out, "Ensuring the runner image or sandbox template is current for %s\n", configPath)
 	if err = manager.EnsureImage(opts.Context); err != nil {
 		return err
 	}
+	stopGuidance := "Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window."
+	if opts.KeepOnExit {
+		stopGuidance = "Press Ctrl-C once to stop; --keep-on-exit will leave owned runner resources running."
+	}
 	if opts.Instances > 0 {
-		fmt.Fprintf(opts.Out, "Starting EPAR pool with %d instance(s). Press Ctrl-C to stop; cleanup is enabled by default.\n", opts.Instances)
+		fmt.Fprintf(opts.Out, "Starting EPAR pool with %d instance(s). %s\n", opts.Instances, stopGuidance)
 	} else {
-		fmt.Fprintf(opts.Out, "Starting EPAR pool using pool.instances from config. Press Ctrl-C to stop; cleanup is enabled by default.\n")
+		fmt.Fprintf(opts.Out, "Starting EPAR pool using pool.instances from config. %s\n", stopGuidance)
 	}
 	err = manager.RunPool(opts.Context, pool.RunOptions{
 		Instances:         opts.Instances,

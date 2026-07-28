@@ -11,9 +11,10 @@ Thanks for taking the time to contribute.
 ## Development Workflow
 
 1. Fork the repository and create a focused branch from `develop`.
-2. Keep the change small and document any operational or security behavior that it changes.
-3. Run the relevant tests locally. The baseline Go test suite is `go test ./...`.
-4. Open a pull request targeting `develop` and complete the pull-request template.
+2. Read and preserve the [Development and Extension Principles](docs/development-principles.md).
+3. Keep the change small and document any operational or security behavior that it changes.
+4. Run the relevant tests locally. The baseline Go test suite is `go test ./...`.
+5. Open a pull request targeting `develop` and complete the pull-request template.
 
 Fork pull requests run the safe hosted verification workflow. The live EPAR canary is reserved for branches in this repository because it uses a protected environment and disposable privileged containers.
 
@@ -23,5 +24,6 @@ Fork pull requests run the safe hosted verification workflow. The live EPAR cana
 - Add or update tests when behavior changes.
 - Keep credentials, private keys, tokens, and machine-specific configuration out of commits.
 - Update the relevant documentation when a user-visible or operational behavior changes.
+- Document and test every intentional platform or security exception.
 
 By contributing, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).

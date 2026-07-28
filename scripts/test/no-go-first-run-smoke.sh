@@ -63,6 +63,7 @@ if [[ "$host_os" == Linux ]]; then
 fi
 export FAKE_PROJECT="$project"
 export FAKE_DOCKER_LOG="$temporary/docker.log"
+export EPAR_LEGACY_CONTROLLER_IN_DOCKER=1
 
 (cd "$project" && scripts/run-with-docker.sh start)
 [[ "$(grep -c ' <run>' "$FAKE_DOCKER_LOG")" == 2 ]]

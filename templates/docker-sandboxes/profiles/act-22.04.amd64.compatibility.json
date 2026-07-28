@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "candidate": "A",
+  "profile": "act-22.04",
+  "validationStatus": "planned",
+  "platform": "linux/amd64",
+  "supportedSbxVersions": ["0.35.0"],
+  "source": {
+    "reference": "ghcr.io/catthehacker/ubuntu@sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",
+    "indexDigest": "sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",
+    "manifestDigest": "sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8ef546ecb44ca256655"
+  },
+  "runner": {
+    "execution": "direct-actions-listener",
+    "version": "2.332.0",
+    "user": "agent",
+    "uid": 1000,
+    "gid": 1000,
+    "home": "/home/agent",
+    "directory": "/opt/actions-runner"
+  },
+  "docker": {
+    "daemonOwner": "docker-sandboxes-runtime",
+    "expectedDaemonCount": 1,
+    "imagePreloadsVarLibDocker": false,
+    "buildRequiresPrivilegedBuildkit": false
+  }
+}

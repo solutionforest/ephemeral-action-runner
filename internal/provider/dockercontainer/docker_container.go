@@ -125,7 +125,7 @@ func (p *Provider) Delete(ctx context.Context, name string) error {
 }
 
 func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
-	result, err := p.run(ctx, nil, "ps", "-a", "--filter", "label="+labelProvider, "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}")
+	result, err := p.run(ctx, nil, "ps", "-a", "--no-trunc", "--filter", "label="+labelProvider, "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}")
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +135,11 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 		if line == "" {
 			continue
 		}
-		fields := strings.SplitN(line, "\t", 3)
-		if len(fields) < 3 {
+		fields := strings.SplitN(line, "\t", 4)
+		if len(fields) < 4 || strings.TrimSpace(fields[0]) == "" {
 			continue
 		}
-		out = append(out, provider.Instance{Name: fields[0], Source: fields[1], State: fields[2]})
+		out = append(out, provider.Instance{ProviderID: "docker:" + fields[0], Name: fields[1], Source: fields[2], State: fields[3]})
 	}
 	return out, nil
 }

@@ -1,4 +1,4 @@
-package pool
+package image
 
 import (
 	"bytes"
@@ -19,13 +19,13 @@ import (
 
 const trustedCAGuestDir = "/usr/local/share/ca-certificates/epar"
 
-type trustedCACertificate struct {
+type TrustedCACertificate struct {
 	DestinationName string
 	PEM             []byte
 }
 
-func (m *Manager) trustedCACertificates() ([]trustedCACertificate, error) {
-	byName := make(map[string]trustedCACertificate)
+func (m *Coordinator) trustedCACertificates() ([]TrustedCACertificate, error) {
+	byName := make(map[string]TrustedCACertificate)
 	for _, configuredPath := range m.Config.Image.TrustedCACertificatePaths {
 		path := config.ProjectPath(m.ProjectRoot, strings.TrimSpace(configuredPath))
 		info, err := os.Stat(path)
@@ -49,7 +49,7 @@ func (m *Manager) trustedCACertificates() ([]trustedCACertificate, error) {
 			}
 			sum := sha256.Sum256(certificate.Raw)
 			name := "epar-" + hex.EncodeToString(sum[:12]) + ".crt"
-			byName[name] = trustedCACertificate{
+			byName[name] = TrustedCACertificate{
 				DestinationName: name,
 				PEM:             pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw}),
 			}
@@ -60,11 +60,16 @@ func (m *Manager) trustedCACertificates() ([]trustedCACertificate, error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	out := make([]trustedCACertificate, 0, len(names))
+	out := make([]TrustedCACertificate, 0, len(names))
 	for _, name := range names {
 		out = append(out, byName[name])
 	}
 	return out, nil
+}
+
+// TrustedCACertificates returns validated CA material for provider-specific guest installation.
+func (m *Coordinator) TrustedCACertificates() ([]TrustedCACertificate, error) {
+	return m.trustedCACertificates()
 }
 
 func parseTrustedCACertificateFile(content []byte) ([]*x509.Certificate, error) {
@@ -105,7 +110,7 @@ func parseTrustedCACertificateFile(content []byte) ([]*x509.Certificate, error) 
 	return nil, fmt.Errorf("no PEM certificates found")
 }
 
-func (m *Manager) copyTrustedCACertificatesToDir(destination string) error {
+func (m *Coordinator) copyTrustedCACertificatesToDir(destination string) error {
 	certificates, err := m.trustedCACertificates()
 	if err != nil {
 		return err
@@ -121,7 +126,7 @@ func (m *Manager) copyTrustedCACertificatesToDir(destination string) error {
 	return nil
 }
 
-func (m *Manager) installTrustedCACertificates(ctx context.Context, vmName string) error {
+func (m *Coordinator) installTrustedCACertificates(ctx context.Context, vmName string) error {
 	certificates, err := m.trustedCACertificates()
 	if err != nil {
 		return err

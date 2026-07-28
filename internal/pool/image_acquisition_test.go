@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 )
 
@@ -34,15 +35,15 @@ func TestDockerPullProgressUsesManagerLoggerAndPreservesSourceTranscript(t *test
 	previousTerminal := dockerPullProgressTerminal
 	dockerPullProgressTerminal = func() bool { return false }
 	t.Cleanup(func() { dockerPullProgressTerminal = previousTerminal })
-	manager.writeDockerPullProgress(logPath, map[string]dockerLayerProgress{
-		"layer-a": {current: 512, total: 1024, completed: false},
-		"layer-b": {completed: true},
+	manager.writeDockerPullProgress(logPath, map[string]image.DockerPullProgress{
+		"layer-a": {Current: 512, Total: 1024, Completed: false},
+		"layer-b": {Completed: true},
 	})
 	transcriptWriter, err := manager.transcript(logPath, "", "docker-pull")
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeDockerPullEvent(transcriptWriter.Stdout, "layer-a", "Downloading", nil, "", nil)
+	writeDockerPullEvent(transcriptWriter.Stdout, image.DockerPullEvent{ID: "layer-a", Status: "Downloading"})
 	manager.writeDockerPullNotice(logPath, "Docker source pull complete: example.invalid/source:latest")
 	if err := manager.releaseTranscript(logPath); err != nil {
 		t.Fatal(err)
@@ -92,7 +93,7 @@ func TestDockerPullProgressHonorsManagerJSONConsoleFormat(t *testing.T) {
 	dockerPullProgressTerminal = func() bool { return true }
 	t.Cleanup(func() { dockerPullProgressTerminal = previousTerminal })
 	logPath := filepath.Join(root, "builds", "source.docker-pull.log")
-	manager.writeDockerPullProgress(logPath, map[string]dockerLayerProgress{"layer-a": {current: 1, total: 2}})
+	manager.writeDockerPullProgress(logPath, map[string]image.DockerPullProgress{"layer-a": {Current: 1, Total: 2}})
 
 	var record map[string]any
 	if err := json.Unmarshal(console.Bytes(), &record); err != nil {
@@ -127,7 +128,7 @@ func TestDockerPullProgressUsesSingleLineTerminalDisplayForTextManagerConsole(t 
 	})
 
 	manager := Manager{Config: config.Default(), Logging: runtime}
-	manager.writeDockerPullProgress("source.docker-pull.log", map[string]dockerLayerProgress{"layer-a": {current: 1, total: 2}})
+	manager.writeDockerPullProgress("source.docker-pull.log", map[string]image.DockerPullProgress{"layer-a": {Current: 1, Total: 2}})
 
 	if got, want := terminalConsole.String(), "\r\033[2KDocker source pull: 0/1 layers complete; 1 B/2 B (50%)"; got != want {
 		t.Fatalf("terminal pull progress = %q, want %q", got, want)

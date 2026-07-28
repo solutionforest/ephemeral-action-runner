@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+test_root="$(mktemp -d)"
+trap 'rm -rf "$test_root"' EXIT
+
+cat >"$test_root/uname" <<'SCRIPT'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SCRIPT
+cat >"$test_root/go" <<'SCRIPT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "version" ]]; then
+  exit 0
+fi
+printf '%s\n' "$@" >"$EPAR_START_FORWARD_LOG"
+SCRIPT
+chmod +x "$test_root/uname" "$test_root/go"
+
+export PATH="$test_root:$PATH"
+export EPAR_GO_BIN=go
+export EPAR_USE_DOCKER_RUN=0
+export EPAR_START_FORWARD_LOG="$test_root/arguments"
+
+"$repo_root/start" storage prune --provider docker-sandboxes
+actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
+expected="run ./cmd/ephemeral-action-runner storage prune --provider docker-sandboxes "
+if [[ "$actual" != "$expected" ]]; then
+  echo "explicit command forwarding mismatch: got '$actual', want '$expected'" >&2
+  exit 1
+fi
+
+"$repo_root/start" version
+actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
+expected="run ./cmd/ephemeral-action-runner version "
+if [[ "$actual" != "$expected" ]]; then
+  echo "version forwarding mismatch: got '$actual', want '$expected'" >&2
+  exit 1
+fi
+
+printf 'start command-forwarding smoke passed\n'

@@ -396,7 +396,6 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 		GitHub:      github,
 		ProjectRoot: t.TempDir(),
 	}
-	var resolveCalls int32
 	snapshot := func(generation string) hosttrust.Snapshot {
 		return hosttrust.Snapshot{
 			Generation: generation, HostOS: "linux", Scopes: []string{"system"},
@@ -405,7 +404,7 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 		}
 	}
 	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
-		if atomic.AddInt32(&resolveCalls, 1) <= 2 {
+		if atomic.LoadInt32(&github.waitOnlineCalls)+atomic.LoadInt32(&github.waitOnlineIdleCalls) == 0 {
 			return snapshot("g1"), nil
 		}
 		return snapshot("g2"), nil
@@ -770,6 +769,29 @@ func TestProvisionOneCapturesReadinessTimeoutAndPreservesCause(t *testing.T) {
 	}
 	if got := fake.logPathFor("collect-runner-diagnostics.sh"); !strings.HasSuffix(got, "epar-test-1.guest.log") {
 		t.Fatalf("diagnostic LogPath = %q, want existing guest log", got)
+	}
+}
+
+func TestCommonLifecycleOwnsGuestTranscriptPath(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-1", State: "running"}}}
+	manager := newRegisteredTestManager(t, fake, nil)
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+
+	if _, err := manager.execGuest(context.Background(), "epar-test-1", []string{"true"}, provider.ExecOptions{Env: map[string]string{"EPAR_TEST": "value"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.logPathFor("true"); got != "" {
+		t.Fatalf("provider received common host transcript path %q", got)
+	}
+	fake.mu.Lock()
+	command := fake.commands[len(fake.commands)-1]
+	options := fake.execOptions[len(fake.execOptions)-1]
+	fake.mu.Unlock()
+	if len(options.Env) != 0 {
+		t.Fatalf("provider received ambient host environment: %#v", options.Env)
+	}
+	if !strings.Contains(command, "env EPAR_TEST=value true") {
+		t.Fatalf("provider command = %q, want explicit guest environment", command)
 	}
 }
 
@@ -1286,7 +1308,7 @@ type fakeProvider struct {
 func (p *fakeProvider) Clone(_ context.Context, source, name string) error {
 	atomic.AddInt32(&p.cloneCalls, 1)
 	p.mu.Lock()
-	p.instances = append(p.instances, provider.Instance{Name: name, Source: source, State: "running"})
+	p.instances = append(p.instances, provider.Instance{Name: name, ProviderID: "fake:" + name, Source: source, State: "running"})
 	if len(p.instances) > int(atomic.LoadInt32(&p.maxInventory)) {
 		atomic.StoreInt32(&p.maxInventory, int32(len(p.instances)))
 	}
@@ -1386,7 +1408,13 @@ func (p *fakeProvider) List(ctx context.Context) ([]provider.Instance, error) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]provider.Instance(nil), p.instances...), p.listErr
+	result := append([]provider.Instance(nil), p.instances...)
+	for i := range result {
+		if result[i].ProviderID == "" {
+			result[i].ProviderID = "fake:" + result[i].Name
+		}
+	}
+	return result, p.listErr
 }
 
 type fakeGitHub struct {

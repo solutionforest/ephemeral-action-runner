@@ -13,12 +13,13 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
+	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
+	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
-	dockercontainerprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockercontainer"
-	tartprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
-	wslprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/registry"
+	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
 const binaryName = "ephemeral-action-runner"
@@ -113,6 +114,8 @@ func run(args []string) error {
 		return runStatus(args[1:])
 	case "logs":
 		return runLogs(args[1:])
+	case "storage":
+		return runStorage(args[1:])
 	case "version":
 		printVersion(os.Stdout)
 		return nil
@@ -232,6 +235,9 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		if err := rejectDockerSandboxesImageCommand(m, "image update-upstream"); err != nil {
+			return err
+		}
 		controllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
 			return err
@@ -252,6 +258,9 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		if err := rejectDockerSandboxesImageCommand(m, "image build"); err != nil {
+			return err
+		}
 		ctx := interruptContext()
 		poolControllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
@@ -282,6 +291,9 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		if err := rejectDockerSandboxesImageCommand(m, "image refresh-scripts"); err != nil {
+			return err
+		}
 		controllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
 			return err
@@ -303,7 +315,7 @@ func runPool(args []string) error {
 		common := addCommonFlags(fs)
 		instances := fs.Int("instances", 0, "number of concurrent instances to verify; overrides pool.instances")
 		registerOnly := fs.Bool("register-only", false, "register runners and verify online/idle without dispatching a job")
-		cleanup := fs.Bool("cleanup", false, "clean up prefixed instances and GitHub runners after verification")
+		cleanup := fs.Bool("cleanup", false, "clean up verification resources; legacy providers use the configured pool prefix, while Docker Sandboxes uses exact owned records")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -352,6 +364,7 @@ func runCleanup(args []string) error {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	common := addCommonFlags(fs)
 	noGitHub := fs.Bool("no-github", false, "skip GitHub runner deletion")
+	acknowledgeFailedDiagnostics := fs.Bool("acknowledge-failed-diagnostics", false, "allow exact cleanup of retained sandboxes after failed diagnostics evidence has been reviewed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -360,6 +373,7 @@ func runCleanup(args []string) error {
 		return err
 	}
 	defer m.Close()
+	m.AcknowledgeFailedDiagnostics = *acknowledgeFailedDiagnostics
 	return m.Cleanup(context.Background())
 }
 
@@ -428,6 +442,16 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	if err := config.Validate(cfg); err != nil {
 		return nil, err
 	}
+	providerRuntime, err := registry.New(cfg, projectRoot, dryRun)
+	if err != nil {
+		return nil, err
+	}
+	if providerRuntime.Lifecycle == nil || providerRuntime.Storage == nil {
+		return nil, fmt.Errorf("provider %q registry entry is missing required lifecycle or storage behavior", cfg.Provider.Type)
+	}
+	if err := preflightControllerStorage(projectRoot, cfg, providerRuntime.Storage); err != nil {
+		return nil, err
+	}
 	var client pool.GitHubClient
 	if githubEnabled && !dryRun {
 		if err := config.ValidateGitHub(cfg); err != nil {
@@ -435,9 +459,12 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		}
 		client = gh.New(cfg.GitHub)
 	}
-	provider, err := newProvider(cfg, projectRoot, dryRun)
-	if err != nil {
-		return nil, err
+	var lifecycleState *poolstate.Store
+	if !dryRun {
+		lifecycleState, err = pool.OpenLifecycleState(projectRoot, resolvedConfigPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	runtime, err := logging.NewRuntime(logging.Options{
 		Directory:                   config.ProjectPath(projectRoot, cfg.Logging.Directory),
@@ -458,13 +485,17 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		return nil, err
 	}
 	manager := &pool.Manager{
-		Config:      cfg,
-		Provider:    provider,
-		GitHub:      client,
-		ProjectRoot: projectRoot,
-		ConfigPath:  resolvedConfigPath,
-		DryRun:      dryRun,
-		Logging:     runtime,
+		Config:         cfg,
+		Provider:       providerRuntime.Legacy,
+		Lifecycle:      providerRuntime.Lifecycle,
+		PolicyManager:  providerRuntime.PolicyManager,
+		Storage:        providerRuntime.Storage,
+		LifecycleState: lifecycleState,
+		GitHub:         client,
+		ProjectRoot:    projectRoot,
+		ConfigPath:     resolvedConfigPath,
+		DryRun:         dryRun,
+		Logging:        runtime,
 	}
 	if cfg.Logging.RetentionEnabled {
 		report, pruneErr := manager.PruneLogs(false)
@@ -477,6 +508,74 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		}
 	}
 	return manager, nil
+}
+
+func preflightControllerStorage(projectRoot string, cfg config.Config, contributions ...provider.StorageContribution) error {
+	minimumFree, err := config.EffectiveMinimumFreeBytes(cfg)
+	if err != nil {
+		return err
+	}
+	if len(contributions) != 0 && contributions[0] != nil {
+		snapshot, err := contributions[0].StorageSnapshot(context.Background(), provider.StorageRequest{
+			Operation:        "controller-bootstrap",
+			Now:              time.Now(),
+			MinimumFreeBytes: minimumFree,
+		})
+		if err != nil {
+			return fmt.Errorf("provider storage surface cannot be measured before controller bootstrap: %w\n\nInspect storage with:\n  %s", err, invocation.Command("storage", "status", "--provider", cfg.Provider.Type))
+		}
+		surfaces := make(map[string]storage.Surface, len(snapshot.Surfaces))
+		for _, surface := range snapshot.Surfaces {
+			surfaces[surface.ID] = surface
+		}
+		for _, requirement := range snapshot.Requirements {
+			surface, found := surfaces[requirement.SurfaceID]
+			if !found {
+				return fmt.Errorf("controller storage requirement %q references unknown surface %q", requirement.ID, requirement.SurfaceID)
+			}
+			check, err := storage.EvaluateCapacity(surface, requirement)
+			if err != nil {
+				return err
+			}
+			if check.Status != storage.CapacityReady {
+				return storage.CapacityAdmissionError("initialize the EPAR controller", surface, requirement, check, invocation.Command("storage", "prune", "--provider", cfg.Provider.Type))
+			}
+		}
+		return nil
+	}
+	capacity, err := storage.ProbeFilesystemCapacity(projectRoot, time.Now())
+	if err != nil {
+		return fmt.Errorf("controller storage surface %q cannot be measured before bootstrap: %w\n\nInspect storage with:\n  %s", projectRoot, err, invocation.Command("storage", "status", "--provider", cfg.Provider.Type))
+	}
+	check, err := storage.EvaluateCapacity(storage.Surface{
+		ID:       "project",
+		Provider: cfg.Provider.Type,
+		Kind:     storage.SurfaceHostFilesystem,
+		Location: projectRoot,
+		Capacity: capacity,
+	}, storage.Requirement{
+		ID:               "controller-bootstrap",
+		Provider:         cfg.Provider.Type,
+		SurfaceID:        "project",
+		MinimumFreeBytes: minimumFree,
+	})
+	if err != nil {
+		return fmt.Errorf("evaluate controller storage capacity: %w", err)
+	}
+	if check.Status != storage.CapacityReady {
+		return storage.CapacityAdmissionError("initialize the EPAR controller", storage.Surface{
+			Location: projectRoot,
+			Capacity: check.Capacity,
+		}, check.Requirement, check, invocation.Command("storage", "prune", "--provider", cfg.Provider.Type))
+	}
+	return nil
+}
+
+func rejectDockerSandboxesImageCommand(manager *pool.Manager, command string) error {
+	if manager.Config.Provider.Type != "docker-sandboxes" {
+		return nil
+	}
+	return fmt.Errorf("%s is not supported by docker-sandboxes; build and load the pinned template with scripts/docker-sandboxes before admission", command)
 }
 
 func loggingSinks(values []string) logging.Sinks {
@@ -522,25 +621,6 @@ func resolveConfigPath(projectRoot, explicit string) (string, error) {
 	return "", nil
 }
 
-func newProvider(cfg config.Config, projectRoot string, dryRun bool) (provider.Provider, error) {
-	switch cfg.Provider.Type {
-	case "tart":
-		return tartprovider.New("", dryRun), nil
-	case "wsl":
-		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.Provider.InstallRoot), projectRoot, dryRun), nil
-	case "docker-container":
-		hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
-		environment := map[string]string{
-			"HTTP_PROXY":  cfg.Docker.HTTPProxy,
-			"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
-			"NO_PROXY":    cfg.Docker.NoProxy,
-		}
-		return dockercontainerprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), nil
-	default:
-		return nil, provider.UnsupportedTypeError(cfg.Provider.Type)
-	}
-}
-
 func interruptContext() context.Context {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -568,6 +648,8 @@ Commands:
   ephemeral-action-runner logs path
   ephemeral-action-runner logs list
   ephemeral-action-runner logs prune [--dry-run]
+  ephemeral-action-runner storage status [--provider NAME] [--json]
+  ephemeral-action-runner storage prune [--provider NAME] [--json] [--execute]
   ephemeral-action-runner version
 `)
 }

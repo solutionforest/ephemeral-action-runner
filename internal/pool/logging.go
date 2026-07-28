@@ -34,6 +34,25 @@ func (m *Manager) warnf(format string, args ...any) {
 	m.logger().Warn(fmt.Sprintf(strings.TrimSuffix(format, "\n"), args...))
 }
 
+func (m *Manager) logPoolRunning(label string) {
+	m.infof("%s is running. Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.\n", label)
+}
+
+func (m *Manager) logReplacementReady(label, name string) {
+	m.infof("Replacement runner %s is online; %s is ready for the next job. Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.\n", name, label)
+}
+
+func (m *Manager) cleanupPoolWithStatus(resources string, cleanup func() error) error {
+	m.infof("Stopping EPAR pool. Cleaning up %s. Please wait; do not press Ctrl-C again or close this window.\n", resources)
+	err := cleanup()
+	if err != nil {
+		m.warnf("Cleanup did not fully complete. EPAR retained its cleanup state and will reconcile it on the next run: %v\n", err)
+		return err
+	}
+	m.infof("Cleanup complete. EPAR can now exit safely.\n")
+	return nil
+}
+
 func (m *Manager) Close() error {
 	if m == nil || m.Logging == nil {
 		return nil

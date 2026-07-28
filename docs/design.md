@@ -1,82 +1,43 @@
 # Design
 
-EPAR has three main layers:
-
-- `cmd/ephemeral-action-runner`: CLI for image builds, pool lifecycle, verification, cleanup, and status.
-- `internal/provider`: a local instance provider interface. Tart, WSL, and Docker Container are implemented providers.
-- `internal/github`: GitHub App authentication and self-hosted runner API calls.
+EPAR has one provider-neutral control flow:
 
 ```mermaid
 flowchart LR
-  CLI["CLI commands"] --> Manager["Pool manager"]
-  Manager --> Provider["Provider interface"]
-  Manager --> GitHub["GitHub App client"]
-  Provider --> Tart["Tart"]
-  Provider --> WSL["WSL2"]
-  Provider --> DockerContainer["Docker Container"]
-  GitHub --> API["GitHub Actions runner APIs"]
+  CLI["CLI and ./start wizard"] --> Pool["Common pool lifecycle"]
+  Pool --> Provider["Provider contracts"]
+  Pool --> GitHub["GitHub runner API"]
+  Pool --> Storage["Capacity and retention"]
+  Provider --> Implementations["Tart, WSL, Docker Container, Docker Sandboxes"]
 ```
 
-## Lifecycle
+## Responsibilities
 
-For each runner instance:
+- `cmd/ephemeral-action-runner` owns command routing and the missing-config wizard.
+- `internal/pool` owns naming, capacity admission, GitHub registration, readiness, strict instance limits, replacement, reconciliation, diagnostics, status, and exact instance cleanup.
+- `internal/provider` defines required contracts; `internal/provider/<provider>` owns provider commands and host integration.
+- `internal/image` owns reusable runner artifact acquisition, manifests, builds, and updates.
+- `internal/storage` owns storage measurements, artifact ownership, retention plans, and exact cleanup execution.
 
-1. Clone or create an instance from `provider.sourceImage`.
-2. Start the instance headless when the provider supports that distinction.
-3. Wait for provider-level reachability.
-4. Apply optional Docker daemon registry mirror settings.
-5. Run `/opt/epar/validate-runtime.sh`.
-6. Fetch a short-lived GitHub registration token on the host.
-7. Run `config.sh --ephemeral --unattended` inside the instance.
-8. Start the runner process. VM and WSL images use systemd; Docker Container falls back to a PID-file managed background process.
-9. Poll GitHub until the runner is ready. Verification-only flows require online/idle; supervised replacement pools also accept an online runner that is already busy with a queued job.
-10. Monitor the runner service and GitHub runner record.
-11. Delete the instance after the ephemeral runner exits, then create a replacement to maintain pool size.
+Provider code must not implement a second pool lifecycle. A capability that every provider needs belongs in a common contract; genuinely optional behavior uses an explicit capability interface.
 
-```mermaid
-sequenceDiagram
-  participant M as Manager
-  participant P as Provider
-  participant I as Instance
-  participant G as GitHub
-  M->>P: Clone provider.sourceImage
-  M->>P: Start instance
-  M->>I: Apply optional Docker registry mirrors
-  M->>I: Validate runtime
-  M->>G: Request registration token
-  M->>I: Configure ephemeral runner
-  M->>I: Start runner process
-  I-->>G: Runner online
-  G-->>I: Assign one job
-  I-->>G: Runner exits after job
-  M->>P: Stop and delete instance
-  M->>G: Delete stale runner record if needed
-```
+## Instance Lifecycle
 
-## Multi-Instance Behavior
+For every provider, the common controller:
 
-`pool verify --instances 2 --register-only --cleanup` creates two instances concurrently, registers two ephemeral runners, verifies both are online/idle, and removes them. A supervised `pool up --replace-completed` accepts an online runner that is already busy, because requiring an idle observation would race immediate job assignment; the supervisor observes its completion and creates the replacement.
+1. Verifies configuration, runner-group policy, reusable artifacts, and every required storage surface.
+2. Allocates one exact instance using the shared pool prefix and `pool.RunnerName`.
+3. Verifies runtime isolation, trust, diagnostics, and provider admission rules.
+4. Requests a short-lived GitHub token and configures one ephemeral runner.
+5. Tracks the exact provider and GitHub identities in durable state.
+6. Removes the completed instance, verifies absence, and creates a replacement without exceeding `pool.instances`.
 
-`pool up --instances 2` keeps two runners available in the foreground. Replacement names use `pool.namePrefix` plus a timestamp and sequence suffix, for example `epar-20260703-010530-003`.
+Unknown ownership, unavailable dependencies, failed cleanup, and uncertain remote state consume capacity and block new allocation. EPAR does not silently fall back to another provider or broaden cleanup from an exact identity to a prefix, wildcard, prune, or reset.
 
-The supervisor tracks every prefix-owned local resource as provisioning, ready, draining, quarantined, or cleanup-pending. All five states count against `pool.instances`, which is an absolute physical-instance cap. A cleanup failure, unknown remote state, or busy runner therefore blocks allocation rather than allowing a capacity surge; host-trust rotation follows the same rule.
+## Storage Lifecycle
 
-Reconciliation runs at startup and before each replacement allocation. It adopts healthy exact-name local/GitHub pairs, deletes proven stopped or unregistered local resources, and deletes exact stale GitHub records when GitHub is reachable. A pre-listener provisioning failure is locally rolled back immediately and queued for later exact-name GitHub reconciliation because registration may have partially succeeded. After the listener starts, uncertain GitHub readiness becomes quarantine rather than deletion until the remote state can be resolved.
+Each provider reports the storage surfaces and temporary expansion required by bootstrap, artifact builds, instance creation, and replacement. The common preflight requires enough space for the operation plus the configured free-space reserve.
 
-Supervised replacement treats network errors and GitHub HTTP `429` or `5xx` responses as transient: allocation pauses behind the configured exponential retry policy while monitoring and cleanup continue. A fully online replacement or successful adoption resets the retry delay. Initial pool startup remains fail-fast after safe rollback, and authentication or deterministic configuration failures are terminal rather than retryable.
+Artifacts are classified as active, current reusable, superseded EPAR-owned, incomplete temporary, or shared/unknown. Conservative housekeeping may remove only expired, unleased, exactly owned local artifacts and bounded dedicated caches. Removing Docker images, volumes, imported templates, WSL distributions, or Tart images requires an explicit previewed storage-prune operation.
 
-## Liveness Model
-
-The foreground supervisor checks each instance every 15 seconds by default. A runner is considered healthy when:
-
-- The matching GitHub runner record exists and reports `online`.
-- A GitHub runner with `busy=true` is kept alive even if the local service check is temporarily inconclusive.
-- When the runner is idle, `/opt/epar/check-runner.sh` reports the runner process is active. The script checks `actions-runner.service` on systemd instances and `/var/run/actions-runner.pid` on non-systemd instances such as Docker runner containers.
-
-The instance is retired when an idle runner process exits, the runner record disappears, or the runner reports a non-online status. Runner process exit is expected after an ephemeral runner finishes one job.
-
-## Provider Boundary
-
-The controller depends on provider operations for clone/create, start, exec, address discovery, stop, delete, and list. Provider implementations own host-specific details such as Tart VM names, WSL distro names, Docker runner container names, or future Hyper-V VM names.
-
-Docker Container is intentionally modeled as an instance provider, not a host Docker socket shortcut. Each instance is a privileged outer container that starts its own Docker daemon. Workflow `docker compose` resources are created inside that private daemon and disappear when EPAR removes the runner container with its volumes.
+See [Adding a Provider](providers/adding-provider.md) for the extension checklist.

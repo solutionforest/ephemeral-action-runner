@@ -3,22 +3,36 @@ param(
     [string[]] $EparArgs
 )
 
-# Runs EPAR from source with no local Go install: a containerized Go
-# toolchain compiles and executes the source with `go run`, the same as the
-# documented source-first path (docs/usage.md) - just inside a container
-# instead of on the host. No binary is built or left on disk.
+# Runs EPAR from source with no local Go install. By default, a containerized
+# Go toolchain builds a CGO-disabled native controller under .local/bin and the
+# wrapper executes that binary on the host. Set
+# EPAR_LEGACY_CONTROLLER_IN_DOCKER=1 only for compatible legacy providers.
 #
-# Docker is still required (both for this wrapper and for EPAR's own
-# Docker Container provider, reached here via the mounted host socket).
+# Docker is required for the build toolchain and for the Docker Container
+# provider. Docker Sandboxes also requires its separately installed sbx CLI.
 #
 # Usage: scripts\run-with-docker.ps1 [epar-args...]
 
 $ErrorActionPreference = "Stop"
+$OriginalInvocationExists = Test-Path Env:EPAR_INVOCATION
+$OriginalInvocation = $env:EPAR_INVOCATION
+$OwnInvocationMarker = [string]::IsNullOrWhiteSpace($env:EPAR_INVOCATION)
+if (-not $env:EPAR_INVOCATION) {
+    $env:EPAR_INVOCATION = "run-with-docker-powershell"
+}
+
+if ($env:EPAR_LEGACY_CONTROLLER_IN_DOCKER -ne '1') {
+    try {
+        & (Join-Path $PSScriptRoot 'build-native-controller.ps1') @EparArgs
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        if ($OwnInvocationMarker -and $OriginalInvocationExists) { $env:EPAR_INVOCATION = $OriginalInvocation } elseif ($OwnInvocationMarker) { Remove-Item Env:EPAR_INVOCATION -ErrorAction SilentlyContinue }
+    }
+    exit $nativeExitCode
+}
 
 $Image = if ($env:GO_DOCKER_IMAGE) { $env:GO_DOCKER_IMAGE } else { "golang:1.25" }
 $DevImage = if ($env:EPAR_DEV_IMAGE) { $env:EPAR_DEV_IMAGE } else { "epar-dev-toolchain" }
-$GomodVolume = if ($env:EPAR_GOMOD_VOLUME) { $env:EPAR_GOMOD_VOLUME } else { "epar-gomod" }
-$GocacheVolume = if ($env:EPAR_GOCACHE_VOLUME) { $env:EPAR_GOCACHE_VOLUME } else { "epar-gocache" }
 $DockerSock = if ($env:EPAR_DOCKER_SOCK) { $env:EPAR_DOCKER_SOCK } else { "/var/run/docker.sock" }
 $OriginalDockerCliHintsExists = Test-Path Env:DOCKER_CLI_HINTS
 $OriginalDockerCliHints = $env:DOCKER_CLI_HINTS
@@ -37,6 +51,8 @@ if (-not $HostName) {
 }
 $DockerEnvFlags = @()
 $DockerEnvFlags += @("-e", "DOCKER_CLI_HINTS=$DockerCliHints")
+$DockerEnvFlags += @("-e", "EPAR_CONTROLLER_IN_DOCKER=1")
+$DockerEnvFlags += @("-e", "EPAR_INVOCATION=$($env:EPAR_INVOCATION)")
 if ($env:EPAR_CONFIG) {
     $DockerEnvFlags += @("-e", "EPAR_CONFIG=$($env:EPAR_CONFIG)")
 }
@@ -50,13 +66,20 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 
 function Test-EparBenignDockerDesktopPrefaceDiagnostic {
-    param([Parameter(Mandatory = $true)][string] $Line)
-    return $Line -match '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} http2: server: error reading preface from client //\./pipe/(?:dockerDesktopLinuxEngine|docker_engine): file has already been closed$'
+    param([Parameter(Mandatory = $true)][string] $Transcript)
+    $normalized = ($Transcript -replace '\s+', ' ').Trim()
+    return $normalized -match '^(?:docker\s*:\s*)?\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} http2: server: error reading preface from client //\./pipe/(?:dockerDesktopLinuxEngine|docker_engine): file has already been closed(?: At .* FullyQualifiedErrorId\s*:\s*NativeCommandError)?$'
 }
 
 function Invoke-EparBootstrapDockerBuild {
     $stderrPath = [System.IO.Path]::GetTempFileName()
+    $previousErrorActionPreference = $ErrorActionPreference
     try {
+        # Windows PowerShell converts native stderr into ErrorRecord objects
+        # when the preference is Stop. Keep the native transcript as bytes so
+        # the one known successful Docker Desktop diagnostic can be classified
+        # without terminating this wrapper or losing real failure output.
+        $ErrorActionPreference = 'Continue'
         docker build --quiet `
             --build-arg "GO_IMAGE=$Image" `
             -t $DevImage `
@@ -64,15 +87,14 @@ function Invoke-EparBootstrapDockerBuild {
             (Join-Path $RepoRoot "scripts\docker") 2> $stderrPath | Out-Null
         $buildExitCode = $LASTEXITCODE
         if (Test-Path -LiteralPath $stderrPath) {
-            foreach ($line in Get-Content -LiteralPath $stderrPath) {
-                if ($buildExitCode -eq 0 -and (Test-EparBenignDockerDesktopPrefaceDiagnostic -Line ([string]$line))) {
-                    continue
-                }
-                [Console]::Error.WriteLine([string]$line)
+            $stderrTranscript = Get-Content -Raw -LiteralPath $stderrPath
+            if ($stderrTranscript -and -not ($buildExitCode -eq 0 -and (Test-EparBenignDockerDesktopPrefaceDiagnostic -Transcript $stderrTranscript))) {
+                [Console]::Error.Write($stderrTranscript)
             }
         }
         return $buildExitCode
     } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
         Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
     }
 }
@@ -87,6 +109,9 @@ if ($EparCommand -eq "init" -or $ImplicitInit) {
     $DockerEnvFlags += @("-e", "EPAR_CONTROLLER_HOST_OS=$(Get-EparHostTrustHostOS)")
 }
 $DockerRunFlags = @("--rm", "-i")
+$GoCacheFlags = @()
+if ($env:EPAR_GOMOD_VOLUME) { $GoCacheFlags += @("-v", "$($env:EPAR_GOMOD_VOLUME):/go/pkg/mod") }
+if ($env:EPAR_GOCACHE_VOLUME) { $GoCacheFlags += @("-v", "$($env:EPAR_GOCACHE_VOLUME):/root/.cache/go-build") }
 try {
     if (-not [Console]::IsInputRedirected) {
         $DockerRunFlags += "-t"
@@ -106,9 +131,8 @@ try {
             $InitArgs = @(Get-EparHostTrustInitArguments -Arguments $EparArgs)
             docker run @DockerRunFlags `
                 @DockerEnvFlags `
+                @GoCacheFlags `
                 -v "${RepoRoot}:/app" -w /app `
-                -v "${GomodVolume}:/go/pkg/mod" `
-                -v "${GocacheVolume}:/root/.cache/go-build" `
                 -v "${DockerSock}:/var/run/docker.sock" `
                 $DevImage `
                 go run ./cmd/ephemeral-action-runner @InitArgs
@@ -129,9 +153,8 @@ try {
             docker run @DockerRunFlags `
                 @DockerEnvFlags `
                 @HostTrustFlags `
+                @GoCacheFlags `
                 -v "${RepoRoot}:/app" -w /app `
-                -v "${GomodVolume}:/go/pkg/mod" `
-                -v "${GocacheVolume}:/root/.cache/go-build" `
                 -v "${DockerSock}:/var/run/docker.sock" `
                 $DevImage `
                 go run ./cmd/ephemeral-action-runner @EparArgs
@@ -149,6 +172,7 @@ try {
     } else {
         Remove-Item Env:DOCKER_CLI_HINTS -ErrorAction SilentlyContinue
     }
+    if ($OwnInvocationMarker -and $OriginalInvocationExists) { $env:EPAR_INVOCATION = $OriginalInvocation } elseif ($OwnInvocationMarker) { Remove-Item Env:EPAR_INVOCATION -ErrorAction SilentlyContinue }
 }
 
 exit $ExitCode

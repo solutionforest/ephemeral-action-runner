@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -25,17 +28,17 @@ const (
 	hostTrustNativePoll    = 15 * time.Second
 )
 
+// HostTrustMarkerGuest is the stable guest path for verified host-trust metadata.
+const HostTrustMarkerGuest = hostTrustMarkerGuest
+
+// HostTrustLeaseLifetime is the default shared guest lease duration.
+const HostTrustLeaseLifetime = hostTrustLeaseLifetime
+
 var hostTrustRefreshInterval = 5 * time.Second
 var hostTrustControllerInContainer = linuxControllerInContainer
 var hostTrustControllerOS = runtime.GOOS
 
-type hostTrustImageMetadata struct {
-	Mode             string   `json:"mode"`
-	HostOS           string   `json:"hostOS"`
-	Scopes           []string `json:"scopes"`
-	Generation       string   `json:"generation"`
-	CertificateCount int      `json:"certificateCount"`
-}
+type hostTrustImageMetadata = artifactimage.HostTrustMetadata
 
 type hostTrustMarker struct {
 	SchemaVersion    int      `json:"schemaVersion"`
@@ -54,6 +57,12 @@ type hostTrustLease struct {
 	Scopes        []string `json:"scopes"`
 	ExpiresAt     string   `json:"expiresAt"`
 }
+
+// HostTrustMarker and HostTrustLease are shared payloads for specialized
+// providers that install the same verified host-trust contract by another
+// transport.
+type HostTrustMarker = hostTrustMarker
+type HostTrustLease = hostTrustLease
 
 func (m *Manager) hostTrustEnabled() bool {
 	return hosttrust.Enabled(m.Config.Image.HostTrustMode)
@@ -184,6 +193,11 @@ func validateHostTrustSnapshot(snapshot hosttrust.Snapshot, now time.Time) (host
 	return snapshot, nil
 }
 
+// ValidateHostTrustSnapshot verifies the shared host-trust freshness contract.
+func ValidateHostTrustSnapshot(snapshot hosttrust.Snapshot, now time.Time) (hosttrust.Snapshot, error) {
+	return validateHostTrustSnapshot(snapshot, now)
+}
+
 func hostTrustMetadata(snapshot hosttrust.Snapshot) *hostTrustImageMetadata {
 	if snapshot.Generation == "" {
 		return nil
@@ -268,6 +282,53 @@ func copyHostTrustCertificatesToDir(destination string, snapshot hosttrust.Snaps
 	return nil
 }
 
+func hostTrustCertificateArchive(snapshot hosttrust.Snapshot) (string, error) {
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	for _, certificate := range snapshot.Certificates {
+		header := &tar.Header{
+			Name: certificate.Name,
+			Mode: 0644,
+			Size: int64(len(certificate.PEM)),
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			return "", err
+		}
+		if _, err := writer.Write(certificate.PEM); err != nil {
+			return "", err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
+}
+
+func (m *Manager) installHostTrustRuntime(ctx context.Context, instanceName string, snapshot hosttrust.Snapshot) error {
+	if !m.hostTrustEnabled() {
+		return nil
+	}
+	if _, err := validateHostTrustSnapshot(snapshot, time.Now().UTC()); err != nil {
+		return err
+	}
+	archive, err := hostTrustCertificateArchive(snapshot)
+	if err != nil {
+		return fmt.Errorf("archive host trust certificates: %w", err)
+	}
+	script := fmt.Sprintf("sudo install -d -m 0755 %s && sudo find %s -maxdepth 1 -type f -name 'epar-*.crt' -delete && sudo tar -x -f - --no-same-owner --no-same-permissions -C %s && sudo update-ca-certificates", shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir))
+	if _, err := m.execGuest(ctx, instanceName, provider.ShellCommand(script), provider.ExecOptions{Stdin: archive}); err != nil {
+		return fmt.Errorf("install host trust certificates in runtime: %w", err)
+	}
+	content, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		return err
+	}
+	if err := m.copyTextGuest(ctx, instanceName, hostTrustMarkerGuest, "0644", string(content)+"\n", true); err != nil {
+		return fmt.Errorf("install host trust generation marker: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) writeHostTrustBuildInputs(buildContext string, snapshot hosttrust.Snapshot) error {
 	if err := copyHostTrustCertificatesToDir(filepath.Join(buildContext, "host-trust-certificates"), snapshot); err != nil {
 		return err
@@ -298,7 +359,7 @@ func (m *Manager) issueHostTrustLease(ctx context.Context, instanceName string, 
 	if _, err := m.execGuest(ctx, instanceName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar; else install -d -m 0755 /run/epar; fi"), provider.ExecOptions{}); err != nil {
 		return err
 	}
-	return provider.CopyTextAtomic(ctx, m.Provider, instanceName, hostTrustLeaseGuest, "0644", string(content)+"\n")
+	return m.copyTextGuest(ctx, instanceName, hostTrustLeaseGuest, "0644", string(content)+"\n", true)
 }
 
 func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot) int {

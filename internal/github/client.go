@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
@@ -18,6 +19,7 @@ import (
 type Client struct {
 	cfg          config.GitHubConfig
 	httpClient   *http.Client
+	tokenMu      sync.Mutex
 	token        string
 	tokenExpires time.Time
 }
@@ -175,6 +177,9 @@ func (c *Client) installationRequest(ctx context.Context, method, path string, b
 }
 
 func (c *Client) installationToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
 	if c.token != "" && time.Now().Before(c.tokenExpires.Add(-2*time.Minute)) {
 		return c.token, nil
 	}

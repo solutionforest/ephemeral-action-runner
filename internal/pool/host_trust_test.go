@@ -1,8 +1,11 @@
 package pool
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -103,6 +106,46 @@ func TestHostTrustLeaseMatchesMarkerAndExpires(t *testing.T) {
 	}
 	if got := expires.Sub(now); got != hostTrustLeaseLifetime {
 		t.Fatalf("lease lifetime = %s, want %s", got, hostTrustLeaseLifetime)
+	}
+}
+
+func TestHostTrustCertificateArchiveContainsOnlyExactCertificates(t *testing.T) {
+	snapshot := hosttrust.Snapshot{
+		Generation: "generation-one",
+		HostOS:     "windows",
+		Scopes:     []string{"system", "user"},
+		Certificates: []hosttrust.Certificate{
+			{Name: "epar-system-a.crt", PEM: []byte("system")},
+			{Name: "epar-user-b.crt", PEM: []byte("user")},
+		},
+		CollectedAt: time.Now(),
+	}
+	archive, err := hostTrustCertificateArchive(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := tar.NewReader(bytes.NewBufferString(archive))
+	var names []string
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, header.Name)
+		if header.Mode != 0644 {
+			t.Fatalf("certificate mode = %o, want 0644", header.Mode)
+		}
+	}
+	if len(names) != len(snapshot.Certificates) {
+		t.Fatalf("archive entries = %d, want %d", len(names), len(snapshot.Certificates))
+	}
+	for index, certificate := range snapshot.Certificates {
+		if names[index] != certificate.Name {
+			t.Fatalf("archive entry %d = %q, want %q", index, names[index], certificate.Name)
+		}
 	}
 }
 
@@ -350,12 +393,15 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 	builds := 0
 	tagged := false
 	runHostLoggedCommand = func(_ context.Context, _ string, _, _ io.Writer, name string, args ...string) error {
-		if name == "docker" && len(args) > 0 && args[0] == "build" {
+		if name == "docker" && len(args) > 1 && args[0] == "buildx" && args[1] == "build" {
 			builds++
 		}
 		return nil
 	}
-	runHostOutputCommand = func(context.Context, string, ...string) (string, error) {
+	runHostOutputCommand = func(_ context.Context, _ string, args ...string) (string, error) {
+		if len(args) > 1 && args[0] == "buildx" && args[1] == "inspect" {
+			return "", errors.New("builder not found")
+		}
 		return `["source@sha256:1234"]`, nil
 	}
 	runHostQuietCommand = func(context.Context, string, ...string) error { return nil }

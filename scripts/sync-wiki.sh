@@ -52,6 +52,8 @@ rewrite_links() {
       "image-build.md" => "Image-Build",
       "docs/design.md" => "Design",
       "design.md" => "Design",
+      "docs/development-principles.md" => "Development-Principles",
+      "development-principles.md" => "Development-Principles",
       "docs/operations.md" => "Operations",
       "operations.md" => "Operations",
       "docs/security.md" => "Security",
@@ -67,6 +69,9 @@ rewrite_links() {
       "docs/providers/docker-container.md" => "Docker-Container-Provider",
       "providers/docker-container.md" => "Docker-Container-Provider",
       "docker-container.md" => "Docker-Container-Provider",
+      "docs/providers/docker-sandboxes.md" => "Docker-Sandboxes-Provider",
+      "providers/docker-sandboxes.md" => "Docker-Sandboxes-Provider",
+      "docker-sandboxes.md" => "Docker-Sandboxes-Provider",
       "docs/providers/adding-provider.md" => "Adding-A-Provider",
       "providers/adding-provider.md" => "Adding-A-Provider",
       "adding-provider.md" => "Adding-A-Provider",
@@ -106,12 +111,14 @@ copy_page "docs/usage.md" "Usage"
 copy_page "docs/github-app.md" "GitHub-App-Setup"
 copy_page "docs/image-build.md" "Image-Build"
 copy_page "docs/design.md" "Design"
+copy_page "docs/development-principles.md" "Development-Principles"
 copy_page "docs/operations.md" "Operations"
 copy_page "docs/security.md" "Security"
 copy_page "docs/background.md" "Background"
 copy_page "docs/providers/tart.md" "Tart-Provider"
 copy_page "docs/providers/wsl.md" "WSL-Provider"
 copy_page "docs/providers/docker-container.md" "Docker-Container-Provider"
+copy_page "docs/providers/docker-sandboxes.md" "Docker-Sandboxes-Provider"
 copy_page "docs/providers/adding-provider.md" "Adding-A-Provider"
 copy_page "docs/advanced/docker-registry-mirrors.md" "Docker-Registry-Mirrors"
 copy_page "docs/advanced/macos-startup.md" "macOS-Startup"
@@ -131,6 +138,7 @@ cat > "$out_dir/_Sidebar.md" <<'SIDEBAR'
 ## Providers
 
 - [Docker Container](Docker-Container-Provider)
+- [Docker Sandboxes](Docker-Sandboxes-Provider)
 - [Tart](Tart-Provider)
 - [WSL](WSL-Provider)
 - [Adding A Provider](Adding-A-Provider)
@@ -140,6 +148,7 @@ cat > "$out_dir/_Sidebar.md" <<'SIDEBAR'
 - [Operations](Operations)
 - [Security](Security)
 - [Design](Design)
+- [Development Principles](Development-Principles)
 - [Background](Background)
 - [Docker Registry Mirrors](Docker-Registry-Mirrors)
 - [macOS Startup](macOS-Startup)

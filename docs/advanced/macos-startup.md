@@ -24,7 +24,7 @@ Double-click `.local/start-epar.command` in Finder or run it from Terminal:
 The script:
 
 - finds the EPAR source folder, such as when the script lives at `.local/start-epar.command`;
-- delegates to `./start`, which runs EPAR with `go run ./cmd/ephemeral-action-runner` if Go is installed and working, or a containerized `go run` if not (see [No Go Install](#no-go-install));
+- delegates to `./start`, which runs EPAR with `go run ./cmd/ephemeral-action-runner` if Go is installed and working, or uses a containerized toolchain to build and cache a native controller if not (see [No Go Install](#no-go-install));
 - uses `.local/config.yml` by default;
 - waits for Docker to become ready before starting EPAR;
 - starts an existing `epar-dockerhub-cache` mirror container if one exists;
@@ -56,7 +56,7 @@ If you use the optional Docker registry mirror, create the mirror container sepa
 
 ## No Go Install
 
-`start-epar.command` delegates to `./start` at the repo root. If `go` isn't on `PATH`, or the `go` found there doesn't actually run (stale/wrong-architecture installs happen — see below), `./start` runs EPAR straight from source with a containerized Go toolchain (`scripts/run-with-docker.sh`) instead of failing. No binary is built or left on disk either way. Docker is required in both cases.
+`start-epar.command` delegates to `./start` at the repo root. If `go` isn't on `PATH`, or the `go` found there doesn't actually run (stale/wrong-architecture installs happen — see below), `./start` uses a containerized Go toolchain through `scripts/run-with-docker.sh` to cross-compile a CGO-disabled native controller, cache it under `.local/bin`, and run it on the host. Docker is required for this fallback build path.
 
 To force this path even when Go is installed (for example, to avoid rebuilding via `go run` on every start), set in your local copy:
 

@@ -40,7 +40,7 @@ Don't want to install Go at all? See [Running EPAR Without Installing Go](advanc
 
 ## One-Command Start
 
-For the default Docker Container setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, without creating a standalone EPAR executable (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
+Run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, or uses a containerized Go toolchain to build and cache a CGO-disabled native controller under `.local/bin` automatically (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
 
 ```bash
 ./start
@@ -52,7 +52,7 @@ Equivalent without the wrapper:
 go run ./cmd/ephemeral-action-runner
 ```
 
-If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then lists the organization's live runner groups. The group choice is explicit and has no Enter-for-default or offline fallback. Default and broad-access groups require warning confirmation; public-enabled groups are blocked by the generated safety policy. See [Runner Group Security](runner-groups.md). Docker Container is the default. For a new Docker Container config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker Container. The Docker preflight applies to Docker Container and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks runner-group policy and the configured image, builds or replaces the image when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then lists the organization's live runner groups. The group choice is explicit and has no Enter-for-default or offline fallback. Default and broad-access groups require warning confirmation; public-enabled groups are blocked by the generated safety policy. See [Runner Group Security](runner-groups.md). The provider menu always displays the same four choices and prints a prerequisite status beneath each one: option 1 Docker Container requires Docker; option 2 Docker Sandboxes requires Docker, a supported host architecture, the exact supported `sbx` version, and healthy `sbx diagnose --output json` results; option 3 WSL2 requires native Windows, Docker, and `wsl.exe --status` reporting default version 2; option 4 experimental Tart requires native macOS and a successful `tart --version`. Unavailable choices remain visible but cannot be selected. Docker Sandboxes is the Enter default on any OS when those capability checks pass: diagnostics must contain at least one pass and zero failures, while warnings such as an available update are accepted. Setup performs read-only checks for compatible `sbx` admission, an exact locally built and loaded EPAR template, the matching full local Docker image identity and platform, and the current host-global Balanced-policy fingerprint. If discovery fails, the wizard retains the Docker Sandboxes selection and offers to retry the checks without repeating the provider menu; declining exits without writing a config or falling back. The wizard asks only one capacity question, chosen from the available measurement evidence, and writes the other recommended values for later editing. New Docker Sandboxes configs default to sandbox-scoped open public HTTP/HTTPS egress with deny-wins host-alias guardrails so ordinary CI dependency endpoints do not require reactive allowlisting; this does not change the machine's global Docker Sandboxes policy. The wizard asks whether a new Docker Container or Docker Sandboxes config should inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. EPAR then checks provider admission and runner-group policy, prepares the configured environment, and starts the configured number of runners. The default config uses `pool.instances: 1`.
 
 Pass flags through `./start` to choose a config or runner count:
 
@@ -84,7 +84,7 @@ If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.ins
 
 ## Configure Only
 
-Use `init` when you only want to create a config without building an image or starting runners. It creates Docker Container by default, with the same conditional native-Windows WSL2 and macOS Tart choices described above:
+Use `init` when you only want to create a config without building an image or starting runners. It uses the same prerequisite-aware provider menu as missing-config `./start`; Docker Sandboxes is the recommended default on any OS when Docker and the supported `sbx` diagnostics are ready, and Docker Container, WSL2, and experimental Tart remain visible with their current availability status:
 
 ```bash
 go run ./cmd/ephemeral-action-runner init
@@ -100,6 +100,7 @@ For other WSL or Tart variants, or for custom labels, copy one example config in
 
 | Host and image | Example config |
 | --- | --- |
+| Windows Docker Sandboxes, recommended full Catthehacker template | `configs/docker-sandboxes.example.yml` |
 | macOS Tart, experimental basic Ubuntu ARM64 image | `configs/tart.example.yml` |
 | macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
 | Windows WSL2, default full Catthehacker runner image | `configs/wsl.example.yml` |
@@ -216,7 +217,7 @@ Build logs are written under `work/logs/builds` by default. Run `ephemeral-actio
 
 ## Customize The Image
 
-WSL and Docker Container use the full Catthehacker runner image by default. For Docker-focused jobs, `configs/docker-container.act.example.yml` uses the smaller Catthehacker Act image, which includes Node and the Docker Engine/CLI/Compose/Buildx stack EPAR needs. It does not guarantee browser dependencies; use `configs/docker-container.web-e2e.example.yml` for Playwright or other browser tests. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker Container web/E2E examples:
+Docker Sandboxes adapts a pinned full Catthehacker source into its recommended template; WSL and Docker Container use the full Catthehacker runner image by default. For Docker-focused jobs, `configs/docker-container.act.example.yml` uses the smaller Catthehacker Act image, which includes Node and the Docker Engine/CLI/Compose/Buildx stack EPAR needs. It does not guarantee browser dependencies; use `configs/docker-container.web-e2e.example.yml` for Playwright or other browser tests. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different WSL or Docker Container image shape, such as the smaller web/E2E examples. Docker Sandboxes customization uses its separate template build pipeline:
 
 ```yaml
 image:
@@ -317,6 +318,12 @@ For the default Docker Container image, target the default Docker Container labe
 
 ```yaml
 runs-on: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]
+```
+
+For the recommended Docker Sandboxes full template, target the provider label:
+
+```yaml
+runs-on: [self-hosted, linux, X64, epar-docker-sandboxes]
 ```
 
 For the Docker-focused Act image, target its dedicated label:

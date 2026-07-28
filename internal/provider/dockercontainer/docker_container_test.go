@@ -135,16 +135,16 @@ func TestExecRedactsSecretAssignmentsWithoutSensitiveValues(t *testing.T) {
 func TestListParsesDockerPSOutput(t *testing.T) {
 	p := New("docker", "", false)
 	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
-		if strings.Join(args, " ") != "ps -a --filter label=epar.provider=docker-container --format {{.Names}}\t{{.Image}}\t{{.Status}}" {
+		if strings.Join(args, " ") != "ps -a --no-trunc --filter label=epar.provider=docker-container --format {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}" {
 			t.Fatalf("unexpected list args: %#v", args)
 		}
-		return provider.ExecResult{Stdout: "epar-docker-container-1\trunner-image\tUp 2 minutes\n"}, nil
+		return provider.ExecResult{Stdout: "0123456789abcdef\tepar-docker-container-1\trunner-image\tUp 2 minutes\n"}, nil
 	}
 	instances, err := p.List(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []provider.Instance{{Name: "epar-docker-container-1", Source: "runner-image", State: "Up 2 minutes"}}
+	want := []provider.Instance{{Name: "epar-docker-container-1", ProviderID: "docker:0123456789abcdef", Source: "runner-image", State: "Up 2 minutes"}}
 	if !reflect.DeepEqual(instances, want) {
 		t.Fatalf("instances = %#v, want %#v", instances, want)
 	}
