@@ -134,6 +134,52 @@ func (m *Manager) resolveHostTrust(ctx context.Context) (hosttrust.Snapshot, err
 	return validateHostTrustSnapshot(snapshot, time.Now().UTC())
 }
 
+func (m *Manager) resolveBuildTrust(ctx context.Context) (hosttrust.Snapshot, error) {
+	if m.buildTrustResolver != nil {
+		snapshot, err := m.buildTrustResolver(ctx)
+		if err != nil {
+			return hosttrust.Snapshot{}, err
+		}
+		return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+	}
+	if m.hostTrustResolver != nil {
+		snapshot, err := m.hostTrustResolver(ctx)
+		if err != nil {
+			return hosttrust.Snapshot{}, err
+		}
+		return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+	}
+	scopes := buildTrustScopes(m.Config.Image.HostTrustMode, m.Config.Image.HostTrustScopes)
+	feedPath := strings.TrimSpace(os.Getenv("EPAR_BUILD_TRUST_FEED"))
+	controllerHostOS := strings.TrimSpace(os.Getenv("EPAR_CONTROLLER_HOST_OS"))
+	if feedPath == "" && hostTrustControllerOS == "linux" && hostTrustControllerInContainer() {
+		return hosttrust.Snapshot{}, fmt.Errorf("operational BuildKit trust requires EPAR_BUILD_TRUST_FEED when the EPAR controller runs in a container; use an official no-Go wrapper")
+	}
+	snapshot, err := hosttrust.Resolve(ctx, hosttrust.Options{
+		Mode:             hosttrust.ModeOverlay,
+		Scopes:           scopes,
+		FeedPath:         feedPath,
+		ControllerHostOS: controllerHostOS,
+	})
+	if err != nil {
+		return hosttrust.Snapshot{}, fmt.Errorf("resolve operational BuildKit trust: %w", err)
+	}
+	return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+}
+
+func buildTrustScopes(runnerMode string, runnerScopes []string) []string {
+	scopes := []string{hosttrust.ScopeSystem}
+	if hosttrust.Enabled(runnerMode) {
+		for _, scope := range runnerScopes {
+			if strings.EqualFold(strings.TrimSpace(scope), hosttrust.ScopeUser) {
+				scopes = append(scopes, hosttrust.ScopeUser)
+				break
+			}
+		}
+	}
+	return scopes
+}
+
 func linuxControllerInContainer() bool {
 	return linuxContainerEvidence(
 		func(path string) bool { _, err := os.Stat(path); return err == nil },

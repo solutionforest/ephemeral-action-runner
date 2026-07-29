@@ -5,5 +5,16 @@
 !guest/*.sh
 !hook-launcher/
 !hook-launcher/*.go
+!custom-install/
+!custom-install/run.sh
+!inputs/
+!inputs/actions-runner.tar.gz
+!inputs/tini
+!host-trust-certificates/
+!host-trust-certificates/*.crt
+!trusted-ca-certificates/
+!trusted-ca-certificates/*.crt
+!host-trust-metadata/
+!host-trust-metadata/host-trust-generation.json
 !profiles/
 !profiles/*.compatibility.json

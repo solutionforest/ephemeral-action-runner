@@ -27,17 +27,19 @@ import (
 )
 
 type Manager struct {
-	Config         config.Config
-	Provider       provider.Provider
-	Lifecycle      provider.Lifecycle
-	PolicyManager  provider.PolicyManager
-	Storage        provider.StorageContribution
-	LifecycleState *poolstate.Store
-	GitHub         GitHubClient
-	ProjectRoot    string
-	ConfigPath     string
-	DryRun         bool
-	Logging        *logging.Runtime
+	Config                   config.Config
+	Provider                 provider.Provider
+	Lifecycle                provider.Lifecycle
+	PolicyManager            provider.PolicyManager
+	Storage                  provider.StorageContribution
+	LifecycleState           *poolstate.Store
+	GitHub                   GitHubClient
+	ProjectRoot              string
+	ConfigPath               string
+	DryRun                   bool
+	Logging                  *logging.Runtime
+	AllowInsufficientStorage bool
+	StorageOverrideCommand   string
 	// AcknowledgeFailedDiagnostics permits the explicit cleanup command to
 	// dispose an exact retained sandbox after the operator has captured the
 	// durable failed-diagnostics evidence. Normal startup and automatic cleanup
@@ -48,10 +50,16 @@ type Manager struct {
 	transcripts                  map[string]*logging.Transcript
 
 	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
+	buildTrustResolver    func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
 	hostTrustImageMu      sync.Mutex
 	now                   func() time.Time
 	randomFloat64         func() float64
+}
+
+func (m *Manager) ConfigureStorageAdmissionOverride(allow bool, command string) {
+	m.AllowInsufficientStorage = allow
+	m.StorageOverrideCommand = command
 }
 
 type GitHubClient interface {

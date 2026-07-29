@@ -39,6 +39,10 @@ type closingStarterManager interface {
 	Close() error
 }
 
+type storageAdmissionConfiguringStarterManager interface {
+	ConfigureStorageAdmissionOverride(bool, string)
+}
+
 type starterManagerFactory func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error)
 
 var newStarterManager starterManagerFactory = func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error) {
@@ -46,18 +50,20 @@ var newStarterManager starterManagerFactory = func(configPath, projectRoot strin
 }
 
 type startOptions struct {
-	Context          context.Context
-	ProjectRoot      string
-	ConfigPath       string
-	DryRun           bool
-	Instances        int
-	Register         bool
-	KeepOnExit       bool
-	ReplaceCompleted bool
-	MonitorInterval  time.Duration
-	In               io.Reader
-	Out              io.Writer
-	ManagerFactory   starterManagerFactory
+	Context                  context.Context
+	ProjectRoot              string
+	ConfigPath               string
+	DryRun                   bool
+	Instances                int
+	Register                 bool
+	KeepOnExit               bool
+	ReplaceCompleted         bool
+	MonitorInterval          time.Duration
+	AllowInsufficientStorage bool
+	StorageOverrideCommand   string
+	In                       io.Reader
+	Out                      io.Writer
+	ManagerFactory           starterManagerFactory
 }
 
 func runStart(args []string) error {
@@ -68,6 +74,7 @@ func runStart(args []string) error {
 	keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 	replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 	monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
+	allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -75,18 +82,20 @@ func runStart(args []string) error {
 		return fmt.Errorf("--instances must be 1 or greater")
 	}
 	return runStartWithOptions(startOptions{
-		Context:          interruptContext(),
-		ProjectRoot:      *common.projectRoot,
-		ConfigPath:       *common.configPath,
-		DryRun:           *common.dryRun,
-		Instances:        *instances,
-		Register:         *register,
-		KeepOnExit:       *keepOnExit,
-		ReplaceCompleted: *replaceCompleted,
-		MonitorInterval:  *monitorInterval,
-		In:               os.Stdin,
-		Out:              os.Stdout,
-		ManagerFactory:   newStarterManager,
+		Context:                  interruptContext(),
+		ProjectRoot:              *common.projectRoot,
+		ConfigPath:               *common.configPath,
+		DryRun:                   *common.dryRun,
+		Instances:                *instances,
+		Register:                 *register,
+		KeepOnExit:               *keepOnExit,
+		ReplaceCompleted:         *replaceCompleted,
+		MonitorInterval:          *monitorInterval,
+		AllowInsufficientStorage: *allowInsufficientStorage,
+		StorageOverrideCommand:   matchingStartCommand(appendStorageOverride(args)),
+		In:                       os.Stdin,
+		Out:                      os.Stdout,
+		ManagerFactory:           newStarterManager,
 	})
 }
 
@@ -129,6 +138,13 @@ func runStartWithOptions(opts startOptions) (err error) {
 	}
 	if closingManager, ok := manager.(closingStarterManager); ok {
 		defer closingManager.Close()
+	}
+	if configuringManager, ok := manager.(storageAdmissionConfiguringStarterManager); ok {
+		overrideCommand := opts.StorageOverrideCommand
+		if overrideCommand == "" {
+			overrideCommand = matchingStartCommand([]string{"--allow-insufficient-storage"})
+		}
+		configuringManager.ConfigureStorageAdmissionOverride(opts.AllowInsufficientStorage, overrideCommand)
 	}
 	if timingManager, ok := manager.(startupTimingStarterManager); ok {
 		if _, err := timingManager.StartStartupTiming(); err != nil {
@@ -189,6 +205,23 @@ func runStartWithOptions(opts startOptions) (err error) {
 		HostTrustLockHeld: hostTrustLockHeld,
 	})
 	return err
+}
+
+func appendStorageOverride(args []string) []string {
+	result := append([]string(nil), args...)
+	for _, arg := range result {
+		if arg == "--allow-insufficient-storage" || arg == "--allow-insufficient-storage=true" {
+			return result
+		}
+	}
+	return append(result, "--allow-insufficient-storage")
+}
+
+func matchingStartCommand(args []string) string {
+	if os.Getenv(invocation.Environment) == "start" {
+		return invocation.Command(args...)
+	}
+	return invocation.Command(append([]string{"start"}, args...)...)
 }
 
 func ensureConfigForStart(opts startOptions) (string, bool, error) {

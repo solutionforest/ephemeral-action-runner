@@ -156,12 +156,11 @@ type DockerConfig struct {
 	NoProxy         string
 }
 
-// DockerSandboxesConfig configures the docker-sandboxes provider. Template,
-// TemplateDigest, and PolicyGeneration deliberately have no defaults: a sandbox must
-// be created from an explicitly pinned template and policy generation.
+// DockerSandboxesConfig configures host/runtime behavior for the
+// docker-sandboxes provider. The desired source belongs to ImageConfig, while
+// the exact imported template identity is stored in EPAR's local artifact
+// receipt rather than user configuration.
 type DockerSandboxesConfig struct {
-	Template             string
-	TemplateDigest       string
 	PolicyGeneration     string
 	NetworkBaseline      string
 	AdditionalAllow      []string
@@ -172,7 +171,6 @@ type DockerSandboxesConfig struct {
 	RootDisk             string
 	DockerDisk           string
 	MaxConcurrentCreates int
-	MinHostFreeSpace     string
 }
 
 const (
@@ -196,9 +194,10 @@ func DockerSandboxesOpenDefaultDenyResources() []string {
 }
 
 const (
-	DockerSandboxesMinimumRootDiskBytes      int64 = 20 << 30
-	DockerSandboxesMinimumDockerDiskBytes    int64 = 100 << 30
-	DockerSandboxesMinimumHostFreeSpaceBytes int64 = 50 << 30
+	DockerSandboxesAutomaticRootDisk            = "auto"
+	DockerSandboxesMinimumRootDiskBytes   int64 = 20 << 30
+	DockerSandboxesMinimumDockerDiskBytes int64 = 1 << 30
+	DockerSandboxesDefaultDockerDisk            = "50GiB"
 )
 
 type TimeoutConfig struct {
@@ -240,7 +239,7 @@ func Default() Config {
 			ReplacementRetryJitterPercent:  20,
 		},
 		Storage: StorageConfig{
-			MinimumFree:           "20GiB",
+			MinimumFree:           "1GiB",
 			GracePeriod:           "168h",
 			KeepPrevious:          0,
 			AutomaticHousekeeping: StorageHousekeepingConservative,
@@ -291,6 +290,8 @@ func Default() Config {
 			StagingRoot:          ".local/docker-sandboxes-staging",
 			CPUs:                 4,
 			Memory:               "8GiB",
+			RootDisk:             DockerSandboxesAutomaticRootDisk,
+			DockerDisk:           DockerSandboxesDefaultDockerDisk,
 			MaxConcurrentCreates: 2,
 		},
 		Timeouts: TimeoutConfig{
@@ -699,9 +700,9 @@ func apply(cfg *Config, section, key, value string) error {
 	case "dockerSandboxes":
 		switch key {
 		case "template":
-			cfg.DockerSandboxes.Template = value
+			return fmt.Errorf("dockerSandboxes.template is no longer supported; remove generated template identities and rerun ./start to provision a Docker Sandboxes runner template")
 		case "templateDigest":
-			cfg.DockerSandboxes.TemplateDigest = value
+			return fmt.Errorf("dockerSandboxes.templateDigest is no longer supported; remove generated template identities and rerun ./start to provision a Docker Sandboxes runner template")
 		case "policyGeneration":
 			cfg.DockerSandboxes.PolicyGeneration = value
 		case "networkBaseline":
@@ -716,7 +717,7 @@ func apply(cfg *Config, section, key, value string) error {
 				return fmt.Errorf("invalid dockerSandboxes.cpus: %w", err)
 			}
 			cfg.DockerSandboxes.CPUs = v
-		case "memory", "rootDisk", "dockerDisk", "minHostFreeSpace":
+		case "memory", "rootDisk", "dockerDisk":
 			switch key {
 			case "memory":
 				cfg.DockerSandboxes.Memory = value
@@ -724,9 +725,9 @@ func apply(cfg *Config, section, key, value string) error {
 				cfg.DockerSandboxes.RootDisk = value
 			case "dockerDisk":
 				cfg.DockerSandboxes.DockerDisk = value
-			case "minHostFreeSpace":
-				cfg.DockerSandboxes.MinHostFreeSpace = value
 			}
+		case "minHostFreeSpace":
+			return fmt.Errorf("dockerSandboxes.minHostFreeSpace is no longer supported; remove it and configure the provider-neutral storage.minimumFree value instead")
 		case "maxConcurrentCreates":
 			v, err := strconv.Atoi(value)
 			if err != nil {
@@ -831,13 +832,23 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			cfg.Pool.NamePrefix = "epar-docker-container"
 		}
 	case "docker-sandboxes":
-		// Provider.SourceImage belongs to image-building providers. Do not carry the
-		// Tart default into the sandbox provider, where the template is explicit.
 		if !explicit["provider.sourceImage"] {
 			cfg.Provider.SourceImage = ""
 		}
 		if !explicit["provider.platform"] {
 			cfg.Provider.Platform = "linux/amd64"
+		}
+		if !explicit["image.sourceType"] {
+			cfg.Image.SourceType = ImageSourceDockerImage
+		}
+		if !explicit["image.sourceImage"] {
+			cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
+		}
+		if !explicit["image.sourcePlatform"] {
+			cfg.Image.SourcePlatform = cfg.Provider.Platform
+		}
+		if !explicit["image.outputImage"] {
+			cfg.Image.OutputImage = ""
 		}
 		if !explicit["runner.labels"] {
 			architecture := "X64"
@@ -1078,10 +1089,19 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Provider.Type == "docker-sandboxes" {
 		if cfg.Provider.SourceImage != "" {
-			return fmt.Errorf("provider.sourceImage is not supported with provider.type=docker-sandboxes; use dockerSandboxes.template and dockerSandboxes.templateDigest")
+			return fmt.Errorf("provider.sourceImage is not supported with provider.type=docker-sandboxes; use image.sourceImage")
 		}
 		if cfg.Provider.Platform != "linux/amd64" && cfg.Provider.Platform != "linux/arm64" {
 			return fmt.Errorf("provider.platform must be linux/amd64 or linux/arm64 with provider.type=docker-sandboxes")
+		}
+		if cfg.Image.SourceType != "" && cfg.Image.SourceType != ImageSourceDockerImage {
+			return fmt.Errorf("image.sourceType must be docker-image with provider.type=docker-sandboxes")
+		}
+		if cfg.Image.SourceType != "" && !validDockerSandboxesSourceImage(cfg.Image.SourceImage) {
+			return fmt.Errorf("image.sourceImage with provider.type=docker-sandboxes must be an exact ghcr.io/catthehacker/ubuntu:<tag> reference")
+		}
+		if cfg.Image.SourcePlatform != "" && cfg.Image.SourcePlatform != cfg.Provider.Platform {
+			return fmt.Errorf("image.sourcePlatform must match provider.platform with provider.type=docker-sandboxes")
 		}
 		if !cfg.Runner.Ephemeral {
 			return fmt.Errorf("runner.ephemeral must be true with provider.type=docker-sandboxes")
@@ -1219,12 +1239,6 @@ func ValidateStorage(storage StorageConfig) error {
 // callers constructing Config values programmatically receive the same checks as
 // YAML-loaded configuration.
 func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
-	if err := validateDockerSandboxTemplate(sandboxes.Template); err != nil {
-		return err
-	}
-	if err := validateSHA256Fingerprint("dockerSandboxes.templateDigest", sandboxes.TemplateDigest); err != nil {
-		return err
-	}
 	if err := validateSHA256Fingerprint("dockerSandboxes.policyGeneration", sandboxes.PolicyGeneration); err != nil {
 		return err
 	}
@@ -1259,12 +1273,10 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 	if sandboxes.CPUs <= 0 {
 		return fmt.Errorf("dockerSandboxes.cpus must be greater than zero")
 	}
-	parsedSizes := make(map[string]int64, 4)
+	parsedSizes := make(map[string]int64, 2)
 	for key, value := range map[string]string{
-		"memory":           sandboxes.Memory,
-		"rootDisk":         sandboxes.RootDisk,
-		"dockerDisk":       sandboxes.DockerDisk,
-		"minHostFreeSpace": sandboxes.MinHostFreeSpace,
+		"memory":     sandboxes.Memory,
+		"dockerDisk": sandboxes.DockerDisk,
 	} {
 		parsed, err := ParseByteSize(value)
 		if err != nil {
@@ -1272,19 +1284,41 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 		}
 		parsedSizes[key] = parsed
 	}
-	if parsedSizes["rootDisk"] < DockerSandboxesMinimumRootDiskBytes {
-		return fmt.Errorf("dockerSandboxes.rootDisk must be at least 20GiB")
+	if sandboxes.RootDisk != DockerSandboxesAutomaticRootDisk {
+		rootDisk, err := ParseByteSize(sandboxes.RootDisk)
+		if err != nil {
+			return fmt.Errorf("invalid dockerSandboxes.rootDisk: %w", err)
+		}
+		if rootDisk < DockerSandboxesMinimumRootDiskBytes {
+			return fmt.Errorf("dockerSandboxes.rootDisk must be auto or at least 20GiB")
+		}
 	}
 	if parsedSizes["dockerDisk"] < DockerSandboxesMinimumDockerDiskBytes {
-		return fmt.Errorf("dockerSandboxes.dockerDisk must be at least 100GiB")
-	}
-	if parsedSizes["minHostFreeSpace"] < DockerSandboxesMinimumHostFreeSpaceBytes {
-		return fmt.Errorf("dockerSandboxes.minHostFreeSpace must be at least 50GiB")
+		return fmt.Errorf("dockerSandboxes.dockerDisk must be at least 1GiB")
 	}
 	if sandboxes.MaxConcurrentCreates <= 0 {
 		return fmt.Errorf("dockerSandboxes.maxConcurrentCreates must be greater than zero")
 	}
 	return nil
+}
+
+func validDockerSandboxesSourceImage(value string) bool {
+	const prefix = "ghcr.io/catthehacker/ubuntu:"
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	tag := strings.TrimPrefix(value, prefix)
+	if tag == "" || len(tag) > 128 || strings.ContainsAny(tag, "/@\t\r\n ") {
+		return false
+	}
+	for _, character := range tag {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '_' || character == '.' || character == '-' {
+			continue
+		}
+		return false
+	}
+	first := tag[0]
+	return (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9') || first == '_'
 }
 
 func validateDockerSandboxesStagingRoot(value string) error {
@@ -1304,24 +1338,6 @@ func validateDockerSandboxesStagingRoot(value string) error {
 		if clean == reserved || strings.HasPrefix(clean, reserved+"/") {
 			return fmt.Errorf("dockerSandboxes.stagingRoot must not overlap reserved EPAR path %s", reserved)
 		}
-	}
-	return nil
-}
-
-func validateDockerSandboxTemplate(template string) error {
-	if template == "" || template != strings.TrimSpace(template) {
-		return fmt.Errorf("dockerSandboxes.template is required")
-	}
-	if strings.ContainsAny(template, "@\\") || strings.ContainsAny(template, "\t\r\n") || strings.Contains(template, "..") || strings.Contains(template, "//") {
-		return fmt.Errorf("dockerSandboxes.template must be a non-empty immutable template identity")
-	}
-	for i, r := range template {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' || r == '/' || r == ':') {
-			return fmt.Errorf("dockerSandboxes.template contains invalid character at position %d", i)
-		}
-	}
-	if strings.HasPrefix(template, ".") || strings.HasPrefix(template, "-") || strings.HasPrefix(template, "/") || strings.HasSuffix(template, ".") || strings.HasSuffix(template, ":") || strings.HasSuffix(template, "/") {
-		return fmt.Errorf("dockerSandboxes.template must be a non-empty immutable template identity")
 	}
 	return nil
 }
@@ -1430,10 +1446,8 @@ func ParseByteSize(value string) (int64, error) {
 	return 0, fmt.Errorf("must be a positive byte size such as 4GiB")
 }
 
-// EffectiveMinimumFreeBytes returns the provider-neutral reserve, raised to a
-// provider's stricter configured reserve when one exists. Docker Sandboxes
-// keeps its established 50 GiB admission watermark while all providers share
-// the storage.minimumFree contract.
+// EffectiveMinimumFreeBytes returns the single provider-neutral free-space
+// reserve used by every storage-consuming provider operation.
 func EffectiveMinimumFreeBytes(cfg Config) (uint64, error) {
 	value := cfg.Storage.MinimumFree
 	if value == "" {
@@ -1442,15 +1456,6 @@ func EffectiveMinimumFreeBytes(cfg Config) (uint64, error) {
 	minimum, err := ParseByteSize(value)
 	if err != nil {
 		return 0, fmt.Errorf("parse storage minimum free reserve: %w", err)
-	}
-	if cfg.Provider.Type == "docker-sandboxes" && cfg.DockerSandboxes.MinHostFreeSpace != "" {
-		providerMinimum, err := ParseByteSize(cfg.DockerSandboxes.MinHostFreeSpace)
-		if err != nil {
-			return 0, fmt.Errorf("parse dockerSandboxes.minHostFreeSpace: %w", err)
-		}
-		if providerMinimum > minimum {
-			minimum = providerMinimum
-		}
 	}
 	return uint64(minimum), nil
 }

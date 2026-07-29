@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+. (Join-Path $RepoRoot 'scripts\host-trust\wrapper-lib.ps1')
 $GoImage = if ($env:GO_DOCKER_IMAGE) { $env:GO_DOCKER_IMAGE } else { 'golang:1.25' }
 $DevImage = if ($env:EPAR_DEV_IMAGE) { $env:EPAR_DEV_IMAGE } else { 'epar-dev-toolchain' }
 $repoRootPath = [System.IO.Path]::GetFullPath($RepoRoot)
@@ -28,7 +29,7 @@ if ($env:EPAR_GO_CACHE_LIMIT_BYTES) {
     }
     $GoCacheLimitBytes = $parsedGoCacheLimit
 }
-$BootstrapMinimumFreeBytes = [uint64](20GB)
+$BootstrapMinimumFreeBytes = [uint64](1GB)
 if ($env:EPAR_BOOTSTRAP_MIN_FREE_BYTES) {
     $parsedBootstrapMinimum = [uint64] 0
     if (-not [uint64]::TryParse($env:EPAR_BOOTSTRAP_MIN_FREE_BYTES, [ref] $parsedBootstrapMinimum) -or $parsedBootstrapMinimum -eq 0) {
@@ -52,8 +53,12 @@ try {
     exit 1
 }
 if ($bootstrapAvailableBytes -lt $BootstrapMinimumFreeBytes) {
-    Write-Error ("insufficient bootstrap storage on {0}: available={1} required-reserve={2}. Free space or run `ephemeral-action-runner storage status` from an existing controller before retrying." -f $repoVolumeRoot, $bootstrapAvailableBytes, $BootstrapMinimumFreeBytes)
-    exit 1
+    if ($EparArgs -contains '--allow-insufficient-storage') {
+        Write-Warning ("bootstrap storage on {0} is below the {1}-byte reserve; continuing because --allow-insufficient-storage was explicitly supplied." -f $repoVolumeRoot, $BootstrapMinimumFreeBytes)
+    } else {
+        Write-Error ("insufficient bootstrap storage on {0}: available={1} required-reserve={2}. Free space, inspect storage, or retry this invocation with --allow-insufficient-storage." -f $repoVolumeRoot, $bootstrapAvailableBytes, $BootstrapMinimumFreeBytes)
+        exit 1
+    }
 }
 
 function Get-EparGoCacheVolumeIdentity {
@@ -491,9 +496,15 @@ $previousNative = $env:EPAR_NATIVE_CONTROLLER
 $previousControllerOS = $env:EPAR_CONTROLLER_HOST_OS
 $previousHostName = $env:EPAR_HOST_NAME
 $previousHints = $env:DOCKER_CLI_HINTS
+$previousRunnerTrustFeed = $env:EPAR_HOST_TRUST_FEED
+$previousBuildTrustFeed = $env:EPAR_BUILD_TRUST_FEED
+$controllerCommand = if ($EparArgs -and $EparArgs.Count -gt 0) { [string]$EparArgs[0] } else { 'start' }
+$bridge = Start-EparHostTrustBridge -ProjectRoot $RepoRoot -Command $controllerCommand -Arguments $EparArgs
 try {
     $env:EPAR_NATIVE_CONTROLLER = '1'
     $env:EPAR_CONTROLLER_HOST_OS = 'windows'
+    if ($bridge.BuildFeedDir) { $env:EPAR_BUILD_TRUST_FEED = Join-Path $bridge.BuildFeedDir 'current.json' }
+    if ($bridge.RunnerFeedDir) { $env:EPAR_HOST_TRUST_FEED = Join-Path $bridge.RunnerFeedDir 'current.json' }
     if (-not $env:EPAR_HOST_NAME) {
         $env:EPAR_HOST_NAME = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [System.Net.Dns]::GetHostName() }
     }
@@ -501,9 +512,12 @@ try {
     & $binary @EparArgs
     exit $LASTEXITCODE
 } finally {
+    Stop-EparHostTrustBridge -Bridge $bridge
     Remove-Item -LiteralPath $leasePath -Force -ErrorAction SilentlyContinue
     if ($null -eq $previousNative) { Remove-Item Env:EPAR_NATIVE_CONTROLLER -ErrorAction SilentlyContinue } else { $env:EPAR_NATIVE_CONTROLLER = $previousNative }
     if ($null -eq $previousControllerOS) { Remove-Item Env:EPAR_CONTROLLER_HOST_OS -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_HOST_OS = $previousControllerOS }
     if ($null -eq $previousHostName) { Remove-Item Env:EPAR_HOST_NAME -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_NAME = $previousHostName }
     if ($null -eq $previousHints) { Remove-Item Env:DOCKER_CLI_HINTS -ErrorAction SilentlyContinue } else { $env:DOCKER_CLI_HINTS = $previousHints }
+    if ($null -eq $previousRunnerTrustFeed) { Remove-Item Env:EPAR_HOST_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_TRUST_FEED = $previousRunnerTrustFeed }
+    if ($null -eq $previousBuildTrustFeed) { Remove-Item Env:EPAR_BUILD_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_BUILD_TRUST_FEED = $previousBuildTrustFeed }
 }

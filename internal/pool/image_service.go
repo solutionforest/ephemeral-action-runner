@@ -44,10 +44,11 @@ var dockerPullProgressTerminal = func() bool {
 var dockerPullProgressConsole io.Writer = os.Stdout
 
 var (
-	runHostCommand       = runHost
-	runHostLoggedCommand = runHostLogged
-	runHostOutputCommand = runHostOutput
-	runHostQuietCommand  = runHostQuiet
+	runHostCommand         = runHost
+	runHostLoggedCommand   = runHostLogged
+	runHostOutputCommand   = runHostOutput
+	runHostOutputToCommand = runHostOutputTo
+	runHostQuietCommand    = runHostQuiet
 )
 
 func (m *Manager) imageCoordinator() *artifactimage.Coordinator {
@@ -224,6 +225,10 @@ func (environment imageEnvironment) RunHostOutput(ctx context.Context, name stri
 	return runHostOutputCommand(ctx, name, args...)
 }
 
+func (environment imageEnvironment) RunHostOutputTo(ctx context.Context, output io.Writer, name string, args ...string) error {
+	return runHostOutputToCommand(ctx, output, name, args...)
+}
+
 func (environment imageEnvironment) RunHostQuiet(ctx context.Context, name string, args ...string) error {
 	return runHostQuietCommand(ctx, name, args...)
 }
@@ -238,6 +243,10 @@ func (environment imageEnvironment) HostTrustEnabled() bool {
 
 func (environment imageEnvironment) ResolveHostTrust(ctx context.Context) (hosttrust.Snapshot, error) {
 	return environment.manager.resolveHostTrust(ctx)
+}
+
+func (environment imageEnvironment) ResolveBuildTrust(ctx context.Context) (hosttrust.Snapshot, error) {
+	return environment.manager.resolveBuildTrust(ctx)
 }
 
 func (environment imageEnvironment) WriteHostTrustBuildInputs(buildContext string, snapshot hosttrust.Snapshot) error {
@@ -303,6 +312,17 @@ func runHostOutput(ctx context.Context, name string, args ...string) (string, er
 		return "", fmt.Errorf("%s %s failed: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return string(output), nil
+}
+
+func runHostOutputTo(ctx context.Context, output io.Writer, name string, args ...string) error {
+	command := exec.CommandContext(ctx, name, args...)
+	var stderr strings.Builder
+	command.Stdout = output
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("%s %s failed: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 func runHostQuiet(ctx context.Context, name string, args ...string) error {

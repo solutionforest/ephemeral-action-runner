@@ -108,9 +108,9 @@ Startup reports a template identity/digest mismatch, policy-generation drift, an
 
 ### Diagnosis and remediation
 
-Docker Sandboxes uses an explicit local Candidate A template, full OCI configuration digest, and host-global Balanced-policy fingerprint. A mutable tag, a template copied from another host, a changed template digest, or a changed policy generation is intentionally rejected. Return to the wizard or the documented template promotion procedure to obtain a fresh, locally verified configuration; do not weaken the fingerprint or replace it with a guessed value.
+Docker Sandboxes resolves the configured source selector, records the exact OCI identities in a local artifact receipt, and verifies the host-global policy fingerprint. If the desired source, platform, scripts, template inputs, runner inputs, or trust inputs change, rerun `./start`; EPAR builds and imports a replacement and activates it only after exact readback succeeds.
 
-Capacity admission accounts for the configured root disk, inner Docker disk, per-sandbox memory, concurrent creation limit, and host-free reserve. Inspect the storage location reported by the failure and free or expand the relevant backing storage. The minimums are `20GiB` root disk, `100GiB` Docker disk, and `50GiB` host free space; runtime can require more. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
+Capacity admission accounts for estimated incremental physical growth on each measurable backing filesystem plus the fixed `storage.minimumFree` reserve. Docker Sandboxes root and inner-Docker sizes are independent sparse logical maxima and are not added as immediate host usage. Inspect the reported physical surface, run the matching `storage status` and prune-preview commands, or deliberately retry only that invocation with `--allow-insufficient-storage`. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
 
 `networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
 
@@ -160,7 +160,19 @@ HTTPS access fails with `curl: (60)`, `certificate verification failed`, or an u
 
 ### Diagnosis and remediation
 
-Do not disable certificate verification. Configure host trust overlay for an ephemeral runner and rebuild the image:
+Do not disable certificate verification. First identify which trust boundary failed.
+
+For an EPAR Buildx failure, leave `image.hostTrustMode` unchanged. EPAR automatically supplies host system roots to its project-owned builder and prints the full build transcript path before `docker buildx build`. The console and error report include a bounded redacted tail. Inspect the underlying `x509` line together with the registry host, builder identity, and active trust generation:
+
+```powershell
+docker buildx ls
+Get-Content .local/storage/buildx.json
+Get-Content .local/storage/buildkitd.toml
+```
+
+The owned metadata records the exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in Docker Desktop, OrbStack, or Docker Engine because builder trust cannot repair host-daemon trust.
+
+Configure runner overlay only when jobs inside an ephemeral runner must inherit host roots:
 
 ```yaml
 image:
@@ -168,7 +180,7 @@ image:
   hostTrustScopes: [system, user]
 ```
 
-Use `[system]` on Linux. Overlay mode collects the current host roots, validates them before registration, and combines them with Ubuntu roots and any `image.trustedCaCertificatePaths`; it is root-anchor inheritance rather than exact Windows/macOS TLS-policy emulation. It requires `runner.ephemeral: true`.
+Use `[system]` on Linux. Overlay mode collects the current host roots, validates them before registration, and combines them with Ubuntu roots and any `image.trustedCaCertificatePaths`; it is root-anchor inheritance rather than exact Windows/macOS TLS-policy emulation. It requires `runner.ephemeral: true`. Omitted or disabled mode remains valid for Docker Sandboxes and does not install the job-start trust hook.
 
 Use the normal host entry point so EPAR can inspect the real Windows certificate stores or macOS Keychain:
 
@@ -177,7 +189,7 @@ Use the normal host entry point so EPAR can inspect the real Windows certificate
 go run ./cmd/ephemeral-action-runner image build --replace
 ```
 
-On no-Go Windows, use `scripts\run-with-docker.ps1 image build --replace`; on macOS/Linux, use `scripts/run-with-docker.sh image build --replace`. A bare Linux toolchain container is not a replacement for the host-trust bridge. If the source-image `docker pull` itself fails, configure the authorized CA in Docker Desktop, OrbStack, or Docker Engine first.
+On no-Go Windows, use `scripts\run-with-docker.ps1 image build --replace`; on macOS/Linux, use `scripts/run-with-docker.sh image build --replace`. These wrappers publish the separate native-host build feed for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. A bare Linux toolchain container is not a replacement for that bridge.
 
 ## Windows Docker Desktop WSL2 disk is smaller than expected
 

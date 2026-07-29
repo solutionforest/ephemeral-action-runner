@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,6 +56,9 @@ type Provider struct {
 	runCommand      runCommandFunc
 	inspectImage    inspectImageFunc
 	inspectTemplate inspectLocalTemplateFunc
+	activeMu        sync.RWMutex
+	activeTemplate  provider.TemplateArtifact
+	dryRun          bool
 }
 
 type instanceReceipt struct {
@@ -106,20 +110,26 @@ type inspectImageFunc func(context.Context, string) (string, error)
 type inspectLocalTemplateFunc func(context.Context, string) (LocalTemplateImage, error)
 
 func New(binary string) *Provider {
+	return NewWithDryRun(binary, false)
+}
+
+func NewWithDryRun(binary string, dryRun bool) *Provider {
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary}
+	return &Provider{Binary: binary, dryRun: dryRun}
 }
 
-// EnsureArtifacts records that Docker Sandboxes templates are built and
-// imported explicitly. Create verifies the exact configured template digest
-// against the provider cache before it allocates an instance.
-func (*Provider) EnsureArtifacts(_ context.Context, dryRun bool) (bool, error) {
-	if dryRun {
-		return true, fmt.Errorf("docker-sandboxes does not support dry-run because the exact prewarmed template must be read back from sbx")
-	}
-	return true, nil
+// StartDaemon asks Docker Sandboxes to start its host daemon in the
+// background. The command is intentionally exact so onboarding cannot invoke
+// other daemon mutations through this path.
+func (p *Provider) StartDaemon(ctx context.Context) error {
+	_, err := p.run(ctx, commandRequest{
+		args:        []string{"daemon", "start", "--detach"},
+		operation:   "start docker sandboxes daemon",
+		outputLimit: diagnosticOutputLimit,
+	})
+	return err
 }
 
 // VerifyHostReadiness requires machine-readable Docker Sandboxes diagnostics
@@ -140,6 +150,19 @@ func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, erro
 }
 
 func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (provider.Instance, error) {
+	if p.dryRun {
+		return provider.Instance{}, fmt.Errorf("docker-sandboxes does not support dry-run instance creation because exact sandbox and template-cache readback is required")
+	}
+	if request.Template == "" && request.TemplateDigest == "" {
+		p.activeMu.RLock()
+		active := p.activeTemplate
+		p.activeMu.RUnlock()
+		request.Template = active.Reference
+		request.TemplateDigest = active.Digest
+		if request.RootDisk == "auto" {
+			request.RootDisk = active.RootDisk
+		}
+	}
 	if err := validateCreateRequest(request); err != nil {
 		return provider.Instance{}, err
 	}
@@ -231,6 +254,58 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		}
 	}
 	return provider.Instance{}, fmt.Errorf("docker sandbox was not present in inventory after create")
+}
+
+// ImportTemplate performs the one exact provider mutation required after the
+// shared image coordinator has built and verified a local template archive.
+func (p *Provider) ImportTemplate(ctx context.Context, archivePath string) error {
+	if archivePath == "" || strings.ContainsRune(archivePath, 0) {
+		return fmt.Errorf("Docker Sandboxes template archive path is required")
+	}
+	info, err := os.Lstat(archivePath)
+	if err != nil {
+		return fmt.Errorf("inspect Docker Sandboxes template archive: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("Docker Sandboxes template archive must be a regular file")
+	}
+	if _, err := p.run(ctx, commandRequest{
+		args:        []string{"template", "load", archivePath},
+		operation:   "load exact Docker Sandboxes runner template",
+		outputLimit: diagnosticOutputLimit,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *Provider) VerifyTemplate(ctx context.Context, artifact provider.TemplateArtifact) error {
+	if artifact.Reference == "" || !validFullTemplateDigest(artifact.Digest) {
+		return fmt.Errorf("Docker Sandboxes template reference and digest are required")
+	}
+	if artifact.CacheID != strings.TrimPrefix(artifact.Digest, "sha256:")[:12] {
+		return fmt.Errorf("Docker Sandboxes template cache ID does not match its full digest")
+	}
+	return p.verifyCachedTemplate(ctx, artifact.Reference, artifact.Digest)
+}
+
+func (p *Provider) ActivateTemplate(artifact provider.TemplateArtifact) error {
+	if artifact.Reference == "" || !validFullTemplateDigest(artifact.Digest) {
+		return fmt.Errorf("cannot activate an invalid Docker Sandboxes template identity")
+	}
+	if artifact.CacheID != strings.TrimPrefix(artifact.Digest, "sha256:")[:12] {
+		return fmt.Errorf("cannot activate a Docker Sandboxes template with a mismatched cache ID")
+	}
+	if artifact.Platform != "linux/amd64" && artifact.Platform != "linux/arm64" {
+		return fmt.Errorf("cannot activate a Docker Sandboxes template for unsupported platform %q", artifact.Platform)
+	}
+	if !sizePattern.MatchString(artifact.RootDisk) {
+		return fmt.Errorf("cannot activate a Docker Sandboxes template without a resolved root-disk size")
+	}
+	p.activeMu.Lock()
+	p.activeTemplate = artifact
+	p.activeMu.Unlock()
+	return nil
 }
 
 // VerifyAdmission fail-closes on provider-wide channels Docker Sandboxes can
@@ -868,6 +943,9 @@ func validateCommandRequest(request commandRequest) error {
 	if request.args[0] == "ports" && (len(request.args) != 3 || !sandboxNamePattern.MatchString(request.args[1]) || request.args[2] != "--json") {
 		return fmt.Errorf("only exact machine-readable published-port absence verification is permitted")
 	}
+	if request.args[0] == "daemon" && (len(request.args) != 3 || !((request.args[1] == "status" && request.args[2] == "--json") || (request.args[1] == "start" && request.args[2] == "--detach"))) {
+		return fmt.Errorf("only exact daemon status or detached-start operations are permitted")
+	}
 	for _, arg := range request.args {
 		if strings.ContainsRune(arg, 0) {
 			return fmt.Errorf("docker sandboxes argument contains a null byte")
@@ -963,3 +1041,4 @@ var _ provider.Lifecycle = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)
+var _ provider.TemplateArtifactRuntime = (*Provider)(nil)

@@ -12,10 +12,14 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
-const maximumTemplateMetadataBytes = 4 << 20
+const (
+	maximumTemplateMetadataBytes = 4 << 20
+	templateMetadataSchema       = 4
+)
 
 var (
 	templateDigestPattern  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -36,16 +40,17 @@ type templateMetadata struct {
 	Profile       string `json:"profile"`
 	Platform      string `json:"platform"`
 	Template      struct {
-		Tag            string `json:"tag"`
-		Digest         string `json:"digest"`
-		TemplateDigest string `json:"templateDigest"`
-		CacheID        string `json:"cacheID"`
-		Archive        string `json:"archive"`
-		ArchiveSHA256  string `json:"archiveSha256"`
-		ArchiveBytes   uint64 `json:"archiveBytes"`
+		Tag           string `json:"tag"`
+		Digest        string `json:"digest"`
+		CacheID       string `json:"cacheID"`
+		RootDisk      string `json:"rootDisk"`
+		Archive       string `json:"archive"`
+		ArchiveSHA256 string `json:"archiveSha256"`
+		ArchiveBytes  uint64 `json:"archiveBytes"`
 	} `json:"template"`
 	Compatibility struct {
-		Candidate                 string `json:"candidate"`
+		TemplateSchemaVersion     int    `json:"templateSchemaVersion"`
+		RunnerExecution           string `json:"runnerExecution"`
 		DockerDaemonOwner         string `json:"dockerDaemonOwner"`
 		ExpectedDockerDaemonCount int    `json:"expectedDockerDaemonCount"`
 	} `json:"compatibility"`
@@ -189,8 +194,8 @@ func inspectTemplateDirectory(path string) (templateRecord, storage.Artifact, er
 }
 
 func validateTemplateMetadata(metadata templateMetadata) error {
-	if metadata.SchemaVersion != 2 {
-		return fmt.Errorf("template metadata schemaVersion must be 2")
+	if metadata.SchemaVersion != templateMetadataSchema {
+		return fmt.Errorf("template metadata schemaVersion must be %d", templateMetadataSchema)
 	}
 	if !templateProfilePattern.MatchString(metadata.Profile) {
 		return fmt.Errorf("template metadata profile is invalid")
@@ -198,11 +203,15 @@ func validateTemplateMetadata(metadata templateMetadata) error {
 	if metadata.Platform != "linux/amd64" && metadata.Platform != "linux/arm64" {
 		return fmt.Errorf("template metadata platform is invalid")
 	}
-	if !templateTagPattern.MatchString(metadata.Template.Tag) || !templateDigestPattern.MatchString(metadata.Template.Digest) || !templateDigestPattern.MatchString(metadata.Template.TemplateDigest) || !templateCacheIDPattern.MatchString(metadata.Template.CacheID) {
-		return fmt.Errorf("template metadata contains an invalid tag, digest, template identity, or cache ID")
+	if !templateTagPattern.MatchString(metadata.Template.Tag) || !templateDigestPattern.MatchString(metadata.Template.Digest) || !templateCacheIDPattern.MatchString(metadata.Template.CacheID) {
+		return fmt.Errorf("template metadata contains an invalid tag, digest, or cache ID")
 	}
-	if metadata.Template.CacheID != strings.TrimPrefix(metadata.Template.TemplateDigest, "sha256:")[:12] {
-		return fmt.Errorf("template metadata cache ID does not match template identity")
+	if metadata.Template.CacheID != strings.TrimPrefix(metadata.Template.Digest, "sha256:")[:12] {
+		return fmt.Errorf("template metadata cache ID does not match image digest")
+	}
+	rootDisk, err := config.ParseByteSize(metadata.Template.RootDisk)
+	if err != nil || rootDisk < int64(20*storage.GiB) {
+		return fmt.Errorf("template metadata root disk is invalid")
 	}
 	if !templateArchivePattern.MatchString(metadata.Template.Archive) || filepath.Base(metadata.Template.Archive) != metadata.Template.Archive {
 		return fmt.Errorf("template metadata archive is not an exact basename")
@@ -210,8 +219,8 @@ func validateTemplateMetadata(metadata templateMetadata) error {
 	if !templateDigestPattern.MatchString(metadata.Template.ArchiveSHA256) || metadata.Template.ArchiveBytes == 0 {
 		return fmt.Errorf("template metadata archive digest or size is invalid")
 	}
-	if metadata.Compatibility.Candidate != "A" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 {
-		return fmt.Errorf("template metadata compatibility does not preserve the Candidate A runtime contract")
+	if metadata.Compatibility.TemplateSchemaVersion != 1 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 {
+		return fmt.Errorf("template metadata compatibility does not preserve the Docker Sandboxes runner runtime contract")
 	}
 	return nil
 }
@@ -244,7 +253,7 @@ func applyTemplateSelections(records []templateRecord, selections []TemplateSele
 		var matches []int
 		for index := range records {
 			record := records[index]
-			if (selection.Profile == "" || record.metadata.Profile == selection.Profile) && (selection.Platform == "" || record.metadata.Platform == selection.Platform) && normalizedTemplateTag(record.metadata.Template.Tag) == normalizedTemplateTag(selection.Tag) && record.metadata.Template.TemplateDigest == selection.TemplateDigest && (selection.MetadataSHA256 == "" || record.metadataSHA256 == selection.MetadataSHA256) {
+			if (selection.Profile == "" || record.metadata.Profile == selection.Profile) && (selection.Platform == "" || record.metadata.Platform == selection.Platform) && normalizedTemplateTag(record.metadata.Template.Tag) == normalizedTemplateTag(selection.Tag) && record.metadata.Template.Digest == selection.TemplateDigest && (selection.MetadataSHA256 == "" || record.metadataSHA256 == selection.MetadataSHA256) {
 				matches = append(matches, index)
 			}
 		}

@@ -15,7 +15,7 @@ import (
 	sandboxfs "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/staging"
 )
 
-func TestLiveCandidateAIsolation(t *testing.T) {
+func TestLiveRunnerTemplateIsolation(t *testing.T) {
 	if os.Getenv("EPAR_LIVE_DOCKER_SANDBOXES") != "1" {
 		t.Skip("set EPAR_LIVE_DOCKER_SANDBOXES=1 to run the destructive live Docker Sandboxes proof")
 	}

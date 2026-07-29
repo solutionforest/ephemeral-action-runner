@@ -10,13 +10,13 @@ func TestDerivePromotionRequirementsFromMeasuredGuestUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := requirements.RootDisk, 110*GiB; got != want {
+	if got, want := requirements.RootDisk, 100*GiB; got != want {
 		t.Fatalf("root disk = %d, want %d", got, want)
 	}
-	if got, want := requirements.DockerDisk, 120*GiB; got != want {
+	if got, want := requirements.DockerDisk, DefaultDockerDisk; got != want {
 		t.Fatalf("Docker disk = %d, want %d", got, want)
 	}
-	if got, want := requirements.MinHostFreeSpace, 200*GiB; got != want {
+	if got, want := requirements.MinHostFreeSpace, MinimumHostFreeSpace; got != want {
 		t.Fatalf("host watermark = %d, want %d", got, want)
 	}
 }
@@ -54,7 +54,7 @@ func TestDeriveEnforcesAbsoluteFloors(t *testing.T) {
 	if got, want := requirements.RootDisk, 30*GiB; got != want {
 		t.Fatalf("root disk = %d, want %d", got, want)
 	}
-	if got, want := requirements.DockerDisk, MinimumDockerDisk; got != want {
+	if got, want := requirements.DockerDisk, DefaultDockerDisk; got != want {
 		t.Fatalf("Docker disk = %d, want %d", got, want)
 	}
 	if got, want := requirements.MinHostFreeSpace, MinimumHostFreeSpace; got != want {
@@ -69,7 +69,6 @@ func TestDeriveRejectsMissingAndOverflowingEvidence(t *testing.T) {
 	}{
 		{name: "template", template: 0, peak: GiB, disk: GiB},
 		{name: "peak", template: GiB, peak: 0, disk: GiB},
-		{name: "volume", template: GiB, peak: GiB, disk: 0},
 		{name: "overflow", template: math.MaxUint64, peak: GiB, disk: GiB},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -80,15 +79,15 @@ func TestDeriveRejectsMissingAndOverflowingEvidence(t *testing.T) {
 	}
 }
 
-func TestHostWatermarkUsesStrongestFloor(t *testing.T) {
+func TestHostWatermarkUsesFixedConfiguredReserve(t *testing.T) {
 	tests := []struct {
 		name       string
 		configured uint64
 		volume     uint64
 		want       uint64
 	}{
-		{name: "absolute floor", volume: 100 * GiB, want: 50 * GiB},
-		{name: "volume percentage", volume: 2_000 * GiB, want: 200 * GiB},
+		{name: "two terabyte volume uses fixed default", volume: 2_000 * GiB, want: 1 * GiB},
+		{name: "twenty terabyte volume uses fixed default", volume: 20_000 * GiB, want: 1 * GiB},
 		{name: "configured strengthening", configured: 250 * GiB, volume: 2_000 * GiB, want: 250 * GiB},
 	}
 	for _, test := range tests {
@@ -102,8 +101,8 @@ func TestHostWatermarkUsesStrongestFloor(t *testing.T) {
 			}
 		})
 	}
-	if _, err := HostWatermark(0, 0); err == nil {
-		t.Fatal("HostWatermark accepted a zero-sized backing volume")
+	if got, err := HostWatermark(0, 0); err != nil || got != MinimumHostFreeSpace {
+		t.Fatalf("HostWatermark(0, 0) = %d, %v; want fixed default", got, err)
 	}
 }
 
@@ -125,7 +124,7 @@ func TestAdmissionAccountsForReservationsAndWatermark(t *testing.T) {
 		mutate func(*Admission)
 	}{
 		{name: "concurrency", mutate: func(a *Admission) { a.ActiveCreates = 2 }},
-		{name: "weak watermark", mutate: func(a *Admission) { a.MinHostFreeSpace = 49 * GiB }},
+		{name: "weak watermark", mutate: func(a *Admission) { a.MinHostFreeSpace = 0 }},
 		{name: "uncertain reservations", mutate: func(a *Admission) { a.ReservedBytes = 450 * GiB }},
 		{name: "post-reservation watermark", mutate: func(a *Admission) { a.RequestedBytes = 250 * GiB }},
 	}

@@ -92,11 +92,14 @@ func (contribution *filesystemStorage) StorageSnapshot(_ context.Context, reques
 			kind = storage.SurfaceHostFilesystem
 		}
 		snapshot.Surfaces = append(snapshot.Surfaces, storage.Surface{
-			ID:       specification.ID,
-			Provider: contribution.providerType,
-			Kind:     kind,
-			Location: root,
-			Capacity: capacity,
+			ID:                     specification.ID,
+			Provider:               contribution.providerType,
+			Kind:                   kind,
+			Location:               root,
+			Classification:         "physical",
+			Confidence:             "authoritative-filesystem-probe",
+			AdmissionAuthoritative: true,
+			Capacity:               capacity,
 		})
 		if !requiredForOperation {
 			continue

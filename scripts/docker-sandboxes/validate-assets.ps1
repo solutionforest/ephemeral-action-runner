@@ -3,7 +3,8 @@ param(
     [ValidateSet('linux/amd64', 'linux/arm64')]
     [string]$Platform = 'linux/amd64',
     [switch]$VerifyRemote,
-    [switch]$DockerfileCheck
+    [switch]$DockerfileCheck,
+    [string]$Builder
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,7 +135,7 @@ foreach ($profileName in $expectedProfiles.Keys) {
     Assert-Equal "$profileName superseded record authority" $supersededRecord.authoritative $false
     Assert-Equal "$profileName superseded amd64 manifest" $supersededRecord.manifestDigest $expectedProfile.legacyManifest
     Assert-Equal "$profileName superseded template tag" $supersededRecord.templateTag $expectedProfile.legacyTag
-    Assert-Equal "$profileName superseded reason" $supersededRecord.reason 'Predates current Candidate A helper and architecture changes'
+    Assert-Equal "$profileName superseded reason" $supersededRecord.reason 'Predates the current runner-template helper and architecture changes'
     if ($supersededRecord.PSObject.Properties.Name -contains 'validationStatus') {
         throw "$profileName superseded record must not carry a current validation status"
     }
@@ -197,7 +198,7 @@ foreach ($required in @(
 if ($dockerfile -match '(?im)apt-get\s+update|(?im)\blatest\b|(?im)COPY\s+.*var/lib/docker|(?im)--privileged|(?im)--secret') {
     throw 'Dockerfile contains an unpinned, privileged, secret, or /var/lib/docker preload pattern'
 }
-foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!hook-launcher/*.go', '!profiles/*.compatibility.json')) {
+foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!hook-launcher/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
     if (-not ($dockerignore -split "`r?`n").Contains($requiredContextEntry)) {
         throw ".dockerignore is missing deterministic context entry: $requiredContextEntry"
     }
@@ -225,8 +226,8 @@ foreach ($profileName in $expectedProfiles.Keys) {
         $profilePlatform = $profile.platforms.PSObject.Properties[$platformName].Value
         $compatibilityPath = Join-Path (Join-Path $templateDirectory 'profiles') $profilePlatform.compatibilityFile
         $compatibility = Get-Content -Raw -LiteralPath $compatibilityPath | ConvertFrom-Json
-        Assert-Equal "$profileName $platformName compatibility schema" $compatibility.schemaVersion 1
-        Assert-Equal "$profileName $platformName compatibility candidate" $compatibility.candidate 'A'
+        Assert-Equal "$profileName $platformName compatibility schema" $compatibility.schemaVersion 2
+        Assert-Equal "$profileName $platformName template schema" $compatibility.templateSchemaVersion 1
         Assert-Equal "$profileName $platformName compatibility profile" $compatibility.profile $profileName
         Assert-Equal "$profileName $platformName compatibility status" $compatibility.validationStatus $profilePlatform.validationStatus
         Assert-Equal "$profileName $platformName compatibility platform" $compatibility.platform $platformName
@@ -281,14 +282,28 @@ if ($VerifyRemote) {
     }
 }
 if ($DockerfileCheck) {
+    if ([string]::IsNullOrWhiteSpace($Builder)) {
+        $buildxMetadataPath = Join-Path $repositoryRoot '.local\storage\buildx.json'
+        if (Test-Path -LiteralPath $buildxMetadataPath -PathType Leaf) {
+            $buildxMetadata = Get-Content -Raw -LiteralPath $buildxMetadataPath | ConvertFrom-Json
+            $Builder = [string]$buildxMetadata.builder
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Builder)) {
+        throw 'DockerfileCheck requires the exact EPAR-owned Buildx builder. Run ./start image build first or pass -Builder with that owned builder identity; the validation script will not use Docker''s current/default builder.'
+    }
+    & docker buildx inspect $Builder *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "EPAR-owned Buildx builder '$Builder' is unavailable; the validation script will not fall back to Docker's current/default builder."
+    }
     $platformLock = $lock.platforms.PSObject.Properties[$Platform].Value
     foreach ($profileName in $expectedProfiles.Keys) {
         $profile = $lock.profiles.PSObject.Properties[$profileName].Value
         $profilePlatform = $profile.platforms.PSObject.Properties[$Platform].Value
-        & docker buildx build --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg ("ACTIONS_RUNNER_URL={0}" -f $platformLock.actionsRunner.url) --build-arg ("ACTIONS_RUNNER_SHA256=sha256:{0}" -f $platformLock.actionsRunner.sha256) --build-arg ("TINI_URL={0}" -f $platformLock.tini.url) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
+        & docker buildx build --builder $Builder --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg ("ACTIONS_RUNNER_URL={0}" -f $platformLock.actionsRunner.url) --build-arg ("ACTIONS_RUNNER_SHA256=sha256:{0}" -f $platformLock.actionsRunner.sha256) --build-arg ("TINI_URL={0}" -f $platformLock.tini.url) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
         if ($LASTEXITCODE -ne 0) {
             throw "Dockerfile frontend check failed for $profileName"
         }
     }
 }
-Write-Host 'Docker Sandboxes Candidate A template assets passed validation.'
+Write-Host 'Docker Sandboxes runner-template assets passed validation.'

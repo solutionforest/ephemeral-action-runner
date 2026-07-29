@@ -6,6 +6,12 @@ github:
   webBaseUrl: https://github.com
 
 image:
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  sourcePlatform: linux/amd64
+  runnerVersion: latest
+  customInstallScripts:
+    # - examples/custom-install/install-extra-apt-tools.sh
   hostTrustMode: overlay
   hostTrustScopes: [system]
 
@@ -14,7 +20,7 @@ pool:
   namePrefix: change-me-docker-sandboxes
 
 storage:
-  minimumFree: 20GiB
+  minimumFree: 1GiB
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
@@ -41,10 +47,8 @@ provider:
   # Exact host mapping: Windows/Linux amd64 -> linux/amd64; macOS arm64 -> linux/arm64.
   platform: linux/amd64
 
-# This sample tag is the repository's current linux/amd64 full-template lock. Replace template, templateDigest, and policyGeneration with the exact platform-specific identities printed by the wizard or approved for your environment. templateDigest is the full verified local template ID printed by build-template.ps1.
 dockerSandboxes:
-  template: epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64
-  templateDigest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  # The wizard reads and records the exact active host-global policy fingerprint.
   policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
   networkBaseline: open
   additionalAllow:
@@ -55,11 +59,11 @@ dockerSandboxes:
   stagingRoot: .local/docker-sandboxes-staging
   cpus: 4
   memory: 8GiB
-  # Current full-template recommendation: 309.73MiB measured guest root peak + 25% + 20GiB headroom, rounded up to 10GiB.
-  rootDisk: 30GiB
-  dockerDisk: 100GiB
+  # EPAR derives this sparse logical maximum from the selected image and stores the effective size in the active artifact receipt.
+  rootDisk: auto
+  # Independent sparse workload capacity for Docker inside the sandbox.
+  dockerDisk: 50GiB
   maxConcurrentCreates: 2
-  minHostFreeSpace: 50GiB
 
 timeouts:
   bootSeconds: 180

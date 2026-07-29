@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/exec"
 	"regexp"
@@ -126,7 +125,7 @@ func RunPreflight(ctx context.Context, record Record, opts PreflightOptions) Pre
 		case overflow:
 			add("resource availability", "the promoted disk reservation overflows the supported byte range", "Use Docker Container and report the invalid promotion record.")
 		case space.AvailableBytes < required:
-			add("resource availability", fmt.Sprintf("Docker Sandboxes storage free space is %d bytes; at least %d bytes are required for one promoted root disk, Docker disk, and the stronger of the promoted watermark or 10%% of the %d-byte provider-storage volume", space.AvailableBytes, required, space.TotalBytes), "Free space on the Docker Sandboxes provider-storage volume, then rerun setup.")
+			add("resource availability", fmt.Sprintf("Docker Sandboxes storage free space is %d bytes; the configured fixed reserve requires at least %d bytes on the %d-byte provider-storage volume", space.AvailableBytes, required, space.TotalBytes), "Free space on the Docker Sandboxes provider-storage volume, then rerun setup.")
 		}
 	}
 	if opts.RunSBX == nil {
@@ -193,14 +192,7 @@ func requiredHostFreeBytes(record Record, backingVolumeSize uint64) (uint64, boo
 	if err != nil {
 		return 0, true
 	}
-	if record.RootDiskBytes > math.MaxUint64-record.DockerDiskBytes {
-		return 0, true
-	}
-	required := record.RootDiskBytes + record.DockerDiskBytes
-	if required > math.MaxUint64-watermark {
-		return 0, true
-	}
-	return required + watermark, false
+	return watermark, false
 }
 
 func runSBXCommand(ctx context.Context, args []string) ([]byte, error) {

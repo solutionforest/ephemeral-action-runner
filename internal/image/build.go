@@ -74,10 +74,17 @@ func (m *Coordinator) UpdateUpstream(ctx context.Context) error {
 }
 
 func (m *Coordinator) BuildImage(ctx context.Context, opts ImageBuildOptions) error {
-	if err := m.preflightStorage("image-build", imageBuildExpansionBytes); err != nil {
-		return err
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		return m.ensureDockerSandboxesTemplate(ctx, true)
 	}
 	if err := m.validateTrustedCACertificates(); err != nil {
+		return err
+	}
+	plan, err := m.configuredArtifactStoragePlan(ctx, false)
+	if err != nil {
+		return err
+	}
+	if err := m.preflightStorage("image-build", plan.EstimatedIncrementalPeak); err != nil {
 		return err
 	}
 	upstreamDir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
@@ -118,7 +125,7 @@ func (m *Coordinator) buildDockerContainerImageUntimed(ctx context.Context, opts
 			return fmt.Errorf("docker image %s already exists; rerun with --replace", m.Config.Image.OutputImage)
 		}
 	}
-	builder, err := m.ensureBuildxBuilder(ctx)
+	builder, err := m.ensureBuildxBuilder(ctx, []string{m.Config.Image.SourceImage, "docker.io/docker/dockerfile:1"})
 	if err != nil {
 		return err
 	}

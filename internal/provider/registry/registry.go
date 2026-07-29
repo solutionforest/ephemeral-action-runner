@@ -34,7 +34,7 @@ type entry struct {
 
 var entries = []entry{
 	{
-		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker},
+		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles()},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
 			environment := map[string]string{
@@ -46,14 +46,29 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "docker-sandboxes", DisplayName: "Docker Sandboxes", WizardSupported: true, WizardNumber: "2", WizardLabel: "Docker Sandboxes — recommended when ready", WizardAliases: []string{"docker-sandboxes", "sandboxes"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeTemplate},
-		factory: func(cfg config.Config, projectRoot string, _ bool) Runtime {
-			sandboxes := dockersandboxes.New("")
+		descriptor: provider.Descriptor{
+			Type:                   "docker-sandboxes",
+			DisplayName:            "Docker Sandboxes",
+			WizardSupported:        true,
+			WizardNumber:           "2",
+			WizardLabel:            "Docker Sandboxes — recommended when ready",
+			WizardAliases:          []string{"docker-sandboxes", "sandboxes"},
+			ConfigurationDecoder:   true,
+			ConfigurationDefaults:  true,
+			ConfigurationValidator: true,
+			LifecycleSupported:     true,
+			StorageSupported:       true,
+			ImageMode:              provider.ImageModeTemplate,
+			GuidedArtifacts:        true,
+			WizardImageProfiles:    catthehackerProfiles(),
+		},
+		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
+			sandboxes := dockersandboxes.NewWithDryRun("", dryRun)
 			return Runtime{Lifecycle: sandboxes, PolicyManager: sandboxes, Storage: providerStorage(cfg, projectRoot)}
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker},
+		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles()},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			installRoot := config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)
 			return adaptLegacy(wsl.New("", installRoot, projectRoot, dryRun), providerStorage(cfg, projectRoot), dryRun)
@@ -67,11 +82,21 @@ var entries = []entry{
 	},
 }
 
+func catthehackerProfiles() []provider.WizardImageProfile {
+	return []provider.WizardImageProfile{
+		{Name: "full", Tag: "full-latest"},
+		{Name: "act", Tag: "act-latest"},
+		{Name: "dotnet", Tag: "dotnet-latest"},
+		{Name: "js", Tag: "js-latest"},
+	}
+}
+
 func Descriptors() []provider.Descriptor {
 	result := make([]provider.Descriptor, 0, len(entries))
 	for _, registered := range entries {
 		descriptor := registered.descriptor
 		descriptor.WizardAliases = append([]string(nil), descriptor.WizardAliases...)
+		descriptor.WizardImageProfiles = append([]provider.WizardImageProfile(nil), descriptor.WizardImageProfiles...)
 		result = append(result, descriptor)
 	}
 	return result
@@ -82,6 +107,7 @@ func DescriptorFor(providerType string) (provider.Descriptor, bool) {
 		if registered.descriptor.Type == providerType {
 			descriptor := registered.descriptor
 			descriptor.WizardAliases = append([]string(nil), descriptor.WizardAliases...)
+			descriptor.WizardImageProfiles = append([]provider.WizardImageProfile(nil), descriptor.WizardImageProfiles...)
 			return descriptor, true
 		}
 	}
@@ -112,9 +138,17 @@ func New(cfg config.Config, projectRoot string, dryRun bool) (Runtime, error) {
 	if !descriptor.WizardSupported || descriptor.WizardNumber == "" || descriptor.WizardLabel == "" || len(descriptor.WizardAliases) == 0 || !descriptor.ConfigurationDecoder || !descriptor.ConfigurationDefaults || !descriptor.ConfigurationValidator || !descriptor.LifecycleSupported || !descriptor.StorageSupported || descriptor.ImageMode == "" {
 		return Runtime{}, fmt.Errorf("provider %q has an incomplete registry entry", cfg.Provider.Type)
 	}
+	if (descriptor.ImageMode == provider.ImageModeTemplate || descriptor.Type == "docker-container" || descriptor.Type == "wsl") && (!descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0) {
+		return Runtime{}, fmt.Errorf("Docker-image-capable provider %q has no guided artifact onboarding contribution", cfg.Provider.Type)
+	}
 	runtime := registered.factory(cfg, projectRoot, dryRun)
 	if runtime.Lifecycle == nil || runtime.Storage == nil {
 		return Runtime{}, fmt.Errorf("provider %q registry entry did not construct required lifecycle and storage behavior", cfg.Provider.Type)
+	}
+	if descriptor.ImageMode == provider.ImageModeTemplate {
+		if _, ok := runtime.Lifecycle.(provider.TemplateArtifactRuntime); !ok {
+			return Runtime{}, fmt.Errorf("template-backed provider %q did not construct required artifact runtime behavior", cfg.Provider.Type)
+		}
 	}
 	return runtime, nil
 }
@@ -126,28 +160,23 @@ func providerStorage(cfg config.Config, projectRoot string) provider.StorageCont
 	case "docker-container":
 		roots = append(roots, provider.StorageRoot{ID: "docker-engine-backing", Kind: storage.SurfaceDockerEngine, Location: dockerBackingRoot()})
 	case "docker-sandboxes":
-		rootDisk, rootErr := config.ParseByteSize(cfg.DockerSandboxes.RootDisk)
-		dockerDisk, dockerErr := config.ParseByteSize(cfg.DockerSandboxes.DockerDisk)
-		sandboxCreateExpansion := uint64(0)
-		if rootErr == nil && dockerErr == nil && rootDisk > 0 && dockerDisk > 0 {
-			sandboxCreateExpansion = uint64(rootDisk) + uint64(dockerDisk)
-		}
 		roots = append(roots,
 			provider.StorageRoot{
 				ID:       "docker-engine-backing",
 				Kind:     storage.SurfaceDockerEngine,
 				Location: dockerBackingRoot(),
 				MinimumExpansions: map[string]uint64{
-					"image-pull":    0,
-					"image-build":   0,
-					"source-update": 0,
+					"image-pull":     0,
+					"image-build":    0,
+					"source-update":  0,
+					"template-build": 0,
 				},
 			},
 			provider.StorageRoot{
 				ID:                "docker-sandboxes-backing",
 				Kind:              storage.SurfaceSandboxCache,
 				Location:          dockerSandboxesBackingRoot(),
-				MinimumExpansions: map[string]uint64{"instance-create": sandboxCreateExpansion},
+				MinimumExpansions: map[string]uint64{"instance-create": 0, "template-build": 0},
 			},
 			provider.StorageRoot{ID: "docker-sandboxes-staging", Location: config.ProjectPath(projectRoot, cfg.DockerSandboxes.StagingRoot)},
 		)

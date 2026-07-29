@@ -2,13 +2,15 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+EPAR_HOST_TRUST_HELPER="${repo_root}/scripts/host-trust/host-trust-feed.sh"
+source "${repo_root}/scripts/host-trust/wrapper-lib.sh"
 go_image="${GO_DOCKER_IMAGE:-golang:1.25}"
 dev_image="${EPAR_DEV_IMAGE:-epar-dev-toolchain}"
 native_cache_keep_previous=5
 native_cache_max_bytes=$((256 * 1024 * 1024))
 native_cache_grace_seconds=$((7 * 24 * 60 * 60))
 abandoned_build_grace_seconds=$((24 * 60 * 60))
-bootstrap_minimum_free_bytes="${EPAR_BOOTSTRAP_MIN_FREE_BYTES:-$((20 * 1024 * 1024 * 1024))}"
+bootstrap_minimum_free_bytes="${EPAR_BOOTSTRAP_MIN_FREE_BYTES:-$((1 * 1024 * 1024 * 1024))}"
 go_cache_limit_bytes="${EPAR_GO_CACHE_LIMIT_BYTES:-$((10 * 1024 * 1024 * 1024))}"
 
 command -v docker >/dev/null 2>&1 || { echo "docker command not found. Install Docker Desktop, Docker Engine, or a compatible Docker host." >&2; exit 1; }
@@ -24,8 +26,12 @@ bootstrap_available_kib="$(df -Pk "$repo_root" | awk 'NR == 2 { print $4 }')"
 [[ "$bootstrap_available_kib" =~ ^[0-9]+$ ]] || { echo "cannot measure bootstrap storage for ${repo_root}" >&2; exit 1; }
 bootstrap_available_bytes=$((bootstrap_available_kib * 1024))
 if ((bootstrap_available_bytes < bootstrap_minimum_free_bytes)); then
-  echo "insufficient bootstrap storage for ${repo_root}: available=${bootstrap_available_bytes} required-reserve=${bootstrap_minimum_free_bytes}. Free space or run 'ephemeral-action-runner storage status' from an existing controller before retrying." >&2
-  exit 1
+  if [[ " $* " == *" --allow-insufficient-storage "* ]]; then
+    echo "WARNING: bootstrap storage is below the ${bootstrap_minimum_free_bytes}-byte reserve; continuing because --allow-insufficient-storage was explicitly supplied." >&2
+  else
+    echo "insufficient bootstrap storage for ${repo_root}: available=${bootstrap_available_bytes} required-reserve=${bootstrap_minimum_free_bytes}. Free space, inspect storage, or retry this invocation with --allow-insufficient-storage." >&2
+    exit 1
+  fi
 fi
 
 epar_ensure_go_cache_volume() {
@@ -314,8 +320,13 @@ export EPAR_NATIVE_CONTROLLER=1
 export EPAR_CONTROLLER_HOST_OS="$goos"
 export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"
 export EPAR_HOST_NAME="${EPAR_HOST_NAME:-$(hostname 2>/dev/null || true)}"
-"$binary" "$@"
-status=$?
+controller_command="${1:-start}"
+epar_host_trust_prepare "$repo_root" "$controller_command" "$@"
+if [[ -n "${EPAR_BUILD_TRUST_FEED_DIR}" ]]; then export EPAR_BUILD_TRUST_FEED="${EPAR_BUILD_TRUST_FEED_DIR}/current.json"; fi
+if [[ -n "${EPAR_RUNNER_TRUST_FEED_DIR}" ]]; then export EPAR_HOST_TRUST_FEED="${EPAR_RUNNER_TRUST_FEED_DIR}/current.json"; fi
+status=0
+"$binary" "$@" || status=$?
+epar_host_trust_cleanup
 cleanup_build
 trap - EXIT INT TERM
 exit "$status"

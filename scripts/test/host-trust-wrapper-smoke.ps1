@@ -109,6 +109,16 @@ image:
         throw 'Windows wrapper quoted mode/block-scope parsing failed'
     }
 
+    $disabledConfig = Join-Path $temporary 'disabled.yml'
+    [System.IO.File]::WriteAllText($disabledConfig, "image:`n  hostTrustMode: disabled`n  hostTrustScopes: [system, user]`n", [System.Text.UTF8Encoding]::new($false))
+    $disabledRunnerFeed = [string](& $helper sync -ProjectRoot $ProjectRoot -Config $disabledConfig -Purpose runner)
+    if ($LASTEXITCODE -ne 0 -or $disabledRunnerFeed) { throw 'disabled runner trust unexpectedly published a feed' }
+    $disabledBuildCurrent = [string](& $helper sync -ProjectRoot $ProjectRoot -Config $disabledConfig -Purpose build)
+    $disabledBuildFeed = Get-Content -LiteralPath $disabledBuildCurrent -Raw | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or @($disabledBuildFeed.scopes).Count -ne 1 -or $disabledBuildFeed.scopes[0] -ne 'system') {
+        throw 'disabled runner trust did not retain automatic system-only build trust'
+    }
+
     Write-Output 'Windows host-trust wrapper lifecycle smoke passed'
 }
 finally {

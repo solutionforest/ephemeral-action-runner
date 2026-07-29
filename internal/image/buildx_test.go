@@ -63,3 +63,67 @@ func TestLoadBuildxMetadataRequiresExactOwnershipFields(t *testing.T) {
 		t.Fatal("LoadBuildxMetadata accepted a shared Docker driver")
 	}
 }
+
+func TestBuildRegistryHostsUsesDockerHubForUnqualifiedImages(t *testing.T) {
+	got, err := buildRegistryHosts([]string{
+		"source:latest",
+		"docker.io/docker/dockerfile:1",
+		"ghcr.io/catthehacker/ubuntu@sha256:abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"docker.io", "ghcr.io"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("registry hosts = %v, want %v", got, want)
+	}
+}
+
+func TestBuildkitConfigIsDeterministicAndEscapesPaths(t *testing.T) {
+	first := buildkitConfig(64<<30, "generation", `C:\repo path\.local\ca.pem`, []string{"docker.io", "ghcr.io"})
+	second := buildkitConfig(64<<30, "generation", `C:\repo path\.local\ca.pem`, []string{"docker.io", "ghcr.io"})
+	if string(first) != string(second) {
+		t.Fatal("BuildKit configuration is not deterministic")
+	}
+	text := string(first)
+	for _, want := range []string{
+		"# epar-build-trust-generation=generation",
+		`[registry."docker.io"]`,
+		`[registry."ghcr.io"]`,
+		`"C:/repo path/.local/ca.pem"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("BuildKit configuration omitted %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestBuildxSchemaOneMetadataIsOwnedButRequiresUpgrade(t *testing.T) {
+	root := t.TempDir()
+	expected := BuildxMetadata{
+		SchemaVersion:     buildxMetadataSchemaVersion,
+		Builder:           buildxBuilderName(root),
+		Driver:            "docker-container",
+		ProjectRoot:       root,
+		CacheLimit:        "64GiB",
+		ConfigPath:        filepath.Join(root, ".local", "storage", "buildkitd.toml"),
+		ConfigSHA256:      strings.Repeat("a", 64),
+		TrustGeneration:   strings.Repeat("b", 64),
+		CertificateBundle: filepath.Join(root, ".local", "storage", "buildkit-certs", "g", "ca.pem"),
+		CertificateSHA256: strings.Repeat("c", 64),
+		RegistryHosts:     []string{"docker.io"},
+	}
+	legacy := expected
+	legacy.SchemaVersion = 1
+	legacy.ConfigSHA256 = ""
+	legacy.TrustGeneration = ""
+	legacy.CertificateBundle = ""
+	legacy.CertificateSHA256 = ""
+	legacy.RegistryHosts = nil
+	if !buildxOwnershipMatches(legacy, expected) {
+		t.Fatal("schema-one EPAR metadata lost exact ownership")
+	}
+	if buildxMetadataMatches(legacy, expected) {
+		t.Fatal("schema-one EPAR metadata did not require an owned builder upgrade")
+	}
+}

@@ -114,6 +114,25 @@ type ArtifactManager interface {
 	EnsureArtifacts(ctx context.Context, dryRun bool) (handled bool, err error)
 }
 
+// TemplateArtifact is the exact immutable reusable artifact selected by the
+// shared image coordinator for a template-backed provider.
+type TemplateArtifact struct {
+	Reference string `json:"reference"`
+	Digest    string `json:"digest"`
+	CacheID   string `json:"cacheId"`
+	Platform  string `json:"platform"`
+	RootDisk  string `json:"rootDisk,omitempty"`
+}
+
+// TemplateArtifactRuntime exposes only provider-specific template-cache
+// integration. Source resolution, builds, manifests, receipts, and retention
+// remain owned by the shared image and storage packages.
+type TemplateArtifactRuntime interface {
+	ImportTemplate(ctx context.Context, archivePath string) error
+	VerifyTemplate(ctx context.Context, artifact TemplateArtifact) error
+	ActivateTemplate(artifact TemplateArtifact) error
+}
+
 // StorageContribution is required for every registered provider. It describes
 // the provider's measurable capacity surface and operation expansion before
 // the shared pool performs provider side effects.

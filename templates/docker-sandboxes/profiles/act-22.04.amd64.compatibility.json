@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "candidate": "A",
+  "schemaVersion": 2,
+  "templateSchemaVersion": 1,
   "profile": "act-22.04",
   "validationStatus": "planned",
   "platform": "linux/amd64",

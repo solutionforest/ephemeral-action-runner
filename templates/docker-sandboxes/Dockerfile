@@ -27,34 +27,40 @@ ARG SOURCE_MANIFEST_DIGEST=sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8
 ARG SOURCE_REVISION=e2f8efe464c82732f78e967ee709c00b6af53643
 ARG TEMPLATE_VERSION=20260723-r4-amd64
 ARG COMPATIBILITY_FILE=act-22.04.amd64.compatibility.json
-ARG ACTIONS_RUNNER_URL=https://github.com/actions/runner/releases/download/v2.332.0/actions-runner-linux-x64-2.332.0.tar.gz
 ARG ACTIONS_RUNNER_SHA256=sha256:f2094522a6b9afeab07ffb586d1eb3f190b6457074282796c497ce7dce9e0f2a
-ARG TINI_URL=https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64
 ARG TINI_SHA256=sha256:93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c
 
 USER root
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 COPY guest/ /opt/epar/
+COPY custom-install/ /opt/epar/custom-install/
+COPY host-trust-certificates/ /usr/local/share/ca-certificates/epar-host/
+COPY trusted-ca-certificates/ /usr/local/share/ca-certificates/epar/
+COPY host-trust-metadata/ /opt/epar/
 COPY helpers.sha256 /opt/epar/helpers.sha256
 COPY profiles/${COMPATIBILITY_FILE} /opt/epar/template-compatibility.json
 COPY --from=hook-builder --chmod=0555 /out/epar-hook-bash /opt/epar/hook-bin/bash
-
-ADD --chmod=0755 --checksum=${TINI_SHA256} ${TINI_URL} /usr/local/bin/tini
-ADD --checksum=${ACTIONS_RUNNER_SHA256} ${ACTIONS_RUNNER_URL} /tmp/actions-runner.tar.gz
+COPY --chmod=0755 inputs/tini /usr/local/bin/tini
+COPY inputs/actions-runner.tar.gz /tmp/actions-runner.tar.gz
 
 RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && [[ "${TARGETOS}" == "linux" ]] \
     && [[ "${TARGETARCH}" == "amd64" || "${TARGETARCH}" == "arm64" ]] \
+    && echo "${TINI_SHA256#sha256:}  /usr/local/bin/tini" | sha256sum --check - \
+    && echo "${ACTIONS_RUNNER_SHA256#sha256:}  /tmp/actions-runner.tar.gz" | sha256sum --check - \
     && cd /opt/epar \
     && sha256sum --check helpers.sha256 \
     && chmod 0555 ./*.sh \
     && /opt/epar/prepare-template.sh \
+    && /opt/epar/install-trusted-ca-certificates.sh \
     && rm -rf /opt/actions-runner \
     && install -d -m 0755 -o agent -g agent /opt/actions-runner /var/log/actions-runner \
     && tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner \
     && rm -f /tmp/actions-runner.tar.gz \
     && chown -R agent:agent /opt/actions-runner /var/log/actions-runner \
+    && chmod 0555 /opt/epar/custom-install/run.sh \
+    && /opt/epar/custom-install/run.sh \
     && sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version | grep -Fx '2.332.0' \
     && /usr/local/bin/tini --version 2>&1 | grep -F 'version 0.19.0'
 
@@ -67,7 +73,10 @@ ENV HOME=/home/agent \
     DEBIAN_FRONTEND=dialog
 
 LABEL com.docker.sandboxes.start-docker=true \
-    io.solutionforest.epar.template.candidate="A" \
+    io.solutionforest.epar.template.schema-version="1" \
+    io.solutionforest.epar.template.runner-execution="direct-actions-listener" \
+    io.solutionforest.epar.template.docker-daemon-owner="docker-sandboxes-runtime" \
+    io.solutionforest.epar.template.expected-docker-daemon-count="1" \
     io.solutionforest.epar.template.profile="${SOURCE_PROFILE}" \
     io.solutionforest.epar.template.platform="${TEMPLATE_PLATFORM}" \
     io.solutionforest.epar.template.runner-version="2.332.0" \

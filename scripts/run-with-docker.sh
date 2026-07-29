@@ -111,11 +111,19 @@ fi
 if [[ "$status" == 0 ]]; then
   epar_host_trust_prepare "${repo_root}" "${controller_command:-start}" "$@" || status=$?
 fi
-if [[ "$status" == 0 && -n "${EPAR_HOST_TRUST_FEED_DIR}" ]]; then
+if [[ "$status" == 0 && ( -n "${EPAR_BUILD_TRUST_FEED_DIR}" || -n "${EPAR_RUNNER_TRUST_FEED_DIR}" ) ]]; then
+  host_trust_docker_flags+=(-e "EPAR_CONTROLLER_HOST_OS=$(epar_host_trust_host_os)")
+fi
+if [[ "$status" == 0 && -n "${EPAR_BUILD_TRUST_FEED_DIR}" ]]; then
   host_trust_docker_flags+=(
-    -e "EPAR_CONTROLLER_HOST_OS=$(epar_host_trust_host_os)"
+    -e "EPAR_BUILD_TRUST_FEED=/run/epar-build-trust/current.json"
+    -v "${EPAR_BUILD_TRUST_FEED_DIR}:/run/epar-build-trust:ro"
+  )
+fi
+if [[ "$status" == 0 && -n "${EPAR_RUNNER_TRUST_FEED_DIR}" ]]; then
+  host_trust_docker_flags+=(
     -e "EPAR_HOST_TRUST_FEED=/run/epar-host-trust/current.json"
-    -v "${EPAR_HOST_TRUST_FEED_DIR}:/run/epar-host-trust:ro"
+    -v "${EPAR_RUNNER_TRUST_FEED_DIR}:/run/epar-host-trust:ro"
   )
 fi
 

@@ -18,7 +18,7 @@ Under the hood, the wrapper calls `scripts/run-with-docker.sh` or `scripts/run-w
 
 ### Host trust
 
-When the selected config enables `image.hostTrustMode: overlay`, the native controller reads trust from the real Windows, macOS, or Linux host. The temporary Go toolchain container only compiles the binary and does not supply runtime trust roots.
+The wrappers publish a short-lived `EPAR_BUILD_TRUST_FEED` from the real Windows, macOS, or Linux host for build-consuming commands, including when `image.hostTrustMode` is disabled. When runner overlay is enabled, they separately publish `EPAR_HOST_TRUST_FEED`. Native controllers can collect directly; the temporary Go toolchain container only compiles the binary and never substitutes its own trust roots for either host policy.
 
 The explicit legacy path `EPAR_LEGACY_CONTROLLER_IN_DOCKER=1` remains available only for compatible providers. That path uses the existing short-lived host-trust bridge and rejects `provider.type: docker-sandboxes`; it is not an automatic fallback.
 

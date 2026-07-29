@@ -5,8 +5,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -17,6 +20,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	imageartifact "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes"
 	sandboxpromotion "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/promotion"
 	providerregistry "github.com/solutionforest/ephemeral-action-runner/internal/provider/registry"
@@ -159,7 +163,7 @@ func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 	if !strings.Contains(string(configText), "replacementRetryInitialSeconds: 15\n  replacementRetryMaxSeconds: 1800\n  replacementRetryMultiplier: 2\n  replacementRetryJitterPercent: 20\n") {
 		t.Fatalf("generated config did not include replacement retry settings:\n%s", configText)
 	}
-	if !strings.Contains(string(configText), "storage:\n  minimumFree: 20GiB\n  gracePeriod: 168h\n  keepPrevious: 0\n  automaticHousekeeping: conservative\n  buildCacheLimit: 64GiB\n  goCacheLimit: 10GiB\n") {
+	if !strings.Contains(string(configText), "storage:\n  minimumFree: 1GiB\n  gracePeriod: 168h\n  keepPrevious: 0\n  automaticHousekeeping: conservative\n  buildCacheLimit: 64GiB\n  goCacheLimit: 10GiB\n") {
 		t.Fatalf("generated config did not include bounded storage settings:\n%s", configText)
 	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-container-catthehacker-ubuntu") {
@@ -471,7 +475,7 @@ func TestInitCanDisableHostTrustOverlay(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\n\nn\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -521,7 +525,7 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\ncustom-prefix\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\ncustom-prefix\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -547,7 +551,7 @@ func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n-bad\nfixed-prefix\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\n-bad\nfixed-prefix\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -772,7 +776,7 @@ func TestInitWSL2ChoiceDefaultsToDockerContainerAndRepromptsInvalidValues(t *tes
 	}
 }
 
-func TestInitDockerSandboxesGeneratesConfigFromDiscoveredTemplate(t *testing.T) {
+func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
 	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
@@ -792,7 +796,7 @@ func TestInitDockerSandboxesGeneratesConfigFromDiscoveredTemplate(t *testing.T) 
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n2\nnot-a-size\n30GiB\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n2\nn\nnot-a-size\n30GiB\n\n\nn\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -808,11 +812,15 @@ func TestInitDockerSandboxesGeneratesConfigFromDiscoveredTemplate(t *testing.T) 
 	if got, want := cfg.Provider.Platform, "linux/amd64"; got != want {
 		t.Fatalf("provider.platform = %q, want %q", got, want)
 	}
-	if got, want := cfg.DockerSandboxes.Template, "docker.io/library/epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64"; got != want {
-		t.Fatalf("dockerSandboxes.template = %q, want %q", got, want)
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:act-latest"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.DockerSandboxes.TemplateDigest, "sha256:"+strings.Repeat("c", 64); got != want {
-		t.Fatalf("dockerSandboxes.templateDigest = %q, want %q", got, want)
+	configContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(configContent), "templateDigest:") || strings.Contains(string(configContent), "\n  template:") {
+		t.Fatalf("generated config retained local template identities:\n%s", configContent)
 	}
 	if got, want := cfg.DockerSandboxes.PolicyGeneration, policyFingerprint; got != want {
 		t.Fatalf("dockerSandboxes.policyGeneration = %q, want %q", got, want)
@@ -821,22 +829,285 @@ func TestInitDockerSandboxesGeneratesConfigFromDiscoveredTemplate(t *testing.T) 
 		t.Fatalf("dockerSandboxes.networkBaseline = %q, want %q", got, want)
 	}
 	for key, values := range map[string]struct{ got, want string }{
-		"rootDisk":         {cfg.DockerSandboxes.RootDisk, "30GiB"},
-		"dockerDisk":       {cfg.DockerSandboxes.DockerDisk, "100GiB"},
-		"minHostFreeSpace": {cfg.DockerSandboxes.MinHostFreeSpace, "50GiB"},
+		"rootDisk":   {cfg.DockerSandboxes.RootDisk, "auto"},
+		"dockerDisk": {cfg.DockerSandboxes.DockerDisk, "50GiB"},
 	} {
 		if values.got != values.want {
 			t.Fatalf("dockerSandboxes.%s = %q, want %q", key, values.got, values.want)
 		}
 	}
-	for _, want := range []string{"Docker Sandboxes — recommended", "provides EPAR's strongest current host boundary", "current host-global Balanced policy", "default to open public HTTP/HTTPS egress with owned deny-wins host-alias guardrails", "Verified local Docker Sandboxes source profiles:", "Catthehacker Ubuntu Full (recommended) — ghcr.io/catthehacker/ubuntu:full-latest", "Catthehacker Ubuntu Act 22.04 (current lean profile) — ghcr.io/catthehacker/ubuntu:act-22.04", "Automatic Docker Sandboxes source refresh is not implemented yet", "Resolved exact EPAR template tag: docker.io/library/epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64", "Resolved full local template digest: sha256:" + strings.Repeat("c", 64), "8GiB on host", "default selection; capacity unmeasured", "Shared host template cache: 4GiB (already present; do not add this byte count arithmetically to each sandbox root disk).", "Measured guest root peak: unavailable", "Sandbox root filesystem total capacity is invalid", "Automatically selected sandbox Docker disk: 100GiB.", "Automatically selected minimum host free space: 50GiB.", "Verified policy fingerprint: " + policyFingerprint} {
+	for _, want := range []string{"Docker Sandboxes image setup:", "Runner base image:", "1. full — full-latest (default)", "2. act — act-latest", "Image catalog:", "Runner artifact estimate (informational; configuration creation is not blocked):", "Source: ghcr.io/catthehacker/ubuntu:act-latest", "Automatic sandbox root limit:"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("init output omitted %q:\n%s", want, out.String())
 		}
 	}
 }
 
-func TestDockerSandboxesPrerequisitesRejectInsufficientMinimumCapacity(t *testing.T) {
+func TestInitDockerSandboxesWritesConfigBeforeOrdinaryProvisioning(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+		Templates:         []initDockerSandboxesTemplate{{Platform: "linux/amd64", Size: 4 << 30}},
+		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+	}, nil)
+	initEnsureDockerSandboxesTemplate = func(context.Context, string, string) error {
+		return errors.New("simulated import readback failure")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	err := runInitWithOptions(initOptions{
+		ProjectRoot:        dir,
+		ConfigPath:         path,
+		SkipDockerCheck:    true,
+		SkipHostTrustCheck: true,
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\n\nn\n"),
+		Out:                io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("runInitWithOptions() error = %v", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("configuration was not created before ordinary provisioning: %v", statErr)
+	}
+}
+
+func TestDockerSandboxesWizardResolvesEveryBuiltInImageChoice(t *testing.T) {
+	for _, test := range []struct {
+		choice string
+		want   string
+	}{
+		{choice: "", want: "ghcr.io/catthehacker/ubuntu:full-latest"},
+		{choice: "1", want: "ghcr.io/catthehacker/ubuntu:full-latest"},
+		{choice: "2", want: "ghcr.io/catthehacker/ubuntu:act-latest"},
+		{choice: "3", want: "ghcr.io/catthehacker/ubuntu:dotnet-latest"},
+		{choice: "4", want: "ghcr.io/catthehacker/ubuntu:js-latest"},
+	} {
+		t.Run(test.want, func(t *testing.T) {
+			stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+				PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+			}, nil)
+			input := test.choice + "\nn\n\n\n"
+			profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, io.Discard, bufio.NewReader(strings.NewReader(input)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !accepted || profile == nil || profile.SourceImage != test.want {
+				t.Fatalf("wizard profile = %+v, accepted=%t, want source %q", profile, accepted, test.want)
+			}
+		})
+	}
+}
+
+func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.T) {
+	for _, providerType := range []string{"docker-container", "docker-sandboxes", "wsl"} {
+		t.Run(providerType, func(t *testing.T) {
+			stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+				PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+			}, nil)
+			var out bytes.Buffer
+			profile, accepted, err := promptDockerImageProfile(context.Background(), t.TempDir(), providerType, sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("\nn\n\n")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !accepted || profile == nil || profile.Provider != providerType || profile.SourceImage != "ghcr.io/catthehacker/ubuntu:full-latest" {
+				t.Fatalf("shared wizard profile = %+v, accepted=%t", profile, accepted)
+			}
+			for _, want := range []string{"1. full — full-latest (default)", "2. act — act-latest", "3. dotnet — dotnet-latest", "4. js — js-latest", "Runner artifact estimate (informational; configuration creation is not blocked):"} {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("%s wizard output omitted %q:\n%s", providerType, want, out.String())
+				}
+			}
+		})
+	}
+}
+
+func TestDockerSandboxesWizardCollectsCustomTagAndInstallScript(t *testing.T) {
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.DarwinARM64, initDockerSandboxesDiscovery{
+		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+	}, nil)
+	projectRoot := t.TempDir()
+	scriptPath := filepath.Join(projectRoot, "scripts", "install-extra.sh")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\nset -euo pipefail\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), projectRoot, sandboxpromotion.DarwinARM64, &out, bufio.NewReader(strings.NewReader("5\ngo-24.04\ny\nscripts/install-extra.sh\nn\n\n\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted || profile == nil || profile.SourceImage != "ghcr.io/catthehacker/ubuntu:go-24.04" || profile.HostPlatform != sandboxpromotion.DarwinARM64 {
+		t.Fatalf("wizard profile = %+v, accepted=%t", profile, accepted)
+	}
+	if len(profile.CustomScripts) != 1 || profile.CustomScripts[0] != "scripts/install-extra.sh" {
+		t.Fatalf("custom scripts = %#v", profile.CustomScripts)
+	}
+	for _, want := range []string{"Scripts run as root", "Do not put secrets", "Platform: linux/arm64", "Custom install scripts: scripts/install-extra.sh"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("wizard output omitted %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestDockerSandboxesWizardRepromptsAfterUnresolvableTag(t *testing.T) {
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+	}, nil)
+	resolver := initResolveDockerSandboxesSource
+	initResolveDockerSandboxesSource = func(ctx context.Context, input, platform string) (imageartifact.ResolvedDockerSource, error) {
+		if input == "missing" {
+			return imageartifact.ResolvedDockerSource{}, errors.New("tag does not exist")
+		}
+		return resolver(ctx, input, platform)
+	}
+	var out bytes.Buffer
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("5\nmissing\n4\nn\n\n\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted || profile == nil || profile.SourceImage != "ghcr.io/catthehacker/ubuntu:js-latest" {
+		t.Fatalf("wizard profile = %+v, accepted=%t", profile, accepted)
+	}
+	if !strings.Contains(out.String(), "That image cannot be used for linux/amd64: tag does not exist") {
+		t.Fatalf("wizard did not explain the failed tag resolution:\n%s", out.String())
+	}
+}
+
+func TestDockerSandboxesWizardConfirmationRefusalReturnsNoProfile(t *testing.T) {
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+	}, nil)
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, io.Discard, bufio.NewReader(strings.NewReader("1\nn\nn\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile != nil || accepted {
+		t.Fatalf("confirmation refusal returned profile=%+v accepted=%t", profile, accepted)
+	}
+}
+
+func TestPrepareDockerSandboxesReadinessStartsInstalledDaemonBeforeDiagnostics(t *testing.T) {
+	oldLookPath := initDockerSandboxesLookPath
+	oldStartDaemon := initDockerSandboxesStartDaemon
+	oldDiagnose := initDockerSandboxesDiagnose
+	t.Cleanup(func() {
+		initDockerSandboxesLookPath = oldLookPath
+		initDockerSandboxesStartDaemon = oldStartDaemon
+		initDockerSandboxesDiagnose = oldDiagnose
+	})
+
+	const binary = `C:\Program Files\Docker\Docker\resources\bin\sbx.exe`
+	var operations []string
+	initDockerSandboxesLookPath = func(name string) (string, error) {
+		if name != "sbx" {
+			t.Fatalf("looked up %q, want sbx", name)
+		}
+		return binary, nil
+	}
+	initDockerSandboxesStartDaemon = func(_ context.Context, actual string) error {
+		if actual != binary {
+			t.Fatalf("daemon binary = %q, want %q", actual, binary)
+		}
+		operations = append(operations, "start")
+		return nil
+	}
+	initDockerSandboxesDiagnose = func(_ context.Context, actual string) (dockersandboxes.HostReadiness, error) {
+		if actual != binary {
+			t.Fatalf("diagnostic binary = %q, want %q", actual, binary)
+		}
+		operations = append(operations, "diagnose")
+		return dockersandboxes.HostReadiness{ChecksPassed: 8}, nil
+	}
+
+	readiness, err := prepareInitDockerSandboxesReadiness(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readiness.ChecksPassed != 8 || !reflect.DeepEqual(operations, []string{"start", "diagnose"}) {
+		t.Fatalf("readiness = %+v, operations = %v", readiness, operations)
+	}
+}
+
+func TestPrepareDockerSandboxesReadinessSkipsDaemonStartWhenSBXIsMissing(t *testing.T) {
+	oldLookPath := initDockerSandboxesLookPath
+	oldStartDaemon := initDockerSandboxesStartDaemon
+	oldDiagnose := initDockerSandboxesDiagnose
+	t.Cleanup(func() {
+		initDockerSandboxesLookPath = oldLookPath
+		initDockerSandboxesStartDaemon = oldStartDaemon
+		initDockerSandboxesDiagnose = oldDiagnose
+	})
+
+	initDockerSandboxesLookPath = func(string) (string, error) {
+		return "", exec.ErrNotFound
+	}
+	initDockerSandboxesStartDaemon = func(context.Context, string) error {
+		t.Fatal("daemon start was attempted without an installed sbx executable")
+		return nil
+	}
+	initDockerSandboxesDiagnose = func(_ context.Context, binary string) (dockersandboxes.HostReadiness, error) {
+		if binary != "sbx" {
+			t.Fatalf("diagnostic binary = %q, want sbx", binary)
+		}
+		return dockersandboxes.HostReadiness{}, exec.ErrNotFound
+	}
+
+	if _, err := prepareInitDockerSandboxesReadiness(context.Background()); !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("readiness error = %v, want executable-not-found error", err)
+	}
+}
+
+func TestPrepareDockerSandboxesReadinessUsesSuccessfulDiagnosticsAfterStartWarning(t *testing.T) {
+	oldLookPath := initDockerSandboxesLookPath
+	oldStartDaemon := initDockerSandboxesStartDaemon
+	oldDiagnose := initDockerSandboxesDiagnose
+	t.Cleanup(func() {
+		initDockerSandboxesLookPath = oldLookPath
+		initDockerSandboxesStartDaemon = oldStartDaemon
+		initDockerSandboxesDiagnose = oldDiagnose
+	})
+
+	initDockerSandboxesLookPath = func(string) (string, error) { return "sbx-test", nil }
+	initDockerSandboxesStartDaemon = func(context.Context, string) error { return errors.New("daemon already running") }
+	initDockerSandboxesDiagnose = func(context.Context, string) (dockersandboxes.HostReadiness, error) {
+		return dockersandboxes.HostReadiness{ChecksPassed: 8, ChecksWarned: 1}, nil
+	}
+
+	readiness, err := prepareInitDockerSandboxesReadiness(context.Background())
+	if err != nil {
+		t.Fatalf("healthy diagnostics were rejected after a daemon-start warning: %v", err)
+	}
+	if readiness.ChecksPassed != 8 || readiness.ChecksWarned != 1 {
+		t.Fatalf("readiness = %+v", readiness)
+	}
+}
+
+func TestPrepareDockerSandboxesReadinessReportsStartAndDiagnosticFailures(t *testing.T) {
+	oldLookPath := initDockerSandboxesLookPath
+	oldStartDaemon := initDockerSandboxesStartDaemon
+	oldDiagnose := initDockerSandboxesDiagnose
+	t.Cleanup(func() {
+		initDockerSandboxesLookPath = oldLookPath
+		initDockerSandboxesStartDaemon = oldStartDaemon
+		initDockerSandboxesDiagnose = oldDiagnose
+	})
+
+	initDockerSandboxesLookPath = func(string) (string, error) { return "sbx-test", nil }
+	initDockerSandboxesStartDaemon = func(context.Context, string) error { return errors.New("daemon startup failed") }
+	initDockerSandboxesDiagnose = func(context.Context, string) (dockersandboxes.HostReadiness, error) {
+		return dockersandboxes.HostReadiness{}, errors.New("daemon diagnostic failed")
+	}
+
+	_, err := prepareInitDockerSandboxesReadiness(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "sbx daemon start --detach") || !strings.Contains(err.Error(), "daemon startup failed") || !strings.Contains(err.Error(), "daemon diagnostic failed") {
+		t.Fatalf("combined readiness error = %v", err)
+	}
+}
+
+func TestDockerSandboxesPrerequisitesIgnoreStorageCapacity(t *testing.T) {
 	stubNoWSL2(t)
 	oldReadiness := initDockerSandboxesReadiness
 	oldCapacityCheck := initDockerSandboxesCapacityCheck
@@ -844,19 +1115,8 @@ func TestDockerSandboxesPrerequisitesRejectInsufficientMinimumCapacity(t *testin
 		return dockersandboxes.HostReadiness{ChecksPassed: 8, ChecksWarned: 1}, nil
 	}
 	initDockerSandboxesCapacityCheck = func(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {
-		if rootDisk != 20<<30 || dockerDisk != 100<<30 || minHostFreeSpace != 50<<30 {
-			t.Fatalf("minimum capacity check = root %d, Docker %d, reserve %d", rootDisk, dockerDisk, minHostFreeSpace)
-		}
-		return initDockerSandboxesCapacityResult{
-			StorageRoot:    `C:\Users\runner\AppData\Local\DockerSandboxes`,
-			AvailableBytes: 140 << 30,
-			TotalBytes:     1 << 40,
-			Reservation:    120 << 30,
-			HostWatermark:  50 << 30,
-			RequiredBytes:  170 << 30,
-			DeficitBytes:   30 << 30,
-			CapacityStatus: storage.CapacityInsufficient,
-		}, nil
+		t.Fatal("provider prerequisite detection must not perform storage admission")
+		return initDockerSandboxesCapacityResult{}, nil
 	}
 	t.Cleanup(func() {
 		initDockerSandboxesReadiness = oldReadiness
@@ -864,13 +1124,8 @@ func TestDockerSandboxesPrerequisitesRejectInsufficientMinimumCapacity(t *testin
 	})
 
 	got := detectInitProviderPrerequisites(context.Background(), sandboxpromotion.WindowsAMD64, true)
-	if got.DockerSandboxesAvailable {
-		t.Fatal("Docker Sandboxes was available despite insufficient minimum capacity")
-	}
-	for _, want := range []string{`C:\Users\runner\AppData\Local\DockerSandboxes`, "140GiB available", "require 170GiB", "shortfall 30GiB"} {
-		if !strings.Contains(got.DockerSandboxesStatus, want) {
-			t.Fatalf("Docker Sandboxes status omitted %q: %s", want, got.DockerSandboxesStatus)
-		}
+	if !got.DockerSandboxesAvailable {
+		t.Fatalf("Docker Sandboxes was unavailable despite passing tooling diagnostics: %s", got.DockerSandboxesStatus)
 	}
 }
 
@@ -922,7 +1177,7 @@ func TestInitProviderRefreshRechecksAvailabilityAndRedrawsMenu(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if providerType != "docker-sandboxes" || selectedRecord.Template != record.Template || profile != nil {
+	if providerType != "docker-sandboxes" || selectedRecord.Template != "" || profile == nil || profile.SourceImage != "ghcr.io/catthehacker/ubuntu:full-latest" {
 		t.Fatalf("refreshed selection = provider %q, record template %q, profile %+v", providerType, selectedRecord.Template, profile)
 	}
 	if readinessCalls != 2 {
@@ -943,7 +1198,7 @@ func TestInitProviderRefreshRechecksAvailabilityAndRedrawsMenu(t *testing.T) {
 	}
 }
 
-func TestDockerSandboxesProfileRejectsSelectedCapacityWithoutWritingConfig(t *testing.T) {
+func TestDockerSandboxesProfileShowsEstimateWithoutCapacityAdmission(t *testing.T) {
 	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
 		Templates: []initDockerSandboxesTemplate{{
@@ -959,33 +1214,22 @@ func TestDockerSandboxesProfileRejectsSelectedCapacityWithoutWritingConfig(t *te
 	}, nil)
 	oldCapacityCheck := initDockerSandboxesCapacityCheck
 	initDockerSandboxesCapacityCheck = func(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {
-		if rootDisk != 30<<30 || dockerDisk != 100<<30 || minHostFreeSpace != 50<<30 {
-			t.Fatalf("selected capacity check = root %d, Docker %d, reserve %d", rootDisk, dockerDisk, minHostFreeSpace)
-		}
-		return initDockerSandboxesCapacityResult{
-			StorageRoot:    `C:\Users\runner\AppData\Local\DockerSandboxes`,
-			AvailableBytes: 140 << 30,
-			TotalBytes:     1 << 40,
-			Reservation:    130 << 30,
-			HostWatermark:  50 << 30,
-			RequiredBytes:  180 << 30,
-			DeficitBytes:   40 << 30,
-			CapacityStatus: storage.CapacityInsufficient,
-		}, nil
+		t.Fatal("image onboarding must not perform storage admission")
+		return initDockerSandboxesCapacityResult{}, nil
 	}
 	t.Cleanup(func() { initDockerSandboxesCapacityCheck = oldCapacityCheck })
 
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("1\n30GiB\n")))
-	if err == nil || !strings.Contains(err.Error(), "no config was written") {
-		t.Fatalf("capacity rejection error = %v", err)
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("1\nn\n\n")))
+	if err != nil {
+		t.Fatalf("informational estimate error = %v", err)
 	}
-	if profile != nil || accepted {
-		t.Fatalf("capacity rejection returned profile=%+v accepted=%t", profile, accepted)
+	if profile == nil || !accepted {
+		t.Fatalf("informational estimate returned profile=%+v accepted=%t", profile, accepted)
 	}
-	for _, want := range []string{"Docker Sandboxes capacity admission failed:", "Available: 140GiB", "Required before creation: 180GiB", "Shortfall: 40GiB", "storage prune --provider docker-sandboxes"} {
+	for _, want := range []string{"Runner artifact estimate (informational; configuration creation is not blocked):", "Available physical space:", "Fixed free-space reserve: 1GiB", "sparse logical maximum"} {
 		if !strings.Contains(out.String(), want) {
-			t.Fatalf("capacity rejection output omitted %q:\n%s", want, out.String())
+			t.Fatalf("informational estimate output omitted %q:\n%s", want, out.String())
 		}
 	}
 }
@@ -1025,7 +1269,7 @@ func TestInitCapabilityReadyDockerSandboxesIsDefaultWithoutPreviewAcknowledgemen
 				ConfigPath:         path,
 				SkipDockerCheck:    true,
 				SkipHostTrustCheck: true,
-				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\nn\n"),
+				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n\n\nn\n"),
 				Out:                &out,
 			}); err != nil {
 				t.Fatal(err)
@@ -1045,9 +1289,10 @@ func TestInitCapabilityReadyDockerSandboxesIsDefaultWithoutPreviewAcknowledgemen
 				"2. Docker Container — private daemon",
 				"Docker Sandboxes — recommended (default)",
 				"Runner provider (press Enter to use 1):",
-				"Docker Sandboxes setup:",
-				"recommended default because Docker and sbx diagnostics passed on this machine",
-				"Default resource reservations are recommended starting values",
+				"Docker Sandboxes image setup:",
+				"Runner base image:",
+				"full — full-latest (default)",
+				"Runner artifact estimate (informational; configuration creation is not blocked):",
 			} {
 				if !strings.Contains(out.String(), want) {
 					t.Fatalf("capability-default output omitted %q:\n%s", want, out.String())
@@ -1130,7 +1375,7 @@ func TestReadDockerSandboxesActiveProfilesRejectsUnexpectedSourceChannel(t *test
 	}
 }
 
-func TestInitDockerSandboxesDerivesRootDiskFromExactMeasurement(t *testing.T) {
+func TestInitDockerSandboxesUsesGuidedRootDiskDefault(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
 	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
@@ -1173,7 +1418,7 @@ func TestInitDockerSandboxesDerivesRootDiskFromExactMeasurement(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n2\n99GiB\n100GiB\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\n\nn\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1182,21 +1427,17 @@ func TestInitDockerSandboxesDerivesRootDiskFromExactMeasurement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := cfg.DockerSandboxes.RootDisk, "30GiB"; got != want {
+	if got, want := cfg.DockerSandboxes.RootDisk, "auto"; got != want {
 		t.Fatalf("dockerSandboxes.rootDisk = %q, want %q", got, want)
 	}
-	if got, want := cfg.DockerSandboxes.Template, template.Reference; got != want {
-		t.Fatalf("dockerSandboxes.template = %q, want measured default %q", got, want)
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
+		t.Fatalf("image.sourceImage = %q, want guided default %q", got, want)
 	}
 	for _, want := range []string{
-		"17.44GiB on host",
-		"default selection; capacity unmeasured",
-		"Shared host template cache: 17.44GiB (already present; do not add this byte count arithmetically to each sandbox root disk).",
-		"Measured guest root peak: 309.73MiB (test workload).",
-		"Automatically selected sandbox root filesystem total capacity: 30GiB.",
-		"Sandbox Docker disk must be at least 100GiB.",
-		"Automatically selected minimum host free space: 50GiB.",
-		"EPAR rechecks current Docker Sandboxes storage free space, existing and uncertain reservations",
+		"1. full — full-latest (default)",
+		"Automatic sandbox root limit:",
+		"Estimated download:",
+		"Expected duration:",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("init output omitted %q:\n%s", want, out.String())
@@ -1278,7 +1519,7 @@ func TestInitDockerSandboxesDiscoveryRetryKeepsProviderSelectionAndWritesVerifie
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\ny\n\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\nn\n\n\n\nn\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1296,14 +1537,11 @@ func TestInitDockerSandboxesDiscoveryRetryKeepsProviderSelectionAndWritesVerifie
 	if got := strings.Count(out.String(), "Continue with explicit preview setup?"); got != 0 {
 		t.Fatalf("preview acknowledgements = %d, want 0 after capability-driven default:\n%s", got, out.String())
 	}
-	if got := strings.Count(out.String(), "Retry Docker Sandboxes setup checks?"); got != 1 {
-		t.Fatalf("setup retry prompts = %d, want 1:\n%s", got, out.String())
+	if discoveryCalls != 3 {
+		t.Fatalf("Docker Sandboxes discovery calls = %d, want 3 including policy readback", discoveryCalls)
 	}
-	if discoveryCalls != 2 {
-		t.Fatalf("Docker Sandboxes discovery calls = %d, want 2", discoveryCalls)
-	}
-	if !strings.Contains(out.String(), "Docker Sandboxes setup preparation failed: template cache unavailable") || !strings.Contains(out.String(), "build and load a Candidate A template") {
-		t.Fatalf("init output did not explain Docker Sandboxes discovery recovery:\n%s", out.String())
+	if !strings.Contains(out.String(), "That image cannot be used for linux/amd64: template cache unavailable") || !strings.Contains(out.String(), "Choose an existing ghcr.io/catthehacker/ubuntu tag") {
+		t.Fatalf("init output did not explain Docker Sandboxes source recovery:\n%s", out.String())
 	}
 }
 
@@ -1323,7 +1561,7 @@ func TestInitDockerSandboxesDiscoveryRetryDeclinedExitsWithoutRepeatingProviderO
 		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\nn\n"),
 		Out:                &out,
 	})
-	if err == nil || !strings.Contains(err.Error(), "no config was written") {
+	if err == nil || !strings.Contains(err.Error(), "resolve runner source image") {
 		t.Fatalf("retry-declined error = %v", err)
 	}
 	if got := strings.Count(out.String(), "Runner provider:"); got != 1 {
@@ -1408,11 +1646,8 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if !slices.Contains(cfg.Runner.Labels, "X64") {
 		t.Fatalf("runner.labels = %q, want the mapped X64 guest architecture", cfg.Runner.Labels)
 	}
-	if got, want := cfg.DockerSandboxes.Template, record.Template; got != want {
-		t.Fatalf("dockerSandboxes.template = %q, want %q", got, want)
-	}
-	if got, want := cfg.DockerSandboxes.TemplateDigest, record.TemplateDigest; got != want {
-		t.Fatalf("dockerSandboxes.templateDigest = %q, want %q", got, want)
+	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.DockerSandboxes.PolicyGeneration, record.PolicyFingerprint; got != want {
 		t.Fatalf("dockerSandboxes.policyGeneration = %q, want %q", got, want)
@@ -1421,9 +1656,8 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 		got  string
 		want string
 	}{
-		"rootDisk":         {cfg.DockerSandboxes.RootDisk, "120GiB"},
-		"dockerDisk":       {cfg.DockerSandboxes.DockerDisk, "100GiB"},
-		"minHostFreeSpace": {cfg.DockerSandboxes.MinHostFreeSpace, "50GiB"},
+		"rootDisk":   {cfg.DockerSandboxes.RootDisk, "auto"},
+		"dockerDisk": {cfg.DockerSandboxes.DockerDisk, "50GiB"},
 	} {
 		if values.got != values.want {
 			t.Fatalf("dockerSandboxes.%s = %q, want %q", key, values.got, values.want)
@@ -1735,12 +1969,28 @@ func stubInitHostAndRandom(t *testing.T, hostname string, random []byte) {
 	t.Helper()
 	oldHostname := initHostname
 	oldRandomRead := initRandomRead
+	oldResolver := initResolveDockerSandboxesSource
 	initHostname = func() (string, error) { return hostname, nil }
 	initRandomRead = fixedRandomRead(random)
+	initResolveDockerSandboxesSource = func(_ context.Context, input, platform string) (imageartifact.ResolvedDockerSource, error) {
+		reference, err := imageartifact.NormalizeCatthehackerSource(input)
+		if err != nil {
+			return imageartifact.ResolvedDockerSource{}, err
+		}
+		return imageartifact.ResolvedDockerSource{
+			Reference:            reference,
+			ImmutableReference:   "ghcr.io/catthehacker/ubuntu@sha256:" + strings.Repeat("a", 64),
+			IndexDigest:          "sha256:" + strings.Repeat("a", 64),
+			PlatformDigest:       "sha256:" + strings.Repeat("b", 64),
+			Platform:             platform,
+			CompressedLayerBytes: 8 << 30,
+		}, nil
+	}
 	stubInitRunnerGroupClient(t)
 	t.Cleanup(func() {
 		initHostname = oldHostname
 		initRandomRead = oldRandomRead
+		initResolveDockerSandboxesSource = oldResolver
 	})
 }
 
@@ -1869,6 +2119,9 @@ func stubInitDockerSandboxesSetup(t *testing.T, platform sandboxpromotion.Platfo
 	oldDiscovery := initDiscoverDockerSandboxes
 	oldReadiness := initDockerSandboxesReadiness
 	oldCapacityCheck := initDockerSandboxesCapacityCheck
+	oldResolver := initResolveDockerSandboxesSource
+	oldPolicyFingerprint := initDockerSandboxesPolicyFingerprint
+	oldEnsureTemplate := initEnsureDockerSandboxesTemplate
 	initSandboxPromotionPlatform = func() sandboxpromotion.Platform { return platform }
 	initSandboxPromotionLookup = func(actual sandboxpromotion.Platform) (sandboxpromotion.Record, bool) {
 		if actual != platform {
@@ -1892,6 +2145,33 @@ func stubInitDockerSandboxesSetup(t *testing.T, platform sandboxpromotion.Platfo
 	initDockerSandboxesReadiness = func(context.Context) (dockersandboxes.HostReadiness, error) {
 		return dockersandboxes.HostReadiness{ChecksPassed: 8, ChecksWarned: 1}, nil
 	}
+	initResolveDockerSandboxesSource = func(ctx context.Context, input, guestPlatform string) (imageartifact.ResolvedDockerSource, error) {
+		current, err := initDiscoverDockerSandboxes(ctx, "test-project", guestPlatform)
+		if err != nil {
+			return imageartifact.ResolvedDockerSource{}, err
+		}
+		reference, err := imageartifact.NormalizeCatthehackerSource(input)
+		if err != nil {
+			return imageartifact.ResolvedDockerSource{}, err
+		}
+		compressed := uint64(8 << 30)
+		if len(current.Templates) > 0 && current.Templates[0].Size > 0 {
+			compressed = uint64(current.Templates[0].Size)
+		}
+		return imageartifact.ResolvedDockerSource{
+			Reference:            reference,
+			ImmutableReference:   "ghcr.io/catthehacker/ubuntu@sha256:" + strings.Repeat("a", 64),
+			IndexDigest:          "sha256:" + strings.Repeat("a", 64),
+			PlatformDigest:       "sha256:" + strings.Repeat("b", 64),
+			Platform:             guestPlatform,
+			CompressedLayerBytes: compressed,
+		}, nil
+	}
+	initDockerSandboxesPolicyFingerprint = func(ctx context.Context) (string, error) {
+		current, err := initDiscoverDockerSandboxes(ctx, "test-project", expectedDockerSandboxesGuestPlatform(t, platform))
+		return current.PolicyFingerprint, err
+	}
+	initEnsureDockerSandboxesTemplate = func(context.Context, string, string) error { return nil }
 	initDockerSandboxesCapacityCheck = func(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {
 		return initDockerSandboxesCapacityResult{
 			StorageRoot:    `C:\stub\DockerSandboxes`,
@@ -1909,7 +2189,19 @@ func stubInitDockerSandboxesSetup(t *testing.T, platform sandboxpromotion.Platfo
 		initDiscoverDockerSandboxes = oldDiscovery
 		initDockerSandboxesReadiness = oldReadiness
 		initDockerSandboxesCapacityCheck = oldCapacityCheck
+		initResolveDockerSandboxesSource = oldResolver
+		initDockerSandboxesPolicyFingerprint = oldPolicyFingerprint
+		initEnsureDockerSandboxesTemplate = oldEnsureTemplate
 	})
+}
+
+func expectedDockerSandboxesGuestPlatform(t *testing.T, platform sandboxpromotion.Platform) string {
+	t.Helper()
+	guestPlatform, _, err := dockerSandboxesPlatform(platform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return guestPlatform
 }
 
 func stubInitSandboxPromotion(t *testing.T, record sandboxpromotion.Record, result sandboxpromotion.PreflightResult) {
@@ -1919,6 +2211,9 @@ func stubInitSandboxPromotion(t *testing.T, record sandboxpromotion.Record, resu
 	oldPreflight := initDockerSandboxesPreflight
 	oldReadiness := initDockerSandboxesReadiness
 	oldCapacityCheck := initDockerSandboxesCapacityCheck
+	oldResolver := initResolveDockerSandboxesSource
+	oldPolicyFingerprint := initDockerSandboxesPolicyFingerprint
+	oldEnsureTemplate := initEnsureDockerSandboxesTemplate
 	initSandboxPromotionPlatform = func() sandboxpromotion.Platform { return record.Platform }
 	initSandboxPromotionLookup = func(platform sandboxpromotion.Platform) (sandboxpromotion.Record, bool) {
 		if platform != record.Platform {
@@ -1932,6 +2227,22 @@ func stubInitSandboxPromotion(t *testing.T, record sandboxpromotion.Record, resu
 	initDockerSandboxesReadiness = func(context.Context) (dockersandboxes.HostReadiness, error) {
 		return dockersandboxes.HostReadiness{ChecksPassed: 8}, nil
 	}
+	initResolveDockerSandboxesSource = func(_ context.Context, input, guestPlatform string) (imageartifact.ResolvedDockerSource, error) {
+		reference, err := imageartifact.NormalizeCatthehackerSource(input)
+		if err != nil {
+			return imageartifact.ResolvedDockerSource{}, err
+		}
+		return imageartifact.ResolvedDockerSource{
+			Reference:            reference,
+			ImmutableReference:   "ghcr.io/catthehacker/ubuntu@" + record.TemplateDigest,
+			IndexDigest:          record.TemplateDigest,
+			PlatformDigest:       record.TemplateDigest,
+			Platform:             guestPlatform,
+			CompressedLayerBytes: 8 << 30,
+		}, nil
+	}
+	initDockerSandboxesPolicyFingerprint = func(context.Context) (string, error) { return record.PolicyFingerprint, nil }
+	initEnsureDockerSandboxesTemplate = func(context.Context, string, string) error { return nil }
 	initDockerSandboxesCapacityCheck = func(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {
 		return initDockerSandboxesCapacityResult{
 			StorageRoot:    `C:\stub\DockerSandboxes`,
@@ -1949,6 +2260,9 @@ func stubInitSandboxPromotion(t *testing.T, record sandboxpromotion.Record, resu
 		initDockerSandboxesPreflight = oldPreflight
 		initDockerSandboxesReadiness = oldReadiness
 		initDockerSandboxesCapacityCheck = oldCapacityCheck
+		initResolveDockerSandboxesSource = oldResolver
+		initDockerSandboxesPolicyFingerprint = oldPolicyFingerprint
+		initEnsureDockerSandboxesTemplate = oldEnsureTemplate
 	})
 }
 

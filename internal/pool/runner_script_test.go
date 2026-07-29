@@ -468,7 +468,7 @@ func TestHostTrustGenerationHookProductionPathsCannotBeRedirectedByWorkflowEnvir
 	}
 }
 
-func TestDockerSandboxesRunnerAlwaysRequiresAdmissionHook(t *testing.T) {
+func TestDockerSandboxesRunnerRequiresExplicitDisabledOrOverlayTrustPolicy(t *testing.T) {
 	path := filepath.Join("..", "..", "templates", "docker-sandboxes", "guest", "run-runner.sh")
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -479,13 +479,17 @@ func TestDockerSandboxesRunnerAlwaysRequiresAdmissionHook(t *testing.T) {
 		"[[ -s /opt/epar/host-trust-generation.json ]]",
 		"ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/check-host-trust-generation.sh",
 		"PATH=/opt/epar/hook-bin:",
+		`if mode == "disabled":`,
+		`elif mode == "overlay":`,
+		`raise SystemExit(f"EPAR runner trust policy: unknown mode {mode!r}")`,
+		`if [[ "${trust_mode}" == "overlay" ]]; then`,
 	} {
 		if !strings.Contains(text, required) {
-			t.Fatalf("Docker Sandboxes runner omitted always-on admission invariant %q", required)
+			t.Fatalf("Docker Sandboxes runner omitted trust-policy invariant %q", required)
 		}
 	}
-	if strings.Contains(text, "if [[ -s /opt/epar/host-trust-generation.json ]]") {
-		t.Fatal("Docker Sandboxes runner made its admission hook conditional")
+	if strings.Contains(text, `if [[ -s /opt/epar/host-trust-generation.json ]]`) {
+		t.Fatal("Docker Sandboxes runner accepts a missing policy marker")
 	}
 }
 

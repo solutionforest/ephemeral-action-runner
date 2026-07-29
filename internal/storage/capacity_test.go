@@ -22,22 +22,22 @@ func TestEvaluateCapacity(t *testing.T) {
 			capacity:     Capacity{},
 			requirement:  Requirement{ID: "full-build", SurfaceID: "host", PeakBytes: 30 * GiB},
 			wantStatus:   CapacityUnknown,
-			wantRequired: 50 * GiB,
+			wantRequired: 31 * GiB,
 		},
 		{
 			name:         "insufficient includes deficit",
-			capacity:     Capacity{Known: true, AvailableBytes: 49 * GiB, TotalBytes: 100 * GiB, ObservedAt: now},
+			capacity:     Capacity{Known: true, AvailableBytes: 30 * GiB, TotalBytes: 100 * GiB, ObservedAt: now},
 			requirement:  Requirement{ID: "full-build", SurfaceID: "host", PeakBytes: 30 * GiB},
 			wantStatus:   CapacityInsufficient,
-			wantRequired: 50 * GiB,
+			wantRequired: 31 * GiB,
 			wantDeficit:  GiB,
 		},
 		{
 			name:         "ready",
-			capacity:     Capacity{Known: true, AvailableBytes: 50 * GiB, TotalBytes: 100 * GiB, ObservedAt: now},
+			capacity:     Capacity{Known: true, AvailableBytes: 31 * GiB, TotalBytes: 100 * GiB, ObservedAt: now},
 			requirement:  Requirement{ID: "full-build", SurfaceID: "host", PeakBytes: 30 * GiB},
 			wantStatus:   CapacityReady,
-			wantRequired: 50 * GiB,
+			wantRequired: 31 * GiB,
 		},
 	}
 	for _, test := range tests {

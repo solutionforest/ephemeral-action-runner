@@ -18,6 +18,13 @@ type Descriptor struct {
 	LifecycleSupported     bool
 	StorageSupported       bool
 	ImageMode              string
+	GuidedArtifacts        bool
+	WizardImageProfiles    []WizardImageProfile
+}
+
+type WizardImageProfile struct {
+	Name string
+	Tag  string
 }
 
 const (

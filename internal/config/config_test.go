@@ -114,7 +114,7 @@ func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 
 func TestStorageDefaultsAreBoundedAndConservative(t *testing.T) {
 	storage := Default().Storage
-	if storage.MinimumFree != "20GiB" ||
+	if storage.MinimumFree != "1GiB" ||
 		storage.GracePeriod != "168h" ||
 		storage.KeepPrevious != 0 ||
 		storage.AutomaticHousekeeping != StorageHousekeepingConservative ||
@@ -1227,12 +1227,9 @@ func TestDockerSandboxesRejectsNamePrefixOutsideProviderGrammar(t *testing.T) {
 	cfg.Pool.NamePrefix = "EPAR_sandbox"
 	cfg.Runner.Ephemeral = true
 	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
-	cfg.DockerSandboxes.Template = "epar-template:v1"
-	cfg.DockerSandboxes.TemplateDigest = "sha256:" + strings.Repeat("a", 64)
 	cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("b", 64)
 	cfg.DockerSandboxes.RootDisk = "120GiB"
-	cfg.DockerSandboxes.DockerDisk = "100GiB"
-	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
+	cfg.DockerSandboxes.DockerDisk = "50GiB"
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "lowercase") {
 		t.Fatalf("Validate() error = %v, want Docker Sandboxes prefix grammar rejection", err)
 	}
@@ -1245,14 +1242,16 @@ func TestLoadDockerSandboxesConfig(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 provider:
   type: docker-sandboxes
+image:
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  sourcePlatform: linux/amd64
 runner:
   ephemeral: true
 security:
   runnerGroup:
     enforcement: enforce
 dockerSandboxes:
-  template: registry.example.invalid/epar/runner-template:preview
-  templateDigest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
   networkBaseline: balanced
   additionalAllow: [api.github.com, '*.githubusercontent.com:443']
@@ -1261,10 +1260,9 @@ dockerSandboxes:
   stagingRoot: .local/docker-sandboxes
   cpus: 2
   memory: 4GiB
-  rootDisk: 20GiB
-  dockerDisk: 100GiB
+  rootDisk: auto
+  dockerDisk: 50GiB
   maxConcurrentCreates: 1
-  minHostFreeSpace: 50GiB
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1295,6 +1293,18 @@ dockerSandboxes:
 	}
 }
 
+func TestLoadDockerSandboxesRejectsRemovedHostReserve(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-sandboxes.yml")
+	if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  minHostFreeSpace: 50GiB\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "remove it and configure the provider-neutral storage.minimumFree value instead") {
+		t.Fatalf("Load() error = %v, want exact regeneration guidance", err)
+	}
+}
+
 func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1315,14 +1325,6 @@ func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T)
 		{
 			name:   "runner group enforcement is not fail closed",
 			mutate: func(cfg *Config) { cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementWarn },
-		},
-		{
-			name:   "template is empty",
-			mutate: func(cfg *Config) { cfg.DockerSandboxes.Template = "" },
-		},
-		{
-			name:   "template digest is not pinned",
-			mutate: func(cfg *Config) { cfg.DockerSandboxes.TemplateDigest = "sha256:ABCDEF" },
 		},
 		{
 			name:   "policy generation is not content addressed",
@@ -1362,11 +1364,7 @@ func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T)
 		},
 		{
 			name:   "docker disk is below the hard minimum",
-			mutate: func(cfg *Config) { cfg.DockerSandboxes.DockerDisk = "99GiB" },
-		},
-		{
-			name:   "host free space is below the hard minimum",
-			mutate: func(cfg *Config) { cfg.DockerSandboxes.MinHostFreeSpace = "49GiB" },
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.DockerDisk = "512MiB" },
 		},
 		{
 			name:   "concurrency is not positive",
@@ -1473,17 +1471,16 @@ func TestParseByteSize(t *testing.T) {
 	}
 }
 
-func TestEffectiveMinimumFreeBytesUsesProviderReserve(t *testing.T) {
+func TestEffectiveMinimumFreeBytesUsesCommonReserve(t *testing.T) {
 	cfg := Default()
 	cfg.Provider.Type = "docker-sandboxes"
 	cfg.Storage.MinimumFree = "20GiB"
-	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
 
 	got, err := EffectiveMinimumFreeBytes(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := uint64(50 << 30); got != want {
+	if want := uint64(20 << 30); got != want {
 		t.Fatalf("EffectiveMinimumFreeBytes() = %d, want %d", got, want)
 	}
 }
@@ -1492,7 +1489,6 @@ func TestEffectiveMinimumFreeBytesKeepsStricterCommonReserve(t *testing.T) {
 	cfg := Default()
 	cfg.Provider.Type = "docker-sandboxes"
 	cfg.Storage.MinimumFree = "60GiB"
-	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
 
 	got, err := EffectiveMinimumFreeBytes(cfg)
 	if err != nil {
@@ -1510,12 +1506,9 @@ func validDockerSandboxesConfig() Config {
 	cfg.Provider.Platform = "linux/amd64"
 	cfg.Runner.Ephemeral = true
 	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
-	cfg.DockerSandboxes.Template = "registry.example.invalid/epar/runner-template:preview"
-	cfg.DockerSandboxes.TemplateDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	cfg.DockerSandboxes.PolicyGeneration = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	cfg.DockerSandboxes.AdditionalAllow = []string{"api.github.com"}
 	cfg.DockerSandboxes.RootDisk = "120GiB"
-	cfg.DockerSandboxes.DockerDisk = "100GiB"
-	cfg.DockerSandboxes.MinHostFreeSpace = "50GiB"
+	cfg.DockerSandboxes.DockerDisk = "50GiB"
 	return cfg
 }

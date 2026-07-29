@@ -29,7 +29,7 @@ pool:
   replacementRetryJitterPercent: 20
 
 storage:
-  minimumFree: 20GiB
+  minimumFree: 1GiB
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative

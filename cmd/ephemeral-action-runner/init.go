@@ -25,7 +25,8 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
-	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
+	imageartifact "github.com/solutionforest/ephemeral-action-runner/internal/image"
+	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes"
 	sandboxcapacity "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/capacity"
 	sandboxpolicy "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/policy"
@@ -60,8 +61,30 @@ var initDockerSandboxesPreflight = func(ctx context.Context, record sandboxpromo
 	return sandboxpromotion.LocalPreflight(ctx, record, projectRoot, os.Getenv("EPAR_CONTROLLER_IN_DOCKER") != "1", sourceRevision)
 }
 
-var initDockerSandboxesReadiness = func(ctx context.Context) (dockersandboxes.HostReadiness, error) {
-	return dockersandboxes.New("sbx").VerifyHostReadiness(ctx)
+var initDockerSandboxesLookPath = exec.LookPath
+
+var initDockerSandboxesStartDaemon = func(ctx context.Context, binary string) error {
+	return dockersandboxes.New(binary).StartDaemon(ctx)
+}
+
+var initDockerSandboxesDiagnose = func(ctx context.Context, binary string) (dockersandboxes.HostReadiness, error) {
+	return dockersandboxes.New(binary).VerifyHostReadiness(ctx)
+}
+
+var initDockerSandboxesReadiness = prepareInitDockerSandboxesReadiness
+
+func prepareInitDockerSandboxesReadiness(ctx context.Context) (dockersandboxes.HostReadiness, error) {
+	binary := "sbx"
+	var daemonStartErr error
+	if installed, err := initDockerSandboxesLookPath(binary); err == nil {
+		binary = installed
+		daemonStartErr = initDockerSandboxesStartDaemon(ctx, binary)
+	}
+	readiness, readinessErr := initDockerSandboxesDiagnose(ctx, binary)
+	if readinessErr != nil && daemonStartErr != nil {
+		return dockersandboxes.HostReadiness{}, fmt.Errorf("automatic 'sbx daemon start --detach' failed: %v; diagnostics also failed: %w", daemonStartErr, readinessErr)
+	}
+	return readiness, readinessErr
 }
 
 type initDockerSandboxesTemplate struct {
@@ -117,13 +140,14 @@ type initDockerSandboxesCapacityResult struct {
 }
 
 type initDockerSandboxesProfile struct {
+	Provider          string
 	HostPlatform      sandboxpromotion.Platform
-	Template          string
-	TemplateDigest    string
+	GuestPlatform     string
+	SourceImage       string
+	CustomScripts     []string
 	PolicyFingerprint string
 	RootDisk          string
 	DockerDisk        string
-	MinHostFreeSpace  string
 }
 
 var initDiscoverDockerSandboxes = discoverDockerSandboxes
@@ -131,6 +155,29 @@ var initDiscoverDockerSandboxes = discoverDockerSandboxes
 var initDockerSandboxesRootMeasurementFor = dockerSandboxesRootMeasurement
 
 var initDockerSandboxesCapacityCheck = checkInitDockerSandboxesCapacity
+
+var initResolveDockerSandboxesSource = imageartifact.ResolveCatthehackerSource
+
+var initDockerSandboxesPolicyFingerprint = func(ctx context.Context) (string, error) {
+	adapter := dockersandboxes.New("")
+	if err := adapter.VerifyAdmission(ctx); err != nil {
+		return "", fmt.Errorf("Docker Sandboxes admission check failed: %w", err)
+	}
+	rules, err := adapter.ReadGlobalNetworkPolicy(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read Docker Sandboxes global network policy: %w", err)
+	}
+	return sandboxpolicy.Fingerprint(rules)
+}
+
+var initEnsureDockerSandboxesTemplate = func(ctx context.Context, projectRoot, configPath string) error {
+	manager, err := newImageProvisioningManager(configPath, projectRoot)
+	if err != nil {
+		return err
+	}
+	defer manager.Close()
+	return manager.EnsureImage(ctx)
+}
 
 type initRunnerGroupClient interface {
 	ListRunnerGroups(context.Context) ([]gh.RunnerGroup, error)
@@ -248,7 +295,7 @@ func runInitWithOptions(opts initOptions) error {
 	if err != nil {
 		return err
 	}
-	providerType, promotionRecord, selectedProfile, err := promptInitProvider(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck)
+	providerType, _, selectedProfile, err := promptInitProvider(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck)
 	if err != nil {
 		return err
 	}
@@ -290,36 +337,37 @@ func runInitWithOptions(opts initOptions) error {
 		}
 	}
 
-	content := defaultDockerContainerConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup)
+	profile := selectedProfile
+	if providerType != "tart" && profile == nil {
+		return fmt.Errorf("%s image selection did not produce a provisioning profile", providerType)
+	}
+	var content string
 	switch providerType {
+	case "docker-container":
+		content = defaultDockerContainerConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile)
 	case "wsl":
-		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
+		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup, *profile)
 	case "tart":
 		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
 	case "docker-sandboxes":
-		profile := selectedProfile
-		if profile == nil {
-			var profileErr error
-			profile, profileErr = promotedDockerSandboxesProfile(promotionRecord)
-			if profileErr != nil {
-				return profileErr
-			}
-		}
 		guestPlatform, runnerArchitectureLabel, platformErr := dockerSandboxesPlatform(profile.HostPlatform)
 		if platformErr != nil {
 			return platformErr
 		}
 		content = defaultDockerSandboxesConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, guestPlatform, runnerArchitectureLabel)
+	default:
+		return fmt.Errorf("unsupported provider.type %q", providerType)
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.ConfigPath), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(opts.ConfigPath, []byte(content), 0600); err != nil {
+	if err := logging.WritePrivateFileAtomic(opts.ConfigPath, []byte(content)); err != nil {
 		return err
 	}
 
 	fmt.Fprintf(opts.Out, "\nCreated %s\n", opts.ConfigPath)
 	if opts.EmbeddedInStart {
+		fmt.Fprintln(opts.Out, "Initialization succeeded. Startup will now provision the selected runner artifact and apply storage admission before side effects.")
 		return nil
 	}
 	fmt.Fprintf(opts.Out, `
@@ -717,7 +765,7 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 	hostPlatform := initSandboxPromotionPlatform()
 	record, promoted := initSandboxPromotionLookup(hostPlatform)
 	for {
-		providerType, promotionPassed, refresh, err := promptInitProviderChoice(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck)
+		providerType, _, refresh, err := promptInitProviderChoice(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck)
 		if err != nil {
 			return "", sandboxpromotion.Record{}, nil, err
 		}
@@ -725,25 +773,20 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 			fmt.Fprintln(out, "Refreshing provider prerequisites...")
 			continue
 		}
-		if providerType != "docker-sandboxes" {
+		if providerType == "tart" {
 			return providerType, sandboxpromotion.Record{}, nil, nil
 		}
-		if promotionPassed {
-			return providerType, record, nil, nil
-		}
-		if !promoted {
-			if _, _, err := dockerSandboxesPlatform(hostPlatform); err == nil {
-				profile, accepted, profileErr := promptDockerSandboxesProfile(ctx, projectRoot, hostPlatform, out, reader)
-				if profileErr != nil {
-					return "", sandboxpromotion.Record{}, nil, profileErr
-				}
-				if !accepted {
-					return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes setup did not complete; no config was written")
-				}
-				return providerType, sandboxpromotion.Record{}, profile, nil
+		if providerType == "docker-container" || providerType == "docker-sandboxes" || providerType == "wsl" {
+			profile, accepted, profileErr := promptDockerImageProfile(ctx, projectRoot, providerType, hostPlatform, out, reader)
+			if profileErr != nil {
+				return "", sandboxpromotion.Record{}, nil, profileErr
 			}
+			if !accepted {
+				return "", sandboxpromotion.Record{}, nil, fmt.Errorf("%s image setup did not complete; no config was written", providerType)
+			}
+			return providerType, sandboxpromotion.Record{}, profile, nil
 		}
-		return "", sandboxpromotion.Record{}, nil, errors.New("Docker Sandboxes selection is unavailable")
+		return "", sandboxpromotion.Record{}, nil, fmt.Errorf("provider %q has no registered image onboarding flow", providerType)
 	}
 }
 
@@ -804,176 +847,202 @@ func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatf
 }
 
 func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Docker Sandboxes setup:")
-	fmt.Fprintln(out, "  Docker Sandboxes is the recommended default because Docker and sbx diagnostics passed on this machine.")
-	fmt.Fprintln(out, "  Docker Sandboxes provides EPAR's strongest current host boundary, but it is not a guarantee that arbitrary hostile workflows are safe.")
-	fmt.Fprintln(out, "  Setup performs read-only checks for an exact locally built and loaded EPAR template and the current host-global Balanced policy.")
-	fmt.Fprintln(out, "  New EPAR sandboxes default to open public HTTP/HTTPS egress with owned deny-wins host-alias guardrails; Docker Sandboxes' private-network isolation remains in force.")
-	if os.Getenv(sandboxpromotion.DisableEnvironment) == "1" {
-		fmt.Fprintf(out, "  Unavailable: %s=1 disables Docker Sandboxes admission.\n", sandboxpromotion.DisableEnvironment)
-		return nil, false, fmt.Errorf("Docker Sandboxes setup is disabled by %s; no config was written", sandboxpromotion.DisableEnvironment)
-	}
+	return promptDockerImageProfile(ctx, projectRoot, "docker-sandboxes", hostPlatform, out, reader)
+}
 
-	guestPlatform, _, err := dockerSandboxesPlatform(hostPlatform)
+func promptDockerImageProfile(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
+	guestPlatform, err := initDockerGuestPlatform(providerType, hostPlatform)
 	if err != nil {
-		fmt.Fprintf(out, "  Docker Sandboxes is unavailable: %v\n", err)
-		return nil, false, fmt.Errorf("Docker Sandboxes setup is unavailable: %w", err)
+		return nil, false, fmt.Errorf("%s image setup is unavailable: %w", providerType, err)
 	}
-	var discovery initDockerSandboxesDiscovery
+	descriptor, found := providerregistry.DescriptorFor(providerType)
+	if !found || !descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0 {
+		return nil, false, fmt.Errorf("%s has no registered guided image onboarding contribution", providerType)
+	}
+	fmt.Fprintln(out, "")
+	fmt.Fprintf(out, "%s image setup:\n", descriptor.DisplayName)
+	fmt.Fprintln(out, "  Choose the desired Catthehacker Ubuntu image. EPAR will create the configuration now and provision or update the reusable runner artifact during startup.")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Runner base image:")
+	for index, profile := range descriptor.WizardImageProfiles {
+		defaultLabel := ""
+		if index == 0 {
+			defaultLabel = " (default)"
+		}
+		fmt.Fprintf(out, "  %d. %s — %s%s\n", index+1, profile.Name, profile.Tag, defaultLabel)
+	}
+	customChoice := strconv.Itoa(len(descriptor.WizardImageProfiles) + 1)
+	fmt.Fprintf(out, "  %s. Another catthehacker/ubuntu tag, such as go-24.04\n", customChoice)
+	fmt.Fprintln(out, "  Image catalog: https://github.com/catthehacker/docker_images#images-available")
+
+	var source imageartifact.ResolvedDockerSource
 	for {
-		discoveryContext, cancel := context.WithTimeout(ctx, 45*time.Second)
-		discovery, err = initDiscoverDockerSandboxes(discoveryContext, projectRoot, guestPlatform)
-		cancel()
-		if err == nil && len(discovery.Templates) > 0 {
-			break
-		}
-		if err != nil {
-			fmt.Fprintf(out, "  Docker Sandboxes setup preparation failed: %v\n", err)
-			fmt.Fprintln(out, "  Action: repair the reported local admission check. For template or cache failures, build and load a Candidate A template using docs/providers/docker-sandboxes.md.")
-		} else {
-			fmt.Fprintln(out, "  Docker Sandboxes setup found no exact locally built and loaded EPAR template for this platform.")
-			fmt.Fprintln(out, "  Action: build and load a Candidate A template using docs/providers/docker-sandboxes.md.")
-		}
-		retry, promptErr := promptYesNo(out, reader, "Retry Docker Sandboxes setup checks?", false)
+		choice, hitEOF, promptErr := promptDefault(out, reader, "Runner base image", "1")
 		if promptErr != nil {
 			return nil, false, promptErr
 		}
-		if !retry {
-			return nil, false, errors.New("Docker Sandboxes setup checks did not pass; no config was written")
-		}
-	}
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Verified local Docker Sandboxes source profiles:")
-	for index, template := range discovery.Templates {
-		suffix := ""
-		if index == 0 {
-			if _, measured := initDockerSandboxesRootMeasurementFor(hostPlatform, template); measured {
-				suffix = " (recommended measured default)"
-			} else {
-				suffix = " (default selection; capacity unmeasured)"
+		normalizedChoice := strings.ToLower(choice)
+		input := ""
+		for index, profile := range descriptor.WizardImageProfiles {
+			if normalizedChoice == strconv.Itoa(index+1) || normalizedChoice == profile.Name {
+				input = profile.Name
+				break
 			}
 		}
-		fmt.Fprintf(out, "  %d. %s — %s [%s, cache %s, %s on host]%s\n", index+1, template.Label, template.SourceChannel, template.Platform, template.CacheID, formatInitByteCount(template.Size), suffix)
-	}
-	fmt.Fprintln(out, "  This wizard saves the exact verified EPAR template tag and full local digest in configuration.")
-	fmt.Fprintln(out, "  Automatic Docker Sandboxes source refresh is not implemented yet; build and load a new locked EPAR template manually before running setup.")
-	var selected initDockerSandboxesTemplate
-	for {
-		value, hitEOF, promptErr := promptDefault(out, reader, "Docker Sandboxes source profile", "1")
-		if promptErr != nil {
-			return nil, false, promptErr
+		if normalizedChoice == customChoice {
+			input, promptErr = promptRequired(out, reader, "catthehacker/ubuntu tag")
+			if promptErr != nil {
+				return nil, false, promptErr
+			}
 		}
-		index, parseErr := strconv.Atoi(value)
-		if parseErr == nil && index >= 1 && index <= len(discovery.Templates) {
-			selected = discovery.Templates[index-1]
+		if input == "" {
+			fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, or %s for another catthehacker/ubuntu tag.\n", len(descriptor.WizardImageProfiles), customChoice)
+			if hitEOF {
+				return nil, false, fmt.Errorf("invalid runner base image %q", choice)
+			}
+			continue
+		}
+		resolveContext, cancel := context.WithTimeout(ctx, 90*time.Second)
+		source, err = initResolveDockerSandboxesSource(resolveContext, input, guestPlatform)
+		cancel()
+		if err == nil {
 			break
 		}
-		fmt.Fprintf(out, "Docker Sandboxes source profile must be a number from 1 to %d.\n", len(discovery.Templates))
+		fmt.Fprintf(out, "  That image cannot be used for %s: %v\n", guestPlatform, err)
+		fmt.Fprintln(out, "  Choose an existing ghcr.io/catthehacker/ubuntu tag that publishes this platform.")
 		if hitEOF {
-			return nil, false, fmt.Errorf("invalid Docker Sandboxes source profile %q", value)
+			return nil, false, fmt.Errorf("resolve runner source image: %w", err)
 		}
 	}
-	fmt.Fprintf(out, "  Resolved exact EPAR template tag: %s\n", selected.Reference)
-	fmt.Fprintf(out, "  Resolved full local template digest: %s\n", selected.Digest)
 
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Selected template capacity:")
-	fmt.Fprintf(out, "  Shared host template cache: %s (already present; do not add this byte count arithmetically to each sandbox root disk).\n", formatInitByteCount(selected.Size))
-	fmt.Fprintln(out, "  Source-image virtual or unpacked-size figures are not guest root-disk requirements.")
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Default resource reservations are recommended starting values and can be adjusted in the generated config.")
-	var rootDisk string
-	var dockerDisk string
-	if measurement, ok := initDockerSandboxesRootMeasurementFor(hostPlatform, selected); ok {
-		fmt.Fprintf(out, "  Measured guest root peak: %s (%s).\n", formatInitByteCount(measurement.PeakBytes), measurement.Evidence)
-		fmt.Fprintln(out, "  Root formula: measured peak + 25% safety margin + the recommended 20GiB writable headroom, rounded up to 10GiB.")
-		derivedRootDisk, deriveErr := sandboxcapacity.DeriveRootDisk(uint64(measurement.PeakBytes), sandboxcapacity.RootWritableHeadroom)
-		if deriveErr != nil {
-			return nil, false, fmt.Errorf("derive sandbox root filesystem capacity: %w", deriveErr)
+	var customScripts []string
+	addScripts, err := promptYesNo(out, reader, "Run custom install scripts while building the runner artifact?", false)
+	if err != nil {
+		return nil, false, err
+	}
+	if addScripts {
+		fmt.Fprintln(out, "  Scripts run as root during the image build. Do not put secrets in scripts or build inputs.")
+		for {
+			script, promptErr := promptRequired(out, reader, "Custom install script path")
+			if promptErr != nil {
+				return nil, false, promptErr
+			}
+			normalized, validationErr := validateInitCustomInstallScript(projectRoot, script)
+			if validationErr != nil {
+				fmt.Fprintf(out, "  Invalid custom install script: %v\n", validationErr)
+				continue
+			}
+			customScripts = append(customScripts, normalized)
+			another, promptErr := promptYesNo(out, reader, "Add another custom install script?", false)
+			if promptErr != nil {
+				return nil, false, promptErr
+			}
+			if !another {
+				break
+			}
 		}
-		if derivedRootDisk > math.MaxInt64 {
-			return nil, false, errors.New("derived sandbox root filesystem capacity exceeds the supported size")
-		}
-		rootDisk = formatInitByteCount(int64(derivedRootDisk))
-		fmt.Fprintf(out, "  Automatically selected sandbox root filesystem total capacity: %s.\n", rootDisk)
-		fmt.Fprintln(out, "  Docker storage is the most workload-dependent reservation and is the only capacity question asked.")
-		dockerDisk, err = promptInitByteSize(out, reader, "Sandbox Docker disk", "100GiB", config.DockerSandboxesMinimumDockerDiskBytes)
+	}
+
+	policyFingerprint := ""
+	if providerType == "docker-sandboxes" {
+		policyFingerprint, err = initDockerSandboxesPolicyFingerprint(ctx)
 		if err != nil {
 			return nil, false, err
 		}
+	}
+	sourceEstimate, err := imageartifact.EstimateSourceSize(source.CompressedLayerBytes, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	const dockerDisk = config.DockerSandboxesDefaultDockerDisk
+	dockerDiskBytes, _ := config.ParseByteSize(dockerDisk)
+	artifactPlan, err := imageartifact.PlanArtifactStorage(providerType, sourceEstimate, false, uint64(dockerDiskBytes))
+	if err != nil {
+		return nil, false, err
+	}
+	var availableText = "unknown"
+	if capacity, probeErr := storage.ProbeFilesystemCapacity(projectRoot, time.Now()); probeErr == nil && capacity.Known {
+		availableText = formatInitUintByteCount(capacity.AvailableBytes)
+	}
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Runner artifact estimate (informational; configuration creation is not blocked):")
+	fmt.Fprintf(out, "  Source: %s\n", source.Reference)
+	fmt.Fprintf(out, "  Platform: %s\n", source.Platform)
+	if len(customScripts) == 0 {
+		fmt.Fprintln(out, "  Custom install scripts: none")
 	} else {
-		fmt.Fprintln(out, "  Measured guest root peak: unavailable for this exact template digest.")
-		fmt.Fprintln(out, "  Root capacity is the least certain reservation and is the only capacity question asked; the 30GiB default is provisional and is not derived from the template cache size.")
-		var promptErr error
-		rootDisk, promptErr = promptInitByteSize(out, reader, "Sandbox root filesystem total capacity", "30GiB", int64(sandboxcapacity.MinimumRootDisk))
-		if promptErr != nil {
-			return nil, false, promptErr
-		}
-		dockerDisk = "100GiB"
-		fmt.Fprintln(out, "  Automatically selected sandbox Docker disk: 100GiB.")
+		fmt.Fprintf(out, "  Custom install scripts: %s\n", strings.Join(customScripts, ", "))
 	}
-	minHostFreeSpace := "50GiB"
-	fmt.Fprintln(out, "  Automatically selected minimum host free space: 50GiB.")
-	fmt.Fprintln(out, "  EPAR rechecks current Docker Sandboxes storage free space, existing and uncertain reservations, and raises the effective host watermark to at least 10% of the backing volume before every sandbox create.")
-	rootDiskBytes, err := config.ParseByteSize(rootDisk)
+	fmt.Fprintf(out, "  Estimated download: %s compressed layers\n", formatInitUintByteCount(source.CompressedLayerBytes))
+	fmt.Fprintf(out, "  Estimated expanded source: %s\n", formatInitUintByteCount(sourceEstimate.ExpandedBytes))
+	fmt.Fprintf(out, "  Estimated incremental physical peak: %s\n", formatInitUintByteCount(artifactPlan.EstimatedIncrementalPeak))
+	fmt.Fprintf(out, "  Available physical space: %s\n", availableText)
+	fmt.Fprintln(out, "  Fixed free-space reserve: 1GiB")
+	fmt.Fprintf(out, "  Estimate confidence: %s\n", artifactPlan.Confidence)
+	if providerType == "docker-sandboxes" {
+		fmt.Fprintf(out, "  Automatic sandbox root limit: %s (sparse logical maximum)\n", formatInitUintByteCount(artifactPlan.LogicalRootMaximumBytes))
+		fmt.Fprintf(out, "  Inner Docker limit: %s (independent sparse logical maximum)\n", formatInitUintByteCount(artifactPlan.LogicalDockerMaximumBytes))
+	}
+	fmt.Fprintln(out, "  Expected duration: several minutes; full-latest can take substantially longer on a cold cache.")
+	confirmed, err := promptYesNo(out, reader, "Create this configuration?", true)
 	if err != nil {
-		return nil, false, fmt.Errorf("parse sandbox root filesystem capacity: %w", err)
+		return nil, false, err
 	}
-	dockerDiskBytes, err := config.ParseByteSize(dockerDisk)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse sandbox Docker disk capacity: %w", err)
+	if !confirmed {
+		return nil, false, nil
 	}
-	minHostFreeSpaceBytes, err := config.ParseByteSize(minHostFreeSpace)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse minimum host free space: %w", err)
-	}
-	capacityResult, err := initDockerSandboxesCapacityCheck(uint64(rootDiskBytes), uint64(dockerDiskBytes), uint64(minHostFreeSpaceBytes))
-	if err != nil {
-		return nil, false, fmt.Errorf("Docker Sandboxes setup cannot measure provider storage capacity: %w; no config was written", err)
-	}
-	if capacityResult.CapacityStatus != storage.CapacityReady {
-		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Docker Sandboxes capacity admission failed:")
-		fmt.Fprintf(out, "  Provider storage: %s\n", capacityResult.StorageRoot)
-		fmt.Fprintf(out, "  Available: %s\n", formatInitUintByteCount(capacityResult.AvailableBytes))
-		fmt.Fprintf(out, "  Sandbox reservation: %s\n", formatInitUintByteCount(capacityResult.Reservation))
-		fmt.Fprintf(out, "  Required host reserve: %s\n", formatInitUintByteCount(capacityResult.HostWatermark))
-		fmt.Fprintf(out, "  Required before creation: %s\n", formatInitUintByteCount(capacityResult.RequiredBytes))
-		fmt.Fprintf(out, "  Shortfall: %s\n", formatInitUintByteCount(capacityResult.DeficitBytes))
-		fmt.Fprintf(out, "  Preview exact policy-selected cleanup with: %s\n", invocation.Command("storage", "prune", "--provider", "docker-sandboxes"))
-		return nil, false, errors.New("Docker Sandboxes storage is insufficient for the selected profile; no config was written")
-	}
-	fmt.Fprintf(out, "  Verified Docker Sandboxes storage admission on %s: %s available; %s required before creation.\n", capacityResult.StorageRoot, formatInitUintByteCount(capacityResult.AvailableBytes), formatInitUintByteCount(capacityResult.RequiredBytes))
-	profile := &initDockerSandboxesProfile{
+	return &initDockerSandboxesProfile{
+		Provider:          providerType,
 		HostPlatform:      hostPlatform,
-		Template:          selected.Reference,
-		TemplateDigest:    selected.Digest,
-		PolicyFingerprint: discovery.PolicyFingerprint,
-		RootDisk:          rootDisk,
+		GuestPlatform:     guestPlatform,
+		SourceImage:       source.Reference,
+		CustomScripts:     customScripts,
+		PolicyFingerprint: policyFingerprint,
+		RootDisk:          config.DockerSandboxesAutomaticRootDisk,
 		DockerDisk:        dockerDisk,
-		MinHostFreeSpace:  minHostFreeSpace,
+	}, true, nil
+}
+
+func initDockerGuestPlatform(providerType string, hostPlatform sandboxpromotion.Platform) (string, error) {
+	if providerType == "docker-sandboxes" {
+		platform, _, err := dockerSandboxesPlatform(hostPlatform)
+		return platform, err
 	}
-	if err := config.ValidateDockerSandboxes(config.DockerSandboxesConfig{
-		Template:             profile.Template,
-		TemplateDigest:       profile.TemplateDigest,
-		PolicyGeneration:     profile.PolicyFingerprint,
-		NetworkBaseline:      config.DockerSandboxesNetworkBaselineOpen,
-		StagingRoot:          ".local/docker-sandboxes-staging",
-		CPUs:                 4,
-		Memory:               "8GiB",
-		RootDisk:             profile.RootDisk,
-		DockerDisk:           profile.DockerDisk,
-		MaxConcurrentCreates: 2,
-		MinHostFreeSpace:     profile.MinHostFreeSpace,
-	}); err != nil {
-		return nil, false, fmt.Errorf("validate discovered Docker Sandboxes profile: %w", err)
+	_, architecture, found := strings.Cut(string(hostPlatform), "/")
+	if !found {
+		return "", fmt.Errorf("unsupported controller platform %q", hostPlatform)
 	}
-	fmt.Fprintf(out, "  Verified policy fingerprint: %s\n", discovery.PolicyFingerprint)
-	return profile, true, nil
+	switch architecture {
+	case "amd64", "arm64":
+		return "linux/" + architecture, nil
+	default:
+		return "", fmt.Errorf("unsupported Docker image architecture %q", architecture)
+	}
+}
+
+func validateInitCustomInstallScript(projectRoot, configured string) (string, error) {
+	value := strings.TrimSpace(configured)
+	if value == "" || filepath.IsAbs(value) || filepath.VolumeName(value) != "" {
+		return "", fmt.Errorf("path must be project-relative")
+	}
+	path := config.ProjectPath(projectRoot, value)
+	relative, err := filepath.Rel(projectRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path must remain under the project root")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("path must name a regular file")
+	}
+	return filepath.ToSlash(filepath.Clean(relative)), nil
 }
 
 func checkInitDockerSandboxesCapacity(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {
+	_ = rootDisk
+	_ = dockerDisk
 	storageRoot, err := sandboxcapacity.DockerSandboxesStorageRoot()
 	if err != nil {
 		return initDockerSandboxesCapacityResult{}, err
@@ -995,10 +1064,7 @@ func checkInitDockerSandboxesCapacity(rootDisk, dockerDisk, minHostFreeSpace uin
 	if err != nil {
 		return initDockerSandboxesCapacityResult{}, fmt.Errorf("probe %s for %s: %w", probePath, storageRoot, err)
 	}
-	if rootDisk > math.MaxUint64-dockerDisk {
-		return initDockerSandboxesCapacityResult{}, errors.New("sandbox root and Docker disk reservation overflows")
-	}
-	reservation := rootDisk + dockerDisk
+	reservation := uint64(0)
 	hostWatermark, err := sandboxcapacity.HostWatermark(minHostFreeSpace, capacity.TotalBytes)
 	if err != nil {
 		return initDockerSandboxesCapacityResult{}, err
@@ -1250,16 +1316,8 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 		readiness, err := initDockerSandboxesReadiness(readinessContext)
 		cancel()
 		if err == nil {
-			capacityResult, capacityErr := initDockerSandboxesCapacityCheck(sandboxcapacity.MinimumRootDisk, sandboxcapacity.MinimumDockerDisk, sandboxcapacity.MinimumHostFreeSpace)
-			switch {
-			case capacityErr != nil:
-				result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — provider storage capacity cannot be measured: %v", capacityErr)
-			case capacityResult.CapacityStatus != storage.CapacityReady:
-				result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — provider storage %s has %s available; the minimum valid sandbox and host reserve require %s (shortfall %s)", capacityResult.StorageRoot, formatInitUintByteCount(capacityResult.AvailableBytes), formatInitUintByteCount(capacityResult.RequiredBytes), formatInitUintByteCount(capacityResult.DeficitBytes))
-			default:
-				result.DockerSandboxesAvailable = true
-				result.DockerSandboxesStatus = fmt.Sprintf("READY — Docker and sbx diagnostics passed (%d pass, %d warn, %d fail, %d skip); minimum storage admission passed", readiness.ChecksPassed, readiness.ChecksWarned, readiness.ChecksFailed, readiness.ChecksSkipped)
-			}
+			result.DockerSandboxesAvailable = true
+			result.DockerSandboxesStatus = fmt.Sprintf("READY — Docker and sbx diagnostics passed (%d pass, %d warn, %d fail, %d skip)", readiness.ChecksPassed, readiness.ChecksWarned, readiness.ChecksFailed, readiness.ChecksSkipped)
 		} else {
 			result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — sbx readiness failed: %v", err)
 			if !strings.Contains(err.Error(), "sbx diagnose --output json") {
@@ -1655,7 +1713,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-func defaultDockerContainerConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection) string {
+func defaultDockerContainerConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -1665,7 +1723,8 @@ func defaultDockerContainerConfig(appID int64, organization, privateKeyPath stri
 
 image:
   sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  sourceImage: %s
+  sourcePlatform: %s
   outputImage: epar-docker-container-catthehacker-ubuntu
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
@@ -1673,6 +1732,7 @@ image:
   hostTrustMode: %s
   hostTrustScopes: [%s]
   customInstallScripts:
+%s
 
 pool:
   instances: 1
@@ -1683,7 +1743,7 @@ pool:
   replacementRetryJitterPercent: 20
 
 storage:
-  minimumFree: 20GiB
+  minimumFree: 1GiB
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
@@ -1737,7 +1797,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
+`, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, hostTrustMode, strings.Join(hostTrustScopes, ", "), renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
 func promotedDockerSandboxesPlatform(record sandboxpromotion.Record) (string, string, error) {
@@ -1763,21 +1823,6 @@ func dockerSandboxesPlatform(platform sandboxpromotion.Platform) (string, string
 	}
 }
 
-func promotedDockerSandboxesProfile(record sandboxpromotion.Record) (*initDockerSandboxesProfile, error) {
-	if _, _, err := promotedDockerSandboxesPlatform(record); err != nil {
-		return nil, err
-	}
-	return &initDockerSandboxesProfile{
-		HostPlatform:      record.Platform,
-		Template:          record.Template,
-		TemplateDigest:    record.TemplateDigest,
-		PolicyFingerprint: record.PolicyFingerprint,
-		RootDisk:          formatPromotionBytes(record.RootDiskBytes),
-		DockerDisk:        formatPromotionBytes(record.DockerDiskBytes),
-		MinHostFreeSpace:  formatPromotionBytes(record.MinHostFreeSpaceBytes),
-	}, nil
-}
-
 func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, guestPlatform, runnerArchitectureLabel string) string {
 	return fmt.Sprintf(`github:
   appId: %d
@@ -1787,6 +1832,12 @@ func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath stri
   webBaseUrl: https://github.com
 
 image:
+  sourceType: docker-image
+  sourceImage: %s
+  sourcePlatform: %s
+  runnerVersion: latest
+  customInstallScripts:
+%s
   hostTrustMode: %s
   hostTrustScopes: [%s]
 
@@ -1799,7 +1850,7 @@ pool:
   replacementRetryJitterPercent: 20
 
 storage:
-  minimumFree: 20GiB
+  minimumFree: 1GiB
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
@@ -1845,8 +1896,6 @@ provider:
   platform: %s
 
 dockerSandboxes:
-  template: %s
-  templateDigest: %s
   policyGeneration: %s
   networkBaseline: open
   stagingRoot: .local/docker-sandboxes-staging
@@ -1855,24 +1904,26 @@ dockerSandboxes:
   rootDisk: %s
   dockerDisk: %s
   maxConcurrentCreates: 2
-  minHostFreeSpace: %s
 
 timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.Template, profile.TemplateDigest, profile.PolicyFingerprint, profile.RootDisk, profile.DockerDisk, profile.MinHostFreeSpace)
+`, appID, organization, privateKeyPath, profile.SourceImage, guestPlatform, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, profile.RootDisk, profile.DockerDisk)
 }
 
-func formatPromotionBytes(value uint64) string {
-	const gib = uint64(1 << 30)
-	if value != 0 && value%gib == 0 {
-		return strconv.FormatUint(value/gib, 10) + "GiB"
+func renderInitCustomInstallScripts(paths []string) string {
+	if len(paths) == 0 {
+		return "    # - examples/custom-install/install-extra-apt-tools.sh"
 	}
-	return strconv.FormatUint(value, 10) + "B"
+	var lines []string
+	for _, path := range paths {
+		lines = append(lines, "    - "+strconv.Quote(path))
+	}
+	return strings.Join(lines, "\n")
 }
 
-func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection) string {
+func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -1882,14 +1933,14 @@ func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolName
 
 image:
   sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
-  sourcePlatform: linux/amd64
+  sourceImage: %s
+  sourcePlatform: %s
   outputImage: work/images/epar-wsl-catthehacker-ubuntu.tar
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
   customInstallScripts:
-    # - examples/custom-install/install-extra-apt-tools.sh
+%s
 
 pool:
   instances: 1
@@ -1901,7 +1952,7 @@ pool:
   replacementRetryJitterPercent: 20
 
 storage:
-  minimumFree: 20GiB
+  minimumFree: 1GiB
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
@@ -1956,7 +2007,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
+`, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
 func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection) string {
@@ -1988,7 +2039,7 @@ pool:
   replacementRetryJitterPercent: 20
 
 storage:
-  minimumFree: 20GiB
+  minimumFree: 1GiB
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative

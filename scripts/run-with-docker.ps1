@@ -138,17 +138,23 @@ try {
                 go run ./cmd/ephemeral-action-runner @InitArgs
             $ExitCode = $LASTEXITCODE
             if ($ExitCode -eq 0) {
-                $initBridge = [pscustomobject]@{ FeedDir = $null; WatchProcess = $null; Config = $ConfigPath; PostInit = $true }
+                $initBridge = [pscustomobject]@{ FeedDir = $null; BuildFeedDir = $null; RunnerFeedDir = $null; WatchProcess = $null; WatchProcesses = @(); Config = $ConfigPath; PostInit = $true }
                 Complete-EparHostTrustInit -ProjectRoot $RepoRoot -Bridge $initBridge
             }
         }
         if ($ExitCode -eq 0) {
             $bridge = Start-EparHostTrustBridge -ProjectRoot $RepoRoot -Command $EparCommand -Arguments $EparArgs
             $HostTrustFlags = @()
-            if ($bridge.FeedDir) {
+            if ($bridge.BuildFeedDir -or $bridge.RunnerFeedDir) {
                 $HostTrustFlags += @("-e", "EPAR_CONTROLLER_HOST_OS=$(Get-EparHostTrustHostOS)")
+            }
+            if ($bridge.BuildFeedDir) {
+                $HostTrustFlags += @("-e", "EPAR_BUILD_TRUST_FEED=/run/epar-build-trust/current.json")
+                $HostTrustFlags += @("-v", "$($bridge.BuildFeedDir):/run/epar-build-trust:ro")
+            }
+            if ($bridge.RunnerFeedDir) {
                 $HostTrustFlags += @("-e", "EPAR_HOST_TRUST_FEED=/run/epar-host-trust/current.json")
-                $HostTrustFlags += @("-v", "$($bridge.FeedDir):/run/epar-host-trust:ro")
+                $HostTrustFlags += @("-v", "$($bridge.RunnerFeedDir):/run/epar-host-trust:ro")
             }
             docker run @DockerRunFlags `
                 @DockerEnvFlags `

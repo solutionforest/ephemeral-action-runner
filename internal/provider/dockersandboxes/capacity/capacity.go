@@ -12,9 +12,10 @@ const (
 	GiB                    uint64 = 1 << 30
 	MinimumRootDisk               = 20 * GiB
 	RootWritableHeadroom          = 20 * GiB
-	DockerDeletionHeadroom        = 20 * GiB
-	MinimumDockerDisk             = 100 * GiB
-	MinimumHostFreeSpace          = 50 * GiB
+	CustomizationAllowance        = 5 * GiB
+	DefaultDockerDisk             = 50 * GiB
+	MinimumDockerDisk             = 1 * GiB
+	MinimumHostFreeSpace          = 1 * GiB
 	rootRoundingQuantum           = 10 * GiB
 )
 
@@ -32,21 +33,15 @@ type HostSpace struct {
 	TotalBytes     uint64
 }
 
-// HostWatermark returns the effective physical free-space floor for the
-// backing volume. A configured or promoted floor may strengthen the rule, but
-// can never weaken the larger of 50 GiB and ten percent of the current volume.
+// HostWatermark returns the configured fixed physical free-space reserve. The
+// backing volume size is deliberately not used: a percentage reserve produces
+// nonsensical requirements on large volumes.
 func HostWatermark(configured, backingVolumeSize uint64) (uint64, error) {
-	if backingVolumeSize == 0 {
-		return 0, errors.New("backing volume size must be greater than zero")
+	_ = backingVolumeSize
+	if configured == 0 {
+		return MinimumHostFreeSpace, nil
 	}
-	watermark := ceilDiv(backingVolumeSize, 10)
-	if watermark < MinimumHostFreeSpace {
-		watermark = MinimumHostFreeSpace
-	}
-	if configured > watermark {
-		watermark = configured
-	}
-	return watermark, nil
+	return configured, nil
 }
 
 // Derive calculates the resource floors required by the Docker Sandboxes
@@ -59,21 +54,12 @@ func Derive(measuredRootPeak, representativeDockerPeak, backingVolumeSize uint64
 	if representativeDockerPeak == 0 {
 		return Requirements{}, errors.New("representative Docker peak must be greater than zero")
 	}
-	if backingVolumeSize == 0 {
-		return Requirements{}, errors.New("backing volume size must be greater than zero")
-	}
-
 	rootDisk, err := DeriveRootDisk(measuredRootPeak, RootWritableHeadroom)
 	if err != nil {
 		return Requirements{}, fmt.Errorf("derive root disk: %w", err)
 	}
-	dockerDisk, err := addPercentAndHeadroom(representativeDockerPeak, DockerDeletionHeadroom)
-	if err != nil {
-		return Requirements{}, fmt.Errorf("derive Docker disk: %w", err)
-	}
-	if dockerDisk < MinimumDockerDisk {
-		dockerDisk = MinimumDockerDisk
-	}
+	_ = representativeDockerPeak
+	dockerDisk := DefaultDockerDisk
 	hostWatermark, err := HostWatermark(0, backingVolumeSize)
 	if err != nil {
 		return Requirements{}, fmt.Errorf("derive host watermark: %w", err)
@@ -81,10 +67,8 @@ func Derive(measuredRootPeak, representativeDockerPeak, backingVolumeSize uint64
 	return Requirements{RootDisk: rootDisk, DockerDisk: dockerDisk, MinHostFreeSpace: hostWatermark}, nil
 }
 
-// DeriveRootDisk turns a measured guest root-filesystem peak and operator
-// headroom into the total root-disk capacity passed to Docker Sandboxes. The
-// cached template size is deliberately not an input because it is host-cache
-// storage, not measured guest root usage.
+// DeriveRootDisk turns the expanded source-image estimate and writable
+// headroom into the total root-disk capacity passed to Docker Sandboxes.
 func DeriveRootDisk(measuredRootPeak, writableHeadroom uint64) (uint64, error) {
 	if measuredRootPeak == 0 {
 		return 0, errors.New("measured root peak must be greater than zero")
@@ -92,10 +76,14 @@ func DeriveRootDisk(measuredRootPeak, writableHeadroom uint64) (uint64, error) {
 	if writableHeadroom < RootWritableHeadroom {
 		return 0, fmt.Errorf("writable root headroom must be at least %d", RootWritableHeadroom)
 	}
-	rootWithMargin, err := addPercentAndHeadroom(measuredRootPeak, writableHeadroom)
-	if err != nil {
-		return 0, err
+	if measuredRootPeak > math.MaxUint64-CustomizationAllowance {
+		return 0, errors.New("customization allowance overflows uint64")
 	}
+	rootWithAllowance := measuredRootPeak + CustomizationAllowance
+	if rootWithAllowance > math.MaxUint64-writableHeadroom {
+		return 0, errors.New("writable headroom overflows uint64")
+	}
+	rootWithMargin := rootWithAllowance + writableHeadroom
 	rootDisk, err := roundUp(rootWithMargin, rootRoundingQuantum)
 	if err != nil {
 		return 0, err

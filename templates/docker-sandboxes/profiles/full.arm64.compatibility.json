@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 1,
-  "candidate": "A",
+  "schemaVersion": 2,
+  "templateSchemaVersion": 1,
   "profile": "full",
   "validationStatus": "unvalidated",
   "platform": "linux/arm64",

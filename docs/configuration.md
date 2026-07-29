@@ -24,11 +24,11 @@ EPAR chooses the first available configuration path in this order: `--config <pa
 | Provider | Host and artifact model | Image defaults | Provider-only configuration |
 | --- | --- | --- | --- |
 | `docker-container` | A Docker-compatible host creates an outer disposable runner with its own inner Docker daemon. | `docker-image`, `ghcr.io/catthehacker/ubuntu:full-latest`, output `epar-docker-container-catthehacker-ubuntu`. | Optional `provider.platform`; `docker` proxy and mirror settings apply to its private daemon. |
-| `docker-sandboxes` | A host with healthy `sbx diagnose --output json` results creates a pinned Linux sandbox template. It is preview-only until the exact host/platform combination has independent live evidence. | No source image or build artifact is accepted; the wizard selects and pins a local Candidate A template. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. |
+| `docker-sandboxes` | A host with healthy `sbx diagnose --output json` results builds and imports a Linux runner template. It is preview-only until the exact host/platform combination has independent live evidence. | `image.sourceImage` selects a `ghcr.io/catthehacker/ubuntu` tag; EPAR records the exact artifact in local state. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. |
 | `wsl` | Windows WSL2 imports a Docker image or rootfs tar into disposable Linux distros. | Docker source defaults to Catthehacker full Ubuntu, x64, with output under `work/images/`. | `provider.installRoot` controls WSL storage. |
 | `tart` | Experimental Apple Silicon Linux VM path. | `ghcr.io/cirruslabs/ubuntu:latest`, output `epar-ubuntu-24-arm64`. | `provider.network` and optional `provider.rosettaTag`. Validate the exact workload before relying on Rosetta. |
 
-Docker Sandboxes never falls back to Docker Container. Its wizard is available only when `sbx diagnose --output json` reports at least one passing check and no failed checks and the host mapping, local template identity, policy fingerprint, and capacity evidence pass. Warnings and skipped checks remain visible; failures prevent selection.
+Docker Sandboxes never falls back to Docker Container. Its wizard is available when the required tooling, daemon diagnostics, and host-platform mapping pass; storage is estimated after image selection but never blocks provider selection or configuration creation. After the configuration is saved, ordinary startup performs storage admission, source resolution, policy fingerprinting, template construction, import, and exact readback before any runner starts. Warnings and skipped diagnostics remain visible, and provisioning failures preserve the desired configuration without silently running an old artifact.
 
 ## Configuration reference
 
@@ -54,11 +54,11 @@ Docker Sandboxes never falls back to Docker Container. Its wizard is available o
 | `upstreamLock` | string; `third_party/runner-images.lock` | Image builds that adapt upstream scripts. | Lock file identifying the approved upstream revision. |
 | `runnerVersion` | string; `latest` | Runner image builds. | Runner release selector. Pin a version when repeatability matters. |
 | `customInstallScripts` | list of non-empty paths; empty | Optional image customization. | Scripts run while creating the runner image; treat them as trusted build input. |
-| `trustedCaCertificatePaths` | list of non-empty paths; empty | Optional additional TLS roots. | PEM or DER CA files are validated and installed in the Ubuntu trust bundle. They supplement, not replace, host trust. |
-| `hostTrustMode` | `disabled` or `overlay`; `disabled` | Optional host-root inheritance for ephemeral runners. | `overlay` requires `runner.ephemeral: true`; it collects a current host-trust generation before registration and fails closed on an invalid or stale result. |
+| `trustedCaCertificatePaths` | list of non-empty paths; empty | Optional additional TLS roots. | PEM or DER CA files are validated, supplied to EPAR's operational builder, and installed in the runner artifact. They supplement, not replace, system or runner-overlay trust. |
+| `hostTrustMode` | `disabled` or `overlay`; `disabled` | Optional host-root inheritance for ephemeral runners. | Controls runner inheritance only. `overlay` requires `runner.ephemeral: true`; it collects a current host-trust generation before registration and fails closed on an invalid or stale result. EPAR's owned builder independently receives operational system trust. |
 | `hostTrustScopes` | list of `system`, `user`; `[system]` | Required and non-empty with `hostTrustMode: overlay`. | Windows/macOS may use `[system, user]`; Linux supports `[system]` only. This is root-anchor inheritance, not exact host TLS-policy emulation. |
 
-Host trust is a common ephemeral-runner contract, not a Docker Container-only configuration rule. The interactive Docker Container and Docker Sandboxes paths offer it, while the configuration validator applies the same overlay and ephemeral requirements independently of provider type. A host Docker daemon must separately trust a private registry before EPAR can pull an image; the guest overlay cannot repair a failed source-image pull.
+Runner host trust is a common ephemeral-runner contract, not a Docker Container-only configuration rule. The interactive Docker Container and Docker Sandboxes paths offer it, while the configuration validator applies the same overlay and ephemeral requirements independently of provider type. Operational builder trust is automatic and separate: system roots are supplied to EPAR's dedicated BuildKit builder even when runner overlay is disabled, user roots remain opt-in through runner overlay scope, and explicit CA paths apply to both paths. A host Docker daemon must separately trust a private registry before EPAR can pull an image; neither builder nor guest overlay can repair a failed host-daemon pull.
 
 ### `pool`
 
@@ -79,7 +79,7 @@ GitHub `429` and `5xx` responses and transient network failures back off replace
 
 | Property | Type and default | Required or applies when | Effect and caution |
 | --- | --- | --- | --- |
-| `minimumFree` | positive byte size; `20GiB` | All providers. | Provider-neutral admission reserve. Docker Sandboxes raises it to `minHostFreeSpace` when that is larger. |
+| `minimumFree` | positive byte size; `1GiB` | All providers. | Fixed provider-neutral physical free-space reserve. Existing explicit values remain authoritative; the default does not scale with volume size. |
 | `gracePeriod` | positive Go duration; `168h` | Conservative housekeeping. | Minimum age before eligible EPAR-owned artifacts can be considered for removal. |
 | `keepPrevious` | integer; `0` | Conservative housekeeping. Must be non-negative. | Number of prior reusable artifact generations to retain. |
 | `automaticHousekeeping` | `conservative` or `disabled`; `conservative` | All providers. | Conservative mode touches only expired, unleased, exactly owned artifacts; it does not run a broad Docker or WSL prune. |
@@ -156,8 +156,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 
 | Property | Type and default | Required or applies when | Effect and caution |
 | --- | --- | --- | --- |
-| `template` | immutable local template identity; no default | Required with Docker Sandboxes. | Exact Candidate A template selected by the wizard; raw Catthehacker images are not runnable templates. |
-| `templateDigest` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Full local OCI configuration digest for the template identity. |
+| `image.sourceImage` | `ghcr.io/catthehacker/ubuntu:full-latest` | Required with Docker Sandboxes. | Desired Catthehacker source selector; EPAR builds and imports the runnable template automatically. |
 | `policyGeneration` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Fingerprint of the verified host-global Balanced policy. Policy drift blocks admission. |
 | `networkBaseline` | `open` or `balanced`; `open` | Docker Sandboxes. | `open` adds a sandbox-scoped public-egress rule while denying host aliases; it does not change the host-global policy. |
 | `additionalAllow` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped allow resources. With `open`, it cannot re-allow EPAR's host-alias deny guardrails. |
@@ -165,9 +164,8 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 | `stagingRoot` | canonical project-relative `.local/...` path; `.local/docker-sandboxes-staging` | Docker Sandboxes. | Per-create staging root; cannot be absolute, escape `.local`, or overlap `.local/bin` or `.local/state`. |
 | `cpus` | positive integer; `4` | Docker Sandboxes. | CPU allocation for each sandbox. |
 | `memory` | positive byte size; `8GiB` | Docker Sandboxes. | Per-sandbox memory allocation written by the wizard. |
-| `rootDisk` | byte size at least `20GiB`; no schema default | Docker Sandboxes. | Guest root capacity. Wizard sizing uses measured guest use plus margin/headroom when evidence exists. |
-| `dockerDisk` | byte size at least `100GiB`; no schema default | Docker Sandboxes. | Inner Docker disk capacity. |
-| `minHostFreeSpace` | byte size at least `50GiB`; no schema default | Docker Sandboxes. | Host admission floor; effective reserve is the larger of this and `storage.minimumFree`. Runtime may require a stricter backing-volume percentage. |
+| `rootDisk` | `auto` or byte size at least `20GiB`; `auto` | Docker Sandboxes. | Sparse guest-root logical maximum. `auto` is recalculated for each artifact as the expanded image estimate plus 5 GiB build allowance and 20 GiB writable headroom, rounded up to 10 GiB. An explicit undersized value is rejected before creation. |
+| `dockerDisk` | byte size at least `1GiB`; `50GiB` | Docker Sandboxes. | Independent sparse logical maximum for the Docker daemon inside the sandbox; it is workload capacity and is not derived from the base image. |
 | `maxConcurrentCreates` | positive integer; `2` | Docker Sandboxes. | Limits concurrent sandbox creation to control capacity pressure. |
 
 ### `timeouts`
@@ -182,7 +180,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 
 - `provider.sourceImage` is required for Tart, WSL, and Docker Container, and forbidden for Docker Sandboxes.
 - `provider.rosettaTag` is accepted only for Tart. `provider.platform` is accepted only for Docker Container or Docker Sandboxes. Docker Sandboxes accepts only `linux/amd64` and `linux/arm64`.
-- Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, a valid pinned template/digest/policy generation, resource values, and a lowercase-compatible pool prefix.
+- Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, a valid desired Catthehacker image, policy generation, resource values, and a lowercase-compatible pool prefix.
 - `image.sourcePlatform` requires `image.sourceType: docker-image`; all byte-size fields require a positive `B`, `KiB`, `MiB`, `GiB`, or `TiB` value.
 - Host-trust overlay requires a non-empty, duplicate-free scope list and `runner.ephemeral: true`; `user` is not supported on Linux.
 - `pool.namePrefix` is an ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses its durable ledger of exact owned identities. Do not share a prefix between controllers or assume broad prefix cleanup is safe.
@@ -195,7 +193,7 @@ The configuration loader starts with Tart defaults, then applies provider-specif
 | Provider | Source and output | Default labels and prefix |
 | --- | --- | --- |
 | Docker Container | Catthehacker full Ubuntu to `epar-docker-container-catthehacker-ubuntu`. | `self-hosted`, `linux`, `epar-docker-container-catthehacker-ubuntu`; prefix `epar-docker-container`. |
-| Docker Sandboxes | Pinned Candidate A template, digest, and policy generation; no `provider.sourceImage`. | `self-hosted`, `linux`, matching `X64`/`ARM64`, `epar-docker-sandboxes`; prefix `epar-docker-sandboxes`. |
+| Docker Sandboxes | Desired image settings plus policy generation; exact template identities live in the local artifact receipt. | `self-hosted`, `linux`, matching `X64`/`ARM64`, `epar-docker-sandboxes`; prefix `epar-docker-sandboxes`. |
 | WSL Docker source | Catthehacker full Ubuntu, `linux/amd64`, output `work/images/epar-wsl-catthehacker-ubuntu.tar`. | `self-hosted`, `linux`, `X64`, `epar-wsl-catthehacker-ubuntu`; prefix `epar-wsl`. |
 | WSL rootfs tar | `work/images/ubuntu-24.04-clean.rootfs.tar`, output `work/images/epar-ubuntu-24-wsl.tar`. | `self-hosted`, `linux`, `X64`, `epar-wsl-ubuntu-24.04-base`; prefix `epar-wsl`. |
 | Tart | `ghcr.io/cirruslabs/ubuntu:latest` to `epar-ubuntu-24-arm64`. | `self-hosted`, `linux`, `ARM64`, `epar-tart-ubuntu-24.04-base`; prefix `epar`. |
@@ -245,4 +243,4 @@ docker:
   noProxy: localhost,127.0.0.1,.example.test
 ```
 
-For Docker Sandboxes, run `./start` and let the wizard write the pinned template, digest, policy fingerprint, and capacity settings. Do not hand-copy a template tag from another host or replace its digest with a mutable tag.
+For Docker Sandboxes, run `./start` and let the wizard select the desired image, provision the native-platform runner template, and write the policy fingerprint and capacity settings. Do not hand-copy generated template identities between hosts; EPAR records them in the local artifact receipt.

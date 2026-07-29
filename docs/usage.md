@@ -9,7 +9,7 @@ Use this page for normal EPAR tasks. Start with the host and provider you alread
 | Run a source archive | Go 1.25 or newer, or Docker for the no-Go controller builder |
 | Register or inspect GitHub runners | A GitHub App with organization self-hosted runner read/write permission |
 | Docker Container | Docker Engine, Docker Desktop, or OrbStack with privileged Linux-container support |
-| Docker Sandboxes | Docker, the `sbx` CLI with at least one diagnostic pass and zero failures, and an approved EPAR template already built and loaded |
+| Docker Sandboxes | Docker and the `sbx` CLI with at least one diagnostic pass and zero failures; the wizard builds and imports the selected EPAR template |
 | WSL | Native Windows, WSL2, and Docker when preparing the default WSL image |
 | Tart | Native Apple Silicon macOS and Tart |
 
@@ -35,9 +35,9 @@ The wrapper uses local Go when available, otherwise it uses Docker to build and 
 go run ./cmd/ephemeral-action-runner start
 ```
 
-When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group, shows every provider with its current prerequisite result, and refuses unavailable selections. Docker Sandboxes becomes the Enter default only when Docker, `sbx diagnose --output json`, the host platform, and the exact locally built-and-loaded template pass admission. The wizard does not build or load a template, and it never falls back from a selected provider.
+When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group, shows every provider with its tooling and daemon prerequisite result, and refuses unavailable selections. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share one Catthehacker image/profile and custom-script flow, followed by an informational physical-growth estimate and confirmation. The wizard writes the desired configuration first; direct `init` then exits, while embedded `./start` continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
 
-Before choosing Docker Sandboxes, follow [Docker Sandboxes](providers/docker-sandboxes.md) to build, review, and load the approved template for the host platform. The wizard verifies the template cache entry and its full local image identity before it writes configuration.
+See [Docker Sandboxes](providers/docker-sandboxes.md) for source profiles, capacity, local receipts, and platform validation status.
 
 ## Create or choose configuration
 
@@ -67,6 +67,8 @@ go run ./cmd/ephemeral-action-runner start --config .local\ci.yml --instances 2
 ```
 
 If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.instances` from the selected config. EPAR resolves configuration from `--config`, `EPAR_CONFIG`, `.local/config.yml`, then `~/.config/ephemeral-action-runner/config.yml`. Tracked files in `configs/` are examples; keep App values and key paths in an ignored local file. See [Configuration](configuration.md) for every setting and [Runner Group Security](runner-groups.md) before broadening repository access.
+
+Storage-consuming commands fail before their provider side effects when an authoritative physical surface cannot retain `storage.minimumFree`. The one-invocation `--allow-insufficient-storage` option keeps all probes and warnings but permits only storage admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, and cleanup protections remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
 
 Press `Ctrl-C` once to stop a foreground pool and wait for cleanup confirmation. Use `--keep-on-exit` only to retain owned resources for deliberate debugging.
 
@@ -104,7 +106,7 @@ For a command-construction preview on compatible providers, add `--dry-run`:
 go run ./cmd/ephemeral-action-runner pool verify --dry-run --instances 1
 ```
 
-Docker Sandboxes intentionally does not support this dry run because EPAR must read back the exact prewarmed template identity. Use its admission and template checks instead.
+Docker Sandboxes intentionally does not support dry-run instance creation because EPAR must read back the exact active template-cache identity. Use its admission and template checks instead.
 
 ## Target the right runner
 

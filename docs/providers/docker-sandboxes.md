@@ -34,54 +34,61 @@ EPAR selects this provider by capability, not by an operating-system allowlist: 
 ## Prerequisites
 
 - A working Docker CLI and daemon.
-- Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Warnings and skipped checks do not make the provider unavailable.
-- A native `amd64` or `arm64` controller with the matching `linux/amd64` or `linux/arm64` EPAR template. EPAR does not use emulation to admit a mismatched template.
-- A locally built and loaded, lock-selected Candidate A template whose full local identity matches configuration.
-- Enough Docker Sandboxes backing storage for the configured root disk, Docker disk, existing reservations, and host-free watermark.
+- Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Before the first-run provider assessment, the wizard runs `sbx daemon start --detach` when the `sbx` executable is installed, then runs diagnostics. Warnings and skipped checks do not make the provider unavailable.
+- A native `amd64` or `arm64` controller with matching `linux/amd64` or `linux/arm64` image support. EPAR does not use emulation to admit a mismatched template.
+- Enough capacity to resolve, build, export, import, and retain the selected runner template.
+- Enough physical backing storage for the estimated incremental template and sandbox bootstrap work while retaining `storage.minimumFree`. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
 - A GitHub runner group that meets enforced policy. Docker Sandboxes requires `security.runnerGroup.enforcement: enforce` and `runner.ephemeral: true`.
 
-Build and load the template before running the wizard. See [Docker Sandboxes template build and retention](../advanced/docker-sandboxes-template.md).
+The wizard builds and imports the template. The recipes in `templates/docker-sandboxes` are build inputs, not prebuilt images.
 
 ## Minimal Configuration
 
-Start with [`configs/docker-sandboxes.example.yml`](../../configs/docker-sandboxes.example.yml). The wizard writes the exact values after it verifies local admission; do not substitute a raw Catthehacker image for the template.
+Start with `./start` or [`configs/docker-sandboxes.example.yml`](../../configs/docker-sandboxes.example.yml). Configuration expresses the desired source; EPAR stores immutable build and cache identities in its local receipt.
 
 ```yaml
 provider:
   type: docker-sandboxes
   platform: linux/amd64
 
+image:
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  sourcePlatform: linux/amd64
+  runnerVersion: latest
+  customInstallScripts:
+    # - examples/custom-install/install-extra-apt-tools.sh
+
 dockerSandboxes:
-  template: epar-docker-sandboxes-catthehacker-full:<version>
-  templateDigest: sha256:<full-local-image-identity>
   policyGeneration: sha256:<balanced-policy-fingerprint>
   networkBaseline: open
   stagingRoot: .local/docker-sandboxes-staging
   cpus: 4
   memory: 8GiB
-  rootDisk: 30GiB
-  dockerDisk: 100GiB
+  rootDisk: auto
+  dockerDisk: 50GiB
   maxConcurrentCreates: 2
-  minHostFreeSpace: 50GiB
 ```
 
-`provider.sourceImage` is invalid for this provider. `templateDigest` is the full local image identity, not Docker Sandboxes' short cache ID. The `rootDisk`, `dockerDisk`, and host-free settings are reservations: the minimums are 20 GiB, 100 GiB, and 50 GiB respectively, and runtime also enforces at least 10% free on the backing volume. See [Configuration](../configuration.md) for the complete schema.
+`provider.sourceImage` is invalid for this provider; use the common `image` section. `rootDisk: auto` derives a sparse logical root maximum from the selected artifact. `dockerDisk` is an independent sparse workload limit whose default is 50 GiB and minimum is 1 GiB. Neither virtual maximum is treated as immediately consumed host space; the only physical reserve is `storage.minimumFree`, whose generated default is 1 GiB. See [Configuration](../configuration.md) for the complete schema.
 
 `networkBaseline: open` adds EPAR-owned sandbox-scoped public egress plus deny-wins guardrails for host aliases; it does not change the host-global Docker Sandboxes policy. Use `balanced` with `additionalAllow` for default-deny public egress. Additional allow/deny entries are exact hostnames or `*.domain[:port]`; they cannot override the Open host-alias denies.
 
 ## Normal Workflow
 
-1. Build and load a reviewed template using the advanced guide.
-2. Run `./start` with no config, or `ephemeral-action-runner init`, and select Docker Sandboxes when its checks pass. The wizard records the exact template, policy fingerprint, architecture, and reservations.
+1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose a Catthehacker profile or tag and optional custom install scripts; review the non-blocking physical-growth estimate, sparse logical limits, reserve, confidence, and expected duration.
+2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, performs authoritative storage admission, builds and imports the template, and activates it only after exact readback.
 3. Prewarm the selected template without GitHub registration:
 
    ```powershell
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-native-controller.ps1 pool verify --config .local/docker-sandboxes.yml --project-root . --instances 1 --cleanup
    ```
 
-4. Start the pool with `./start`. EPAR validates the already loaded template; it does not build or load one for you.
+4. Start the pool with `./start`. EPAR re-resolves mutable selectors such as `full-latest` and reuses or rebuilds the exact desired template automatically.
 
-Each allocation receives an empty owner-restricted staging directory, but Actions `_work` stays on the guest filesystem. EPAR verifies the guest, policy, private daemon, and host-trust generation before requesting a short-lived registration token. The token remains on the native host except for registration through `sbx exec` standard input.
+Each allocation receives an empty owner-restricted staging directory, but Actions `_work` stays on the guest filesystem. EPAR verifies the guest, policy, private daemon, and runner trust policy before requesting a short-lived registration token. With `image.hostTrustMode: overlay`, the common pool lifecycle installs the selected roots, verifies the immutable generation, and maintains the job-start lease. With the setting omitted or disabled, the template carries an explicit disabled-policy marker and does not install the trust hook. The token remains on the native host except for registration through `sbx exec` standard input.
+
+Template construction uses two independent trust paths. EPAR's project-owned BuildKit builder automatically receives host system roots for Docker Hub, GHCR, and the other pinned registries used by the build. The native controller downloads the locked Actions runner and `tini`, verifies their SHA-256 values, and then supplies them as local build inputs; the Dockerfile does not perform remote HTTPS downloads.
 
 ## Limitations
 

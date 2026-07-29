@@ -30,7 +30,7 @@ func TestValidateRejectsEveryNonWaivableGate(t *testing.T) {
 		{name: "unknown EPAR revision", mutate: func(record *Record) { record.EPARRevision = "unknown" }},
 		{name: "wrong template cache ID", mutate: func(record *Record) { record.TemplateCacheID = "bbbbbbbbbbbb" }},
 		{name: "unverified", mutate: func(record *Record) { record.Verifier = "" }},
-		{name: "weak Docker disk", mutate: func(record *Record) { record.DockerDiskBytes = 99 << 30 }},
+		{name: "weak Docker disk", mutate: func(record *Record) { record.DockerDiskBytes = 512 << 20 }},
 		{name: "too few jobs", mutate: func(record *Record) { record.ReliabilityJobs = 24 }},
 		{name: "short soak", mutate: func(record *Record) { record.ReliabilityDuration = 119 * time.Minute }},
 		{name: "slow create", mutate: func(record *Record) { record.CachedCreateP95 = 61 * time.Second }},

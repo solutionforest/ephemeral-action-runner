@@ -41,8 +41,8 @@ func hostTrustMetadata(snapshot hosttrust.Snapshot) *HostTrustMetadata {
 }
 
 func (m *Coordinator) EnsureImage(ctx context.Context) error {
-	if err := m.preflightStorage("image-pull", imagePullExpansionBytes); err != nil {
-		return err
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		return m.ensureDockerSandboxesTemplate(ctx, false)
 	}
 	if artifactManager, ok := m.Lifecycle.(provider.ArtifactManager); ok {
 		handled, err := artifactManager.EnsureArtifacts(ctx, m.DryRun)

@@ -28,15 +28,13 @@ func (m *Manager) createProviderInstance(ctx context.Context, name string) (prov
 		return provider.Instance{}, fmt.Errorf("provider lifecycle is required")
 	}
 	return lifecycle.Create(ctx, provider.CreateRequest{
-		Name:           name,
-		Source:         m.Config.Provider.SourceImage,
-		Template:       m.Config.DockerSandboxes.Template,
-		TemplateDigest: m.Config.DockerSandboxes.TemplateDigest,
-		StagingPath:    filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.DockerSandboxes.StagingRoot), name),
-		CPUs:           m.Config.DockerSandboxes.CPUs,
-		Memory:         m.Config.DockerSandboxes.Memory,
-		RootDisk:       m.Config.DockerSandboxes.RootDisk,
-		DockerDisk:     m.Config.DockerSandboxes.DockerDisk,
+		Name:        name,
+		Source:      m.Config.Provider.SourceImage,
+		StagingPath: filepath.Join(config.ProjectPath(m.ProjectRoot, m.Config.DockerSandboxes.StagingRoot), name),
+		CPUs:        m.Config.DockerSandboxes.CPUs,
+		Memory:      m.Config.DockerSandboxes.Memory,
+		RootDisk:    m.Config.DockerSandboxes.RootDisk,
+		DockerDisk:  m.Config.DockerSandboxes.DockerDisk,
 	})
 }
 

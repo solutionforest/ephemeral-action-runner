@@ -36,6 +36,14 @@ func TestEveryProviderRegistersRequiredContributions(t *testing.T) {
 		default:
 			t.Errorf("%s has unsupported image mode %q", descriptor.Type, descriptor.ImageMode)
 		}
+		if descriptor.ImageMode == provider.ImageModeTemplate {
+			if !descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0 {
+				t.Errorf("%s has no guided template provisioning contribution", descriptor.Type)
+			}
+			if descriptor.WizardImageProfiles[0].Name != "full" || descriptor.WizardImageProfiles[0].Tag != "full-latest" {
+				t.Errorf("%s does not register its default image profile first", descriptor.Type)
+			}
+		}
 	}
 	if len(seen) != len(SupportedTypes()) {
 		t.Fatalf("descriptors=%d supported types=%d", len(seen), len(SupportedTypes()))

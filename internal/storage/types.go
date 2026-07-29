@@ -5,7 +5,7 @@ import "time"
 const (
 	GiB uint64 = 1 << 30
 
-	DefaultMinimumFreeBytes = 20 * GiB
+	DefaultMinimumFreeBytes = 1 * GiB
 	DefaultGracePeriod      = 168 * time.Hour
 	DefaultKeepPrevious     = 0
 	DefaultBuildKitMaxBytes = 64 * GiB
@@ -34,11 +34,18 @@ type Capacity struct {
 
 // Surface identifies one capacity and reclaim domain.
 type Surface struct {
-	ID       string      `json:"id"`
-	Provider string      `json:"provider,omitempty"`
-	Kind     SurfaceKind `json:"kind"`
-	Location string      `json:"location,omitempty"`
-	Capacity Capacity    `json:"capacity"`
+	ID                     string      `json:"id"`
+	Provider               string      `json:"provider,omitempty"`
+	Kind                   SurfaceKind `json:"kind"`
+	Location               string      `json:"location,omitempty"`
+	Classification         string      `json:"classification,omitempty"`
+	Sparse                 bool        `json:"sparse,omitempty"`
+	VirtualMaximumBytes    uint64      `json:"virtualMaximumBytes,omitempty"`
+	AllocatedBytes         uint64      `json:"allocatedBytes,omitempty"`
+	Confidence             string      `json:"confidence,omitempty"`
+	AdmissionAuthoritative bool        `json:"admissionAuthoritative"`
+	Advisory               bool        `json:"advisory,omitempty"`
+	Capacity               Capacity    `json:"capacity"`
 }
 
 // Requirement is the peak additional capacity needed by an operation on one

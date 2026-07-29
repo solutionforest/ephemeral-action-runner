@@ -137,7 +137,7 @@ func Validate(record Record) error {
 			return fmt.Errorf("Docker Sandboxes promotion record %s gate did not pass", gate)
 		}
 	}
-	if record.RootDiskBytes == 0 || record.DockerDiskBytes < 100<<30 || record.MinHostFreeSpaceBytes < 50<<30 {
+	if record.RootDiskBytes < 20<<30 || record.DockerDiskBytes < 1<<30 || record.MinHostFreeSpaceBytes < 1<<30 {
 		return fmt.Errorf("Docker Sandboxes promotion record resource floors are incomplete")
 	}
 	if record.ReliabilityJobs < 25 || record.ReliabilityDuration < 2*time.Hour {

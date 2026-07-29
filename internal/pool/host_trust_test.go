@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -350,6 +351,10 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 	writeTestCACertificate(t, secondPath, "Host Root G2")
 	g1 := hostTrustSnapshotFromFile(t, firstPath, "windows", []string{"system", "user"})
 	g2 := hostTrustSnapshotFromFile(t, secondPath, "windows", []string{"system", "user"})
+	var buildTrustBundleContent strings.Builder
+	for _, certificate := range g1.Certificates {
+		buildTrustBundleContent.Write(certificate.PEM)
+	}
 	sequence := []hosttrust.Snapshot{g1, g2, g2, g2}
 	manager := Manager{
 		Config: config.Config{
@@ -378,6 +383,11 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 		value.CollectedAt = time.Now().UTC()
 		return value, nil
 	}
+	manager.buildTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
+		value := g1
+		value.CollectedAt = time.Now().UTC()
+		return value, nil
+	}
 	oldLogged := runHostLoggedCommand
 	oldOutput := runHostOutputCommand
 	oldQuiet := runHostQuietCommand
@@ -402,6 +412,12 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 		if len(args) > 1 && args[0] == "buildx" && args[1] == "inspect" {
 			return "", errors.New("builder not found")
 		}
+		if len(args) > 3 && args[0] == "exec" && strings.Contains(args[3], "/certs/") {
+			return buildTrustBundleContent.String(), nil
+		}
+		if len(args) > 1 && args[0] == "exec" {
+			return "# epar-build-trust-generation=" + g1.Generation + "\n[registry.\"docker.io\"]\n", nil
+		}
 		return `["source@sha256:1234"]`, nil
 	}
 	runHostQuietCommand = func(context.Context, string, ...string) error { return nil }
@@ -420,6 +436,15 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 	}
 	if !tagged {
 		t.Fatal("stable generation was not published to the configured image tag")
+	}
+}
+
+func TestBuildTrustScopesAreIndependentFromDisabledRunnerOverlay(t *testing.T) {
+	if got := buildTrustScopes(config.HostTrustModeDisabled, []string{hosttrust.ScopeSystem, hosttrust.ScopeUser}); !slices.Equal(got, []string{hosttrust.ScopeSystem}) {
+		t.Fatalf("disabled runner build scopes = %v, want system only", got)
+	}
+	if got := buildTrustScopes(config.HostTrustModeOverlay, []string{hosttrust.ScopeUser}); !slices.Equal(got, []string{hosttrust.ScopeSystem, hosttrust.ScopeUser}) {
+		t.Fatalf("user-overlay build scopes = %v, want mandatory system plus opted-in user", got)
 	}
 }
 

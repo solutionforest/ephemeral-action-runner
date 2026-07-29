@@ -12,7 +12,7 @@ Use these guides after the short [README quick start](../README.md). Start with 
 ## Choose a provider
 
 - [Docker Container](providers/docker-container.md): disposable containers with a private Docker daemon.
-- [Docker Sandboxes](providers/docker-sandboxes.md): dedicated microVM runners and the required prebuilt template.
+- [Docker Sandboxes](providers/docker-sandboxes.md): dedicated microVM runners and guided template provisioning.
 - [WSL](providers/wsl.md): disposable Windows WSL2 runners.
 - [Tart](providers/tart.md): experimental Apple Silicon ARM64 Linux VMs.
 
@@ -22,7 +22,7 @@ Use these guides after the short [README quick start](../README.md). Start with 
 - [Troubleshooting](troubleshooting.md): symptom-first diagnostics.
 - [Logging](logging.md) and [Storage](storage.md): retention, capacity, and exact cleanup boundaries.
 - [Image customization](image-build.md): build layers and custom install scripts.
-- [Docker Sandboxes templates](advanced/docker-sandboxes-template.md): build, review, load, size, and retain pinned templates.
+- [Docker Sandboxes templates](advanced/docker-sandboxes-template.md): build, verify, import, size, and retain exact templates.
 - [Cross-architecture containers](advanced/cross-architecture-containers.md): image platforms, emulation, labels, and verification.
 - [Docker registry mirrors](advanced/docker-registry-mirrors.md): an optional pull-time optimization.
 - [Windows startup](advanced/windows-startup.md), [macOS startup](advanced/macos-startup.md), and [no-Go startup](advanced/no-go-install.md): host-specific launch help.

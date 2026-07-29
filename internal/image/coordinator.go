@@ -2,6 +2,7 @@ package image
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 
@@ -13,8 +14,6 @@ import (
 )
 
 const (
-	imagePullExpansionBytes    = 20 * storage.GiB
-	imageBuildExpansionBytes   = 30 * storage.GiB
 	sourceUpdateExpansionBytes = 5 * storage.GiB
 	hostTrustGuestDir          = "/usr/local/share/ca-certificates/epar-host"
 	hostTrustMarkerGuest       = "/opt/epar/host-trust-generation.json"
@@ -32,10 +31,12 @@ type Environment interface {
 	RunHostLogged(ctx context.Context, logPath, name string, args ...string) error
 	RunHost(ctx context.Context, name string, args ...string) error
 	RunHostOutput(ctx context.Context, name string, args ...string) (string, error)
+	RunHostOutputTo(ctx context.Context, output io.Writer, name string, args ...string) error
 	RunHostQuiet(ctx context.Context, name string, args ...string) error
 	TimeStartupStage(stage string, fn func() error) error
 	HostTrustEnabled() bool
 	ResolveHostTrust(ctx context.Context) (hosttrust.Snapshot, error)
+	ResolveBuildTrust(ctx context.Context) (hosttrust.Snapshot, error)
 	WriteHostTrustBuildInputs(buildContext string, snapshot hosttrust.Snapshot) error
 	ValidateRuntime(ctx context.Context, instance string) error
 	ExecGuest(ctx context.Context, instance string, command []string, opts provider.ExecOptions) (provider.ExecResult, error)
@@ -101,6 +102,10 @@ func (m *Coordinator) runHostOutput(ctx context.Context, name string, args ...st
 	return m.environment.RunHostOutput(ctx, name, args...)
 }
 
+func (m *Coordinator) runHostOutputTo(ctx context.Context, output io.Writer, name string, args ...string) error {
+	return m.environment.RunHostOutputTo(ctx, output, name, args...)
+}
+
 func (m *Coordinator) runHostQuiet(ctx context.Context, name string, args ...string) error {
 	return m.environment.RunHostQuiet(ctx, name, args...)
 }
@@ -115,6 +120,25 @@ func (m *Coordinator) hostTrustEnabled() bool {
 
 func (m *Coordinator) resolveHostTrust(ctx context.Context) (hosttrust.Snapshot, error) {
 	return m.environment.ResolveHostTrust(ctx)
+}
+
+func (m *Coordinator) resolveBuildTrust(ctx context.Context) (hosttrust.Snapshot, error) {
+	snapshot, err := m.environment.ResolveBuildTrust(ctx)
+	if err != nil {
+		return hosttrust.Snapshot{}, err
+	}
+	explicit, err := m.trustedCACertificates()
+	if err != nil {
+		return hosttrust.Snapshot{}, err
+	}
+	for _, certificate := range explicit {
+		parsed, err := hosttrust.CertificatesFromBytes(certificate.PEM)
+		if err != nil {
+			return hosttrust.Snapshot{}, fmt.Errorf("canonicalize explicit build CA %s: %w", certificate.DestinationName, err)
+		}
+		snapshot.Certificates = append(snapshot.Certificates, parsed...)
+	}
+	return hosttrust.Canonicalize(snapshot)
 }
 
 func (m *Coordinator) writeHostTrustBuildInputs(buildContext string, snapshot hosttrust.Snapshot) error {

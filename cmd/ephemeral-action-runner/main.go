@@ -227,6 +227,7 @@ func runImage(args []string) error {
 	case "update-upstream":
 		fs := flag.NewFlagSet("image update-upstream", flag.ExitOnError)
 		common := addCommonFlags(fs)
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -235,6 +236,7 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"image", "update-upstream"}, appendStorageOverride(args[1:])...)...))
 		if err := rejectDockerSandboxesImageCommand(m, "image update-upstream"); err != nil {
 			return err
 		}
@@ -250,6 +252,7 @@ func runImage(args []string) error {
 		replace := fs.Bool("replace", false, "delete an existing output image before building")
 		update := fs.Bool("update-upstream", false, "refresh runner-images before building")
 		skipUpstream := fs.Bool("skip-upstream-check", false, "skip checking the runner-images checkout")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -258,9 +261,7 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
-		if err := rejectDockerSandboxesImageCommand(m, "image build"); err != nil {
-			return err
-		}
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"image", "build"}, appendStorageOverride(args[1:])...)...))
 		ctx := interruptContext()
 		poolControllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
@@ -316,6 +317,7 @@ func runPool(args []string) error {
 		instances := fs.Int("instances", 0, "number of concurrent instances to verify; overrides pool.instances")
 		registerOnly := fs.Bool("register-only", false, "register runners and verify online/idle without dispatching a job")
 		cleanup := fs.Bool("cleanup", false, "clean up verification resources; legacy providers use the configured pool prefix, while Docker Sandboxes uses exact owned records")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -327,6 +329,7 @@ func runPool(args []string) error {
 			return err
 		}
 		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"pool", "verify"}, appendStorageOverride(args[1:])...)...))
 		return m.Verify(interruptContext(), pool.VerifyOptions{Instances: *instances, RegisterOnly: *registerOnly, Cleanup: *cleanup})
 	case "up":
 		fs := flag.NewFlagSet("pool up", flag.ExitOnError)
@@ -336,6 +339,7 @@ func runPool(args []string) error {
 		keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 		replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 		monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -346,6 +350,7 @@ func runPool(args []string) error {
 		if err != nil {
 			return err
 		}
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"pool", "up"}, appendStorageOverride(args[1:])...)...))
 		return m.RunPool(interruptContext(), pool.RunOptions{
 			Instances:        *instances,
 			Register:         *register,
@@ -423,6 +428,14 @@ func flagPassed(fs *flag.FlagSet, name string) bool {
 }
 
 func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool) (*pool.Manager, error) {
+	return newManagerWithLifecycleState(configPath, projectRoot, dryRun, githubEnabled, true)
+}
+
+func newImageProvisioningManager(configPath, projectRoot string) (*pool.Manager, error) {
+	return newManagerWithLifecycleState(configPath, projectRoot, false, false, false)
+}
+
+func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, githubEnabled bool, openLifecycleState bool) (*pool.Manager, error) {
 	projectRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return nil, err
@@ -449,9 +462,6 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	if providerRuntime.Lifecycle == nil || providerRuntime.Storage == nil {
 		return nil, fmt.Errorf("provider %q registry entry is missing required lifecycle or storage behavior", cfg.Provider.Type)
 	}
-	if err := preflightControllerStorage(projectRoot, cfg, providerRuntime.Storage); err != nil {
-		return nil, err
-	}
 	var client pool.GitHubClient
 	if githubEnabled && !dryRun {
 		if err := config.ValidateGitHub(cfg); err != nil {
@@ -460,7 +470,7 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		client = gh.New(cfg.GitHub)
 	}
 	var lifecycleState *poolstate.Store
-	if !dryRun {
+	if !dryRun && openLifecycleState {
 		lifecycleState, err = pool.OpenLifecycleState(projectRoot, resolvedConfigPath)
 		if err != nil {
 			return nil, err
@@ -575,7 +585,7 @@ func rejectDockerSandboxesImageCommand(manager *pool.Manager, command string) er
 	if manager.Config.Provider.Type != "docker-sandboxes" {
 		return nil
 	}
-	return fmt.Errorf("%s is not supported by docker-sandboxes; build and load the pinned template with scripts/docker-sandboxes before admission", command)
+	return fmt.Errorf("%s is not applicable to docker-sandboxes; edit image.sourceImage or image.customInstallScripts, then run %s", command, invocation.Command("image", "build"))
 }
 
 func loggingSinks(values []string) logging.Sinks {

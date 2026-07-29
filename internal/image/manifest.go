@@ -37,10 +37,12 @@ type Manifest struct {
 	SourceImage           string             `json:"sourceImage"`
 	SourcePlatform        string             `json:"sourcePlatform,omitempty"`
 	SourceDigest          string             `json:"sourceDigest,omitempty"`
+	SourcePlatformDigest  string             `json:"sourcePlatformDigest,omitempty"`
 	OutputImage           string             `json:"outputImage"`
 	RunnerVersion         string             `json:"runnerVersion"`
 	UpstreamCommit        string             `json:"upstreamCommit,omitempty"`
 	EPARScripts           []FileDigest       `json:"eparScripts,omitempty"`
+	TemplateInputs        []FileDigest       `json:"templateInputs,omitempty"`
 	CustomInstallScripts  []FileDigest       `json:"customInstallScripts,omitempty"`
 	TrustedCACertificates []FileDigest       `json:"trustedCaCertificates,omitempty"`
 	HostTrust             *HostTrustMetadata `json:"hostTrust,omitempty"`

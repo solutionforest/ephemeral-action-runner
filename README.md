@@ -24,7 +24,7 @@ The normal path is a source archive plus Docker. EPAR's first run opens a guided
 
 ### 1. Install the host tools
 
-Install a Docker-compatible daemon: [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows or macOS, [OrbStack](https://orbstack.dev/) on macOS, or [Docker Engine](https://docs.docker.com/engine/) on Linux. Docker Sandboxes also needs the `sbx` CLI to pass its diagnostics and a prepared EPAR template; see [Docker Sandboxes](docs/providers/docker-sandboxes.md).
+Install a Docker-compatible daemon: [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows or macOS, [OrbStack](https://orbstack.dev/) on macOS, or [Docker Engine](https://docs.docker.com/engine/) on Linux. Docker Sandboxes also needs the `sbx` CLI to pass its diagnostics; the wizard provisions its EPAR runner template. See [Docker Sandboxes](docs/providers/docker-sandboxes.md).
 
 ### 2. Download EPAR
 

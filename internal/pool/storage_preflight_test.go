@@ -91,3 +91,19 @@ func TestRunPoolCapacityRejectionDoesNotCleanupUncreatedInstance(t *testing.T) {
 		t.Fatalf("lifecycle records = %+v, want none before capacity admission", records)
 	}
 }
+
+func TestStorageOverrideContinuesOnlyStorageAdmission(t *testing.T) {
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{Type: "docker-sandboxes"},
+			Storage:  config.StorageConfig{MinimumFree: "1GiB"},
+		},
+		Storage:                  insufficientStorage{},
+		AllowInsufficientStorage: true,
+		StorageOverrideCommand:   "./start --allow-insufficient-storage",
+		ProjectRoot:              t.TempDir(),
+	}
+	if err := manager.preflightStorage("instance-create", 20*storage.GiB); err != nil {
+		t.Fatalf("storage override rejected storage-only admission: %v", err)
+	}
+}

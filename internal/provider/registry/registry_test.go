@@ -130,7 +130,7 @@ func TestDockerSandboxesStorageRoutesOperationsToTheirBackingSurfaces(t *testing
 	for _, requirement := range create.Requirements {
 		createRequirements[requirement.SurfaceID] = requirement.PeakBytes
 	}
-	if got, want := createRequirements["docker-sandboxes-backing"], uint64(130<<30); got != want {
+	if got, want := createRequirements["docker-sandboxes-backing"], uint64(10<<30); got != want {
 		t.Fatalf("sandbox backing create expansion = %d, want %d", got, want)
 	}
 	if _, found := createRequirements["docker-engine-backing"]; found {

@@ -94,42 +94,57 @@ function Start-EparHostTrustBridge {
 
     $config = Get-EparHostTrustConfigPath -ProjectRoot $ProjectRoot -Arguments $Arguments
     if ($Command -eq "init") {
-        return [pscustomobject]@{ FeedDir = $null; WatchProcess = $null; Config = $config; PostInit = $true }
+        return [pscustomobject]@{ FeedDir = $null; BuildFeedDir = $null; RunnerFeedDir = $null; WatchProcess = $null; WatchProcesses = @(); Config = $config; PostInit = $true }
     }
     $subcommand = if ($Arguments -and $Arguments.Count -gt 1) { [string]$Arguments[1] } else { "" }
     $needsBridge = $Command -eq "start" -or
         ($Command -eq "image" -and $subcommand -eq "build") -or
         ($Command -eq "pool" -and $subcommand -in @("up", "verify"))
     if (-not $needsBridge) {
-        return [pscustomobject]@{ FeedDir = $null; WatchProcess = $null; Config = $config; PostInit = $false }
+        return [pscustomobject]@{ FeedDir = $null; BuildFeedDir = $null; RunnerFeedDir = $null; WatchProcess = $null; WatchProcesses = @(); Config = $config; PostInit = $false }
     }
 
     $helper = Join-Path $ProjectRoot "scripts\host-trust\host-trust-feed.ps1"
-    $feedLines = @(& $helper sync -ProjectRoot $ProjectRoot -Config $config 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Host-trust preflight failed: $($feedLines -join [Environment]::NewLine)"
-    }
-    $feedDir = ($feedLines | Where-Object { $_ -is [string] -and $_.Trim() } | Select-Object -Last 1)
-    if (-not $feedDir) {
-        return [pscustomobject]@{ FeedDir = $null; WatchProcess = $null; Config = $config; PostInit = $false }
-    }
-    $feedDir = Split-Path -Parent $feedDir.Trim()
-    $watchOut = Join-Path $feedDir "watcher.log"
-    $watchErr = Join-Path $feedDir "watcher-error.log"
     $powershell = (Get-Process -Id $PID).Path
-    $watchCommand = '& ' + (ConvertTo-EparPowerShellLiteral $helper) +
-        ' watch -ProjectRoot ' + (ConvertTo-EparPowerShellLiteral $ProjectRoot) +
-        ' -Config ' + (ConvertTo-EparPowerShellLiteral $config) +
-        ' -Interval 10'
-    $encodedWatchCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchCommand))
-    $watch = Start-Process -FilePath $powershell -WindowStyle Hidden -PassThru `
-        -ArgumentList @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedWatchCommand) `
-        -RedirectStandardOutput $watchOut -RedirectStandardError $watchErr
-    Start-Sleep -Milliseconds 150
-    if ($watch.HasExited) {
-        throw "Host-trust watcher exited during startup. See $watchErr"
+    $watchers = [System.Collections.Generic.List[object]]::new()
+    $feedDirectories = @{}
+    foreach ($purpose in @('build', 'runner')) {
+        $feedLines = @(& $helper sync -ProjectRoot $ProjectRoot -Config $config -Purpose $purpose 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "$purpose trust preflight failed: $($feedLines -join [Environment]::NewLine)"
+        }
+        $feedPath = ($feedLines | Where-Object { $_ -is [string] -and $_.Trim() } | Select-Object -Last 1)
+        if (-not $feedPath) {
+            $feedDirectories[$purpose] = $null
+            continue
+        }
+        $feedDir = Split-Path -Parent $feedPath.Trim()
+        $feedDirectories[$purpose] = $feedDir
+        $watchOut = Join-Path $feedDir "watcher.log"
+        $watchErr = Join-Path $feedDir "watcher-error.log"
+        $watchCommand = '& ' + (ConvertTo-EparPowerShellLiteral $helper) +
+            ' watch -ProjectRoot ' + (ConvertTo-EparPowerShellLiteral $ProjectRoot) +
+            ' -Config ' + (ConvertTo-EparPowerShellLiteral $config) +
+            ' -Purpose ' + (ConvertTo-EparPowerShellLiteral $purpose) +
+            ' -Interval 10 >> ' + (ConvertTo-EparPowerShellLiteral $watchOut) +
+            ' 2>> ' + (ConvertTo-EparPowerShellLiteral $watchErr)
+        $encodedWatchCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchCommand))
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $powershell
+        $startInfo.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedWatchCommand"
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $watch = [System.Diagnostics.Process]::Start($startInfo)
+        Start-Sleep -Milliseconds 150
+        if ($watch.HasExited) {
+            throw "$purpose trust watcher exited during startup. See $watchErr"
+        }
+        [void]$watchers.Add([pscustomobject]@{ Process = $watch; FeedDir = $feedDir })
     }
-    return [pscustomobject]@{ FeedDir = $feedDir; WatchProcess = $watch; Config = $config; PostInit = $false }
+    $runnerFeedDir = $feedDirectories['runner']
+    $buildFeedDir = $feedDirectories['build']
+    $firstWatcher = if ($watchers.Count -gt 0) { $watchers[0].Process } else { $null }
+    return [pscustomobject]@{ FeedDir = $runnerFeedDir; BuildFeedDir = $buildFeedDir; RunnerFeedDir = $runnerFeedDir; WatchProcess = $firstWatcher; WatchProcesses = @($watchers); Config = $config; PostInit = $false }
 }
 
 function Complete-EparHostTrustInit {
@@ -150,21 +165,26 @@ function Complete-EparHostTrustInit {
 
 function Stop-EparHostTrustBridge {
     param($Bridge)
-    if ($null -eq $Bridge -or $null -eq $Bridge.WatchProcess) { return }
-    try {
-        if (-not $Bridge.WatchProcess.HasExited) {
-            Stop-Process -Id $Bridge.WatchProcess.Id -ErrorAction SilentlyContinue
-            $Bridge.WatchProcess.WaitForExit(3000) | Out-Null
-        }
-    } catch {
-        Write-Warning "Could not stop host-trust watcher: $($_.Exception.Message)"
+    if ($null -eq $Bridge) { return }
+    $entries = @($Bridge.WatchProcesses)
+    if ($entries.Count -eq 0 -and $null -ne $Bridge.WatchProcess) {
+        $entries = @([pscustomobject]@{ Process = $Bridge.WatchProcess; FeedDir = $Bridge.FeedDir })
     }
-    if ($Bridge.FeedDir -and $Bridge.WatchProcess.HasExited) {
-        $lockDir = $Bridge.FeedDir + '.lock'
+    foreach ($entry in $entries) {
+        try {
+            if (-not $entry.Process.HasExited) {
+                Stop-Process -Id $entry.Process.Id -ErrorAction SilentlyContinue
+                $entry.Process.WaitForExit(3000) | Out-Null
+            }
+        } catch {
+            Write-Warning "Could not stop trust-feed watcher: $($_.Exception.Message)"
+        }
+        if (-not $entry.FeedDir -or -not $entry.Process.HasExited) { continue }
+        $lockDir = $entry.FeedDir + '.lock'
         $ownerPath = Join-Path $lockDir 'pid'
         $owner = 0
         [void][int]::TryParse((Get-Content -LiteralPath $ownerPath -ErrorAction SilentlyContinue | Select-Object -First 1), [ref]$owner)
-        if ($owner -eq $Bridge.WatchProcess.Id) {
+        if ($owner -eq $entry.Process.Id) {
             Remove-Item -LiteralPath $ownerPath -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $lockDir -Force -ErrorAction SilentlyContinue
         }

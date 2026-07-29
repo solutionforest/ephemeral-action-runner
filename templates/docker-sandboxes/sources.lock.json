@@ -63,13 +63,13 @@
     "linux/amd64": {
       "act-22.04": {
         "authoritative": false,
-        "reason": "Predates current Candidate A helper and architecture changes",
+        "reason": "Predates the current runner-template helper and architecture changes",
         "manifestDigest": "sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8ef546ecb44ca256655",
         "templateTag": "epar-docker-sandboxes-catthehacker-act-22.04:20260723-r3-amd64"
       },
       "full": {
         "authoritative": false,
-        "reason": "Predates current Candidate A helper and architecture changes",
+        "reason": "Predates the current runner-template helper and architecture changes",
         "manifestDigest": "sha256:58314fa8cbf0f0e5384a37b3444811033320038816ef7c16f30b3e841ed65e51",
         "templateTag": "epar-docker-sandboxes-catthehacker-full:20260723-r1-amd64"
       }

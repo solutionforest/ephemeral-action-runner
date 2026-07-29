@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -69,13 +70,21 @@ func runStorage(args []string) error {
 	}
 	now := time.Now().UTC()
 	var selections []inventory.TemplateSelection
-	if cfg.DockerSandboxes.Template != "" && cfg.DockerSandboxes.TemplateDigest != "" {
-		selections = append(selections, inventory.TemplateSelection{
-			Platform:       cfg.Provider.Platform,
-			Tag:            cfg.DockerSandboxes.Template,
-			TemplateDigest: cfg.DockerSandboxes.TemplateDigest,
-			ActivatedAt:    configTime,
-		})
+	activeTemplateRootDisk := ""
+	if cfg.Provider.Type == "docker-sandboxes" {
+		artifact, metadataSHA256, activatedAt, receiptErr := artifactimage.LoadDockerSandboxesReceipt(projectRoot)
+		if receiptErr == nil {
+			activeTemplateRootDisk = artifact.RootDisk
+			selections = append(selections, inventory.TemplateSelection{
+				Platform:       artifact.Platform,
+				Tag:            artifact.Reference,
+				TemplateDigest: artifact.Digest,
+				MetadataSHA256: metadataSHA256,
+				ActivatedAt:    activatedAt,
+			})
+		} else if !errors.Is(receiptErr, os.ErrNotExist) {
+			return fmt.Errorf("read Docker Sandboxes active artifact receipt: %w", receiptErr)
+		}
 	}
 	currentExecutable, _ := os.Executable()
 	configuredFiles := configuredStorageFiles(cfg, projectRoot, configTime)
@@ -141,6 +150,44 @@ func runStorage(args []string) error {
 			snapshot.Artifacts = append(snapshot.Artifacts, providerSnapshot.Artifacts...)
 			requirements = append(requirements, providerSnapshot.Requirements...)
 		}
+	}
+	if storageProvider == "docker-sandboxes" {
+		rootDisk := cfg.DockerSandboxes.RootDisk
+		if rootDisk == config.DockerSandboxesAutomaticRootDisk {
+			rootDisk = activeTemplateRootDisk
+		}
+		appendLogicalSurface := func(id, configured string) {
+			if configured == "" && id == "docker-sandboxes-root-logical" {
+				snapshot.Surfaces = append(snapshot.Surfaces, storage.Surface{
+					ID:             id,
+					Provider:       "docker-sandboxes",
+					Kind:           storage.SurfaceExternal,
+					Classification: "logical",
+					Sparse:         true,
+					Confidence:     "pending-artifact-resolution",
+					Advisory:       true,
+					Capacity:       storage.Capacity{ObservedAt: now},
+				})
+				return
+			}
+			parsed, parseErr := config.ParseByteSize(configured)
+			if parseErr != nil || parsed <= 0 {
+				return
+			}
+			snapshot.Surfaces = append(snapshot.Surfaces, storage.Surface{
+				ID:                  id,
+				Provider:            "docker-sandboxes",
+				Kind:                storage.SurfaceExternal,
+				Classification:      "logical",
+				Sparse:              true,
+				VirtualMaximumBytes: uint64(parsed),
+				Confidence:          "configured-logical-limit",
+				Advisory:            true,
+				Capacity:            storage.Capacity{ObservedAt: now},
+			})
+		}
+		appendLogicalSurface("docker-sandboxes-root-logical", rootDisk)
+		appendLogicalSurface("docker-sandboxes-inner-docker-logical", cfg.DockerSandboxes.DockerDisk)
 	}
 	plan, err := storage.Preview(snapshot.PreviewRequest(policy, requirements))
 	if err != nil {
@@ -305,7 +352,7 @@ func printStorageReport(subcommand string, report storageCommandReport) {
 		if surface.Capacity.Known {
 			available = formatStorageBytes(surface.Capacity.AvailableBytes)
 		}
-		fmt.Fprintf(os.Stdout, "Surface %s\tprovider=%s\tkind=%s\tavailable=%s\tlocation=%s\n", surface.ID, valueOrDash(surface.Provider), surface.Kind, available, surface.Location)
+		fmt.Fprintf(os.Stdout, "Surface %s\tprovider=%s\tkind=%s\tclassification=%s\tsparse=%t\tavailable=%s\tallocated=%s\tvirtualMaximum=%s\tconfidence=%s\tauthoritative=%t\tadvisory=%t\tlocation=%s\n", surface.ID, valueOrDash(surface.Provider), surface.Kind, valueOrDash(surface.Classification), surface.Sparse, available, formatStorageOptionalBytes(surface.AllocatedBytes), formatStorageOptionalBytes(surface.VirtualMaximumBytes), valueOrDash(surface.Confidence), surface.AdmissionAuthoritative, surface.Advisory, surface.Location)
 	}
 	for _, check := range report.Plan.CapacityChecks {
 		fmt.Fprintf(os.Stdout, "Capacity %s\tstatus=%s\tavailable=%s\testimated=%s\treserve=%s\trequired=%s\n", check.Requirement.ID, check.Status, formatStorageBytes(check.Capacity.AvailableBytes), formatStorageBytes(check.Requirement.PeakBytes), formatStorageBytes(check.Requirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes))
@@ -324,6 +371,13 @@ func printStorageReport(subcommand string, report storageCommandReport) {
 	if subcommand == "prune" && report.Execution == nil {
 		fmt.Fprintln(os.Stdout, "Preview only. Re-run with --execute to apply only the exact identities marked remove.")
 	}
+}
+
+func formatStorageOptionalBytes(value uint64) string {
+	if value == 0 {
+		return "-"
+	}
+	return formatStorageBytes(value)
 }
 
 func formatStorageBytes(value uint64) string {

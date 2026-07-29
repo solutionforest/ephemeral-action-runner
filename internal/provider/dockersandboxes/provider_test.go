@@ -31,6 +31,32 @@ const (
 
 var testInstance = provider.Instance{Name: testName, ProviderID: testID, Source: "shell", State: "running"}
 
+func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
+	p := NewWithDryRun("sbx", true)
+	called := false
+	p.runCommand = func(context.Context, commandRequest) (provider.ExecResult, error) {
+		called = true
+		return provider.ExecResult{}, nil
+	}
+	_, err := p.Create(context.Background(), provider.CreateRequest{Name: testName})
+	if err == nil || !strings.Contains(err.Error(), "does not support dry-run") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if called {
+		t.Fatal("dry-run Create invoked a provider command")
+	}
+}
+
+func TestStartDaemonUsesExactDetachedCommand(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "start", "--detach"}},
+	)
+	if err := p.StartDaemon(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	done()
+}
+
 type commandStep struct {
 	args        []string
 	result      provider.ExecResult
@@ -999,6 +1025,11 @@ func TestCommandBoundaryRejectsInteractiveAndDestructiveGlobalCommands(t *testin
 	for _, arguments := range [][]string{{"ports"}, {"ports", testName}, {"ports", "../other", "--json"}, {"ports", testName, "--json", "extra"}, {"ports", testName, "--unpublish"}} {
 		if err := validateCommandRequest(commandRequest{args: arguments, operation: "test forbidden port command"}); err == nil {
 			t.Fatalf("non-exact Docker Sandboxes published-port inspection was accepted: %q", arguments)
+		}
+	}
+	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
+		if err := validateCommandRequest(commandRequest{args: arguments, operation: "test forbidden daemon command"}); err == nil {
+			t.Fatalf("non-exact Docker Sandboxes daemon command was accepted: %q", arguments)
 		}
 	}
 }

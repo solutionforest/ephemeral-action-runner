@@ -52,10 +52,8 @@ for key in ("generation", "hostOS", "mode", "scopes"):
             f"(image={marker.get(key)!r}, lease={lease.get(key)!r})"
         )
 
-if marker.get("mode") not in ("overlay", "disabled") or not marker.get("generation"):
-    raise SystemExit("EPAR host-trust gate: invalid image trust policy")
-if marker.get("mode") == "disabled" and marker.get("scopes") != []:
-    raise SystemExit("EPAR host-trust gate: disabled trust mode must not carry scopes")
+if marker.get("mode") != "overlay" or not marker.get("generation") or not marker.get("scopes"):
+    raise SystemExit("EPAR host-trust gate: image trust policy is not an enabled overlay")
 
 expires = lease.get("expiresAt")
 if not isinstance(expires, str) or not expires:

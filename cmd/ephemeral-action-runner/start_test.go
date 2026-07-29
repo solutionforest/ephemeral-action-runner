@@ -86,10 +86,43 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	}
 }
 
+func TestStartConfiguresOneInvocationStorageOverride(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeStarterManager{}
+	err := runStartWithOptions(startOptions{
+		Context:                  context.Background(),
+		ProjectRoot:              dir,
+		ConfigPath:               configPath,
+		AllowInsufficientStorage: true,
+		StorageOverrideCommand:   "./start --allow-insufficient-storage",
+		Out:                      &bytes.Buffer{},
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			return fake, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fake.allowStorage || fake.overrideHint != "./start --allow-insufficient-storage" {
+		t.Fatalf("storage override = allow %t hint %q", fake.allowStorage, fake.overrideHint)
+	}
+}
+
+func TestMatchingStartCommandPreservesWrapperEntryPoint(t *testing.T) {
+	t.Setenv("EPAR_INVOCATION", "start")
+	if got, want := matchingStartCommand([]string{"--allow-insufficient-storage"}), "./start --allow-insufficient-storage"; got != want {
+		t.Fatalf("matchingStartCommand() = %q, want %q", got, want)
+	}
+}
+
 func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	stubNoWSL2(t)
-	stubInitRunnerGroupClient(t)
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
 	oldResolveHostTrust := initResolveHostTrust
@@ -109,7 +142,7 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -137,7 +170,7 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
 	dir := t.TempDir()
 	stubNoWSL2(t)
-	stubInitRunnerGroupClient(t)
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
 	oldResolveHostTrust := initResolveHostTrust
@@ -156,7 +189,7 @@ func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\nn\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\nn\nn\n"),
 		Out:         &out,
 		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
 			t.Fatal("manager factory should not run after choosing to review the new config")
@@ -259,7 +292,7 @@ func TestStartInteractiveMissingConfigCanSelectDockerSandboxes(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n\n\nn\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -391,11 +424,12 @@ func TestStartPreflightsBeforeImageAndPool(t *testing.T) {
 
 	fake = &fakeStarterManager{preflightErr: errors.New("unsafe group")}
 	err = runStartWithOptions(startOptions{
-		Context:     context.Background(),
-		ProjectRoot: dir,
-		ConfigPath:  configPath,
-		Register:    true,
-		Out:         &bytes.Buffer{},
+		Context:                  context.Background(),
+		ProjectRoot:              dir,
+		ConfigPath:               configPath,
+		Register:                 true,
+		AllowInsufficientStorage: true,
+		Out:                      &bytes.Buffer{},
 		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
 			return fake, nil
 		},
@@ -406,6 +440,9 @@ func TestStartPreflightsBeforeImageAndPool(t *testing.T) {
 	if got := strings.Join(fake.calls, ","); got != "preflight" {
 		t.Fatalf("call order after rejection = %q, want preflight only", got)
 	}
+	if !fake.allowStorage {
+		t.Fatal("storage override was not configured before the non-storage safety check")
+	}
 }
 
 type fakeStarterManager struct {
@@ -414,6 +451,13 @@ type fakeStarterManager struct {
 	runCalls     int
 	runOptions   pool.RunOptions
 	calls        []string
+	allowStorage bool
+	overrideHint string
+}
+
+func (m *fakeStarterManager) ConfigureStorageAdmissionOverride(allow bool, command string) {
+	m.allowStorage = allow
+	m.overrideHint = command
 }
 
 func (m *fakeStarterManager) PreflightRunnerGroup(context.Context) error {

@@ -1,6 +1,6 @@
 # Image Customization
 
-EPAR prepares a reusable runner artifact before it creates disposable instances. The artifact differs by provider: Docker Container uses a Docker image, WSL2 uses a rootfs tar, Tart uses a Tart VM image, and Docker Sandboxes uses a separately built and loaded template.
+EPAR prepares a reusable runner artifact before it creates disposable instances. The artifact differs by provider: Docker Container uses a Docker image, WSL2 uses a rootfs tar, Tart uses a Tart VM image, and Docker Sandboxes uses a built, imported, and read-back runner template.
 
 ```mermaid
 flowchart LR
@@ -19,9 +19,9 @@ flowchart LR
 | Docker Container | `ghcr.io/catthehacker/ubuntu:full-latest` | Docker image tag | `image build --replace` |
 | WSL2 | Catthehacker Docker image converted to rootfs | Rootfs tar | `image build --replace` |
 | Tart | `ghcr.io/cirruslabs/ubuntu:latest` | Tart VM image | `image build --replace` |
-| Docker Sandboxes | Lock-selected Catthehacker source | Loaded Candidate A template | [template guide](advanced/docker-sandboxes-template.md) |
+| Docker Sandboxes | Selected Catthehacker source | Verified imported runner template | `image build` |
 
-`./start` compares the configured image artifact with its manifest and builds Docker Container, WSL2, or Tart artifacts when they are missing or no longer match. Docker Sandboxes is intentionally different: `start` validates the configured, already loaded template and never builds or loads it.
+The first-run wizard gives Docker Container, Docker Sandboxes, and WSL the same ordered Catthehacker choices (`full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another validated tag), platform resolution, optional custom-script collection, and storage estimate. `./start` compares the desired image settings with the active artifact receipt and builds a replacement when the source digest, platform, EPAR assets, runner inputs, trust inputs, or custom-script hashes change. Docker Sandboxes imports the replacement into its template cache and activates it only after exact readback succeeds.
 
 ## Add Tools
 
@@ -55,9 +55,11 @@ image:
     - .local/enterprise-root.pem
 ```
 
-EPAR validates PEM or DER CA certificates and adds them before networked guest install steps. Keep TLS verification enabled.
+EPAR validates PEM or DER CA certificates and incorporates their hashes into artifact freshness. Explicit certificates are available to both the operational image build and the resulting runner artifact. Keep TLS verification enabled.
 
-The wizard can also enable `image.hostTrustMode: overlay` for Docker Container and Docker Sandboxes. It inherits selected host root anchors into fresh runner generations; it is additive to Ubuntu roots and explicit CA paths, not an emulation of every Windows or macOS trust policy. Use `[system, user]` on Windows/macOS or `[system]` on Linux. See [Configuration](configuration.md) and [Security](security.md) before enabling it.
+EPAR's project-owned BuildKit builder always receives current host system roots so image acquisition can operate behind authorized HTTPS inspection. This operational trust is independent of `image.hostTrustMode` and is not copied into runners. If runner overlay explicitly includes the `user` scope, those user roots are also available to the builder for the same invocation.
+
+The wizard can enable `image.hostTrustMode: overlay` for Docker Container and Docker Sandboxes when runners themselves must inherit selected host root anchors. Omitted or `disabled` mode creates a Docker Sandboxes template with an explicit disabled-policy marker and no job-start trust hook. Overlay mode is additive to Ubuntu roots and explicit CA paths, not an emulation of every Windows or macOS trust policy. Use `[system, user]` on Windows/macOS or `[system]` on Linux. See [Configuration](configuration.md) and [Security](security.md) before enabling it.
 
 ## Provider Differences
 
@@ -75,7 +77,7 @@ The output is a local Tart VM image. The default is intentionally lean; use a cu
 
 ### Docker Sandboxes
 
-Docker Sandboxes has no `image build` path and rejects `provider.sourceImage`. Build and load the reviewed template with [Docker Sandboxes template build and retention](advanced/docker-sandboxes-template.md), then let the wizard write the exact template identity into configuration.
+Docker Sandboxes uses `image.sourceImage`, `image.sourcePlatform`, and `image.customInstallScripts` as the desired template inputs. `./start` and `./start image build` share the same build/import implementation. Exact Docker image and Sandbox cache identities are stored in `.local/state/image/docker-sandboxes/active.json`, not user configuration; a failed desired update leaves the previous receipt and artifact intact but does not run it as a fallback.
 
 ## Verify A Customized Artifact
 
