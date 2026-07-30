@@ -66,9 +66,9 @@ runs-on: [self-hosted, linux, epar-docker-sandboxes]
 
 Use labels that describe the environment your job actually needs. In particular, an ARM64 Tart runner is not a replacement for GitHub-hosted `ubuntu-latest` or an x64-only workload.
 
-## Trusted jobs only
+## Security depends on the provider
 
-Use it only for workflows and repositories you trust, restrict access with [runner groups](docs/runner-groups.md), and do not expose it to unreviewed public or fork pull-request code. Read [Security](docs/security.md) before choosing a provider.
+Docker Sandboxes places each runner inside a dedicated microVM sandbox and provides EPAR's strongest host-isolation boundary. Docker Container and WSL remain trusted-workflow providers; Tart is VM-isolated but experimental. With every provider, restrict access with [runner groups](docs/runner-groups.md) and expose only the secrets and services each workflow needs. Read [Security](docs/security.md) before choosing a provider.
 
 ## Find the right guide
 

@@ -161,7 +161,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 | Property | Type and default | Required or applies when | Effect and caution |
 | --- | --- | --- | --- |
 | `image.sourceImage` | `ghcr.io/catthehacker/ubuntu:full-latest` | Required with Docker Sandboxes. | Desired Catthehacker source selector; EPAR builds and imports the runnable template automatically. |
-| `policyGeneration` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Fingerprint of the verified host-global Balanced policy. Policy drift blocks admission. |
+| `policyGeneration` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Recorded fingerprint of the host-global Balanced policy. |
 | `networkBaseline` | `open` or `balanced`; `open` | Docker Sandboxes. | `open` adds a sandbox-scoped public-egress rule while denying host aliases; it does not change the host-global policy. |
 | `additionalAllow` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped allow resources. With `open`, it cannot re-allow EPAR's host-alias deny guardrails. |
 | `additionalDeny` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped deny resources. A resource cannot be in both allow and deny lists. |

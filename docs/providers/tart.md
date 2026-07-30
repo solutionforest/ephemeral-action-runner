@@ -45,7 +45,7 @@ Tart clones the reusable image, starts the VM headless, uses the guest agent for
 
 ## Limitations
 
-- This provider is experimental and intended for trusted jobs.
+- This provider is experimental. It uses a per-runner VM boundary, but workflows still control the guest and any secrets or services exposed to the job.
 - The default image is runner-only. Add only the dependencies your workflows need, or maintain a fuller source image yourself.
 - `provider.network: softnet` may require additional host privileges; NAT is the default.
 - Rosetta can translate some Linux amd64 user-space workloads in an ARM64 guest, but it does not turn the VM into an x64 VM or guarantee every amd64 workload.

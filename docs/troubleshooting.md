@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Start with the symptom that most closely matches the failure. EPAR is trusted-job infrastructure: keep TLS verification enabled, preserve the first relevant log, and do not use broad Docker/WSL resets or prune commands as a first response.
+Start with the symptom that most closely matches the failure. Regardless of provider, keep TLS verification enabled, preserve the first relevant log, and do not use broad Docker/WSL resets or prune commands as a first response.
 
 ## Contents
 

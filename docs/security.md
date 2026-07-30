@@ -1,6 +1,6 @@
 # Security
 
-EPAR is intended for trusted jobs by default. It adds cleanup and isolation around GitHub self-hosted runners, but it does not make an existing host safe for arbitrary untrusted workflows.
+EPAR provides disposable GitHub self-hosted runners with provider-dependent isolation. Docker Sandboxes places each runner inside a dedicated microVM sandbox and provides EPAR's strongest current host-isolation boundary. Docker Container and WSL remain trusted-workflow infrastructure; Tart uses a VM but is experimental. No provider is guaranteed to be universally safe for arbitrary hostile workflows.
 
 GitHub's self-hosted runner warning still applies: GitHub recommends using self-hosted runners only with private repositories because public repository forks can run code on the runner machine through pull request workflows. Read the official GitHub guidance before exposing any self-hosted runner to public or untrusted workflows: [Adding self-hosted runners](https://docs.github.com/actions/hosting-your-own-runners/adding-self-hosted-runners).
 
@@ -18,7 +18,7 @@ Disposable instances reduce host pollution, stale runner state, and accidental c
 
 ## What EPAR Does Not Guarantee
 
-A workflow controls the runner environment while it runs and can access any secrets exposed to that workflow. Ephemeral cleanup reduces persistence risk after the job, but it is not a hostile-code sandbox.
+A workflow controls its runner environment while it runs and can access any secrets and reachable services exposed to that workflow. Ephemeral cleanup alone is not a sandbox boundary: Docker Sandboxes supplies a dedicated microVM boundary, while the other providers use their documented isolation models.
 
 Do not mount host source directories, Docker sockets, private keys, or long-lived cloud credentials into runner instances unless that is inside your trust boundary.
 
@@ -30,7 +30,7 @@ EPAR intentionally does not implement a Docker-socket provider. A runner that co
 
 Docker Container uses a privileged outer container with a private inner Docker daemon. That gives good cleanup and Docker resource separation for each job, but it is still trusted-job infrastructure because `--privileged` weakens container isolation.
 
-Docker Sandboxes places the listener, guest filesystem, network boundary, and private Docker daemon inside a dedicated microVM. It provides EPAR's strongest current host boundary and materially strengthens host isolation relative to Docker Container. The first-run wizard makes it the capability-driven default on any OS when Docker works and `sbx diagnose --output json` reports at least one pass and zero failures; this selection rule is separate from independent platform certification and does not claim that every host combination has received the same real-host validation. EPAR does not market any provider as universally safe for arbitrary hostile workflows.
+Docker Sandboxes places the listener, guest filesystem, and private Docker daemon inside a dedicated microVM sandbox. It provides EPAR's strongest current host boundary and materially strengthens host isolation relative to Docker Container. The first-run wizard recommends it when the supported-platform, Docker, and machine-readable `sbx` readiness checks pass; startup then performs the remaining storage, template, policy-rule, runtime, and registration admission checks and fails closed. This selection rule is separate from independent platform certification and does not claim that every host combination has received the same real-host validation.
 
 Tart runs jobs inside VMs on Apple Silicon macOS. That is a stronger host boundary than Docker Container, but workflows still control the guest and any secrets exposed to the job.
 

@@ -29,7 +29,7 @@ Use these guides after the short [README quick start](../README.md). Start with 
 
 ## Safety and support
 
-- [Security](security.md): trusted-job boundary, secrets, provider caveats, and private vulnerability reporting.
+- [Security](security.md): provider-dependent isolation, secrets, provider caveats, and private vulnerability reporting.
 - [Support](../SUPPORT.md): information to collect before opening an issue.
 
 ## Contribute
