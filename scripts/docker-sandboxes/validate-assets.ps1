@@ -61,7 +61,6 @@ Assert-Equal 'SBOM generator index' $lock.sbomGenerator.indexDigest 'sha256:79e7
 Assert-Equal 'Go builder version' $lock.goBuilder.version '1.25.12'
 Assert-Equal 'Go builder index' $lock.goBuilder.indexDigest 'sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980'
 Assert-Equal 'hook launcher source checksum' $lock.hookLauncher.sha256 '7fe07f10f484fa6888481a4165e81570187c0aeff422738d3ea5add6b95dd9b7'
-Assert-Equal 'Actions runner version' $lock.actionsRunner.version '2.332.0'
 Assert-Equal 'Tini version' $lock.tini.version '0.19.0'
 $expectedPlatforms = [ordered]@{
     'linux/amd64' = [ordered]@{
@@ -69,8 +68,6 @@ $expectedPlatforms = [ordered]@{
         frontendManifest = 'sha256:b5f3b260a9678e1d83d2fce86eeddf79420b79147eaba2a25986f47133d73720'
         goBuilderManifest = 'sha256:12e171e33ce7ade87ac8ab2bbe65cea9371527285bdab43ca02780a9e6ac60e5'
         sbomManifest = 'sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7'
-        runnerUrl = 'https://github.com/actions/runner/releases/download/v2.332.0/actions-runner-linux-x64-2.332.0.tar.gz'
-        runnerSha256 = 'f2094522a6b9afeab07ffb586d1eb3f190b6457074282796c497ce7dce9e0f2a'
         tiniUrl = 'https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64'
         tiniSha256 = '93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c'
     }
@@ -79,8 +76,6 @@ $expectedPlatforms = [ordered]@{
         frontendManifest = 'sha256:c8678869a83fab70232869ba24acc1c0be661f4d65135c0eeacb6a8e78420fdd'
         goBuilderManifest = 'sha256:afe53a4752b49f57ddebc97501a99394e2f7715236b4241efa830d54efb44434'
         sbomManifest = 'sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d'
-        runnerUrl = 'https://github.com/actions/runner/releases/download/v2.332.0/actions-runner-linux-arm64-2.332.0.tar.gz'
-        runnerSha256 = 'b72f0599cdbd99dd9513ab64fcb59e424fc7359c93b849e8f5efdd5a72f743a6'
         tiniUrl = 'https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm64'
         tiniSha256 = '07952557df20bfd2a95f9bef198b445e006171969499a1d361bd9e6f8e5e0e81'
     }
@@ -94,8 +89,6 @@ foreach ($platformName in $expectedPlatforms.Keys) {
     Assert-Equal "$platformName Go builder reference" $platformRecord.goBuilderReference ("docker.io/library/golang@{0}" -f $expectedPlatform.goBuilderManifest)
     Assert-Equal "$platformName SBOM generator manifest" $platformRecord.sbomGeneratorManifestDigest $expectedPlatform.sbomManifest
     Assert-Equal "$platformName SBOM generator reference" $platformRecord.sbomGeneratorReference ("docker.io/docker/buildkit-syft-scanner@{0}" -f $expectedPlatform.sbomManifest)
-    Assert-Equal "$platformName Actions runner URL" $platformRecord.actionsRunner.url $expectedPlatform.runnerUrl
-    Assert-Equal "$platformName Actions runner checksum" $platformRecord.actionsRunner.sha256 $expectedPlatform.runnerSha256
     Assert-Equal "$platformName Tini URL" $platformRecord.tini.url $expectedPlatform.tiniUrl
     Assert-Equal "$platformName Tini checksum" $platformRecord.tini.sha256 $expectedPlatform.tiniSha256
 }
@@ -188,7 +181,10 @@ foreach ($required in @(
     'com.docker.sandboxes.start-docker=true',
     'USER agent',
     'ENTRYPOINT ["/usr/local/bin/tini", "-g", "--", "/opt/epar/template-entrypoint.sh"]',
-    'sha256:f2094522a6b9afeab07ffb586d1eb3f190b6457074282796c497ce7dce9e0f2a',
+    'ARG ACTIONS_RUNNER_VERSION',
+    'ARG ACTIONS_RUNNER_SHA256',
+    'COPY inputs/actions-runner.tar.gz /tmp/actions-runner.tar.gz',
+    'echo "${ACTIONS_RUNNER_SHA256#sha256:}  /tmp/actions-runner.tar.gz" | sha256sum --check -',
     'sha256:93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c'
 )) {
     if (-not $dockerfile.Contains($required)) {
@@ -300,7 +296,7 @@ if ($DockerfileCheck) {
     foreach ($profileName in $expectedProfiles.Keys) {
         $profile = $lock.profiles.PSObject.Properties[$profileName].Value
         $profilePlatform = $profile.platforms.PSObject.Properties[$Platform].Value
-        & docker buildx build --builder $Builder --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg ("ACTIONS_RUNNER_URL={0}" -f $platformLock.actionsRunner.url) --build-arg ("ACTIONS_RUNNER_SHA256=sha256:{0}" -f $platformLock.actionsRunner.sha256) --build-arg ("TINI_URL={0}" -f $platformLock.tini.url) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
+        & docker buildx build --builder $Builder --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg 'ACTIONS_RUNNER_VERSION=0.0.0' --build-arg ('ACTIONS_RUNNER_SHA256=sha256:' + ('0' * 64)) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
         if ($LASTEXITCODE -ne 0) {
             throw "Dockerfile frontend check failed for $profileName"
         }

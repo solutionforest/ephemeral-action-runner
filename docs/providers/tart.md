@@ -24,6 +24,8 @@ Start with [`configs/tart.example.yml`](../../configs/tart.example.yml):
 image:
   sourceImage: ghcr.io/cirruslabs/ubuntu:latest
   outputImage: epar-ubuntu-24-arm64
+  updateFrequency: weekly
+  updateTime: "07:00"
 
 provider:
   type: tart

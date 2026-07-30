@@ -16,7 +16,8 @@ docker info >/dev/null
 [[ -x /opt/epar/hook-bin/bash ]]
 [[ "$(PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v bash)" == "/opt/epar/hook-bin/bash" ]]
 [[ -x /usr/bin/python3 ]]
-[[ "$(sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version)" == "2.332.0" ]]
+[[ -s /opt/epar/actions-runner-version ]]
+[[ "$(sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version)" == "$(cat /opt/epar/actions-runner-version)" ]]
 case "${EPAR_TEMPLATE_PLATFORM}" in
   linux/amd64)
     [[ "$(uname -m)" == "x86_64" ]]

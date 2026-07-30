@@ -58,6 +58,7 @@ type Coordinator struct {
 	ProjectRoot string
 	ConfigPath  string
 	DryRun      bool
+	Clock       func() time.Time
 	environment Environment
 }
 
@@ -70,6 +71,13 @@ func NewCoordinator(cfg config.Config, legacy provider.Provider, lifecycle provi
 		DryRun:      dryRun,
 		environment: environment,
 	}
+}
+
+func (m *Coordinator) now() time.Time {
+	if m.Clock != nil {
+		return m.Clock()
+	}
+	return time.Now()
 }
 
 func (m *Coordinator) preflightStorage(operation string, peakBytes uint64) error {

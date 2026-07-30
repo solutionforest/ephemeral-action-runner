@@ -41,7 +41,7 @@ func TestImageManifestHashChangesWithImageInputs(t *testing.T) {
 	}
 	hash := func() string {
 		t.Helper()
-		manifest, err := manager.desiredImageManifest(context.Background())
+		manifest, err := manager.desiredLocalImageManifest(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}

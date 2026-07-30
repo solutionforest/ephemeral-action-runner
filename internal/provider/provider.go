@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -83,6 +84,7 @@ type RunningProcess struct {
 
 type ExecOptions struct {
 	Stdin              string
+	StdinReader        io.Reader
 	Env                map[string]string
 	SensitiveValues    []string
 	LogPath            string
@@ -246,6 +248,28 @@ func CopyTextAtomic(ctx context.Context, p Provider, vmName, path, mode, content
 	staging := "/tmp/epar-copy"
 	cmd := []string{"bash", "-lc", fmt.Sprintf("cat > %s && if command -v sudo >/dev/null 2>&1; then sudo install -m %s %s %s && sudo mv -f %s %s; else install -m %s %s %s && mv -f %s %s; fi && rm -f %s", shellQuote(staging), shellQuote(mode), shellQuote(staging), shellQuote(tmp), shellQuote(tmp), shellQuote(path), shellQuote(mode), shellQuote(staging), shellQuote(tmp), shellQuote(tmp), shellQuote(path), shellQuote(staging))}
 	_, err := p.Exec(ctx, vmName, cmd, ExecOptions{Stdin: content})
+	return err
+}
+
+// CopyFile streams one regular host file into a guest without loading the
+// complete payload into memory. The provider command installs through a
+// temporary file and removes it on both success and failure.
+func CopyFile(ctx context.Context, p Provider, vmName, source, destination, mode string) error {
+	file, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("copy source %s must be a regular file", source)
+	}
+	tmp := "/tmp/epar-copy"
+	cmd := []string{"bash", "-lc", fmt.Sprintf("trap 'rm -f %s' EXIT; cat > %s && if command -v sudo >/dev/null 2>&1; then sudo install -m %s %s %s; else install -m %s %s %s; fi", shellQuote(tmp), shellQuote(tmp), shellQuote(mode), shellQuote(tmp), shellQuote(destination), shellQuote(mode), shellQuote(tmp), shellQuote(destination))}
+	_, err = p.Exec(ctx, vmName, cmd, ExecOptions{StdinReader: file})
 	return err
 }
 

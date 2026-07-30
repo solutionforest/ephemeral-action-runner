@@ -25,6 +25,8 @@ image:
   sourceType: docker-image
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   outputImage: epar-docker-container-catthehacker-ubuntu
+  updateFrequency: weekly
+  updateTime: "07:00"
 
 provider:
   type: docker-container
@@ -39,7 +41,7 @@ Use `configs/docker-container.act.example.yml` for a smaller Docker-focused Catt
 ## Normal Workflow
 
 1. Create a local configuration with the wizard or copy an example.
-2. Run `./start`. EPAR builds or refreshes the reusable image when its manifest no longer matches the configuration, then starts the pool.
+2. Run `./start`. EPAR immediately applies local input changes and checks mutable upstream identities when the configured schedule is due, then starts the pool.
 3. Target the configured label in a workflow, for example `runs-on: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]`.
 
 The outer container has no host Docker socket mount and does not publish host ports by default. The inner daemon defaults to the reliable nested-Docker `vfs` storage driver. Use a different `EPAR_DOCKERD_STORAGE_DRIVER` only in a derived image after validating the exact host runtime.

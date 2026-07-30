@@ -69,12 +69,16 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 
 func (p *Provider) Exec(ctx context.Context, name string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
 	full := []string{"exec"}
-	if opts.Stdin != "" {
+	if opts.Stdin != "" || opts.StdinReader != nil {
 		full = append(full, "-i")
 	}
 	full = append(full, name)
 	full = append(full, provider.EnvCommand(opts.Env, command)...)
-	return p.runWithSensitiveLog(ctx, strings.NewReader(opts.Stdin), opts.Stdout, opts.Stderr, opts.SensitiveValues, full...)
+	stdin := opts.StdinReader
+	if stdin == nil && opts.Stdin != "" {
+		stdin = strings.NewReader(opts.Stdin)
+	}
+	return p.runWithSensitiveLog(ctx, stdin, opts.Stdout, opts.Stderr, opts.SensitiveValues, full...)
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {

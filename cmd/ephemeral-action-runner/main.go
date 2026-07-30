@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 )
 
 const binaryName = "ephemeral-action-runner"
+
+var imageUpdateDefaultNotice sync.Once
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -221,9 +224,36 @@ func retentionPolicy(cfg config.LoggingConfig) logging.RetentionPolicy {
 
 func runImage(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("image requires subcommand: update-upstream or build")
+		return fmt.Errorf("image requires subcommand: update, update-upstream, build, or refresh-scripts")
 	}
 	switch args[0] {
+	case "update":
+		fs := flag.NewFlagSet("image update", flag.ExitOnError)
+		common := addCommonFlags(fs)
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		m, err := newManager(*common.configPath, *common.projectRoot, *common.dryRun, false)
+		if err != nil {
+			return err
+		}
+		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"image", "update"}, appendStorageOverride(args[1:])...)...))
+		ctx := interruptContext()
+		poolControllerLock, err := m.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		defer poolControllerLock.Close()
+		hostTrustControllerLock, err := m.AcquireHostTrustControllerLock()
+		if err != nil {
+			return err
+		}
+		if hostTrustControllerLock != nil {
+			defer hostTrustControllerLock.Close()
+		}
+		return m.UpdateImage(ctx)
 	case "update-upstream":
 		fs := flag.NewFlagSet("image update-upstream", flag.ExitOnError)
 		common := addCommonFlags(fs)
@@ -609,6 +639,12 @@ func loggingSinks(values []string) logging.Sinks {
 
 func printConfigWarnings(cfg config.Config) {
 	for _, warning := range cfg.Warnings() {
+		if strings.Contains(warning, "image update policy is not configured") {
+			imageUpdateDefaultNotice.Do(func() {
+				fmt.Fprintln(os.Stderr, "warning:", warning)
+			})
+			continue
+		}
 		fmt.Fprintln(os.Stderr, "warning:", warning)
 	}
 }
@@ -653,6 +689,7 @@ Commands:
   ephemeral-action-runner
   ephemeral-action-runner start [--instances N] [--config .local/config.yml]
   ephemeral-action-runner init
+  ephemeral-action-runner image update [--config .local/config.yml]
   ephemeral-action-runner image update-upstream [--config .local/config.yml]
   ephemeral-action-runner image build [--replace] [--update-upstream]
   ephemeral-action-runner image refresh-scripts

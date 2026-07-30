@@ -4,10 +4,13 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -576,7 +579,25 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 		}
 		return nil
 	}
-	if err := manager.buildDockerContainerImage(context.Background(), ImageBuildOptions{Replace: true}, t.TempDir()); err != nil {
+	runnerPackage := []byte("test-actions-runner-package")
+	runnerServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write(runnerPackage)
+	}))
+	defer runnerServer.Close()
+	runnerDigest := sha256.Sum256(runnerPackage)
+	manifest := ImageManifest{
+		SchemaVersion:     imageManifestSchemaVersion,
+		ProviderType:      "docker-container",
+		SourceType:        config.ImageSourceDockerImage,
+		SourceImage:       "source:latest",
+		OutputImage:       "output:latest",
+		RunnerSelector:    "latest",
+		RunnerVersion:     "2.332.0",
+		RunnerAssetName:   "actions-runner-linux-x64-2.332.0.tar.gz",
+		RunnerAssetURL:    runnerServer.URL,
+		RunnerAssetDigest: fmt.Sprintf("sha256:%x", runnerDigest),
+	}
+	if err := manager.buildDockerContainerImage(context.Background(), ImageBuildOptions{Replace: true, Manifest: &manifest}, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	if builds != 2 {

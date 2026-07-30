@@ -68,11 +68,23 @@ go run ./cmd/ephemeral-action-runner start --config .local\ci.yml --instances 2
 
 If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.instances` from the selected config. EPAR resolves configuration from `--config`, `EPAR_CONFIG`, `.local/config.yml`, then `~/.config/ephemeral-action-runner/config.yml`. Tracked files in `configs/` are examples; keep App values and key paths in an ignored local file. See [Configuration](configuration.md) for every setting and [Runner Group Security](runner-groups.md) before broadening repository access.
 
-Storage-consuming commands fail before their provider side effects when an authoritative physical surface cannot retain `storage.minimumFree`. The one-invocation `--allow-insufficient-storage` option keeps all probes and warnings but permits only storage admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, and cleanup protections remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
+Storage-consuming commands fail before their provider side effects when an authoritative physical surface cannot retain `storage.minimumFree`. The one-invocation `--allow-insufficient-storage` option keeps all probes and warnings but permits only storage admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, and cleanup protections remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image update`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
 
 Each normal start also reconciles interrupted exact-owned work and retires unreferenced superseded artifacts after replacement readback. Use `./start storage status` to inspect the result. `./start storage prune --legacy` previews prefix-era resources, which remain manual and require the displayed plan hash before execution.
 
 Press `Ctrl-C` once to stop a foreground pool, then wait for cleanup to finish before closing the terminal. Use `--keep-on-exit` only to retain owned resources for deliberate debugging.
+
+## Update runner artifacts
+
+By default, EPAR checks mutable source-image tags and `runnerVersion: latest` weekly at 07:00 local time. The wizard can select daily, weekly, every two weeks, monthly, or manual checks. Local image settings, script or certificate content, platform, EPAR assets, and missing or corrupt artifacts always apply on the next start without waiting for the schedule.
+
+Force an immediate remote check without forcing a rebuild:
+
+```bash
+./start image update
+```
+
+Manual policy means this command triggers remote checks. `./start image build` remains the force-build path. A running ephemeral pool checks when due, drains only after busy jobs finish, activates the verified replacement, and restores pool capacity; persistent runners record the update for the next process start.
 
 ## Verify before sending jobs
 

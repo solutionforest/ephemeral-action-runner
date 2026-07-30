@@ -98,7 +98,7 @@ function Start-EparHostTrustBridge {
     }
     $subcommand = if ($Arguments -and $Arguments.Count -gt 1) { [string]$Arguments[1] } else { "" }
     $needsBridge = $Command -eq "start" -or
-        ($Command -eq "image" -and $subcommand -eq "build") -or
+        ($Command -eq "image" -and $subcommand -in @("build", "update")) -or
         ($Command -eq "pool" -and $subcommand -in @("up", "verify"))
     if (-not $needsBridge) {
         return [pscustomobject]@{ FeedDir = $null; BuildFeedDir = $null; RunnerFeedDir = $null; WatchProcess = $null; WatchProcesses = @(); Config = $config; PostInit = $false }

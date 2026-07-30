@@ -21,7 +21,9 @@ flowchart LR
 | Tart | `ghcr.io/cirruslabs/ubuntu:latest` | Tart VM image | `image build --replace` |
 | Docker Sandboxes | Selected Catthehacker source | Verified imported runner template | `image build` |
 
-The first-run wizard gives Docker Container, Docker Sandboxes, and WSL the same ordered Catthehacker choices (`full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another validated tag), platform resolution, optional custom-script collection, and storage estimate. `./start` compares the desired image settings with the active artifact receipt and builds a replacement when the source digest, platform, EPAR assets, runner inputs, trust inputs, or custom-script hashes change. Docker Sandboxes imports the replacement into its template cache and activates it only after exact readback succeeds.
+The first-run wizard gives Docker Container, Docker Sandboxes, and WSL the same ordered Catthehacker choices (`full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another validated tag), platform resolution, optional custom-script collection, update policy, and storage estimate. `./start` always verifies local inputs and the active artifact, but checks mutable source tags and `runnerVersion: latest` only when the configured schedule is due. The default is weekly at 07:00 local time. Docker Sandboxes imports a replacement into its template cache and activates it only after exact readback succeeds.
+
+Use `./start image update` for an immediate remote check that rebuilds only when an immutable source or Actions runner identity changed. Use `./start image build` to force a build. Actions runner packages are selected by exact platform, downloaded into a content-addressed cache by the native controller, and SHA-256 verified before entering any provider build; guests do not resolve `latest`.
 
 ## Add Tools
 

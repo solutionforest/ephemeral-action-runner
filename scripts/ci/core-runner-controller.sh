@@ -248,6 +248,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
   customInstallScripts:
 EOF
 if [[ -n "${EPAR_TRUSTED_CA_CERTIFICATE_PATH:-}" ]]; then

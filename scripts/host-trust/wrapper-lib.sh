@@ -91,7 +91,7 @@ epar_host_trust_prepare() {
       return 0
       ;;
     start) ;;
-    image) [[ "$subcommand" == build ]] || return 0 ;;
+    image) [[ "$subcommand" == build || "$subcommand" == update ]] || return 0 ;;
     pool) [[ "$subcommand" == up || "$subcommand" == verify ]] || return 0 ;;
     *) return 0 ;;
   esac

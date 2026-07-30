@@ -172,7 +172,7 @@ func TestTrustedCACertificateDigestInvalidatesImageManifest(t *testing.T) {
 		},
 		ProjectRoot: root,
 	}
-	manifest, err := manager.desiredImageManifest(context.Background())
+	manifest, err := manager.desiredLocalImageManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestTrustedCACertificateDigestInvalidatesImageManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeTestCACertificate(t, certificatePath, "Enterprise Root Two")
-	manifest, err = manager.desiredImageManifest(context.Background())
+	manifest, err = manager.desiredLocalImageManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

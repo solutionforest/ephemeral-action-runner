@@ -52,13 +52,17 @@ Docker Sandboxes never falls back to Docker Container. Its wizard is available w
 | `outputImage` | string; provider default | Image-building providers. | EPAR-owned reusable runner artifact name or path. |
 | `upstreamDir` | string; `third_party/runner-images` | Image builds that adapt upstream scripts. | Local checkout/cache location for the pinned upstream runner-image scripts. |
 | `upstreamLock` | string; `third_party/runner-images.lock` | Image builds that adapt upstream scripts. | Lock file identifying the approved upstream revision. |
-| `runnerVersion` | string; `latest` | Runner image builds. | Runner release selector. Pin a version when repeatability matters. |
+| `runnerVersion` | string; `latest` | Runner image builds. | Runner release selector. EPAR resolves it to an exact platform package and verified SHA-256 when a remote check is due. |
+| `updateFrequency` | `daily`, `weekly`, `biweekly`, `monthly`, or `manual`; `weekly` | Mutable source-image tags and `runnerVersion: latest`. | Controls remote freshness checks only. Local configuration, scripts, trust inputs, EPAR assets, and missing or corrupt artifacts apply immediately. |
+| `updateTime` | local 24-hour `HH:MM`; `"07:00"` | Automatic update frequencies. | Preferred local check time. Manual mode ignores it. |
 | `customInstallScripts` | list of non-empty paths; empty | Optional image customization. | Scripts run while creating the runner image; treat them as trusted build input. |
 | `trustedCaCertificatePaths` | list of non-empty paths; empty | Optional additional TLS roots. | PEM or DER CA files are validated, supplied to EPAR's operational builder, and installed in the runner artifact. They supplement, not replace, system or runner-overlay trust. |
 | `hostTrustMode` | `disabled` or `overlay`; `disabled` | Optional host-root inheritance for ephemeral runners. | Controls runner inheritance only. `overlay` requires `runner.ephemeral: true`; it collects a current host-trust generation before registration and fails closed on an invalid or stale result. EPAR's owned builder independently receives operational system trust. |
 | `hostTrustScopes` | list of `system`, `user`; `[system]` | Required and non-empty with `hostTrustMode: overlay`. | Windows/macOS may use `[system, user]`; Linux supports `[system]` only. This is root-anchor inheritance, not exact host TLS-policy emulation. |
 
 Runner host trust is a common ephemeral-runner contract, not a Docker Container-only configuration rule. The interactive Docker Container and Docker Sandboxes paths offer it, while the configuration validator applies the same overlay and ephemeral requirements independently of provider type. Operational builder trust is automatic and separate: system roots are supplied to EPAR's dedicated BuildKit builder even when runner overlay is disabled, user roots remain opt-in through runner overlay scope, and explicit CA paths apply to both paths. A host Docker daemon must separately trust a private registry before EPAR can pull an image; neither builder nor guest overlay can repair a failed host-daemon pull.
+
+The default update policy checks remotely mutable inputs weekly at 07:00 local time. Repeated starts before the next check verify and reuse local artifacts without contacting the image registry or Actions runner release API. Run `./start image update` for an immediate check; `image build` remains the force-build command. Scheduled failures keep an exactly verified current generation available with visible persisted retry state, while user-requested local changes remain fail-closed.
 
 ### `pool`
 

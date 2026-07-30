@@ -43,11 +43,22 @@ func hostTrustMetadata(snapshot hosttrust.Snapshot) *HostTrustMetadata {
 }
 
 func (m *Coordinator) EnsureImage(ctx context.Context) error {
+	return m.ensureImage(ctx, false)
+}
+
+// UpdateImage forces an immediate remote freshness observation and rebuilds
+// only when the resolved immutable inputs differ from the active artifact.
+func (m *Coordinator) UpdateImage(ctx context.Context) error {
+	return m.ensureImage(ctx, true)
+}
+
+func (m *Coordinator) ensureImage(ctx context.Context, forceRemote bool) error {
 	if err := m.cleanupSupersededCatalog(ctx); err != nil {
 		return fmt.Errorf("reconcile EPAR storage before image provisioning: %w", err)
 	}
+	m.logEffectiveUpdatePolicy(forceRemote)
 	if m.Config.Provider.Type == "docker-sandboxes" {
-		return m.ensureDockerSandboxesTemplate(ctx, false)
+		return m.ensureDockerSandboxesTemplateWithPolicy(ctx, forceRemote)
 	}
 	if artifactManager, ok := m.Lifecycle.(provider.ArtifactManager); ok {
 		handled, err := artifactManager.EnsureArtifacts(ctx, m.DryRun)
@@ -55,41 +66,183 @@ func (m *Coordinator) EnsureImage(ctx context.Context) error {
 			return err
 		}
 	}
-	manifest, err := m.desiredImageManifest(ctx)
+	localManifest, err := m.desiredLocalImageManifest(ctx)
 	if err != nil {
 		return err
 	}
-	hash, err := imageManifestHash(manifest)
+	localHash, err := imageManifestHash(localManifest)
 	if err != nil {
 		return err
 	}
 	if m.DryRun {
-		m.infof("[dry-run] would ensure image %s has manifest %s\n", m.Config.Image.OutputImage, hash)
+		m.infof("[dry-run] would ensure image %s has local-input manifest %s\n", m.Config.Image.OutputImage, localHash)
+		manifest, err := m.resolveRemoteImageManifest(ctx, localManifest)
+		if err != nil {
+			return err
+		}
 		return m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest})
 	}
-	state, err := m.currentImageState(ctx, hash)
+
+	now := m.now()
+	updateState, err := m.readUpdatePolicyState()
 	if err != nil {
-		return err
+		m.warnf("ignoring stale image update state and performing an immediate check: %v\n", err)
+		updateState = UpdatePolicyState{SchemaVersion: updatePolicyStateSchemaVersion}
 	}
-	switch state {
-	case imageStateCurrent:
-		m.infof("image is current: %s\n", m.Config.Image.OutputImage)
-		if err := m.recordCurrentArtifact(ctx, hash); err != nil {
+	if m.Config.Provider.Type == "wsl" {
+		outputPath := config.ProjectPath(m.ProjectRoot, m.Config.Image.OutputImage)
+		sidecarPath := wslImageManifestSidecarPath(outputPath)
+		if stored, readErr := readStoredImageManifest(sidecarPath); readErr == nil {
+			if info, statErr := os.Stat(sidecarPath); statErr == nil {
+				bootstrapped, bootstrapErr := bootstrapUpdatePolicyState(&updateState, m.Config.Image, localManifest, stored.Manifest, nil, info.ModTime(), now.Location())
+				if bootstrapErr != nil {
+					return bootstrapErr
+				}
+				if bootstrapped {
+					if err := m.writeUpdatePolicyState(updateState); err != nil {
+						return err
+					}
+					m.infof("initialized image update schedule from the verified active WSL artifact\n")
+				}
+			}
+		}
+	}
+	if recalculateScheduleForTimeZone(&updateState, m.Config.Image, now.Location()) {
+		if err := m.writeUpdatePolicyState(updateState); err != nil {
+			return err
+		}
+	}
+
+	localChanged := updateState.LocalInputHash != "" && updateState.LocalInputHash != localHash
+	var (
+		currentState imageState
+		currentHash  string
+		haveResolved bool
+	)
+	if updateState.LocalInputHash == localHash && updateState.LastResolvedManifest != nil {
+		currentHash, err = imageManifestHash(*updateState.LastResolvedManifest)
+		if err != nil {
+			return err
+		}
+		currentState, err = m.currentImageState(ctx, currentHash)
+		if err != nil {
+			return err
+		}
+		haveResolved = true
+	}
+	if updateState.LocalInputHash == localHash && pendingUpdateReady(updateState, now) {
+		if err := m.ApplyPendingUpdate(ctx, now); err != nil {
+			if !forceRemote && haveResolved && currentState == imageStateCurrent {
+				status, _ := m.UpdatePolicyStatus()
+				m.warnf("pending scheduled image update failed; continuing with the previous verified artifact and retrying after %s: %v\n", formatUpdateTime(status.NextRetryAt), err)
+				return nil
+			}
+			return err
+		}
+		m.infof("pending image update activated\n")
+		return nil
+	}
+
+	remoteDue := updateCheckDue(updateState, m.Config.Image, now)
+	needsRemote := forceRemote || !haveResolved || localChanged || currentState != imageStateCurrent || remoteDue
+	if !needsRemote {
+		m.infof("image is current: %s; next remote check %s\n", m.Config.Image.OutputImage, formatUpdateTime(updateState.NextEligibleAt))
+		if err := m.recordCurrentArtifact(ctx, currentHash); err != nil {
 			return fmt.Errorf("record current EPAR artifact ownership: %w", err)
 		}
 		return m.cleanupSupersededCatalog(ctx)
-	case imageStateMissing:
-		m.infof("image is missing; building %s\n", m.Config.Image.OutputImage)
-	case imageStateOutdated:
-		m.infof("image is outdated or not aligned with config; rebuilding %s\n", m.Config.Image.OutputImage)
 	}
-	if err := m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest}); err != nil {
+
+	updateState.LastAttemptAt = now.UTC()
+	manifest, resolveErr := m.resolveRemoteImageManifest(ctx, localManifest)
+	if resolveErr != nil {
+		scheduleUpdateFailure(&updateState, now, resolveErr)
+		_ = m.writeUpdatePolicyState(updateState)
+		if !forceRemote && !localChanged && haveResolved && currentState == imageStateCurrent {
+			m.warnf("scheduled image update check failed; continuing with the last verified artifact and retrying after %s: %v\n", formatUpdateTime(updateState.NextRetryAt), resolveErr)
+			return nil
+		}
+		return resolveErr
+	}
+	resolvedHash, err := imageManifestHash(manifest)
+	if err != nil {
 		return err
 	}
-	if err := m.recordCurrentArtifact(ctx, hash); err != nil {
+	resolvedState, err := m.currentImageState(ctx, resolvedHash)
+	if err != nil {
+		return err
+	}
+	if resolvedState == imageStateCurrent {
+		updateState.LocalInputHash = localHash
+		updateState.LastResolvedManifest = &manifest
+		updateState.PendingManifest = nil
+		if err := scheduleNextSuccess(&updateState, m.Config.Image, now); err != nil {
+			return err
+		}
+		if err := m.writeUpdatePolicyState(updateState); err != nil {
+			return err
+		}
+		m.infof("image is current: %s; next remote check %s\n", m.Config.Image.OutputImage, formatUpdateTime(updateState.NextEligibleAt))
+		if err := m.recordCurrentArtifact(ctx, resolvedHash); err != nil {
+			return fmt.Errorf("record current EPAR artifact ownership: %w", err)
+		}
+		return m.cleanupSupersededCatalog(ctx)
+	}
+	if resolvedState == imageStateMissing {
+		m.infof("image is missing; building %s\n", m.Config.Image.OutputImage)
+	} else {
+		m.infof("image inputs changed; rebuilding %s\n", m.Config.Image.OutputImage)
+	}
+	updateState.LocalInputHash = localHash
+	updateState.PendingManifest = &manifest
+	updateState.DeferredReason = "artifact build and activation pending"
+	if err := m.writeUpdatePolicyState(updateState); err != nil {
+		return err
+	}
+	if err := m.buildResolvedImage(ctx, manifest); err != nil {
+		scheduleUpdateFailure(&updateState, now, err)
+		_ = m.writeUpdatePolicyState(updateState)
+		if !forceRemote && !localChanged && haveResolved && currentState == imageStateCurrent {
+			m.warnf("scheduled image update failed; restoring the last verified artifact and retrying after %s: %v\n", formatUpdateTime(updateState.NextRetryAt), err)
+			return nil
+		}
+		return err
+	}
+	if err := m.recordCurrentArtifact(ctx, resolvedHash); err != nil {
 		return fmt.Errorf("record current EPAR artifact ownership: %w", err)
 	}
+	updateState.LastResolvedManifest = &manifest
+	updateState.PendingManifest = nil
+	if err := scheduleNextSuccess(&updateState, m.Config.Image, m.now()); err != nil {
+		return err
+	}
+	if err := m.writeUpdatePolicyState(updateState); err != nil {
+		return err
+	}
 	return m.cleanupSupersededCatalog(ctx)
+}
+
+func (m *Coordinator) logEffectiveUpdatePolicy(forceRemote bool) {
+	if forceRemote {
+		m.infof("image update policy: immediate manual check requested\n")
+		return
+	}
+	if m.Config.Image.UpdateFrequency == config.ImageUpdateFrequencyManual {
+		m.infof("image update policy: manual; remote image and Actions runner checks run only when requested\n")
+		return
+	}
+	m.infof("image update policy: %s at %s local time\n", m.Config.Image.UpdateFrequency, m.Config.Image.UpdateTime)
+}
+
+func (m *Coordinator) buildResolvedImage(ctx context.Context, manifest Manifest) error {
+	originalSource := m.Config.Image.SourceImage
+	if manifest.SourceType == config.ImageSourceDockerImage && strings.Contains(manifest.SourceDigest, "@sha256:") {
+		m.Config.Image.SourceImage = manifest.SourceDigest
+	}
+	defer func() {
+		m.Config.Image.SourceImage = originalSource
+	}()
+	return m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest})
 }
 
 type imageState int
@@ -229,6 +382,22 @@ func (m *Coordinator) desiredImageManifest(ctx context.Context) (ImageManifest, 
 }
 
 func (m *Coordinator) desiredImageManifestWithHostTrust(ctx context.Context, snapshot hosttrust.Snapshot) (ImageManifest, error) {
+	manifest, err := m.desiredLocalImageManifestWithHostTrust(snapshot)
+	if err != nil {
+		return ImageManifest{}, err
+	}
+	return m.resolveRemoteImageManifest(ctx, manifest)
+}
+
+func (m *Coordinator) desiredLocalImageManifest(ctx context.Context) (ImageManifest, error) {
+	snapshot, err := m.resolveHostTrust(ctx)
+	if err != nil {
+		return ImageManifest{}, err
+	}
+	return m.desiredLocalImageManifestWithHostTrust(snapshot)
+}
+
+func (m *Coordinator) desiredLocalImageManifestWithHostTrust(snapshot hosttrust.Snapshot) (ImageManifest, error) {
 	sourceType := m.Config.Image.SourceType
 	if sourceType == "" {
 		sourceType = config.ImageSourceRootFSTar
@@ -245,18 +414,11 @@ func (m *Coordinator) desiredImageManifestWithHostTrust(ctx context.Context, sna
 		SourceImage:        m.Config.Image.SourceImage,
 		SourcePlatform:     m.Config.Image.SourcePlatform,
 		OutputImage:        m.Config.Image.OutputImage,
-		RunnerVersion:      m.Config.Image.RunnerVersion,
+		RunnerSelector:     normalizedRunnerSelector(m.Config.Image.RunnerVersion),
 		HostTrust:          hostTrustMetadata(snapshot),
 	}
 	switch sourceType {
 	case config.ImageSourceDockerImage:
-		if m.Config.Provider.Type == "docker-container" || m.Config.Provider.Type == "wsl" {
-			digest, err := m.refreshDockerSourceDigest(ctx)
-			if err != nil {
-				return manifest, err
-			}
-			manifest.SourceDigest = digest
-		}
 	case config.ImageSourceRootFSTar:
 		if m.Config.Provider.Type == "wsl" {
 			digest, err := m.fileSHA256(config.ProjectPath(m.ProjectRoot, m.Config.Image.SourceImage))
@@ -292,6 +454,31 @@ func (m *Coordinator) desiredImageManifestWithHostTrust(ctx context.Context, sna
 		manifest.UpstreamCommit = commit
 	}
 	return manifest, nil
+}
+
+func (m *Coordinator) resolveRemoteImageManifest(ctx context.Context, manifest ImageManifest) (ImageManifest, error) {
+	if manifest.SourceType == config.ImageSourceDockerImage {
+		switch m.Config.Provider.Type {
+		case "docker-container", "wsl":
+			source, err := m.resolveDockerSandboxesSource(ctx)
+			if err != nil {
+				return manifest, err
+			}
+			manifest.SourceImage = source.Reference
+			manifest.SourcePlatform = source.Platform
+			manifest.SourceDigest = source.ImmutableReference
+			manifest.SourcePlatformDigest = source.PlatformDigest
+		case "tart":
+			source, err := m.resolveTartOCIReference(ctx, manifest.SourceImage)
+			if err != nil {
+				return manifest, err
+			}
+			manifest.SourceDigest = source
+		default:
+			return manifest, fmt.Errorf("unsupported provider.type %q for Docker image source resolution", m.Config.Provider.Type)
+		}
+	}
+	return m.resolveActionsRunner(ctx, manifest)
 }
 
 func (m *Coordinator) refreshDockerSourceDigest(ctx context.Context) (string, error) {

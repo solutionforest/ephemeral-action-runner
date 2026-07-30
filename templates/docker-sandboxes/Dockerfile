@@ -28,7 +28,8 @@ ARG SOURCE_MANIFEST_DIGEST=sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8
 ARG SOURCE_REVISION=e2f8efe464c82732f78e967ee709c00b6af53643
 ARG TEMPLATE_VERSION=20260723-r4-amd64
 ARG COMPATIBILITY_FILE=act-22.04.amd64.compatibility.json
-ARG ACTIONS_RUNNER_SHA256=sha256:f2094522a6b9afeab07ffb586d1eb3f190b6457074282796c497ce7dce9e0f2a
+ARG ACTIONS_RUNNER_VERSION
+ARG ACTIONS_RUNNER_SHA256
 ARG TINI_SHA256=sha256:93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c
 
 USER root
@@ -59,10 +60,11 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && install -d -m 0755 -o agent -g agent /opt/actions-runner /opt/actions-runner/_work /opt/actions-runner/_work/_tool /var/log/actions-runner \
     && tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner \
     && rm -f /tmp/actions-runner.tar.gz \
+    && printf '%s\n' "${ACTIONS_RUNNER_VERSION}" > /opt/epar/actions-runner-version \
     && chown -R agent:agent /opt/actions-runner /var/log/actions-runner \
     && chmod 0555 /opt/epar/custom-install/run.sh \
     && /opt/epar/custom-install/run.sh \
-    && sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version | grep -Fx '2.332.0' \
+    && sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version | grep -Fx "${ACTIONS_RUNNER_VERSION}" \
     && /usr/local/bin/tini --version 2>&1 | grep -F 'version 0.19.0'
 
 ENV HOME=/home/agent \
@@ -83,7 +85,7 @@ LABEL com.docker.sandboxes.start-docker=true \
     io.solutionforest.epar.template.expected-docker-daemon-count="1" \
     io.solutionforest.epar.template.profile="${SOURCE_PROFILE}" \
     io.solutionforest.epar.template.platform="${TEMPLATE_PLATFORM}" \
-    io.solutionforest.epar.template.runner-version="2.332.0" \
+    io.solutionforest.epar.template.runner-version="${ACTIONS_RUNNER_VERSION}" \
     io.solutionforest.epar.template.source-index-digest="${SOURCE_INDEX_DIGEST}" \
     io.solutionforest.epar.template.source-manifest-digest="${SOURCE_MANIFEST_DIGEST}" \
     org.opencontainers.image.base.name="${SOURCE_IMAGE}" \

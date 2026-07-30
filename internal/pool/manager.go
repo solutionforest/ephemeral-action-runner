@@ -346,7 +346,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	var currentHostTrust hosttrust.Snapshot
 	hostTrustBusyHandoff := make(map[string]bool)
 	confirmedInactiveChecks := make(map[string]int)
+	imageMaintenanceIdleChecks := make(map[string]int)
 	retry := replacementRetryState{}
+	imageMaintenancePending := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -357,6 +359,38 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if m.Config.Logging.RetentionEnabled && !time.Now().Before(nextRetention) {
 				m.pruneLogsBestEffort()
 				nextRetention = time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
+			}
+			if m.AutomaticImageLifecycle && !imageMaintenancePending && m.Config.Image.UpdateFrequency != config.ImageUpdateFrequencyManual {
+				check, checkErr := m.CheckRemoteImageUpdate(ctx, now)
+				if checkErr != nil {
+					m.warnf("scheduled image update check failed; the current verified pool remains available: %v\n", checkErr)
+				} else if check.Changed {
+					if !m.Config.Runner.Ephemeral {
+						_ = m.DeferPendingImageUpdate("runner.ephemeral=false; the update will be applied on the next EPAR startup")
+						m.warnf("image update is available but this pool uses persistent runners; restart EPAR to apply it without an assignment race\n")
+					} else {
+						imageMaintenancePending = true
+						m.infof("image or Actions runner update is available; draining the ephemeral pool before artifact provisioning\n")
+					}
+				}
+			}
+			if imageMaintenancePending {
+				remaining, drainErr := m.drainPoolForImageUpdate(ctx, active, imageMaintenanceIdleChecks)
+				if drainErr != nil {
+					m.warnf("scheduled image maintenance drain warning; retrying without creating replacements: %v\n", drainErr)
+					continue
+				}
+				if remaining > 0 {
+					continue
+				}
+				m.infof("scheduled image maintenance drain complete; building and activating the verified replacement artifact\n")
+				if updateErr := m.ApplyPendingImageUpdate(ctx, now); updateErr != nil {
+					m.warnf("scheduled image update failed; restoring pool capacity with the previous verified generation: %v\n", updateErr)
+				} else {
+					m.infof("scheduled image update activated; restoring pool capacity\n")
+				}
+				imageMaintenancePending = false
+				clear(imageMaintenanceIdleChecks)
 			}
 			trustRetired := 0
 			trustCapacityReady := true
@@ -538,6 +572,45 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 		}
 	}
+}
+
+func (m *Manager) drainPoolForImageUpdate(ctx context.Context, active map[string]ProvisionedInstance, confirmedIdle map[string]int) (int, error) {
+	for name, vm := range active {
+		if m.GitHub != nil {
+			runner, found, err := m.GitHub.RunnerByName(ctx, name)
+			if err != nil {
+				delete(confirmedIdle, name)
+				return len(active), fmt.Errorf("inspect GitHub runner %s before maintenance: %w", name, err)
+			}
+			if found {
+				vm.RunnerID = runner.ID
+				active[name] = vm
+				if err := m.recordLifecycleJobObservation(ctx, runner); err != nil {
+					delete(confirmedIdle, name)
+					return len(active), fmt.Errorf("record GitHub job state for %s before maintenance: %w", name, err)
+				}
+			}
+			if found && runner.Busy {
+				delete(confirmedIdle, name)
+				m.infof("[%s] scheduled image maintenance is waiting for the active job to finish\n", name)
+				continue
+			}
+			if found {
+				confirmedIdle[name]++
+				if confirmedIdle[name] < 2 {
+					m.infof("[%s] scheduled image maintenance observed the runner idle; confirming it remains unassigned before retirement\n", name)
+					continue
+				}
+			}
+		}
+		m.infof("[%s] retiring idle runner for scheduled image maintenance\n", name)
+		if err := m.retireInstance(context.Background(), vm, "scheduled image and Actions runner update"); err != nil {
+			return len(active), err
+		}
+		delete(active, name)
+		delete(confirmedIdle, name)
+	}
+	return len(active), nil
 }
 
 func currentHostTrustCapacity(active map[string]ProvisionedInstance, generation string) int {
@@ -1161,6 +1234,39 @@ func (m *Manager) cleanupLegacyTestProvider(ctx context.Context) error {
 
 func (m *Manager) Status(ctx context.Context) (string, error) {
 	var b strings.Builder
+	updateStatus, updateErr := m.ImageUpdatePolicyStatus()
+	if updateErr != nil {
+		if m.Config.Image.UpdateFrequency == config.ImageUpdateFrequencyManual {
+			fmt.Fprintf(&b, "Image updates:\n  policy=manual\tstate=unavailable\terror=%s\n", updateErr)
+		} else {
+			fmt.Fprintf(&b, "Image updates:\n  policy=%s at %s local\tstate=unavailable\terror=%s\n", m.Config.Image.UpdateFrequency, m.Config.Image.UpdateTime, updateErr)
+		}
+	} else {
+		if updateStatus.Frequency == config.ImageUpdateFrequencyManual {
+			fmt.Fprintf(&b, "Image updates:\n  policy=manual")
+		} else {
+			fmt.Fprintf(&b, "Image updates:\n  policy=%s at %s local", updateStatus.Frequency, updateStatus.UpdateTime)
+		}
+		if !updateStatus.LastSuccessfulCheckAt.IsZero() {
+			fmt.Fprintf(&b, "\tlast=%s", updateStatus.LastSuccessfulCheckAt.In(time.Local).Format("2006-01-02 15:04 MST"))
+		}
+		if !updateStatus.NextEligibleAt.IsZero() {
+			fmt.Fprintf(&b, "\tnext=%s", updateStatus.NextEligibleAt.In(time.Local).Format("2006-01-02 15:04 MST"))
+		}
+		if !updateStatus.NextRetryAt.IsZero() {
+			fmt.Fprintf(&b, "\tretry=%s", updateStatus.NextRetryAt.In(time.Local).Format("2006-01-02 15:04 MST"))
+		}
+		if updateStatus.Pending {
+			fmt.Fprintf(&b, "\tpending=%s", updateStatus.PendingIdentity)
+		}
+		b.WriteString("\n")
+		if updateStatus.DeferredReason != "" {
+			fmt.Fprintf(&b, "  deferred: %s\n", updateStatus.DeferredReason)
+		}
+		if updateStatus.LastError != "" {
+			fmt.Fprintf(&b, "  last error: %s\n", updateStatus.LastError)
+		}
+	}
 	items, err := m.inventoryProvider(ctx)
 	if err != nil {
 		return "", err

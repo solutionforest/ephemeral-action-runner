@@ -922,6 +922,61 @@ func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.
 	}
 }
 
+func TestImageUpdatePolicyWizardDefaultsAndOrdering(t *testing.T) {
+	var out bytes.Buffer
+	policy, err := promptImageUpdatePolicy(&out, bufio.NewReader(strings.NewReader("\n\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Frequency != config.ImageUpdateFrequencyWeekly || policy.Time != config.DefaultImageUpdateTime {
+		t.Fatalf("default policy = %+v", policy)
+	}
+	text := out.String()
+	choices := []string{"1. Weekly (default)", "2. Daily", "3. Every two weeks", "4. Monthly", "5. Manual"}
+	last := -1
+	for _, choice := range choices {
+		index := strings.Index(text, choice)
+		if index <= last {
+			t.Fatalf("wizard choices are missing or out of order: %q\n%s", choice, text)
+		}
+		last = index
+	}
+	if strings.Contains(strings.ToLower(text), "monthly") && strings.Contains(strings.ToLower(text), "warning") {
+		t.Fatalf("monthly choice should not carry a warning:\n%s", text)
+	}
+}
+
+func TestImageUpdatePolicyWizardManualSkipsTimePrompt(t *testing.T) {
+	var out bytes.Buffer
+	policy, err := promptImageUpdatePolicy(&out, bufio.NewReader(strings.NewReader("5\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Frequency != config.ImageUpdateFrequencyManual {
+		t.Fatalf("manual policy = %+v", policy)
+	}
+	if strings.Contains(out.String(), "Local update time") {
+		t.Fatalf("manual policy unexpectedly prompted for a time:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "./start image update") {
+		t.Fatalf("manual policy omitted its neutral trigger explanation:\n%s", out.String())
+	}
+}
+
+func TestImageUpdatePolicyWizardRepromptsInvalidChoiceAndTime(t *testing.T) {
+	var out bytes.Buffer
+	policy, err := promptImageUpdatePolicy(&out, bufio.NewReader(strings.NewReader("invalid\n2\n7am\n06:30\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Frequency != config.ImageUpdateFrequencyDaily || policy.Time != "06:30" {
+		t.Fatalf("reprompted policy = %+v", policy)
+	}
+	if !strings.Contains(out.String(), "Choose 1") || !strings.Contains(out.String(), "24-hour HH:MM") {
+		t.Fatalf("wizard did not explain invalid input:\n%s", out.String())
+	}
+}
+
 func TestDockerSandboxesWizardCollectsCustomTagAndInstallScript(t *testing.T) {
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.DarwinARM64, initDockerSandboxesDiscovery{
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),

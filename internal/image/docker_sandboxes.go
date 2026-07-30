@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -82,9 +83,6 @@ type dockerSandboxesSourceLock struct {
 	HookLauncher struct {
 		SHA256 string `json:"sha256"`
 	} `json:"hookLauncher"`
-	ActionsRunner struct {
-		Version string `json:"version"`
-	} `json:"actionsRunner"`
 	Tini struct {
 		Version string `json:"version"`
 	} `json:"tini"`
@@ -94,11 +92,7 @@ type dockerSandboxesSourceLock struct {
 		SBOMGeneratorReference           string `json:"sbomGeneratorReference"`
 		SBOMGeneratorManifestDigest      string `json:"sbomGeneratorManifestDigest"`
 		DockerfileFrontendManifestDigest string `json:"dockerfileFrontendManifestDigest"`
-		ActionsRunner                    struct {
-			URL    string `json:"url"`
-			SHA256 string `json:"sha256"`
-		} `json:"actionsRunner"`
-		Tini struct {
+		Tini                             struct {
 			URL    string `json:"url"`
 			SHA256 string `json:"sha256"`
 		} `json:"tini"`
@@ -247,13 +241,13 @@ func parseResolvedDockerSource(reference, platform string, indexRaw, platformRaw
 		}
 		compressed += layer.Size
 	}
-	tagSeparator := strings.LastIndex(reference, ":")
-	if tagSeparator < 0 {
-		return ResolvedDockerSource{}, fmt.Errorf("source image %s has no tag", reference)
+	repository, err := dockerRepository(reference)
+	if err != nil {
+		return ResolvedDockerSource{}, err
 	}
 	return ResolvedDockerSource{
 		Reference:            reference,
-		ImmutableReference:   reference[:tagSeparator] + "@" + indexDigest,
+		ImmutableReference:   repository + "@" + indexDigest,
 		IndexDigest:          indexDigest,
 		PlatformDigest:       matching[0].Digest,
 		Platform:             platform,
@@ -286,6 +280,16 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 	if platform == "" {
 		platform = strings.TrimSpace(m.Config.Provider.Platform)
 	}
+	if platform == "" {
+		architecture := runtime.GOARCH
+		if architecture == "386" {
+			architecture = "amd64"
+		}
+		if architecture != "amd64" && architecture != "arm64" {
+			return ResolvedDockerSource{}, fmt.Errorf("cannot infer a Linux source-image platform from host architecture %s; set image.sourcePlatform explicitly", runtime.GOARCH)
+		}
+		platform = "linux/" + architecture
+	}
 	indexRaw, err := m.runHostOutput(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", reference)
 	if err != nil {
 		return ResolvedDockerSource{}, fmt.Errorf("resolve source image %s: %w", reference, err)
@@ -309,11 +313,10 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 	if platformDigest == "" {
 		return ResolvedDockerSource{}, fmt.Errorf("source image %s does not provide %s", reference, platform)
 	}
-	tagSeparator := strings.LastIndex(reference, ":")
-	if tagSeparator <= strings.LastIndex(reference, "/") {
-		return ResolvedDockerSource{}, fmt.Errorf("source image %s must include a tag", reference)
+	repository, err := dockerRepository(reference)
+	if err != nil {
+		return ResolvedDockerSource{}, err
 	}
-	repository := reference[:tagSeparator]
 	platformRaw, err := m.runHostOutput(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", repository+"@"+platformDigest)
 	if err != nil {
 		return ResolvedDockerSource{}, fmt.Errorf("resolve source platform manifest %s: %w", platform, err)
@@ -321,52 +324,79 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 	return parseResolvedDockerSource(reference, platform, []byte(indexRaw), []byte(platformRaw))
 }
 
+func dockerRepository(reference string) (string, error) {
+	if separator := strings.Index(reference, "@"); separator > 0 {
+		return reference[:separator], nil
+	}
+	tagSeparator := strings.LastIndex(reference, ":")
+	if tagSeparator <= strings.LastIndex(reference, "/") {
+		return "", fmt.Errorf("source image %s must include a tag or digest", reference)
+	}
+	return reference[:tagSeparator], nil
+}
+
 func (m *Coordinator) dockerSandboxesDesiredManifest(ctx context.Context) (Manifest, ResolvedDockerSource, error) {
+	manifest, err := m.dockerSandboxesLocalManifest(ctx)
+	if err != nil {
+		return Manifest{}, ResolvedDockerSource{}, err
+	}
 	source, err := m.resolveDockerSandboxesSource(ctx)
 	if err != nil {
 		return Manifest{}, ResolvedDockerSource{}, err
 	}
-	lock, err := loadDockerSandboxesSourceLock(m.ProjectRoot, source.Platform)
+	manifest.ProviderPlatform = source.Platform
+	manifest.SourceImage = source.Reference
+	manifest.SourcePlatform = source.Platform
+	manifest.SourceDigest = source.IndexDigest
+	manifest.SourcePlatformDigest = source.PlatformDigest
+	manifest, err = m.resolveActionsRunner(ctx, manifest)
 	if err != nil {
 		return Manifest{}, ResolvedDockerSource{}, err
 	}
-	configuredRunnerVersion := strings.TrimSpace(m.Config.Image.RunnerVersion)
-	if configuredRunnerVersion != "" && configuredRunnerVersion != "latest" && configuredRunnerVersion != lock.ActionsRunner.Version {
-		return Manifest{}, ResolvedDockerSource{}, fmt.Errorf("Docker Sandboxes build inputs pin Actions runner %s; image.runnerVersion %q is not available", lock.ActionsRunner.Version, configuredRunnerVersion)
+	return manifest, source, nil
+}
+
+func (m *Coordinator) dockerSandboxesLocalManifest(ctx context.Context) (Manifest, error) {
+	reference, err := NormalizeCatthehackerSource(strings.TrimSpace(m.Config.Image.SourceImage))
+	if err != nil {
+		return Manifest{}, err
 	}
+	platform := strings.TrimSpace(m.Config.Image.SourcePlatform)
+	if platform == "" {
+		platform = strings.TrimSpace(m.Config.Provider.Platform)
+	}
+	configuredRunnerVersion := normalizedRunnerSelector(m.Config.Image.RunnerVersion)
 	snapshot, err := m.resolveHostTrust(ctx)
 	if err != nil {
-		return Manifest{}, ResolvedDockerSource{}, err
+		return Manifest{}, err
 	}
 	customScripts, err := m.customInstallScriptDigests()
 	if err != nil {
-		return Manifest{}, ResolvedDockerSource{}, err
+		return Manifest{}, err
 	}
 	trustedCertificates, err := m.trustedCACertificateDigests()
 	if err != nil {
-		return Manifest{}, ResolvedDockerSource{}, err
+		return Manifest{}, err
 	}
 	templateInputs, err := fileDigestsRecursive(filepath.Join(m.ProjectRoot, "templates", "docker-sandboxes"))
 	if err != nil {
-		return Manifest{}, ResolvedDockerSource{}, err
+		return Manifest{}, err
 	}
 	manifest := Manifest{
 		SchemaVersion:         ManifestSchemaVersion,
 		ProviderType:          "docker-sandboxes",
-		ProviderPlatform:      source.Platform,
+		ProviderPlatform:      platform,
 		SourceType:            config.ImageSourceDockerImage,
-		SourceImage:           source.Reference,
-		SourcePlatform:        source.Platform,
-		SourceDigest:          source.IndexDigest,
-		SourcePlatformDigest:  source.PlatformDigest,
+		SourceImage:           reference,
+		SourcePlatform:        platform,
 		OutputImage:           "docker-sandboxes-template",
-		RunnerVersion:         lock.ActionsRunner.Version,
+		RunnerSelector:        configuredRunnerVersion,
 		TemplateInputs:        templateInputs,
 		CustomInstallScripts:  customScripts,
 		TrustedCACertificates: trustedCertificates,
 		HostTrust:             hostTrustMetadata(snapshot),
 	}
-	return manifest, source, nil
+	return manifest, nil
 }
 
 func fileDigestsRecursive(root string) ([]FileDigest, error) {
@@ -464,13 +494,17 @@ func readDockerSandboxesReceiptPath(path string) (dockerSandboxesReceipt, error)
 }
 
 func (m *Coordinator) ensureDockerSandboxesTemplate(ctx context.Context, force bool) error {
-	runtime, ok := m.Lifecycle.(provider.TemplateArtifactRuntime)
-	if !ok {
-		return fmt.Errorf("docker-sandboxes provider is missing required template artifact integration")
-	}
 	manifest, source, err := m.dockerSandboxesDesiredManifest(ctx)
 	if err != nil {
 		return err
+	}
+	return m.ensureDockerSandboxesTemplateResolved(ctx, force, manifest, source)
+}
+
+func (m *Coordinator) ensureDockerSandboxesTemplateResolved(ctx context.Context, force bool, manifest Manifest, source ResolvedDockerSource) error {
+	runtime, ok := m.Lifecycle.(provider.TemplateArtifactRuntime)
+	if !ok {
+		return fmt.Errorf("docker-sandboxes provider is missing required template artifact integration")
 	}
 	manifestHash, err := ManifestHash(manifest)
 	if err != nil {
@@ -511,6 +545,139 @@ func (m *Coordinator) ensureDockerSandboxesTemplate(ctx context.Context, force b
 		return nil
 	}
 	return m.buildDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, runtime)
+}
+
+func (m *Coordinator) ensureDockerSandboxesTemplateWithPolicy(ctx context.Context, forceRemote bool) error {
+	localManifest, err := m.dockerSandboxesLocalManifest(ctx)
+	if err != nil {
+		return err
+	}
+	localHash, err := ManifestHash(localManifest)
+	if err != nil {
+		return err
+	}
+	if m.DryRun {
+		manifest, source, err := m.dockerSandboxesDesiredManifest(ctx)
+		if err != nil {
+			return err
+		}
+		return m.ensureDockerSandboxesTemplateResolved(ctx, false, manifest, source)
+	}
+	now := m.now()
+	state, err := m.readUpdatePolicyState()
+	if err != nil {
+		m.warnf("ignoring stale image update state and performing an immediate check: %v\n", err)
+		state = UpdatePolicyState{SchemaVersion: updatePolicyStateSchemaVersion}
+	}
+	if receipt, receiptErr := m.readDockerSandboxesReceipt(); receiptErr == nil {
+		runtime, ok := m.Lifecycle.(provider.TemplateArtifactRuntime)
+		if !ok {
+			return fmt.Errorf("docker-sandboxes provider is missing required template artifact integration")
+		}
+		if verifyErr := runtime.VerifyImportedTemplate(ctx, receipt.Artifact); verifyErr == nil {
+			bootstrapped, bootstrapErr := bootstrapUpdatePolicyState(&state, m.Config.Image, localManifest, receipt.Manifest, &receipt.Source, receipt.ActivatedAt, now.Location())
+			if bootstrapErr != nil {
+				return bootstrapErr
+			}
+			if bootstrapped {
+				if err := m.writeUpdatePolicyState(state); err != nil {
+					return err
+				}
+				m.infof("initialized image update schedule from the verified active Docker Sandboxes template\n")
+			}
+		} else if !errors.Is(verifyErr, provider.ErrTemplateNotFound) {
+			return fmt.Errorf("measure configured Docker Sandboxes artifact availability: %w", verifyErr)
+		}
+	}
+	if recalculateScheduleForTimeZone(&state, m.Config.Image, now.Location()) {
+		if err := m.writeUpdatePolicyState(state); err != nil {
+			return err
+		}
+	}
+	localChanged := state.LocalInputHash != "" && state.LocalInputHash != localHash
+	currentVerified := false
+	if state.LocalInputHash == localHash && state.LastResolvedManifest != nil {
+		receipt, receiptErr := m.readDockerSandboxesReceipt()
+		if receiptErr == nil {
+			wantHash, hashErr := ManifestHash(*state.LastResolvedManifest)
+			if hashErr != nil {
+				return hashErr
+			}
+			runtime, ok := m.Lifecycle.(provider.TemplateArtifactRuntime)
+			if !ok {
+				return fmt.Errorf("docker-sandboxes provider is missing required template artifact integration")
+			}
+			if receipt.ManifestHash == wantHash {
+				if verifyErr := runtime.VerifyImportedTemplate(ctx, receipt.Artifact); verifyErr == nil {
+					currentVerified = true
+				} else if !errors.Is(verifyErr, provider.ErrTemplateNotFound) {
+					return fmt.Errorf("measure configured Docker Sandboxes artifact availability: %w", verifyErr)
+				}
+			}
+		}
+	}
+	if state.LocalInputHash == localHash && pendingUpdateReady(state, now) {
+		if err := m.ApplyPendingUpdate(ctx, now); err != nil {
+			if !forceRemote && currentVerified {
+				status, _ := m.UpdatePolicyStatus()
+				m.warnf("pending scheduled Docker Sandboxes update failed; continuing with the previous verified template and retrying after %s: %v\n", formatUpdateTime(status.NextRetryAt), err)
+				return m.ensureDockerSandboxesTemplateFromState(ctx, state)
+			}
+			return err
+		}
+		m.infof("pending Docker Sandboxes update activated\n")
+		return nil
+	}
+	if !forceRemote && currentVerified && !updateCheckDue(state, m.Config.Image, now) {
+		if err := m.ensureDockerSandboxesTemplateFromState(ctx, state); err != nil {
+			return err
+		}
+		m.infof("Docker Sandboxes runner template is current; next remote check %s\n", formatUpdateTime(state.NextEligibleAt))
+		return nil
+	}
+
+	state.LastAttemptAt = now.UTC()
+	manifest, source, resolveErr := m.dockerSandboxesDesiredManifest(ctx)
+	if resolveErr != nil {
+		scheduleUpdateFailure(&state, now, resolveErr)
+		_ = m.writeUpdatePolicyState(state)
+		if !forceRemote && !localChanged && currentVerified {
+			m.warnf("scheduled image update check failed; continuing with the last verified Docker Sandboxes template and retrying after %s: %v\n", formatUpdateTime(state.NextRetryAt), resolveErr)
+			return m.ensureDockerSandboxesTemplateFromState(ctx, state)
+		}
+		return resolveErr
+	}
+	state.LocalInputHash = localHash
+	state.PendingManifest = &manifest
+	state.PendingSource = &source
+	state.DeferredReason = "template build and activation pending"
+	if err := m.writeUpdatePolicyState(state); err != nil {
+		return err
+	}
+	if err := m.ensureDockerSandboxesTemplateResolved(ctx, false, manifest, source); err != nil {
+		scheduleUpdateFailure(&state, now, err)
+		_ = m.writeUpdatePolicyState(state)
+		if !forceRemote && !localChanged && currentVerified {
+			m.warnf("scheduled Docker Sandboxes update failed; restoring the last verified template and retrying after %s: %v\n", formatUpdateTime(state.NextRetryAt), err)
+			return m.ensureDockerSandboxesTemplateFromState(ctx, state)
+		}
+		return err
+	}
+	state.LastResolvedManifest = &manifest
+	state.LastResolvedSource = &source
+	state.PendingManifest = nil
+	state.PendingSource = nil
+	if err := scheduleNextSuccess(&state, m.Config.Image, m.now()); err != nil {
+		return err
+	}
+	return m.writeUpdatePolicyState(state)
+}
+
+func (m *Coordinator) ensureDockerSandboxesTemplateFromState(ctx context.Context, state UpdatePolicyState) error {
+	if state.LastResolvedManifest == nil || state.LastResolvedSource == nil {
+		return fmt.Errorf("Docker Sandboxes update state is missing its resolved artifact inputs")
+	}
+	return m.ensureDockerSandboxesTemplateResolved(ctx, false, *state.LastResolvedManifest, *state.LastResolvedSource)
 }
 
 func estimatedDockerSandboxesExpansion(source ResolvedDockerSource) uint64 {
@@ -591,8 +758,12 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	inputRoot := filepath.Join(artifactRoot, "inputs")
 	actionsRunnerPath := filepath.Join(inputRoot, "actions-runner.tar.gz")
 	tiniPath := filepath.Join(inputRoot, "tini")
-	if err := verifiedDownload(ctx, downloadClient, platformLock.ActionsRunner.URL, actionsRunnerPath, platformLock.ActionsRunner.SHA256, 0o600); err != nil {
-		return fmt.Errorf("acquire locked Actions runner: %w", err)
+	actionsRunnerCachePath, err := m.acquireActionsRunner(ctx, manifest)
+	if err != nil {
+		return err
+	}
+	if err := copyFile(actionsRunnerCachePath, actionsRunnerPath, 0o600); err != nil {
+		return fmt.Errorf("stage GitHub Actions runner %s: %w", manifest.RunnerVersion, err)
 	}
 	if err := verifiedDownload(ctx, downloadClient, platformLock.Tini.URL, tiniPath, platformLock.Tini.SHA256, 0o700); err != nil {
 		return fmt.Errorf("acquire locked tini: %w", err)
@@ -703,7 +874,8 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"SOURCE_REVISION=" + source.IndexDigest,
 			"TEMPLATE_VERSION=" + manifestHash[:16] + "-" + architecture,
 			"COMPATIBILITY_FILE=generated.compatibility.json",
-			"ACTIONS_RUNNER_SHA256=sha256:" + strings.TrimPrefix(platformLock.ActionsRunner.SHA256, "sha256:"),
+			"ACTIONS_RUNNER_VERSION=" + manifest.RunnerVersion,
+			"ACTIONS_RUNNER_SHA256=sha256:" + strings.TrimPrefix(manifest.RunnerAssetDigest, "sha256:"),
 			"TINI_SHA256=sha256:" + strings.TrimPrefix(platformLock.Tini.SHA256, "sha256:"),
 		}
 		for _, buildArg := range buildArguments {
@@ -1311,11 +1483,11 @@ func loadDockerSandboxesSourceLock(projectRoot, platform string) (dockerSandboxe
 	if lock.SchemaVersion != 2 {
 		return lock, fmt.Errorf("unsupported Docker Sandboxes source lock schema %d", lock.SchemaVersion)
 	}
-	if lock.DockerfileFrontend.Reference == "" || lock.SBOMGenerator.InspectionReference == "" || lock.GoBuilder.Version == "" || lock.GoBuilder.IndexDigest == "" || lock.HookLauncher.SHA256 == "" || lock.ActionsRunner.Version == "" || lock.Tini.Version == "" {
+	if lock.DockerfileFrontend.Reference == "" || lock.SBOMGenerator.InspectionReference == "" || lock.GoBuilder.Version == "" || lock.GoBuilder.IndexDigest == "" || lock.HookLauncher.SHA256 == "" || lock.Tini.Version == "" {
 		return lock, errors.New("Docker Sandboxes source lock has incomplete shared build inputs")
 	}
 	platformLock, ok := lock.Platforms[platform]
-	if !ok || platformLock.GoBuilderReference == "" || platformLock.GoBuilderManifestDigest == "" || platformLock.SBOMGeneratorReference == "" || platformLock.SBOMGeneratorManifestDigest == "" || platformLock.DockerfileFrontendManifestDigest == "" || platformLock.ActionsRunner.URL == "" || platformLock.ActionsRunner.SHA256 == "" || platformLock.Tini.URL == "" || platformLock.Tini.SHA256 == "" {
+	if !ok || platformLock.GoBuilderReference == "" || platformLock.GoBuilderManifestDigest == "" || platformLock.SBOMGeneratorReference == "" || platformLock.SBOMGeneratorManifestDigest == "" || platformLock.DockerfileFrontendManifestDigest == "" || platformLock.Tini.URL == "" || platformLock.Tini.SHA256 == "" {
 		return lock, fmt.Errorf("Docker Sandboxes source lock has incomplete build inputs for %s", platform)
 	}
 	return lock, nil

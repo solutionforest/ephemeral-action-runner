@@ -22,6 +22,8 @@ export PATH="$test_root:$PATH"
 export EPAR_GO_BIN=go
 export EPAR_USE_DOCKER_RUN=0
 export EPAR_START_FORWARD_LOG="$test_root/arguments"
+export EPAR_CONFIG="$test_root/config.yml"
+printf 'image:\n  hostTrustMode: disabled\n' >"$EPAR_CONFIG"
 
 "$repo_root/start"
 actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
@@ -44,6 +46,14 @@ actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
 expected="run ./cmd/ephemeral-action-runner storage prune --provider docker-sandboxes "
 if [[ "$actual" != "$expected" ]]; then
   echo "explicit command forwarding mismatch: got '$actual', want '$expected'" >&2
+  exit 1
+fi
+
+"$repo_root/start" image update --config .local/custom-config.yml
+actual="$(tr '\n' ' ' <"$EPAR_START_FORWARD_LOG")"
+expected="run ./cmd/ephemeral-action-runner image update --config .local/custom-config.yml "
+if [[ "$actual" != "$expected" ]]; then
+  echo "image update forwarding mismatch: got '$actual', want '$expected'" >&2
   exit 1
 fi
 

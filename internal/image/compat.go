@@ -24,6 +24,13 @@ func (m *Coordinator) DesiredImageManifest(ctx context.Context) (Manifest, error
 	return m.desiredImageManifest(ctx)
 }
 
+func (m *Coordinator) DesiredLocalImageManifest(ctx context.Context) (Manifest, error) {
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		return m.dockerSandboxesLocalManifest(ctx)
+	}
+	return m.desiredLocalImageManifest(ctx)
+}
+
 func (m *Coordinator) CurrentImageState(ctx context.Context, wantedHash string) (ImageState, error) {
 	return m.currentImageState(ctx, wantedHash)
 }

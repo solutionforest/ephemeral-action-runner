@@ -49,6 +49,8 @@ type ImageConfig struct {
 	UpstreamDir               string
 	UpstreamLock              string
 	RunnerVersion             string
+	UpdateFrequency           string
+	UpdateTime                string
 	CustomInstallScripts      []string
 	TrustedCACertificatePaths []string
 	HostTrustMode             string
@@ -61,6 +63,13 @@ const (
 
 	HostTrustScopeSystem = "system"
 	HostTrustScopeUser   = "user"
+
+	ImageUpdateFrequencyDaily    = "daily"
+	ImageUpdateFrequencyWeekly   = "weekly"
+	ImageUpdateFrequencyBiweekly = "biweekly"
+	ImageUpdateFrequencyMonthly  = "monthly"
+	ImageUpdateFrequencyManual   = "manual"
+	DefaultImageUpdateTime       = "07:00"
 )
 
 type PoolConfig struct {
@@ -220,12 +229,14 @@ func Default() Config {
 			WebBaseURL: "https://github.com",
 		},
 		Image: ImageConfig{
-			SourceImage:   "ghcr.io/cirruslabs/ubuntu:latest",
-			OutputImage:   "epar-ubuntu-24-arm64",
-			UpstreamDir:   "third_party/runner-images",
-			UpstreamLock:  "third_party/runner-images.lock",
-			RunnerVersion: "latest",
-			HostTrustMode: HostTrustModeDisabled,
+			SourceImage:     "ghcr.io/cirruslabs/ubuntu:latest",
+			OutputImage:     "epar-ubuntu-24-arm64",
+			UpstreamDir:     "third_party/runner-images",
+			UpstreamLock:    "third_party/runner-images.lock",
+			RunnerVersion:   "latest",
+			UpdateFrequency: ImageUpdateFrequencyWeekly,
+			UpdateTime:      DefaultImageUpdateTime,
+			HostTrustMode:   HostTrustModeDisabled,
 			HostTrustScopes: []string{
 				HostTrustScopeSystem,
 			},
@@ -419,6 +430,9 @@ func Load(path string) (Config, error) {
 		!explicit["security.runnerGroup.requirePublicRepositoriesDisabled"] {
 		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s: runner-group security policy is not configured; using strict recommended checks in warn mode (add security.runnerGroup.enforcement: enforce after reviewing the policy)", path))
 	}
+	if !explicit["image.updateFrequency"] && !explicit["image.updateTime"] {
+		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s: image update policy is not configured; using weekly checks at 07:00 local time", path))
+	}
 	applyProviderDefaults(&cfg, explicit)
 	applyRunnerHostLabel(&cfg)
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
@@ -472,6 +486,10 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Image.UpstreamLock = value
 		case "runnerVersion":
 			cfg.Image.RunnerVersion = value
+		case "updateFrequency":
+			cfg.Image.UpdateFrequency = strings.ToLower(value)
+		case "updateTime":
+			cfg.Image.UpdateTime = value
 		case "profile":
 			return fmt.Errorf("image.profile is not supported; use image.customInstallScripts")
 		case "customInstallScripts":
@@ -1142,6 +1160,9 @@ func Validate(cfg Config) error {
 	if err := ValidateHostTrust(cfg.Image, cfg.Provider, cfg.Runner); err != nil {
 		return err
 	}
+	if err := ValidateImageUpdatePolicy(cfg.Image); err != nil {
+		return err
+	}
 	switch cfg.Image.SourceType {
 	case "", ImageSourceDockerImage, ImageSourceRootFSTar:
 	default:
@@ -1201,6 +1222,23 @@ func Validate(cfg Config) error {
 	}
 	if err := ValidateDockerNoProxy(cfg.Docker.NoProxy); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateImageUpdatePolicy keeps remote freshness scheduling predictable while
+// allowing manual mode to retain an otherwise valid update time for later use.
+func ValidateImageUpdatePolicy(image ImageConfig) error {
+	switch image.UpdateFrequency {
+	case ImageUpdateFrequencyDaily, ImageUpdateFrequencyWeekly, ImageUpdateFrequencyBiweekly, ImageUpdateFrequencyMonthly, ImageUpdateFrequencyManual:
+	default:
+		return fmt.Errorf("unsupported image.updateFrequency %q; supported values are daily, weekly, biweekly, monthly, and manual", image.UpdateFrequency)
+	}
+	if image.UpdateFrequency == ImageUpdateFrequencyManual {
+		return nil
+	}
+	if _, err := time.Parse("15:04", image.UpdateTime); err != nil {
+		return fmt.Errorf("invalid image.updateTime %q; use 24-hour HH:MM local time", image.UpdateTime)
 	}
 	return nil
 }

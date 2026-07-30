@@ -56,6 +56,8 @@ image:
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64
   runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
   customInstallScripts:
     # - examples/custom-install/install-extra-apt-tools.sh
 
@@ -84,7 +86,7 @@ dockerSandboxes:
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-native-controller.ps1 pool verify --config .local/docker-sandboxes.yml --project-root . --instances 1 --cleanup
    ```
 
-4. Start the pool with `./start`. EPAR re-resolves mutable selectors such as `full-latest` and reuses or rebuilds the exact desired template automatically.
+4. Start the pool with `./start`. EPAR reuses the verified imported template without a registry check until the configured update schedule is due; local input changes and missing templates still rebuild immediately.
 
 Each allocation receives an empty owner-restricted staging directory, but Actions `_work` stays on the guest filesystem. EPAR verifies the guest, policy, private daemon, and runner trust policy before requesting a short-lived registration token. With `image.hostTrustMode: overlay`, the common pool lifecycle installs the selected roots, verifies the immutable generation, and maintains the job-start lease. With the setting omitted or disabled, the template carries an explicit disabled-policy marker and does not install the trust hook. The token remains on the native host except for registration through `sbx exec` standard input.
 

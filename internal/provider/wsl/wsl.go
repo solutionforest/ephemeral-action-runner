@@ -101,7 +101,9 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 
 func (p *Provider) Exec(ctx context.Context, name string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
 	var stdin io.Reader
-	if opts.Stdin != "" {
+	if opts.StdinReader != nil {
+		stdin = opts.StdinReader
+	} else if opts.Stdin != "" {
 		stdin = strings.NewReader(opts.Stdin)
 	}
 	return p.runWithSensitiveLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, opts.SensitiveValues, p.execArgs(name, command, opts.Env)...)

@@ -102,6 +102,90 @@ image:
 	}
 }
 
+func TestImageUpdatePolicyDefaults(t *testing.T) {
+	cfg := Default()
+	if got, want := cfg.Image.UpdateFrequency, ImageUpdateFrequencyWeekly; got != want {
+		t.Fatalf("Image.UpdateFrequency = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.UpdateTime, DefaultImageUpdateTime; got != want {
+		t.Fatalf("Image.UpdateTime = %q, want %q", got, want)
+	}
+	if err := ValidateImageUpdatePolicy(cfg.Image); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadImageUpdatePolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "image:\n  updateFrequency: biweekly\n  updateTime: \"06:30\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.UpdateFrequency, ImageUpdateFrequencyBiweekly; got != want {
+		t.Fatalf("Image.UpdateFrequency = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.UpdateTime, "06:30"; got != want {
+		t.Fatalf("Image.UpdateTime = %q, want %q", got, want)
+	}
+	if slices.ContainsFunc(cfg.Warnings(), func(warning string) bool {
+		return strings.Contains(warning, "image update policy is not configured")
+	}) {
+		t.Fatalf("Warnings() = %#v, want no image-policy default notice", cfg.Warnings())
+	}
+}
+
+func TestLoadOmittedImageUpdatePolicyAddsNotice(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("image:\n  runnerVersion: latest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(cfg.Warnings(), func(warning string) bool {
+		return strings.Contains(warning, "using weekly checks at 07:00 local time")
+	}) {
+		t.Fatalf("Warnings() = %#v, want image-policy default notice", cfg.Warnings())
+	}
+}
+
+func TestValidateImageUpdatePolicy(t *testing.T) {
+	for _, frequency := range []string{
+		ImageUpdateFrequencyDaily,
+		ImageUpdateFrequencyWeekly,
+		ImageUpdateFrequencyBiweekly,
+		ImageUpdateFrequencyMonthly,
+		ImageUpdateFrequencyManual,
+	} {
+		image := Default().Image
+		image.UpdateFrequency = frequency
+		if err := ValidateImageUpdatePolicy(image); err != nil {
+			t.Fatalf("ValidateImageUpdatePolicy(%q): %v", frequency, err)
+		}
+	}
+	image := Default().Image
+	image.UpdateFrequency = "hourly"
+	if err := ValidateImageUpdatePolicy(image); err == nil || !strings.Contains(err.Error(), "unsupported image.updateFrequency") {
+		t.Fatalf("invalid frequency error = %v", err)
+	}
+	image = Default().Image
+	image.UpdateTime = "7am"
+	if err := ValidateImageUpdatePolicy(image); err == nil || !strings.Contains(err.Error(), "24-hour HH:MM") {
+		t.Fatalf("invalid time error = %v", err)
+	}
+	image.UpdateFrequency = ImageUpdateFrequencyManual
+	if err := ValidateImageUpdatePolicy(image); err != nil {
+		t.Fatalf("manual mode should ignore image.updateTime: %v", err)
+	}
+}
+
 func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	cfg := Default()
 	if cfg.Runner.Group != "" {

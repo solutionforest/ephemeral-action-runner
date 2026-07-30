@@ -7,4 +7,4 @@
 a32f6bdb3b883272172e2d7318feb40d88e3ebfaffa909527ca57a3c06773ae1  ./prepare-template.sh
 647fd19d18e608cb794f2b08be3019bd8e6243009aea8b9308703a465f0089a3  ./run-runner.sh
 0746da2abc0a1033ecdad83ec6e432c7a006c83fefd2ce5424d3932c8f38d9aa  ./template-entrypoint.sh
-d1e3b6808118e4c04bfff8db2b42228cb7a376910874b4a1fb486eaaa55d5d5f  ./verify-template.sh
+f50c9cf84021b8c29cbee19e6e78c6bc07101b3aad812a25fb6e3ca02a409ca0  ./verify-template.sh

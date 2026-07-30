@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	ManifestSchemaVersion = 1
+	ManifestSchemaVersion = 2
 	ManifestGuestPath     = "/opt/epar/image-manifest.json"
 	ManifestLabel         = "org.solutionforest.epar.manifest-sha256"
 )
@@ -39,7 +39,11 @@ type Manifest struct {
 	SourceDigest          string             `json:"sourceDigest,omitempty"`
 	SourcePlatformDigest  string             `json:"sourcePlatformDigest,omitempty"`
 	OutputImage           string             `json:"outputImage"`
+	RunnerSelector        string             `json:"runnerSelector"`
 	RunnerVersion         string             `json:"runnerVersion"`
+	RunnerAssetName       string             `json:"runnerAssetName,omitempty"`
+	RunnerAssetURL        string             `json:"runnerAssetUrl,omitempty"`
+	RunnerAssetDigest     string             `json:"runnerAssetDigest,omitempty"`
 	UpstreamCommit        string             `json:"upstreamCommit,omitempty"`
 	EPARScripts           []FileDigest       `json:"eparScripts,omitempty"`
 	TemplateInputs        []FileDigest       `json:"templateInputs,omitempty"`

@@ -627,12 +627,19 @@ func (p *Provider) Exec(ctx context.Context, instance provider.Instance, command
 	args = append(args, command...)
 	return p.run(ctx, commandRequest{
 		args:            args,
-		stdin:           strings.NewReader(opts.Stdin),
+		stdin:           execOptionsReader(opts),
 		stdout:          opts.Stdout,
 		stderr:          opts.Stderr,
 		sensitiveValues: opts.SensitiveValues,
 		operation:       "execute in docker sandbox",
 	})
+}
+
+func execOptionsReader(opts provider.ExecOptions) io.Reader {
+	if opts.StdinReader != nil {
+		return opts.StdinReader
+	}
+	return strings.NewReader(opts.Stdin)
 }
 
 func (p *Provider) Diagnostics(ctx context.Context, instance provider.Instance) (provider.Diagnostics, error) {

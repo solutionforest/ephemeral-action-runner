@@ -143,11 +143,15 @@ func (m *Coordinator) buildDockerContainerImageUntimed(ctx context.Context, opts
 			return err
 		}
 		manifest := opts.Manifest
-		if m.hostTrustEnabled() || manifest == nil {
+		if manifest == nil {
 			value, err := m.desiredImageManifestWithHostTrust(ctx, snapshot)
 			if err != nil {
 				return err
 			}
+			manifest = &value
+		} else if m.hostTrustEnabled() {
+			value := *manifest
+			value.HostTrust = hostTrustMetadata(snapshot)
 			manifest = &value
 		}
 		targetImage := m.Config.Image.OutputImage
@@ -194,6 +198,18 @@ func (m *Coordinator) buildDockerContainerImageAttempt(ctx context.Context, upst
 	if err := m.prepareDockerContainerBuildContextWithHostTrust(buildCtx, upstreamDir, manifestContent, snapshot); err != nil {
 		return err
 	}
+	if !m.DryRun {
+		runnerPackage, err := m.acquireActionsRunner(ctx, manifest)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Join(buildCtx, "inputs"), 0o755); err != nil {
+			return err
+		}
+		if err := copyFile(runnerPackage, filepath.Join(buildCtx, "inputs", "actions-runner.tar.gz"), 0o600); err != nil {
+			return err
+		}
+	}
 	m.infof("building Docker Container image %s from %s\n", targetImage, m.Config.Image.SourceImage)
 	m.infof("log: %s\n", buildLogPath)
 	args := []string{"buildx", "build", "--builder", builder, "--load", "-t", targetImage}
@@ -211,7 +227,8 @@ func (m *Coordinator) buildDockerContainerImageAttempt(ctx context.Context, upst
 		"--label", "io.solutionforest.epar.role=runtime-image",
 		"--label", "io.solutionforest.epar.manifest="+manifestHash,
 		"--build-arg", "BASE_IMAGE="+m.Config.Image.SourceImage,
-		"--build-arg", "RUNNER_VERSION="+m.Config.Image.RunnerVersion,
+		"--build-arg", "RUNNER_VERSION="+manifest.RunnerVersion,
+		"--build-arg", "RUNNER_SHA256="+manifest.RunnerAssetDigest,
 		"--build-arg", "EPAR_IMAGE_MANIFEST_SHA256="+manifestHash,
 		buildCtx,
 	)
@@ -331,7 +348,7 @@ func (m *Coordinator) buildTartImageLocked(ctx context.Context, opts ImageBuildO
 		return err
 	}
 	m.infof("installing GitHub Actions runner\n")
-	if _, err := m.execBuildGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
+	if err := m.installActionsRunnerPackage(ctx, buildName, *opts.Manifest); err != nil {
 		return err
 	}
 	if err := m.installRosettaSupport(ctx, buildName); err != nil {
@@ -641,7 +658,7 @@ func (m *Coordinator) buildWSLImageUntimed(ctx context.Context, opts ImageBuildO
 		return err
 	}
 	m.infof("installing GitHub Actions runner\n")
-	if _, err := m.execBuildGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
+	if err := m.installActionsRunnerPackage(ctx, buildName, *opts.Manifest); err != nil {
 		return err
 	}
 	if err := m.installWSLDockerEngine(ctx, buildName); err != nil {
@@ -1228,7 +1245,8 @@ func (m *Coordinator) prepareDockerContainerBuildContextWithHostTrust(buildCtx, 
 	dockerfile := fmt.Sprintf(`ARG BASE_IMAGE=ghcr.io/catthehacker/ubuntu:full-latest
 FROM ${BASE_IMAGE}
 USER root
-ARG RUNNER_VERSION=latest
+ARG RUNNER_VERSION
+ARG RUNNER_SHA256
 ARG EPAR_IMAGE_MANIFEST_SHA256
 ARG OCI_SOURCE=https://github.com/solutionforest/ephemeral-action-runner
 ARG OCI_DESCRIPTION="EPAR Docker Container runner image"
@@ -1250,10 +1268,11 @@ COPY trusted-ca-certificates/ `+trustedCAGuestDir+`/
 COPY host-trust-certificates/ `+hostTrustGuestDir+`/
 COPY host-trust-metadata/ /opt/epar/
 COPY image-manifest.json /opt/epar/image-manifest.json
+COPY inputs/actions-runner.tar.gz /opt/epar/actions-runner.tar.gz
 RUN chmod 0755 /opt/epar/*.sh /opt/epar/container-entrypoint.sh /opt/epar/custom-install/*.sh 2>/dev/null || true
 RUN bash /opt/epar/install-trusted-ca-certificates.sh
 RUN bash /opt/epar/install-base.sh /opt/epar/upstream/runner-images
-RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}"
+RUN bash /opt/epar/install-runner.sh "${RUNNER_VERSION}" /opt/epar/actions-runner.tar.gz "${RUNNER_SHA256}"
 RUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/install-docker-engine.sh /opt/epar/upstream/runner-images
 %sRUN EPAR_CONTAINER_IMAGE_BUILD=true bash /opt/epar/validate-runtime.sh
 RUN bash /opt/epar/finalize-image.sh

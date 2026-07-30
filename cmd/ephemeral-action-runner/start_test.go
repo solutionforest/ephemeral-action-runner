@@ -189,7 +189,7 @@ func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\nn\nn\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\nn\n\n\nn\n"),
 		Out:         &out,
 		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
 			t.Fatal("manager factory should not run after choosing to review the new config")

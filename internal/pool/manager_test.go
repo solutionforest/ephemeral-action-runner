@@ -42,6 +42,47 @@ func TestRunnerAliveKeepsBusyGitHubRunnerWithoutServiceCheck(t *testing.T) {
 	}
 }
 
+func TestImageMaintenanceDrainRequiresConsecutiveIdleObservations(t *testing.T) {
+	host := &fakeProvider{}
+	github := &fakeGitHub{
+		runner: gh.Runner{ID: 42, Name: "epar-test-1", Status: "online"},
+		found:  true,
+	}
+	manager := Manager{Provider: host, GitHub: github}
+	active := map[string]ProvisionedInstance{
+		"epar-test-1": {Name: "epar-test-1", RunnerID: 42},
+	}
+	confirmedIdle := make(map[string]int)
+
+	remaining, err := manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 || atomic.LoadInt32(&github.deleteCalls) != 0 || atomic.LoadInt32(&host.deleteCalls) != 0 {
+		t.Fatalf("first idle observation retired runner: remaining=%d remoteDeletes=%d localDeletes=%d", remaining, github.deleteCalls, host.deleteCalls)
+	}
+
+	github.runner.Busy = true
+	remaining, err = manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 || confirmedIdle["epar-test-1"] != 0 {
+		t.Fatalf("busy observation did not reset idle confirmation: remaining=%d checks=%d", remaining, confirmedIdle["epar-test-1"])
+	}
+
+	github.runner.Busy = false
+	if remaining, err = manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle); err != nil || remaining != 1 {
+		t.Fatalf("idle confirmation after busy = remaining %d, error %v", remaining, err)
+	}
+	if remaining, err = manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle); err != nil || remaining != 0 {
+		t.Fatalf("second consecutive idle confirmation = remaining %d, error %v", remaining, err)
+	}
+	if atomic.LoadInt32(&github.deleteCalls) != 1 || atomic.LoadInt32(&host.deleteCalls) != 1 {
+		t.Fatalf("confirmed idle retirement calls = remote %d local %d, want 1 each", github.deleteCalls, host.deleteCalls)
+	}
+}
+
 func TestRunnerGroupPreflightEnforcesAndWarns(t *testing.T) {
 	violation := gh.RunnerGroupPolicyResult{Violations: []string{"runner group allows public repositories"}}
 	for _, test := range []struct {

@@ -54,6 +54,7 @@ var (
 func (m *Manager) imageCoordinator() *artifactimage.Coordinator {
 	coordinator := artifactimage.NewCoordinator(m.Config, m.Provider, m.Lifecycle, m.ProjectRoot, m.DryRun, imageEnvironment{manager: m})
 	coordinator.ConfigPath = m.ConfigPath
+	coordinator.Clock = m.currentTime
 	return coordinator
 }
 
@@ -74,20 +75,70 @@ func (m *Manager) EnsureImage(ctx context.Context) error {
 	if err := m.imageCoordinator().EnsureImage(ctx); err != nil {
 		return err
 	}
-	if m.Config.Provider.Type == "docker-container" && !m.DryRun {
-		identity, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", m.Config.Image.OutputImage)
-		if err != nil {
-			return fmt.Errorf("resolve immutable Docker Container runtime image: %w", err)
-		}
-		identity = strings.TrimSpace(identity)
-		if identity == "" {
-			return fmt.Errorf("Docker Container runtime image returned an empty immutable identity")
-		}
-		// Keep user configuration as the desired mutable name while the live
-		// manager and all replacements consume the exact verified image ID.
-		m.Config.Provider.SourceImage = identity
+	if err := m.pinDockerRuntimeImage(ctx); err != nil {
+		return err
 	}
 	m.imageEnsured = true
+	return nil
+}
+
+func (m *Manager) UpdateImage(ctx context.Context) error {
+	m.imageEnsureMu.Lock()
+	defer m.imageEnsureMu.Unlock()
+	if err := m.imageCoordinator().UpdateImage(ctx); err != nil {
+		return err
+	}
+	if err := m.pinDockerRuntimeImage(ctx); err != nil {
+		return err
+	}
+	m.imageEnsured = true
+	return nil
+}
+
+func (m *Manager) CheckRemoteImageUpdate(ctx context.Context, now time.Time) (artifactimage.RemoteUpdateCheck, error) {
+	m.imageEnsureMu.Lock()
+	defer m.imageEnsureMu.Unlock()
+	return m.imageCoordinator().CheckRemoteUpdate(ctx, now)
+}
+
+func (m *Manager) ApplyPendingImageUpdate(ctx context.Context, now time.Time) error {
+	m.imageEnsureMu.Lock()
+	defer m.imageEnsureMu.Unlock()
+	if err := m.imageCoordinator().ApplyPendingUpdate(ctx, now); err != nil {
+		return err
+	}
+	if err := m.pinDockerRuntimeImage(ctx); err != nil {
+		return err
+	}
+	m.imageEnsured = true
+	return nil
+}
+
+func (m *Manager) ImageUpdatePolicyStatus() (artifactimage.UpdatePolicyStatus, error) {
+	return m.imageCoordinator().UpdatePolicyStatus()
+}
+
+func (m *Manager) DeferPendingImageUpdate(reason string) error {
+	m.imageEnsureMu.Lock()
+	defer m.imageEnsureMu.Unlock()
+	return m.imageCoordinator().DeferPendingUpdate(reason)
+}
+
+func (m *Manager) pinDockerRuntimeImage(ctx context.Context) error {
+	if m.Config.Provider.Type != "docker-container" || m.DryRun {
+		return nil
+	}
+	identity, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", m.Config.Image.OutputImage)
+	if err != nil {
+		return fmt.Errorf("resolve immutable Docker Container runtime image: %w", err)
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return fmt.Errorf("Docker Container runtime image returned an empty immutable identity")
+	}
+	// Keep user configuration as the desired mutable name while the live
+	// manager and all replacements consume the exact verified image ID.
+	m.Config.Provider.SourceImage = identity
 	return nil
 }
 
@@ -113,6 +164,10 @@ func writeDockerPullEvent(writer io.Writer, event artifactimage.DockerPullEvent)
 
 func (m *Manager) desiredImageManifest(ctx context.Context) (ImageManifest, error) {
 	return m.imageCoordinator().DesiredImageManifest(ctx)
+}
+
+func (m *Manager) desiredLocalImageManifest(ctx context.Context) (ImageManifest, error) {
+	return m.imageCoordinator().DesiredLocalImageManifest(ctx)
 }
 
 func (m *Manager) currentImageState(ctx context.Context, wantedHash string) (imageState, error) {

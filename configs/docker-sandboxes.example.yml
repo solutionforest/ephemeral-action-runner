@@ -10,6 +10,8 @@ image:
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64
   runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
   customInstallScripts:
     # - examples/custom-install/install-extra-apt-tools.sh
   hostTrustMode: overlay

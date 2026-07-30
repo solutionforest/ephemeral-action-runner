@@ -10,7 +10,7 @@ Use a native Docker server that matches the template platform. An amd64 server b
 sbx diagnose --output json
 ```
 
-EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) pins the build tooling, runner, and platform inputs. The selected Catthehacker source tag is resolved independently to exact OCI index and platform-manifest digests for each build.
+EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) pins build tooling and platform inputs. The selected Catthehacker source tag and Actions runner selector are resolved independently to exact immutable identities when the update schedule is due.
 
 ## Build, Import, And Review
 
@@ -50,6 +50,6 @@ The direct build does not create a Docker staging image. Once the imported templ
 
 ## Evidence And Certification
 
-The source lock pins build tooling, Actions runner, Tini, helper inputs, and platform-specific inputs. EPAR resolves a mutable source selector on every start and activates a new immutable template only after build, import, and exact readback succeed.
+The source lock pins build tooling, Tini, helper inputs, and platform-specific inputs. The default policy checks mutable source and Actions runner selectors weekly at 07:00 local time; `./start image update` checks immediately. EPAR activates a new immutable template only after build, import, and exact readback succeed.
 
 The current ARM64 path has pinned inputs and code support but no equivalent recorded native real-host lifecycle or independent-certification evidence. Treat it as capability-ready only after local admission and your own workload validation. An independent certification record, when available, must bind the reviewed native-controller source/build, full template identity, cache ID, metadata/archive digests, and reviewed evidence.

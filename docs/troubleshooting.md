@@ -10,6 +10,7 @@ Start with the symptom that most closely matches the failure. EPAR is trusted-jo
 - [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
 - [Docker Sandboxes rejects template, policy, or capacity](#docker-sandboxes-rejects-template-policy-or-capacity)
 - [An idle runner reports GitHub or Sandbox health warnings](#an-idle-runner-reports-github-or-sandbox-health-warnings)
+- [A scheduled image check or update fails](#a-scheduled-image-check-or-update-fails)
 - [A runner is held for diagnostics or an acknowledgement](#a-runner-is-held-for-diagnostics-or-an-acknowledgement)
 - [Docker image build runs out of space](#docker-image-build-runs-out-of-space)
 - [Storage keeps growing after updates](#storage-keeps-growing-after-updates)
@@ -123,6 +124,10 @@ Capacity admission accounts for estimated incremental physical growth on each me
 A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR keeps the exact runner, lets a trust lease expire closed when it cannot refresh it, and retries. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
 
 `networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
+
+## A scheduled image check or update fails
+
+Run `./start status` to see the last successful remote check, next check or retry, pending immutable identity, deferred reason, and last error. A failed scheduled check or build keeps the previous exactly verified generation available and retries with bounded backoff; a missing artifact or changed local configuration still fails closed. Use `./start image update` to retry an immediate remote check, or correct local input errors and rerun `./start`.
 
 ## A runner is held for diagnostics or an acknowledgement
 

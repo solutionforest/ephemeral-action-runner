@@ -26,6 +26,8 @@ image:
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64
   outputImage: work/images/epar-wsl-catthehacker-ubuntu.tar
+  updateFrequency: weekly
+  updateTime: "07:00"
 
 provider:
   type: wsl

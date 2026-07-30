@@ -60,7 +60,7 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 
 func (p *Provider) Exec(ctx context.Context, name string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
 	args := []string{"exec"}
-	if opts.Stdin != "" {
+	if opts.Stdin != "" || opts.StdinReader != nil {
 		args = append(args, "-i")
 	}
 	for key, value := range opts.Env {
@@ -69,7 +69,9 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 	args = append(args, name)
 	args = append(args, command...)
 	var stdin io.Reader
-	if opts.Stdin != "" {
+	if opts.StdinReader != nil {
+		stdin = opts.StdinReader
+	} else if opts.Stdin != "" {
 		stdin = strings.NewReader(opts.Stdin)
 	}
 	return p.runWithSensitiveLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, opts.SensitiveValues, args...)

@@ -150,6 +150,11 @@ type initDockerSandboxesProfile struct {
 	DockerDisk        string
 }
 
+type initImageUpdatePolicy struct {
+	Frequency string
+	Time      string
+}
+
 var initDiscoverDockerSandboxes = discoverDockerSandboxes
 
 var initDockerSandboxesRootMeasurementFor = dockerSandboxesRootMeasurement
@@ -336,6 +341,10 @@ func runInitWithOptions(opts initOptions) error {
 			}
 		}
 	}
+	updatePolicy, err := promptImageUpdatePolicy(opts.Out, reader)
+	if err != nil {
+		return err
+	}
 
 	profile := selectedProfile
 	if providerType != "tart" && profile == nil {
@@ -344,17 +353,17 @@ func runInitWithOptions(opts initOptions) error {
 	var content string
 	switch providerType {
 	case "docker-container":
-		content = defaultDockerContainerConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile)
+		content = defaultDockerContainerConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, updatePolicy)
 	case "wsl":
-		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup, *profile)
+		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup, *profile, updatePolicy)
 	case "tart":
-		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup)
+		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup, updatePolicy)
 	case "docker-sandboxes":
 		guestPlatform, runnerArchitectureLabel, platformErr := dockerSandboxesPlatform(profile.HostPlatform)
 		if platformErr != nil {
 			return platformErr
 		}
-		content = defaultDockerSandboxesConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, guestPlatform, runnerArchitectureLabel)
+		content = defaultDockerSandboxesConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, updatePolicy, guestPlatform, runnerArchitectureLabel)
 	default:
 		return fmt.Errorf("unsupported provider.type %q", providerType)
 	}
@@ -848,6 +857,55 @@ func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatf
 
 func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
 	return promptDockerImageProfile(ctx, projectRoot, "docker-sandboxes", hostPlatform, out, reader)
+}
+
+func promptImageUpdatePolicy(out io.Writer, reader *bufio.Reader) (initImageUpdatePolicy, error) {
+	var frequency string
+	for frequency == "" {
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, "Automatic image and Actions runner updates:")
+		fmt.Fprintln(out, "  1. Weekly (default)")
+		fmt.Fprintln(out, "  2. Daily")
+		fmt.Fprintln(out, "  3. Every two weeks")
+		fmt.Fprintln(out, "  4. Monthly")
+		fmt.Fprintln(out, "  5. Manual — check only when you run ./start image update")
+		choice, hitEOF, err := promptDefault(out, reader, "Update frequency", "1")
+		if err != nil {
+			return initImageUpdatePolicy{}, err
+		}
+		switch strings.ToLower(strings.TrimSpace(choice)) {
+		case "1", "weekly":
+			frequency = config.ImageUpdateFrequencyWeekly
+		case "2", "daily":
+			frequency = config.ImageUpdateFrequencyDaily
+		case "3", "biweekly", "every two weeks":
+			frequency = config.ImageUpdateFrequencyBiweekly
+		case "4", "monthly":
+			frequency = config.ImageUpdateFrequencyMonthly
+		case "5", "manual":
+			return initImageUpdatePolicy{Frequency: config.ImageUpdateFrequencyManual, Time: config.DefaultImageUpdateTime}, nil
+		default:
+			fmt.Fprintln(out, "  Choose 1–5 or enter daily, weekly, biweekly, monthly, or manual.")
+			if hitEOF {
+				return initImageUpdatePolicy{}, fmt.Errorf("invalid image update frequency %q", choice)
+			}
+		}
+	}
+	for {
+		updateTime, _, promptErr := promptDefault(out, reader, "Local update time (24-hour HH:MM)", config.DefaultImageUpdateTime)
+		if promptErr != nil {
+			return initImageUpdatePolicy{}, promptErr
+		}
+		policy := initImageUpdatePolicy{Frequency: frequency, Time: updateTime}
+		image := config.Default().Image
+		image.UpdateFrequency = policy.Frequency
+		image.UpdateTime = policy.Time
+		if validationErr := config.ValidateImageUpdatePolicy(image); validationErr != nil {
+			fmt.Fprintf(out, "  %v\n", validationErr)
+			continue
+		}
+		return policy, nil
+	}
 }
 
 func promptDockerImageProfile(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
@@ -1706,7 +1764,7 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 
-func defaultDockerContainerConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile) string {
+func defaultDockerContainerConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, updatePolicy initImageUpdatePolicy) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -1722,6 +1780,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  updateFrequency: %s
+  updateTime: "%s"
   hostTrustMode: %s
   hostTrustScopes: [%s]
   customInstallScripts:
@@ -1790,7 +1850,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, hostTrustMode, strings.Join(hostTrustScopes, ", "), renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
+`, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, updatePolicy.Frequency, updatePolicy.Time, hostTrustMode, strings.Join(hostTrustScopes, ", "), renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
 func promotedDockerSandboxesPlatform(record sandboxpromotion.Record) (string, string, error) {
@@ -1816,7 +1876,7 @@ func dockerSandboxesPlatform(platform sandboxpromotion.Platform) (string, string
 	}
 }
 
-func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, guestPlatform, runnerArchitectureLabel string) string {
+func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, updatePolicy initImageUpdatePolicy, guestPlatform, runnerArchitectureLabel string) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -1829,6 +1889,8 @@ image:
   sourceImage: %s
   sourcePlatform: %s
   runnerVersion: latest
+  updateFrequency: %s
+  updateTime: "%s"
   customInstallScripts:
 %s
   hostTrustMode: %s
@@ -1902,7 +1964,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, profile.SourceImage, guestPlatform, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, profile.RootDisk, profile.DockerDisk)
+`, appID, organization, privateKeyPath, profile.SourceImage, guestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, profile.RootDisk, profile.DockerDisk)
 }
 
 func renderInitCustomInstallScripts(paths []string) string {
@@ -1916,7 +1978,7 @@ func renderInitCustomInstallScripts(paths []string) string {
 	return strings.Join(lines, "\n")
 }
 
-func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile) string {
+func defaultWSLConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, updatePolicy initImageUpdatePolicy) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -1932,6 +1994,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  updateFrequency: %s
+  updateTime: "%s"
   customInstallScripts:
 %s
 
@@ -2000,10 +2064,10 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
+`, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
-func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection) string {
+func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection, updatePolicy initImageUpdatePolicy) string {
 	return fmt.Sprintf(`# Experimental: this default is a basic Ubuntu ARM64 Tart VM, not a GitHub-hosted runner image.
 # It does not include the broad dependency set from https://github.com/actions/runner-images.
 github:
@@ -2019,6 +2083,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  updateFrequency: %s
+  updateTime: "%s"
   customInstallScripts:
     # - examples/custom-install/install-extra-apt-tools.sh
 
@@ -2086,7 +2152,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
+`, appID, organization, privateKeyPath, updatePolicy.Frequency, updatePolicy.Time, poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
 var stdinIsInteractive = func() bool {

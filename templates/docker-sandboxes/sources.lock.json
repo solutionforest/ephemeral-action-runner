@@ -19,9 +19,6 @@
   "hookLauncher": {
     "sha256": "7fe07f10f484fa6888481a4165e81570187c0aeff422738d3ea5add6b95dd9b7"
   },
-  "actionsRunner": {
-    "version": "2.332.0"
-  },
   "tini": {
     "version": "0.19.0"
   },
@@ -33,10 +30,6 @@
       "goBuilderReference": "docker.io/library/golang@sha256:12e171e33ce7ade87ac8ab2bbe65cea9371527285bdab43ca02780a9e6ac60e5",
       "sbomGeneratorManifestDigest": "sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7",
       "sbomGeneratorReference": "docker.io/docker/buildkit-syft-scanner@sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7",
-      "actionsRunner": {
-        "url": "https://github.com/actions/runner/releases/download/v2.332.0/actions-runner-linux-x64-2.332.0.tar.gz",
-        "sha256": "f2094522a6b9afeab07ffb586d1eb3f190b6457074282796c497ce7dce9e0f2a"
-      },
       "tini": {
         "url": "https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64",
         "sha256": "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c"
@@ -49,10 +42,6 @@
       "goBuilderReference": "docker.io/library/golang@sha256:afe53a4752b49f57ddebc97501a99394e2f7715236b4241efa830d54efb44434",
       "sbomGeneratorManifestDigest": "sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d",
       "sbomGeneratorReference": "docker.io/docker/buildkit-syft-scanner@sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d",
-      "actionsRunner": {
-        "url": "https://github.com/actions/runner/releases/download/v2.332.0/actions-runner-linux-arm64-2.332.0.tar.gz",
-        "sha256": "b72f0599cdbd99dd9513ab64fcb59e424fc7359c93b849e8f5efdd5a72f743a6"
-      },
       "tini": {
         "url": "https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm64",
         "sha256": "07952557df20bfd2a95f9bef198b445e006171969499a1d361bd9e6f8e5e0e81"

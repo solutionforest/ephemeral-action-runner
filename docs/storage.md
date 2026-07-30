@@ -37,7 +37,7 @@ Docker Sandboxes builds directly to one transient archive, so no Docker staging 
 
 Physical host growth and logical virtual-disk limits are reported separately. A 300 GiB VHDX or `Docker.raw` maximum/apparent length does not mean 300 GiB of live Docker content or 300 GiB of new host space is required: Docker Desktop, WSL, and Docker Sandboxes use dynamically allocated or sparse backing storage. `docker system df` reports Docker-managed usage, not host free capacity. EPAR probes the physical filesystem that contains the backing file when it is measurable and treats an unexposed Docker Desktop internal-free value as advisory.
 
-Storage admission remains fail-closed during normal artifact provisioning, creation, and replacement. To accept the storage risk for one invocation while retaining every non-storage safety check, pass `--allow-insufficient-storage` to `start`, `pool up`, `pool verify`, `image build`, or `image update-upstream`.
+Storage admission remains fail-closed during normal artifact provisioning, creation, and replacement. To accept the storage risk for one invocation while retaining every non-storage safety check, pass `--allow-insufficient-storage` to `start`, `pool up`, `pool verify`, `image update`, `image build`, or `image update-upstream`.
 
 Unknown, shared, prefix-only, custom-path, or identity-drifted resources are report-only. EPAR never turns storage cleanup into a broad Docker prune, Docker Sandboxes reset, Docker Desktop reset, WSL reset, or VHDX compaction.
 

@@ -13,6 +13,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
   # Existing configs stay disabled. Set overlay to add the host's trusted root
   # anchors to Ubuntu runners. Windows/macOS: [system, user]; Linux: [system].
   hostTrustMode: disabled
