@@ -34,7 +34,7 @@ docker info
 docker system df
 ```
 
-Without local Go, use `./start --help`; the wrapper selects the containerized toolchain. For Windows WSL2, Docker Desktop's WSL2 backend, or the WSL provider, also run:
+Without local Go, use `./start --help`; the wrapper selects the containerized toolchain. For Windows WSL2, a WSL-backed Docker daemon, or the WSL provider, also run:
 
 ```powershell
 wsl --version
@@ -43,7 +43,7 @@ docker context ls
 docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
-Container-visible free space is the relevant value for Docker builds. Windows Explorer or Finder free space does not necessarily equal the free space in Docker Desktop, OrbStack, or another Linux VM backing the daemon.
+Container-visible free space is the relevant value for Docker builds. Windows Explorer or Finder free space does not necessarily equal the free space in a Linux VM backing the daemon.
 
 ## Windows no-Go startup prints an HTTP/2 named-pipe diagnostic
 
@@ -207,7 +207,7 @@ Get-Content .local/storage/buildx.json
 Get-Content .local/storage/buildkitd.toml
 ```
 
-The owned metadata records the exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in Docker Desktop, OrbStack, or Docker Engine because builder trust cannot repair host-daemon trust.
+The owned metadata records the exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in the host daemon because builder trust cannot repair host-daemon trust.
 
 Configure runner overlay only when jobs inside an ephemeral runner must inherit host roots:
 
@@ -274,7 +274,7 @@ docker pull ghcr.io/catthehacker/ubuntu:full-latest
 wsl -l -v
 ```
 
-For `Wsl/Service/CreateInstance/E_UNEXPECTED`, `Catastrophic failure`, or import exit `0xffffffff`, stop EPAR, save work in other distros, then run `wsl --shutdown`. This stops every running WSL distro, including Docker Desktop's backend. Restart Docker Desktop, verify a normal distro command returns `0`, then rerun `./start`; a matching cached source rootfs is reused. If it persists, update WSL, shut it down again, reboot, and consult [Microsoft's WSL troubleshooting guidance](https://learn.microsoft.com/windows/wsl/troubleshooting#error-code-0x8000ffff-unexpected-failure).
+For `Wsl/Service/CreateInstance/E_UNEXPECTED`, `Catastrophic failure`, or import exit `0xffffffff`, stop EPAR, save work in other distros, then run `wsl --shutdown`. This stops every running WSL distro, including any Docker backend using WSL. Restart the affected Docker host runtime, verify a normal distro command returns `0`, then rerun `./start`; a matching cached source rootfs is reused. If it persists, update WSL, shut it down again, reboot, and consult [Microsoft's WSL troubleshooting guidance](https://learn.microsoft.com/windows/wsl/troubleshooting#error-code-0x8000ffff-unexpected-failure).
 
 If a guest exists but systemd does not become ready, inspect `work/logs/builds/<image>.wsl-build.log` and `work/logs/builds/<temporary-distro>.guest.log`. Do not unregister a distro until you have identified the exact EPAR-owned target and accepted that unregistration is irreversible.
 

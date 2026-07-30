@@ -12,7 +12,7 @@ This is a supported provider on hosts whose Docker runtime can run privileged Li
 
 ## Prerequisites
 
-- A working Docker-compatible daemon that permits `docker run --privileged`.
+- Docker installed and running with support for `docker run --privileged`.
 - Enough host Docker storage for the reusable image and the requested disposable runners.
 - A GitHub App and runner group configured as described in [Runner Group Security](../runner-groups.md).
 
@@ -50,7 +50,7 @@ The outer container has no host Docker socket mount and does not publish host po
 
 - The inner Docker daemon is private, but its CPU, memory, and disk use still comes from the host.
 - The runner's inner image cache disappears with the instance.
-- Docker Desktop, OrbStack, and Linux Docker Engine can differ in privileged-container and foreign-architecture behavior.
+- Docker-compatible host runtimes can differ in privileged-container and foreign-architecture behavior; verify both on the host you intend to use.
 - Registry mirrors and proxy services are external infrastructure; EPAR configures the runner daemon but does not operate or secure those services.
 
 ## Verification

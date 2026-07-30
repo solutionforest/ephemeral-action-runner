@@ -49,10 +49,10 @@ The compiler container mounts the source read-only and writes only the temporary
 
 ### Windows: WSL versus native PowerShell
 
-- From WSL2 or Git Bash, use `./start`. It behaves like the Linux case and needs Docker Desktop's WSL2 integration when run from WSL2.
+- From WSL2 or Git Bash, use `./start`. It behaves like the Linux case and needs Docker to be available and working in that environment.
 - From native PowerShell or cmd, use `./start.ps1` or `start.cmd`, which use `scripts/run-with-docker.ps1` instead of the Bash script.
 
-`start.ps1` and `scripts/run-with-docker.ps1` are less exercised than the Bash/macOS path. If you hit an issue, check whether Docker Desktop file sharing is enabled for the drive that holds the source folder.
+`start.ps1` and `scripts/run-with-docker.ps1` are less exercised than the Bash/macOS path. If you hit an issue, check whether the host runtime can bind-mount the drive that holds the source folder.
 
 ## macOS Login Item Startup
 

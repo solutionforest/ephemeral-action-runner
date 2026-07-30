@@ -8,12 +8,14 @@ Use this page for normal EPAR tasks. Start with the host and provider you alread
 | --- | --- |
 | Run a source archive | Go 1.25 or newer, or Docker for the no-Go controller builder |
 | Register or inspect GitHub runners | A GitHub App with organization self-hosted runner read/write permission |
-| Docker Container | Docker Engine, Docker Desktop, or OrbStack with privileged Linux-container support |
+| Docker Container | Docker with privileged Linux-container support |
 | Docker Sandboxes | Docker and the `sbx` CLI with at least one diagnostic pass and zero failures; the wizard builds and imports the selected EPAR template |
 | WSL | Native Windows, WSL2, and Docker when preparing the default WSL image |
 | Tart | Native Apple Silicon macOS and Tart |
 
 Get the source from the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), extract the source archive, and work from that folder. You do not need Packer, GitHub CLI, or `sshpass`.
+
+EPAR works with any Docker installation that supports the selected provider.
 
 ## Start a pool
 
@@ -35,7 +37,7 @@ The wrapper uses local Go when available, otherwise it uses Docker to build and 
 go run ./cmd/ephemeral-action-runner start
 ```
 
-When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group, shows every provider with its tooling and daemon prerequisite result, and refuses unavailable selections. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share one Catthehacker image/profile and custom-script flow, followed by an informational physical-growth estimate and confirmation. The wizard writes the desired configuration first; direct `init` then exits, while embedded `./start` continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
+When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group, shows every provider with its prerequisite status, and refuses unavailable selections. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share one Catthehacker image/profile and custom-script flow, followed by an informational physical-growth estimate and confirmation. The wizard writes the desired configuration first; direct `init` then exits, while embedded `./start` continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
 
 See [Docker Sandboxes](providers/docker-sandboxes.md) for source profiles, capacity, local receipts, and platform validation status.
 

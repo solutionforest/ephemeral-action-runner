@@ -45,7 +45,7 @@ if [[ -n "${host_name}" ]]; then
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "docker command not found. Install Docker Desktop, Docker Engine, or a compatible Docker host." >&2
+  echo "docker command not found. Install Docker and make sure it is available on PATH." >&2
   exit 1
 fi
 

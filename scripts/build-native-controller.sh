@@ -13,7 +13,7 @@ abandoned_build_grace_seconds=$((24 * 60 * 60))
 bootstrap_minimum_free_bytes="${EPAR_BOOTSTRAP_MIN_FREE_BYTES:-$((1 * 1024 * 1024 * 1024))}"
 go_cache_limit_bytes="${EPAR_GO_CACHE_LIMIT_BYTES:-$((10 * 1024 * 1024 * 1024))}"
 
-command -v docker >/dev/null 2>&1 || { echo "docker command not found. Install Docker Desktop, Docker Engine, or a compatible Docker host." >&2; exit 1; }
+command -v docker >/dev/null 2>&1 || { echo "docker command not found. Install Docker and make sure it is available on PATH." >&2; exit 1; }
 command -v shasum >/dev/null 2>&1 || { echo "shasum is required to build the native EPAR cache key." >&2; exit 1; }
 [[ "$bootstrap_minimum_free_bytes" =~ ^[1-9][0-9]*$ ]] || { echo "EPAR_BOOTSTRAP_MIN_FREE_BYTES must be a positive integer byte count." >&2; exit 1; }
 [[ "$go_cache_limit_bytes" =~ ^[1-9][0-9]*$ ]] || { echo "EPAR_GO_CACHE_LIMIT_BYTES must be a positive integer byte count." >&2; exit 1; }

@@ -13,7 +13,7 @@ WSL2 is supported only on native Windows with WSL default version 2. It is not e
 ## Prerequisites
 
 - Native Windows, `wsl.exe --status` reporting default version 2, and an Ubuntu-compatible WSL environment.
-- A working Docker daemon for the default Catthehacker Docker-image source during `image build`; later runner startup does not require Docker Desktop unless jobs use Docker.
+- Docker installed and running for the default Catthehacker Docker-image source during `image build`; later runner startup does not require Docker on the host.
 - Enough storage for the pulled source image, intermediate rootfs tar, temporary WSL build distro, reusable tar, and active pool.
 
 ## Minimal Configuration
@@ -47,7 +47,7 @@ EPAR imports each runner from `provider.sourceImage`, enables systemd in the reu
 
 ## Limitations
 
-- The default full image needs Docker only for source conversion; an image build can fail when Docker Desktop/Engine storage is full even if Windows has free disk space.
+- The default full image needs Docker only for source conversion; an image build can fail when the host daemon's storage is full even if Windows has free disk space.
 - EPAR does not install cross-architecture emulation. An x64 WSL runner can pull an ARM64 image but cannot execute it natively.
 - The default Docker-enabled runner uses Docker Engine inside WSL, not a mounted Windows Docker socket.
 

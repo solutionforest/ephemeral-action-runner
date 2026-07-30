@@ -33,7 +33,7 @@ EPAR selects this provider by capability, not by an operating-system allowlist: 
 
 ## Prerequisites
 
-- A working Docker CLI and daemon.
+- Docker installed and running.
 - Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Before the first-run provider assessment, the wizard runs `sbx daemon start --detach` when the `sbx` executable is installed, then runs diagnostics. Warnings and skipped checks do not make the provider unavailable.
 - A native `amd64` or `arm64` controller with matching `linux/amd64` or `linux/arm64` image support. EPAR does not use emulation to admit a mismatched template.
 - Enough capacity to resolve, build, export, import, and retain the selected runner template.

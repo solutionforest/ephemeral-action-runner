@@ -776,7 +776,7 @@ func (m *Coordinator) prepareWSLDockerSourceRootfs(ctx context.Context, outputPa
 		Platform: platform,
 		LogPath:  buildLogPath,
 	}); err != nil {
-		return "", "", fmt.Errorf("wsl image.sourceType=docker-image requires Docker Desktop, Docker Engine, or another reachable Docker daemon; alternatively set image.sourceType=rootfs-tar and provide a prepared rootfs tar: %w", err)
+		return "", "", fmt.Errorf("could not pull the WSL Docker image source; alternatively set image.sourceType=rootfs-tar and provide a prepared rootfs tar: %w", err)
 	}
 	if err := m.runHostLogged(ctx, buildLogPath, "docker", createArgs...); err != nil {
 		return "", "", err

@@ -24,7 +24,8 @@ The normal path is a source archive plus Docker. EPAR's first run opens a guided
 
 ### 1. Install the host tools
 
-Install a Docker-compatible daemon: [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Windows or macOS, [OrbStack](https://orbstack.dev/) on macOS, or [Docker Engine](https://docs.docker.com/engine/) on Linux. Docker Sandboxes also needs the `sbx` CLI to pass its diagnostics; the wizard provisions its EPAR runner template. See [Docker Sandboxes](docs/providers/docker-sandboxes.md).
+- Install and start Docker.
+- For stronger isolation, also install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) to enable the Docker Sandboxes provider.
 
 ### 2. Download EPAR
 
@@ -67,7 +68,7 @@ Use labels that describe the environment your job actually needs. In particular,
 
 ## Trusted jobs only
 
-EPAR reduces stale state after a job; it is not a hostile-code sandbox. Use it only for workflows and repositories you trust, restrict access with [runner groups](docs/runner-groups.md), and do not expose it to unreviewed public or fork pull-request code. Read [Security](docs/security.md) before choosing a provider.
+Use it only for workflows and repositories you trust, restrict access with [runner groups](docs/runner-groups.md), and do not expose it to unreviewed public or fork pull-request code. Read [Security](docs/security.md) before choosing a provider.
 
 ## Find the right guide
 

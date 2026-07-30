@@ -47,13 +47,13 @@ Create a user logon task:
 
 1. Open **Task Scheduler**.
 2. Choose **Create Task**.
-3. On **Triggers**, add **At log on**. Add a short delay if Docker Desktop or another Docker daemon needs time to start.
+3. On **Triggers**, add **At log on**. Add a short delay if Docker needs time to start.
 4. On **Actions**, choose **Start a program**.
 5. Set **Program/script** to `D:\path\to\ephemeral-action-runner\bin\ephemeral-action-runner.exe`.
 6. Set **Add arguments** to `start --config .local\config.yml`.
 7. Set **Start in** to `D:\path\to\ephemeral-action-runner`.
 
-For Docker Desktop, keep the task as a user logon task. Docker Desktop is usually tied to the user session, so a boot-time system task may start too early or without the expected Docker context.
+If the host runtime is tied to the user session, keep the task as a user logon task. A boot-time system task may start too early or without the expected Docker context.
 
 PowerShell equivalent:
 

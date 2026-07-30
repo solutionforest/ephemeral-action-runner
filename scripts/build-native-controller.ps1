@@ -40,7 +40,7 @@ if ($env:EPAR_BOOTSTRAP_MIN_FREE_BYTES) {
 }
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Error 'docker command not found. Install Docker Desktop or another working Docker host.'
+    Write-Error 'docker command not found. Install Docker and make sure it is available on PATH.'
     exit 1
 }
 

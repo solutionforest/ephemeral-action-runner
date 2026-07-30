@@ -22,7 +22,7 @@ Before enabling this config, provide one of these:
 - a mirror service running on another machine in the same LAN or intranet;
 - a managed registry cache, such as a cloud registry pull-through cache.
 
-For a local mirror on the EPAR host, Docker Engine, Docker Desktop, or OrbStack is enough to run the mirror container. No extra EPAR package is required.
+For a local mirror on the EPAR host, Docker is enough to run the mirror container. No extra EPAR package is required.
 
 For an intranet mirror, runners should use the mirror's LAN DNS name or IP address. This is often better for multiple office machines because all EPAR hosts can share one warm cache.
 
@@ -62,7 +62,7 @@ If the mirror is not running or is not reachable from the runner, Docker falls b
 
 ## Local Docker Hub Cache
 
-For local development, a Docker Hub pull-through cache can run on the same host as EPAR. Docker, Docker Desktop, or OrbStack is enough to run the mirror container; no extra EPAR dependency is required.
+For local development, a Docker Hub pull-through cache can run on the same host as EPAR. Docker is enough to run the mirror container; no extra EPAR dependency is required.
 
 For a quick public-image cache:
 
@@ -107,7 +107,7 @@ docker:
     - http://host.docker.internal:5050
 ```
 
-For Docker Container, EPAR adds Docker's `host.docker.internal:host-gateway` alias when any configured mirror uses `host.docker.internal`. On macOS Docker Desktop and OrbStack this name is usually already available; on Linux Docker Engine the alias helps runner containers reach a host-published mirror.
+For Docker Container, EPAR adds Docker's `host.docker.internal:host-gateway` alias when any configured mirror uses `host.docker.internal`. Some host runtimes already provide this name; others support Docker's `host-gateway` token and can use the added alias. If the host runtime supports neither behavior, use a LAN address or DNS name reachable from the runner instead.
 
 For Tart and WSL, `host.docker.internal` may not resolve the way it does in Docker containers. Use a LAN address, DNS name, or other route that is reachable from the guest.
 
