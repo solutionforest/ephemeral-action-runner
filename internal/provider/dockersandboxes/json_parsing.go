@@ -71,24 +71,6 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 	return images, nil
 }
 
-func parseLocalTemplateImage(data []byte) (LocalTemplateImage, error) {
-	var record map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &record); err != nil {
-		return LocalTemplateImage{}, fmt.Errorf("local docker image inspection returned an unsupported json schema")
-	}
-	digest, digestErr := requiredJSONString(record, "Id")
-	osName, osErr := requiredJSONString(record, "Os")
-	architecture, architectureErr := requiredJSONString(record, "Architecture")
-	if digestErr != nil || osErr != nil || architectureErr != nil || !validFullTemplateDigest(digest) {
-		return LocalTemplateImage{}, fmt.Errorf("local docker image inspection returned an unsupported image schema")
-	}
-	platform := osName + "/" + architecture
-	if platform != "linux/amd64" && platform != "linux/arm64" {
-		return LocalTemplateImage{}, fmt.Errorf("local docker image inspection returned an unsupported linux template platform")
-	}
-	return LocalTemplateImage{Digest: digest, Platform: platform}, nil
-}
-
 func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()

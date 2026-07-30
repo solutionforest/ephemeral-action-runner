@@ -78,7 +78,7 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	if fake.runOptions.Instances != 3 {
 		t.Fatalf("instances = %d, want 3", fake.runOptions.Instances)
 	}
-	if !strings.Contains(out.String(), "Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.") {
+	if !strings.Contains(out.String(), "Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window.") {
 		t.Fatalf("start guidance = %q", out.String())
 	}
 	if strings.Contains(out.String(), "Start runners now?") {

@@ -204,6 +204,8 @@ EPAR_HOST_TRUST_HELPER="$helper"
 missing_config="$temporary/missing-project/.local/config.yml"
 missing_output="$("$helper" sync --project-root "$project_root" --config "$missing_config")"
 [[ -z "$missing_output" ]] || { echo "missing config unexpectedly produced a host-trust feed" >&2; exit 1; }
+missing_build_output="$("$helper" sync --project-root "$project_root" --config "$missing_config" --purpose build)"
+[[ -s "$missing_build_output" ]] || { echo "missing config did not produce automatic system build trust" >&2; exit 1; }
 
 native_project="$temporary/native-go-project"
 fake_go="$temporary/fake-go"

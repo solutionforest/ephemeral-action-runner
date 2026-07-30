@@ -82,11 +82,11 @@ func TestCollectDeterministicInventoryAndPreview(t *testing.T) {
 		t.Fatalf("logs artifact protections = %+v", logArtifact.Protections)
 	}
 	currentArchive := findArtifactByArchiveDigest(t, first.Artifacts, currentTemplate.ArchiveSHA256)
-	if !currentArchive.Current || !hasProtection(currentArchive, storage.ProtectionConfiguration) {
-		t.Fatalf("current archive = %+v", currentArchive)
+	if currentArchive.Current || hasProtection(currentArchive, storage.ProtectionConfiguration) {
+		t.Fatalf("imported-template selection retained its transient archive = %+v", currentArchive)
 	}
 	oldArchive := findArtifactByArchiveDigest(t, first.Artifacts, oldTemplate.ArchiveSHA256)
-	if !hasProtection(oldArchive, storage.ProtectionCertification) || oldArchive.SupersededAt == nil {
+	if !hasProtection(oldArchive, storage.ProtectionCertification) || oldArchive.SupersededAt != nil {
 		t.Fatalf("old archive = %+v", oldArchive)
 	}
 

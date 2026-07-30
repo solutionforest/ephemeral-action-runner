@@ -9,10 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 )
+
+var buildxProgressHeartbeatInterval = 5 * time.Second
 
 func (m *Manager) logger() *slog.Logger {
 	if m != nil && m.Logging != nil {
@@ -35,11 +39,11 @@ func (m *Manager) warnf(format string, args ...any) {
 }
 
 func (m *Manager) logPoolRunning(label string) {
-	m.infof("%s is running. Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.\n", label)
+	m.infof("%s is running. Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window.\n", label)
 }
 
 func (m *Manager) logReplacementReady(label, name string) {
-	m.infof("Replacement runner %s is online; %s is ready for the next job. Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.\n", name, label)
+	m.infof("Replacement runner %s is online; %s is ready for the next job. Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window.\n", name, label)
 }
 
 func (m *Manager) cleanupPoolWithStatus(resources string, cleanup func() error) error {
@@ -145,6 +149,100 @@ func (m *Manager) runHostLogged(ctx context.Context, logPath, name string, args 
 		return err
 	}
 	return runHostLoggedCommand(ctx, logPath, transcript.Stdout, transcript.Stderr, name, args...)
+}
+
+func (m *Manager) runHostBuildxLogged(ctx context.Context, logPath, name string, args ...string) error {
+	transcript, err := m.transcript(logPath, "", transcriptComponent(logPath))
+	if err != nil {
+		return err
+	}
+	prefix := "Docker image build"
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		prefix = "Docker Sandboxes template build"
+	}
+	attributes := []any{"provider", m.Config.Provider.Type, "operation", "buildx-build", "logPath", logPath}
+	rawTranscriptOnConsole := stringSliceContains(m.Config.Logging.TranscriptSinks, "console")
+	interactive := dockerPullProgressTerminal() && stringSliceContains(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text" && !rawTranscriptOnConsole
+	archiveExportPath := buildxDockerArchiveDestination(args)
+	var reportMu sync.Mutex
+	report := func(snapshot artifactimage.BuildxProgressSnapshot) {
+		if rawTranscriptOnConsole {
+			return
+		}
+		reportMu.Lock()
+		defer reportMu.Unlock()
+		line := artifactimage.FormatBuildxProgress(prefix, snapshot)
+		if archiveExportPath != "" {
+			if info, err := os.Lstat(archiveExportPath); err == nil && info.Mode().IsRegular() {
+				line += "; archive written " + artifactimage.FormatDockerPullBytes(info.Size())
+			}
+		}
+		if interactive {
+			_, _ = fmt.Fprintf(dockerPullProgressConsole, "\r\033[2K%s", line)
+			return
+		}
+		m.logger().Info(line, attributes...)
+	}
+	monitor := artifactimage.NewBuildxProgressMonitor(report)
+	stdoutProgress := monitor.NewStream()
+	stderrProgress := monitor.NewStream()
+	heartbeatDone := make(chan struct{})
+	var heartbeat sync.WaitGroup
+	if !rawTranscriptOnConsole && buildxProgressHeartbeatInterval > 0 {
+		heartbeat.Add(1)
+		go func() {
+			defer heartbeat.Done()
+			ticker := time.NewTicker(buildxProgressHeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					report(monitor.Snapshot())
+				case <-heartbeatDone:
+					return
+				}
+			}
+		}()
+	}
+	commandErr := runHostLoggedCommand(ctx, logPath, io.MultiWriter(transcript.Stdout, stdoutProgress), io.MultiWriter(transcript.Stderr, stderrProgress), name, args...)
+	close(heartbeatDone)
+	heartbeat.Wait()
+	stdoutProgress.Flush()
+	stderrProgress.Flush()
+	if interactive {
+		fmt.Fprintln(dockerPullProgressConsole)
+	}
+	if commandErr == nil {
+		snapshot := monitor.Snapshot()
+		completion := prefix + " complete"
+		if m.Config.Provider.Type == "docker-sandboxes" {
+			completion = "Docker Sandboxes template Buildx phase complete; finalizing evidence and importing the template next"
+		}
+		m.logger().Info(completion, append(attributes, "elapsed", snapshot.Elapsed.Round(time.Second))...)
+	}
+	return commandErr
+}
+
+func buildxDockerArchiveDestination(args []string) string {
+	const prefix = "type=docker,dest="
+	for index, argument := range args {
+		if argument == "--output" && index+1 < len(args) && strings.HasPrefix(args[index+1], prefix) {
+			return strings.TrimPrefix(args[index+1], prefix)
+		}
+		if strings.HasPrefix(argument, "--output="+prefix) {
+			return strings.TrimPrefix(argument, "--output="+prefix)
+		}
+	}
+	return ""
+}
+
+func stringSliceContains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) retentionPolicy() logging.RetentionPolicy {

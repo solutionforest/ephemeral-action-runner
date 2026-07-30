@@ -39,7 +39,7 @@ Use `configs/wsl.lean.example.yml` with a pre-exported Ubuntu rootfs tar for a s
 
 1. Run `./start`; EPAR converts the default Docker source into a rootfs tar, builds the reusable WSL runner tar, and starts the pool.
 2. Target the configured WSL label, normally `epar-wsl-catthehacker-ubuntu`.
-3. Stop the supervisor with Ctrl-C and wait for cleanup confirmation.
+3. Stop the supervisor with Ctrl-C, then wait for cleanup to finish before closing the terminal.
 
 EPAR imports each runner from `provider.sourceImage`, enables systemd in the reusable image, and keeps a quiet host-side WSL process alive while a runner waits for work. That process is intentional: it prevents an otherwise idle systemd distro from stopping automatically.
 

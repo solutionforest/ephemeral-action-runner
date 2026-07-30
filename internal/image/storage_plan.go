@@ -130,7 +130,7 @@ func PlanArtifactStorage(providerType string, source SourceSizeEstimate, cached 
 		plan.LogicalRootMaximumBytes = rootBytes
 		plan.LogicalDockerMaximumBytes = dockerDiskBytes
 		plan.LogicalLimitsSparse = true
-		plan.Notes = append(plan.Notes, "Physical estimate covers Docker build data, one export archive, Sandbox template-cache import, and customization.", "The root and inner-Docker sizes are independent sparse logical limits and are not added to immediate host growth.")
+		plan.Notes = append(plan.Notes, "Physical estimate covers dedicated BuildKit state, one directly exported archive, Sandbox template-cache import, and customization; no Docker Engine output image is created.", "The root and inner-Docker sizes are independent sparse logical limits and are not added to immediate host growth.")
 	case "wsl":
 		for _, value := range []uint64{source.CompressedBytes, source.ExpandedBytes, source.ExpandedBytes, CustomizationAllowanceBytes} {
 			if err := add(value); err != nil {

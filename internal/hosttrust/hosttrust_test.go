@@ -96,7 +96,7 @@ func TestParseFeedVerifiesCertificateHashAndFreshness(t *testing.T) {
 		SchemaVersion: feedSchemaVersion,
 		HostOS:        "darwin",
 		Scopes:        []string{ScopeSystem, ScopeUser},
-		GeneratedAt:   now.Add(-29 * time.Second),
+		GeneratedAt:   now.Add(-maxFeedAge + time.Second),
 		ExpiresAt:     now.Add(time.Minute),
 		Certificates:  []FeedCertificate{{SHA256: certificates[0].SHA256, PEM: string(certificates[0].PEM)}},
 	}
@@ -123,7 +123,7 @@ func TestParseFeedVerifiesCertificateHashAndFreshness(t *testing.T) {
 		t.Fatalf("bad per-certificate hash error = %v", err)
 	}
 	feed.Certificates[0].SHA256 = certificates[0].SHA256
-	feed.GeneratedAt = now.Add(-31 * time.Second)
+	feed.GeneratedAt = now.Add(-maxFeedAge - time.Second)
 	content, err = json.Marshal(feed)
 	if err != nil {
 		t.Fatal(err)

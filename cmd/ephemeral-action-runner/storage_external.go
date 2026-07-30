@@ -385,6 +385,29 @@ func collectDockerSandboxesStorage(snapshot *inventory.Snapshot) {
 	}
 }
 
+func protectConfiguredSandboxTemplates(snapshot *inventory.Snapshot, selections []inventory.TemplateSelection) {
+	for _, selection := range selections {
+		digest := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(selection.TemplateDigest)), "sha256:")
+		if len(digest) != 64 {
+			continue
+		}
+		cacheID := digest[:12]
+		reference := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(selection.Tag)), "docker.io/library/")
+		for index := range snapshot.Artifacts {
+			artifact := &snapshot.Artifacts[index]
+			if artifact.Kind != storage.ArtifactSandboxTemplate {
+				continue
+			}
+			locator := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(artifact.Target.Locator)), "docker.io/library/")
+			if locator != reference || strings.ToLower(artifact.Target.Identity) != cacheID {
+				continue
+			}
+			artifact.Current = true
+			artifact.Protections = append(artifact.Protections, storage.Protection{Kind: storage.ProtectionConfiguration, Detail: "configured Docker Sandboxes template receipt"})
+		}
+	}
+}
+
 func collectWSLStorage(snapshot *inventory.Snapshot) {
 	const surfaceID = "wsl-distributions"
 	snapshot.Surfaces = append(snapshot.Surfaces, storage.Surface{ID: surfaceID, Provider: "wsl", Kind: storage.SurfaceExternal, Location: "wsl", Capacity: storage.Capacity{ObservedAt: snapshot.CollectedAt}})

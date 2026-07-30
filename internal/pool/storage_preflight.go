@@ -16,6 +16,21 @@ const (
 )
 
 func (m *Manager) preflightStorage(operation string, peakBytes uint64) error {
+	return m.preflightStorageAttempt(operation, peakBytes, false)
+}
+
+func (m *Manager) preflightStorageAttempt(operation string, peakBytes uint64, housekeepingRetried bool) error {
+	if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
+		pending, pendingErr := m.imageCoordinator().StorageCleanupPending()
+		if pendingErr != nil {
+			m.warnf("EPAR cleanup-pending check before %s was deferred: %v\n", operation, pendingErr)
+		} else if pending {
+			if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
+				m.warnf("EPAR cleanup-pending retry before %s was deferred: %v\n", operation, cleanupErr)
+			}
+			housekeepingRetried = true
+		}
+	}
 	minimumFree, err := config.EffectiveMinimumFreeBytes(m.Config)
 	if err != nil {
 		return err
@@ -52,6 +67,12 @@ func (m *Manager) preflightStorage(operation string, peakBytes uint64) error {
 				return fmt.Errorf("evaluate storage capacity before %s: %w", operation, err)
 			}
 			if check.Status != storage.CapacityReady {
+				if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
+					if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
+						m.warnf("EPAR storage housekeeping retry before %s was deferred: %v\n", operation, cleanupErr)
+					}
+					return m.preflightStorageAttempt(operation, peakBytes, true)
+				}
 				admissionErr := storageAdmissionError(operation, surface, requirement, check, m.Config.Provider.Type, m.StorageOverrideCommand)
 				if m.AllowInsufficientStorage {
 					m.warnStorageOverride(operation, admissionErr)
@@ -93,6 +114,12 @@ func (m *Manager) preflightStorage(operation string, peakBytes uint64) error {
 		return fmt.Errorf("evaluate storage capacity before %s: %w", operation, err)
 	}
 	if check.Status != storage.CapacityReady {
+		if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
+			if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
+				m.warnf("EPAR storage housekeeping retry before %s was deferred: %v\n", operation, cleanupErr)
+			}
+			return m.preflightStorageAttempt(operation, peakBytes, true)
+		}
 		admissionErr := storageAdmissionError(operation, surface, requirement, check, m.Config.Provider.Type, m.StorageOverrideCommand)
 		if m.AllowInsufficientStorage {
 			m.warnStorageOverride(operation, admissionErr)

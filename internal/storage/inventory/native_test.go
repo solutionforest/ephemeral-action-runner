@@ -56,6 +56,31 @@ func TestCollectNativeCurrentExecutableIdentity(t *testing.T) {
 	}
 }
 
+func TestCollectNativeRecognizesStableControllerLayout(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	fingerprint := repeatedHex("d")
+	toolchainID := repeatedHex("e")
+	executableName := "ephemeral-action-runner"
+	if runtime.GOOS == "windows" {
+		executableName += ".exe"
+	}
+	executable := filepath.Join(root, executableName)
+	mustWriteFile(t, executable, []byte("stable-binary"))
+	completed := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	manifest := fmt.Sprintf("schemaVersion=2\nfingerprint=%s\nexecutable=%s\ntoolchainImageID=sha256:%s\nsourceRevision=dirty:sha256:%s\ncompletedAtUtc=%s\n", fingerprint, executableName, toolchainID, fingerprint, completed.Format(time.RFC3339Nano))
+	mustWriteFile(t, filepath.Join(root, "ephemeral-action-runner.manifest"), []byte(manifest))
+	mustWriteFile(t, filepath.Join(root, ".native-controller.lock"), nil)
+	artifacts, warnings := collectNative(nativeOptions{Root: root, CurrentExecutable: executable})
+	if len(warnings) != 0 || len(artifacts) != 1 {
+		t.Fatalf("collectNative() artifacts=%+v warnings=%v", artifacts, warnings)
+	}
+	stable := findArtifact(t, artifacts, "native-controller-stable:"+fingerprint)
+	if !stable.Current || stable.Ownership.Kind != storage.OwnershipExact || !hasProtection(stable, storage.ProtectionCurrent) || stable.Target.Locator != executable {
+		t.Fatalf("stable native controller = %+v", stable)
+	}
+}
+
 func TestCollectNativeRejectsSymlinkedRevision(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

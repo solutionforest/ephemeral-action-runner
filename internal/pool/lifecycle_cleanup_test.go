@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"sync/atomic"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
+	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
@@ -172,6 +174,18 @@ func TestInterruptedProvisionRecoveryPreservesJobLease(t *testing.T) {
 
 func TestRemoteAbsenceReleasesExactJobLease(t *testing.T) {
 	manager, store, name := readyLifecycleManager(t)
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:    t.TempDir(),
+		ManagerSinks: logging.SinkConsole,
+		Stdout:       &console,
+		Stderr:       &console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	manager.Logging = runtime
 	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
 		t.Fatal(err)
 	}
@@ -193,6 +207,92 @@ func TestRemoteAbsenceReleasesExactJobLease(t *testing.T) {
 	}
 	if lease, active := activeLifecycleLease(record.Leases, time.Now()); active {
 		t.Fatalf("job lease remained active after exact remote absence: %+v", lease)
+	}
+	if message := console.String(); !strings.Contains(message, "["+name+"] Job finished and GitHub released the ephemeral runner; GitHub Actions has the success or failure result.") {
+		t.Fatalf("remote-absence lifecycle output omitted job completion: %q", message)
+	}
+}
+
+func TestReconciliationLogsJobFinishBeforeExactCleanup(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:    t.TempDir(),
+		ManagerSinks: logging.SinkConsole,
+		Stdout:       &console,
+		Stderr:       &console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	manager.Logging = runtime
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = &fakeGitHub{}
+
+	active, err := manager.reconcilePhysicalPool(context.Background(), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active instances = %+v, want none after completed ephemeral runner cleanup", active)
+	}
+	output := console.String()
+	finishedAt := strings.Index(output, "["+name+"] Job finished and GitHub released the ephemeral runner")
+	cleanupAt := strings.Index(output, "cleanup: deleted exact owned instance "+name)
+	if finishedAt < 0 || cleanupAt < 0 || finishedAt >= cleanupAt {
+		t.Fatalf("job completion was not logged before exact cleanup: %q", output)
+	}
+}
+
+func TestLifecycleJobObservationLogsStartAndFinishOnce(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:    t.TempDir(),
+		ManagerSinks: logging.SinkConsole,
+		Stdout:       &console,
+		Stderr:       &console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	manager.Logging = runtime
+
+	runner := gh.Runner{Name: name, ID: 42, Status: "online", Busy: true}
+	if err := manager.recordLifecycleJobObservation(context.Background(), runner); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.recordLifecycleJobObservation(context.Background(), runner); err != nil {
+		t.Fatal(err)
+	}
+	runner.Busy = false
+	if err := manager.recordLifecycleJobObservation(context.Background(), runner); err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseDraining {
+		t.Fatalf("phase = %s, want %s", record.Phase, poolstate.PhaseDraining)
+	}
+	output := console.String()
+	if count := strings.Count(output, "["+name+"] Job started; GitHub assigned work to this runner."); count != 1 {
+		t.Fatalf("job-start log count = %d, want 1: %q", count, output)
+	}
+	if count := strings.Count(output, "["+name+"] Job finished; GitHub Actions has the success or failure result."); count != 1 {
+		t.Fatalf("job-finish log count = %d, want 1: %q", count, output)
 	}
 }
 

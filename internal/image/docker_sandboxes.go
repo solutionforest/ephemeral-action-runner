@@ -20,11 +20,12 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
+	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
 const (
-	dockerSandboxesReceiptSchema  = 2
-	dockerSandboxesMetadataSchema = 4
+	dockerSandboxesReceiptSchema  = 3
+	dockerSandboxesMetadataSchema = 5
 )
 
 var dockerTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
@@ -54,16 +55,16 @@ type dockerManifestDocument struct {
 }
 
 type dockerSandboxesReceipt struct {
-	SchemaVersion  int                       `json:"schemaVersion"`
-	ManifestHash   string                    `json:"manifestHash"`
-	Manifest       Manifest                  `json:"manifest"`
-	Source         ResolvedDockerSource      `json:"source"`
-	Artifact       provider.TemplateArtifact `json:"artifact"`
-	MetadataPath   string                    `json:"metadataPath"`
-	MetadataSHA256 string                    `json:"metadataSha256"`
-	ArchivePath    string                    `json:"archivePath"`
-	ArchiveSHA256  string                    `json:"archiveSha256"`
-	ActivatedAt    time.Time                 `json:"activatedAt"`
+	SchemaVersion  int                         `json:"schemaVersion"`
+	ManifestHash   string                      `json:"manifestHash"`
+	Manifest       Manifest                    `json:"manifest"`
+	Source         ResolvedDockerSource        `json:"source"`
+	Artifact       provider.TemplateArtifact   `json:"artifact"`
+	MetadataSHA256 string                      `json:"metadataSha256"`
+	ArchiveSHA256  string                      `json:"archiveSha256"`
+	ArchiveBytes   uint64                      `json:"archiveBytes"`
+	Evidence       map[string]artifactEvidence `json:"evidence"`
+	ActivatedAt    time.Time                   `json:"activatedAt"`
 }
 
 type dockerSandboxesSourceLock struct {
@@ -108,38 +109,6 @@ type dockerSandboxesBuildMetadata struct {
 	ImageDigest string          `json:"containerimage.digest"`
 	Provenance  json.RawMessage `json:"buildx.build.provenance"`
 	BuildRef    string          `json:"buildx.build.ref"`
-}
-
-type buildxAttachmentDocument struct {
-	Manifests []struct {
-		MediaType   string            `json:"mediaType"`
-		Digest      string            `json:"digest"`
-		Annotations map[string]string `json:"annotations"`
-	} `json:"manifests"`
-	Layers []struct {
-		MediaType   string            `json:"mediaType"`
-		Digest      string            `json:"digest"`
-		Size        uint64            `json:"size"`
-		Annotations map[string]string `json:"annotations"`
-	} `json:"layers"`
-}
-
-type buildxHistoryEntry struct {
-	Ref    string `json:"ref"`
-	Status string `json:"status"`
-}
-
-type buildxHistoryInspection struct {
-	Ref       string `json:"Ref"`
-	Status    string `json:"Status"`
-	BuildArgs []struct {
-		Name  string `json:"Name"`
-		Value string `json:"Value"`
-	} `json:"BuildArgs"`
-	Attachments []struct {
-		Digest string `json:"Digest"`
-		Type   string `json:"Type"`
-	} `json:"Attachments"`
 }
 
 type dockerSandboxesTemplateMetadata struct {
@@ -436,16 +405,51 @@ func DockerSandboxesReceiptPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".local", "state", "image", "docker-sandboxes", "active.json")
 }
 
+func DockerSandboxesReceiptPathForConfig(projectRoot, configPath string) (string, error) {
+	if strings.TrimSpace(configPath) == "" {
+		configPath = filepath.Join(projectRoot, ".local", "config.yml")
+	}
+	configID, err := storagecatalog.ConfigID(projectRoot, configPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(projectRoot, ".local", "state", "image", configID, "docker-sandboxes", "active.json"), nil
+}
+
+func (m *Coordinator) dockerSandboxesReceiptPath() (string, error) {
+	return DockerSandboxesReceiptPathForConfig(m.ProjectRoot, m.ConfigPath)
+}
+
 func LoadDockerSandboxesReceipt(projectRoot string) (provider.TemplateArtifact, string, time.Time, error) {
-	receipt, err := readDockerSandboxesReceipt(projectRoot)
+	receipt, err := readDockerSandboxesReceiptPath(DockerSandboxesReceiptPath(projectRoot))
 	if err != nil {
 		return provider.TemplateArtifact{}, "", time.Time{}, err
 	}
 	return receipt.Artifact, receipt.MetadataSHA256, receipt.ActivatedAt, nil
 }
 
-func readDockerSandboxesReceipt(projectRoot string) (dockerSandboxesReceipt, error) {
-	content, err := os.ReadFile(DockerSandboxesReceiptPath(projectRoot))
+func LoadDockerSandboxesReceiptForConfig(projectRoot, configPath string) (provider.TemplateArtifact, string, time.Time, error) {
+	path, err := DockerSandboxesReceiptPathForConfig(projectRoot, configPath)
+	if err != nil {
+		return provider.TemplateArtifact{}, "", time.Time{}, err
+	}
+	receipt, err := readDockerSandboxesReceiptPath(path)
+	if err != nil {
+		return provider.TemplateArtifact{}, "", time.Time{}, err
+	}
+	return receipt.Artifact, receipt.MetadataSHA256, receipt.ActivatedAt, nil
+}
+
+func (m *Coordinator) readDockerSandboxesReceipt() (dockerSandboxesReceipt, error) {
+	path, err := m.dockerSandboxesReceiptPath()
+	if err != nil {
+		return dockerSandboxesReceipt{}, err
+	}
+	return readDockerSandboxesReceiptPath(path)
+}
+
+func readDockerSandboxesReceiptPath(path string) (dockerSandboxesReceipt, error) {
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return dockerSandboxesReceipt{}, err
 	}
@@ -453,7 +457,7 @@ func readDockerSandboxesReceipt(projectRoot string) (dockerSandboxesReceipt, err
 	if err := json.Unmarshal(content, &receipt); err != nil {
 		return dockerSandboxesReceipt{}, err
 	}
-	if receipt.SchemaVersion != dockerSandboxesReceiptSchema || receipt.ManifestHash == "" || receipt.Artifact.Reference == "" || receipt.Artifact.Digest == "" || receipt.Artifact.RootDisk == "" || receipt.MetadataSHA256 == "" || receipt.ArchiveSHA256 == "" || receipt.ActivatedAt.IsZero() {
+	if receipt.SchemaVersion != dockerSandboxesReceiptSchema || receipt.ManifestHash == "" || receipt.Artifact.Reference == "" || receipt.Artifact.Digest == "" || receipt.Artifact.RootDisk == "" || receipt.MetadataSHA256 == "" || receipt.ArchiveSHA256 == "" || receipt.ArchiveBytes == 0 || len(receipt.Evidence) == 0 || receipt.ActivatedAt.IsZero() {
 		return dockerSandboxesReceipt{}, fmt.Errorf("invalid Docker Sandboxes active artifact receipt")
 	}
 	return receipt, nil
@@ -477,19 +481,29 @@ func (m *Coordinator) ensureDockerSandboxesTemplate(ctx context.Context, force b
 		return err
 	}
 	if !force {
-		receipt, receiptErr := readDockerSandboxesReceipt(m.ProjectRoot)
+		receipt, receiptErr := m.readDockerSandboxesReceipt()
 		if receiptErr == nil && receipt.ManifestHash == manifestHash && receipt.Artifact.RootDisk == rootDisk {
-			if err := runtime.VerifyTemplate(ctx, receipt.Artifact); err != nil {
-				return fmt.Errorf("configured Docker Sandboxes artifact is not available exactly as recorded: %w", err)
+			if err := runtime.VerifyImportedTemplate(ctx, receipt.Artifact); err != nil {
+				if !errors.Is(err, provider.ErrTemplateNotFound) {
+					return fmt.Errorf("measure configured Docker Sandboxes artifact availability: %w", err)
+				}
+				m.warnf("recorded Docker Sandboxes template is absent from the authoritative Sandbox cache; rebuilding it\n")
+			} else {
+				if err := runtime.ActivateTemplate(receipt.Artifact); err != nil {
+					return err
+				}
+				if err := m.recordCurrentSandboxArtifact(ctx, receipt.Artifact, manifestHash, receipt.ActivatedAt); err != nil {
+					return fmt.Errorf("record current Docker Sandboxes template ownership: %w", err)
+				}
+				if err := m.cleanupSupersededCatalog(ctx); err != nil {
+					return err
+				}
+				m.infof("Docker Sandboxes runner template is current: %s@%s\n", receipt.Artifact.Reference, receipt.Artifact.Digest)
+				return nil
 			}
-			if err := runtime.ActivateTemplate(receipt.Artifact); err != nil {
-				return err
-			}
-			m.infof("Docker Sandboxes runner template is current: %s@%s\n", receipt.Artifact.Reference, receipt.Artifact.Digest)
-			return nil
 		}
 		if receiptErr != nil && !errors.Is(receiptErr, os.ErrNotExist) {
-			return fmt.Errorf("read Docker Sandboxes active artifact receipt: %w", receiptErr)
+			m.warnf("ignoring stale unpublished Docker Sandboxes receipt and rebuilding: %v\n", receiptErr)
 		}
 	}
 	if m.DryRun {
@@ -553,6 +567,9 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if err := os.MkdirAll(artifactRoot, 0o755); err != nil {
 		return err
 	}
+	if err := m.recordSandboxWorkspace(ctx, artifactRoot, manifestHash, storagecatalog.StateStaging, time.Now().UTC()); err != nil {
+		return fmt.Errorf("record Docker Sandboxes archive workspace ownership: %w", err)
+	}
 	platformLock := lock.Platforms[source.Platform]
 	builder, err := m.ensureBuildxBuilder(ctx, []string{
 		source.ImmutableReference,
@@ -581,11 +598,13 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		return fmt.Errorf("acquire locked tini: %w", err)
 	}
 	buildMetadataPath := filepath.Join(artifactRoot, "build-metadata.json")
+	attestationMetadataPath := filepath.Join(artifactRoot, "attestation-metadata.json")
 	provenancePath := filepath.Join(artifactRoot, "provenance.json")
 	sbomPath := filepath.Join(artifactRoot, "sbom.intoto.json")
 	inventoryPath := filepath.Join(artifactRoot, "software-inventory.txt")
 	compatibilityEvidencePath := filepath.Join(artifactRoot, "compatibility.json")
 	archivePath := filepath.Join(artifactRoot, "runner-template.tar")
+	partialArchivePath := archivePath + ".partial"
 	metadataPath := filepath.Join(artifactRoot, "template-metadata.json")
 	resumed, err := m.resumeDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, artifactRoot, metadataPath, archivePath, runtime)
 	if err != nil {
@@ -594,10 +613,13 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if resumed {
 		return nil
 	}
-	buildMetadata, localDigest, recoveredBuild, err := m.recoverDockerSandboxesBuild(ctx, builder, templateTag, source, manifestHash, architecture, lock, compatibilityEvidencePath)
-	if err != nil {
-		return err
-	}
+	var buildMetadata dockerSandboxesBuildMetadata
+	var localDigest string
+	var contextRoot string
+	var buildArguments []string
+	var archiveSHA string
+	var archiveBytes uint64
+	recoveredBuild := false
 	if recoveredBuild {
 		m.infof("reusing completed exact Docker Sandboxes Buildx result %s\n", localDigest)
 		if err := writeJSONFile(buildMetadataPath, buildMetadata); err != nil {
@@ -607,7 +629,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			return err
 		}
 	} else {
-		contextRoot, err := os.MkdirTemp(filepath.Join(m.ProjectRoot, ".local"), "docker-sandboxes-context-")
+		contextRoot, err = os.MkdirTemp(filepath.Join(m.ProjectRoot, ".local"), "docker-sandboxes-context-")
 		if err != nil {
 			return err
 		}
@@ -650,17 +672,27 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		if err := copyFile(tiniPath, filepath.Join(contextRoot, "inputs", "tini"), 0o755); err != nil {
 			return err
 		}
-		for _, path := range []string{buildMetadataPath, provenancePath, sbomPath, inventoryPath, archivePath, metadataPath} {
+		for _, path := range []string{buildMetadataPath, attestationMetadataPath, provenancePath, sbomPath, inventoryPath, archivePath, partialArchivePath, metadataPath} {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 		}
-		args := []string{
-			"buildx", "build", "--builder", builder, "--platform", source.Platform, "--pull", "--progress", "plain", "--load",
-			"--provenance", "mode=max", "--sbom", "generator=" + platformLock.SBOMGeneratorReference,
-			"--metadata-file", buildMetadataPath, "--tag", templateTag,
+		installationID, err := m.catalogInstallationID(time.Now().UTC())
+		if err != nil {
+			return fmt.Errorf("resolve EPAR template ownership identity: %w", err)
 		}
-		for _, buildArg := range []string{
+		args := []string{
+			"buildx", "build", "--builder", builder, "--platform", source.Platform, "--pull", "--progress", "plain",
+			"--target", "runner-template", "--output", "type=docker,dest=" + partialArchivePath,
+			"--provenance=false", "--sbom=false",
+			"--metadata-file", buildMetadataPath, "--tag", templateTag,
+			"--label", "io.solutionforest.epar.schema=1",
+			"--label", "io.solutionforest.epar.installation=" + installationID,
+			"--label", "io.solutionforest.epar.provider=docker-sandboxes",
+			"--label", "io.solutionforest.epar.role=template-staging",
+			"--label", "io.solutionforest.epar.manifest=" + manifestHash,
+		}
+		buildArguments = []string{
 			"TEMPLATE_PLATFORM=" + source.Platform,
 			"SOURCE_IMAGE=" + source.ImmutableReference,
 			"GO_BUILDER_IMAGE=" + platformLock.GoBuilderReference,
@@ -673,7 +705,8 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"COMPATIBILITY_FILE=generated.compatibility.json",
 			"ACTIONS_RUNNER_SHA256=sha256:" + strings.TrimPrefix(platformLock.ActionsRunner.SHA256, "sha256:"),
 			"TINI_SHA256=sha256:" + strings.TrimPrefix(platformLock.Tini.SHA256, "sha256:"),
-		} {
+		}
+		for _, buildArg := range buildArguments {
 			args = append(args, "--build-arg", buildArg)
 		}
 		args = append(args, "--file", filepath.Join(contextRoot, "Dockerfile"), contextRoot)
@@ -684,43 +717,97 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		}
 		m.infof("building Docker Sandboxes runner template from %s for %s\n", source.Reference, source.Platform)
 		m.infof("full Docker Sandboxes Buildx progress: %s\n", buildLogPath)
-		if err := m.runHostLogged(ctx, buildLogPath, "docker", args...); err != nil {
+		if err := m.runHostBuildxLogged(ctx, buildLogPath, "docker", args...); err != nil {
 			return fmt.Errorf("build Docker Sandboxes runner template: %w%s", err, boundedRedactedLogTail(buildLogPath, 32*1024))
 		}
 		if err := readJSONFile(buildMetadataPath, &buildMetadata); err != nil {
 			return fmt.Errorf("read Docker Sandboxes Buildx metadata: %w", err)
 		}
-		localDigest, err = m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", templateTag)
+		expectedLabels := map[string]string{
+			"io.solutionforest.epar.schema":       "1",
+			"io.solutionforest.epar.installation": installationID,
+			"io.solutionforest.epar.provider":     "docker-sandboxes",
+			"io.solutionforest.epar.role":         "template-staging",
+			"io.solutionforest.epar.manifest":     manifestHash,
+		}
+		archiveVerification, err := verifyDockerSandboxesArchive(partialArchivePath, "docker.io/library/"+templateTag, source.Platform, buildMetadata.ImageDigest, expectedLabels)
 		if err != nil {
-			return err
+			return fmt.Errorf("verify directly exported Docker Sandboxes archive: %w", err)
 		}
-		localDigest = strings.TrimSpace(localDigest)
-		if !validSHA256(localDigest) || buildMetadata.ImageDigest != localDigest {
-			return fmt.Errorf("Docker Sandboxes template Buildx digest does not match the full local Docker image identity")
-		}
-		if len(buildMetadata.Provenance) == 0 || string(buildMetadata.Provenance) == "null" {
-			return fmt.Errorf("Docker Sandboxes template Buildx metadata omitted max-mode provenance")
-		}
-		if err := writeAtomicFile(provenancePath, append(buildMetadata.Provenance, '\n'), 0o644); err != nil {
-			return err
+		localDigest = archiveVerification.ImageDigest
+		archiveSHA = archiveVerification.ArchiveSHA256
+		archiveBytes = archiveVerification.ArchiveBytes
+		if err := os.Rename(partialArchivePath, archivePath); err != nil {
+			return fmt.Errorf("activate verified Docker Sandboxes archive: %w", err)
 		}
 	}
-	sbomSourceDigest, err := m.persistBuildxSBOM(ctx, builder, buildMetadata, sbomPath)
-	if err != nil {
-		return fmt.Errorf("persist Docker Sandboxes template SBOM attestation: %w", err)
-	}
-	inventory, err := m.runHostOutput(ctx, "docker", "run", "--rm", "--pull", "never", "--platform", source.Platform, "--entrypoint", "/opt/epar/collect-software-inventory.sh", templateTag)
-	if err != nil {
-		return fmt.Errorf("collect Docker Sandboxes template software inventory: %w", err)
-	}
-	if err := writeAtomicFile(inventoryPath, []byte(strings.TrimSpace(inventory)+"\n"), 0o644); err != nil {
+	evidenceExportRoot := filepath.Join(artifactRoot, "evidence-export")
+	if err := os.RemoveAll(evidenceExportRoot); err != nil {
 		return err
 	}
-	if err := m.runHost(ctx, "docker", "image", "save", "--output", archivePath, templateTag); err != nil {
-		return fmt.Errorf("save Docker Sandboxes template archive: %w", err)
+	attestationArgs := []string{
+		"buildx", "build", "--builder", builder, "--platform", source.Platform, "--progress", "plain",
+		"--target", "software-inventory-export", "--output", "type=local,dest=" + evidenceExportRoot,
+		"--provenance", "mode=max", "--sbom", "generator=" + platformLock.SBOMGeneratorReference,
+		"--metadata-file", attestationMetadataPath,
 	}
-	archiveSHA, archiveBytes, err := hashFile(archivePath)
+	for _, buildArg := range buildArguments {
+		attestationArgs = append(attestationArgs, "--build-arg", buildArg)
+	}
+	attestationArgs = append(attestationArgs, "--file", filepath.Join(contextRoot, "Dockerfile"), contextRoot)
+	attestationLogPath := m.buildLogPath("docker-sandboxes-" + manifestHash[:16] + "-attestation.docker-build.log")
+	defer m.releaseTranscript(attestationLogPath)
+	if err := resetLogs(attestationLogPath); err != nil {
+		return err
+	}
+	m.infof("full Docker Sandboxes provenance, SBOM, and software-inventory progress: %s\n", attestationLogPath)
+	if err := m.runHostBuildxLogged(ctx, attestationLogPath, "docker", attestationArgs...); err != nil {
+		return fmt.Errorf("generate Docker Sandboxes template evidence: %w%s", err, boundedRedactedLogTail(attestationLogPath, 16*1024))
+	}
+	var attestationMetadata dockerSandboxesBuildMetadata
+	if err := readJSONFile(attestationMetadataPath, &attestationMetadata); err != nil {
+		return fmt.Errorf("read Docker Sandboxes attestation metadata: %w", err)
+	}
+	if len(attestationMetadata.Provenance) == 0 || string(attestationMetadata.Provenance) == "null" {
+		return fmt.Errorf("Docker Sandboxes attestation build omitted max-mode provenance")
+	}
+	if err := validateBuildxMaxProvenance(attestationMetadata.Provenance); err != nil {
+		return fmt.Errorf("validate Docker Sandboxes Buildx provenance metadata: %w", err)
+	}
+	exportedProvenancePath := filepath.Join(evidenceExportRoot, "provenance.json")
+	exportedProvenance, err := readVerifiedBuildEvidence(exportedProvenancePath, storage.GiB)
 	if err != nil {
+		return fmt.Errorf("read exported Docker Sandboxes provenance: %w", err)
+	}
+	if err := validateInTotoProvenance(exportedProvenance); err != nil {
+		return fmt.Errorf("validate exported Docker Sandboxes provenance: %w", err)
+	}
+	if err := writeAtomicFile(provenancePath, append(exportedProvenance, '\n'), 0o644); err != nil {
+		return err
+	}
+	exportedSBOMPath := filepath.Join(evidenceExportRoot, "sbom-runner-template.spdx.json")
+	exportedSBOM, err := readVerifiedBuildEvidence(exportedSBOMPath, storage.GiB)
+	if err != nil {
+		return fmt.Errorf("read exported Docker Sandboxes runner-template SBOM: %w", err)
+	}
+	if err := writeAtomicFile(sbomPath, exportedSBOM, 0o644); err != nil {
+		return err
+	}
+	if err := validateInTotoSPDX(sbomPath); err != nil {
+		return fmt.Errorf("validate exported Docker Sandboxes runner-template SBOM: %w", err)
+	}
+	sbomSourceDigest, _, err := hashFile(sbomPath)
+	if err != nil {
+		return err
+	}
+	inventory, err := readVerifiedBuildEvidence(filepath.Join(evidenceExportRoot, "software-inventory.txt"), 64*storage.MiB)
+	if err != nil {
+		return fmt.Errorf("read exported Docker Sandboxes software inventory: %w", err)
+	}
+	if len(strings.TrimSpace(string(inventory))) == 0 {
+		return errors.New("exported Docker Sandboxes software inventory is empty")
+	}
+	if err := writeAtomicFile(inventoryPath, inventory, 0o644); err != nil {
 		return err
 	}
 	artifact := provider.TemplateArtifact{
@@ -750,11 +837,12 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
 	for name, path := range map[string]string{
-		"buildMetadata":     buildMetadataPath,
-		"provenance":        provenancePath,
-		"sbom":              sbomPath,
-		"softwareInventory": inventoryPath,
-		"compatibility":     compatibilityEvidencePath,
+		"buildMetadata":       buildMetadataPath,
+		"attestationMetadata": attestationMetadataPath,
+		"provenance":          provenancePath,
+		"sbom":                sbomPath,
+		"softwareInventory":   inventoryPath,
+		"compatibility":       compatibilityEvidencePath,
 	} {
 		digest, _, err := hashFile(path)
 		if err != nil {
@@ -773,278 +861,90 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if err != nil {
 		return err
 	}
-	if err := runtime.VerifyTemplate(ctx, artifact); err != nil {
-		m.infof("importing verified Docker Sandboxes runner template %s\n", artifact.Reference)
-		if err := runtime.ImportTemplate(ctx, archivePath); err != nil {
-			return err
-		}
-	}
-	if err := runtime.VerifyTemplate(ctx, artifact); err != nil {
-		return fmt.Errorf("verify imported Docker Sandboxes runner template: %w", err)
-	}
-	return m.activateDockerSandboxesTemplate(manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
-}
-
-func (m *Coordinator) recoverDockerSandboxesBuild(ctx context.Context, builder, templateTag string, source ResolvedDockerSource, manifestHash, architecture string, lock dockerSandboxesSourceLock, compatibilityPath string) (dockerSandboxesBuildMetadata, string, bool, error) {
-	compatibilityInfo, err := os.Lstat(compatibilityPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return dockerSandboxesBuildMetadata{}, "", false, nil
-		}
-		return dockerSandboxesBuildMetadata{}, "", false, err
-	}
-	if !compatibilityInfo.Mode().IsRegular() {
-		return dockerSandboxesBuildMetadata{}, "", false, fmt.Errorf("Docker Sandboxes compatibility evidence is not a regular file: %s", compatibilityPath)
-	}
-	localDigest, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", templateTag)
-	if err != nil {
-		return dockerSandboxesBuildMetadata{}, "", false, nil
-	}
-	localDigest = strings.TrimSpace(localDigest)
-	if !validSHA256(localDigest) {
-		return dockerSandboxesBuildMetadata{}, "", false, nil
-	}
-	history, err := m.runHostOutput(ctx, "docker", "buildx", "history", "ls", "--builder", builder, "--no-trunc", "--format", "json")
-	if err != nil {
-		m.warnf("could not inspect owned Buildx history for interrupted-build recovery; rebuilding: %v\n", err)
-		return dockerSandboxesBuildMetadata{}, "", false, nil
-	}
-	platformLock := lock.Platforms[source.Platform]
-	expectedArgs := map[string]string{
-		"TEMPLATE_PLATFORM":      source.Platform,
-		"SOURCE_IMAGE":           source.ImmutableReference,
-		"GO_BUILDER_IMAGE":       platformLock.GoBuilderReference,
-		"HOOK_LAUNCHER_SHA256":   lock.HookLauncher.SHA256,
-		"SOURCE_PROFILE":         sourceProfile(source.Reference),
-		"SOURCE_INDEX_DIGEST":    source.IndexDigest,
-		"SOURCE_MANIFEST_DIGEST": source.PlatformDigest,
-		"SOURCE_REVISION":        source.IndexDigest,
-		"TEMPLATE_VERSION":       manifestHash[:16] + "-" + architecture,
-		"COMPATIBILITY_FILE":     "generated.compatibility.json",
-		"ACTIONS_RUNNER_SHA256":  "sha256:" + strings.TrimPrefix(platformLock.ActionsRunner.SHA256, "sha256:"),
-		"TINI_SHA256":            "sha256:" + strings.TrimPrefix(platformLock.Tini.SHA256, "sha256:"),
-	}
-	for _, line := range strings.Split(strings.TrimSpace(history), "\n") {
-		var entry buildxHistoryEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil || entry.Status != "Completed" {
-			continue
-		}
-		buildRef := entry.Ref
-		if separator := strings.LastIndex(buildRef, "/"); separator >= 0 {
-			buildRef = buildRef[separator+1:]
-		}
-		if matched, _ := regexp.MatchString(`^[a-z0-9]{12,128}$`, buildRef); !matched {
-			continue
-		}
-		inspectionJSON, err := m.runHostOutput(ctx, "docker", "buildx", "history", "inspect", "--builder", builder, buildRef, "--format", "json")
-		if err != nil {
-			continue
-		}
-		var inspection buildxHistoryInspection
-		if err := json.Unmarshal([]byte(inspectionJSON), &inspection); err != nil || inspection.Status != "completed" {
-			continue
-		}
-		actualArgs := make(map[string]string, len(inspection.BuildArgs))
-		for _, argument := range inspection.BuildArgs {
-			actualArgs[argument.Name] = argument.Value
-		}
-		matches := true
-		for name, expected := range expectedArgs {
-			if actualArgs[name] != expected {
-				matches = false
-				break
+	if err := m.withSandboxBackendLock(ctx, func() error {
+		if err := runtime.VerifyImportedTemplate(ctx, artifact); err != nil {
+			if !errors.Is(err, provider.ErrTemplateNotFound) {
+				return err
+			}
+			label := fmt.Sprintf("Docker Sandboxes template-cache import for %s", artifact.Reference)
+			if err := m.runProgressOperation(label, nil, func() error {
+				return runtime.ImportTemplate(ctx, archivePath)
+			}); err != nil {
+				return err
 			}
 		}
-		if !matches {
-			continue
+		if err := m.runProgressOperation("Docker Sandboxes imported-template verification", nil, func() error {
+			return runtime.VerifyImportedTemplate(ctx, artifact)
+		}); err != nil {
+			return fmt.Errorf("verify imported Docker Sandboxes runner template: %w", err)
 		}
-		exactImage := false
-		for _, attachment := range inspection.Attachments {
-			if attachment.Type == "application/vnd.oci.image.index.v1+json" && attachment.Digest == localDigest {
-				exactImage = true
-				break
-			}
-		}
-		if !exactImage {
-			continue
-		}
-		provenance, err := m.runHostOutput(ctx, "docker", "buildx", "history", "inspect", "attachment", "--builder", builder, "--type", "provenance", buildRef)
-		if err != nil || !json.Valid([]byte(provenance)) {
-			continue
-		}
-		return dockerSandboxesBuildMetadata{
-			ImageDigest: localDigest,
-			Provenance:  json.RawMessage(provenance),
-			BuildRef:    entry.Ref,
-		}, localDigest, true, nil
+		return nil
+	}); err != nil {
+		return err
 	}
-	return dockerSandboxesBuildMetadata{}, "", false, nil
+	return m.activateDockerSandboxesTemplate(ctx, manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
 }
 
-func (m *Coordinator) persistBuildxSBOM(ctx context.Context, builder string, metadata dockerSandboxesBuildMetadata, destination string) (string, error) {
-	buildRef := metadata.BuildRef
-	if separator := strings.LastIndex(buildRef, "/"); separator >= 0 {
-		buildRef = buildRef[separator+1:]
+func readVerifiedBuildEvidence(path string, maximumBytes uint64) ([]byte, error) {
+	if maximumBytes == 0 || maximumBytes > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("invalid build-evidence size limit %d", maximumBytes)
 	}
-	if matched, _ := regexp.MatchString(`^[a-z0-9]{12,128}$`, buildRef); !matched {
-		return "", fmt.Errorf("Buildx metadata contains invalid build reference %q", metadata.BuildRef)
-	}
-	if !validSHA256(metadata.ImageDigest) {
-		return "", fmt.Errorf("Buildx metadata contains invalid image digest %q", metadata.ImageDigest)
-	}
-	indexJSON, err := m.runHostOutput(ctx, "docker", "buildx", "history", "inspect", "attachment", "--builder", builder, buildRef, metadata.ImageDigest)
+	before, err := storage.SnapshotFilesystemTarget(path)
 	if err != nil {
-		return "", fmt.Errorf("inspect Buildx image-index attachment: %w", err)
+		return nil, err
 	}
-	attestationDigest, err := selectBuildxAttestationDigest([]byte(indexJSON))
+	info, err := os.Lstat(path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	attestationJSON, err := m.runHostOutput(ctx, "docker", "buildx", "history", "inspect", "attachment", "--builder", builder, buildRef, attestationDigest)
+	if !info.Mode().IsRegular() || info.Size() <= 0 || uint64(info.Size()) > maximumBytes {
+		return nil, fmt.Errorf("build evidence %q has invalid size %d", path, info.Size())
+	}
+	content, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("inspect Buildx attestation manifest: %w", err)
+		return nil, err
 	}
-	sbomDigest, sbomSize, err := selectBuildxSBOMDigest([]byte(attestationJSON))
+	after, err := storage.SnapshotFilesystemTarget(path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if sbomSize == 0 || sbomSize > storage.GiB {
-		return "", fmt.Errorf("Buildx SBOM attachment has invalid size %d bytes", sbomSize)
+	if before.Identity != after.Identity || before.Fingerprint != after.Fingerprint || uint64(len(content)) != uint64(info.Size()) {
+		return nil, fmt.Errorf("build evidence %q changed during readback", path)
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-		return "", err
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(destination), "."+filepath.Base(destination)+".partial-")
-	if err != nil {
-		return "", err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return "", err
-	}
-	if err := m.streamLocalDockerContentBlob(ctx, builder, sbomDigest, temporary); err != nil {
-		_ = temporary.Close()
-		return "", fmt.Errorf("extract Buildx SBOM attachment: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return "", err
-	}
-	if err := temporary.Close(); err != nil {
-		return "", err
-	}
-	actualDigest, actualSize, err := hashFile(temporaryPath)
-	if err != nil {
-		return "", err
-	}
-	if actualDigest != sbomDigest || actualSize != sbomSize {
-		return "", fmt.Errorf("Buildx SBOM attachment readback is %s/%d bytes, expected %s/%d bytes", actualDigest, actualSize, sbomDigest, sbomSize)
-	}
-	if err := validateInTotoSPDX(temporaryPath); err != nil {
-		return "", fmt.Errorf("validate Buildx SBOM attachment: %w", err)
-	}
-	if err := os.Rename(temporaryPath, destination); err != nil {
-		return "", err
-	}
-	return sbomDigest, nil
+	return content, nil
 }
 
-func (m *Coordinator) streamLocalDockerContentBlob(ctx context.Context, builder, digest string, destination *os.File) error {
-	if !validSHA256(digest) {
-		return fmt.Errorf("invalid Docker content digest %q", digest)
+func validateBuildxMaxProvenance(content []byte) error {
+	var provenance struct {
+		BuildType  string            `json:"buildType"`
+		Materials  []json.RawMessage `json:"materials"`
+		Invocation struct {
+			Parameters json.RawMessage `json:"parameters"`
+		} `json:"invocation"`
 	}
-	helperImage, err := m.runHostOutput(ctx, "docker", "inspect", "--format", "{{.Image}}", buildxControlContainer(builder))
-	if err != nil {
-		return fmt.Errorf("inspect owned BuildKit control container: %w", err)
+	if err := json.Unmarshal(content, &provenance); err != nil {
+		return err
 	}
-	helperImage = strings.TrimSpace(helperImage)
-	if !validSHA256(helperImage) {
-		return fmt.Errorf("owned BuildKit control container reported invalid image identity %q", helperImage)
+	if provenance.BuildType == "" || len(provenance.Materials) == 0 || len(provenance.Invocation.Parameters) == 0 || string(provenance.Invocation.Parameters) == "null" {
+		return errors.New("max-mode Buildx provenance omitted build type, materials, or invocation parameters")
 	}
-	var failures []string
-	for _, source := range dockerContentBlobCandidates(digest) {
-		if _, err := destination.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		if err := destination.Truncate(0); err != nil {
-			return err
-		}
-		mount := "type=bind,src=" + source + ",dst=/epar-build-attestation,readonly"
-		err := m.runHostOutputTo(
-			ctx,
-			destination,
-			"docker",
-			"run",
-			"--rm",
-			"--pull=never",
-			"--network=none",
-			"--entrypoint",
-			"cat",
-			"--mount",
-			mount,
-			helperImage,
-			"/epar-build-attestation",
-		)
-		if err == nil {
-			return nil
-		}
-		failures = append(failures, err.Error())
-	}
-	return fmt.Errorf("exact content blob %s was not readable from Docker's local containerd image store: %s", digest, strings.Join(failures, "; "))
+	return nil
 }
 
-func dockerContentBlobCandidates(digest string) []string {
-	hexDigest := strings.TrimPrefix(digest, "sha256:")
-	return []string{
-		"/var/lib/desktop-containerd/daemon/io.containerd.content.v1.content/blobs/sha256/" + hexDigest,
-		"/var/lib/docker/containerd/daemon/io.containerd.content.v1.content/blobs/sha256/" + hexDigest,
+func validateInTotoProvenance(content []byte) error {
+	var statement struct {
+		Type          string            `json:"_type"`
+		PredicateType string            `json:"predicateType"`
+		Subject       []json.RawMessage `json:"subject"`
+		Predicate     json.RawMessage   `json:"predicate"`
 	}
-}
-
-func selectBuildxAttestationDigest(content []byte) (string, error) {
-	var document buildxAttachmentDocument
-	if err := json.Unmarshal(content, &document); err != nil {
-		return "", fmt.Errorf("parse Buildx image-index attachment: %w", err)
+	if err := json.Unmarshal(content, &statement); err != nil {
+		return err
 	}
-	var selected string
-	for _, manifest := range document.Manifests {
-		if manifest.Annotations["vnd.docker.reference.type"] != "attestation-manifest" {
-			continue
-		}
-		if !validSHA256(manifest.Digest) || selected != "" {
-			return "", fmt.Errorf("Buildx image index does not contain exactly one valid attestation manifest")
-		}
-		selected = manifest.Digest
+	if statement.Type != "https://in-toto.io/Statement/v1" || statement.PredicateType != "https://slsa.dev/provenance/v1" || len(statement.Subject) == 0 || len(statement.Predicate) == 0 || string(statement.Predicate) == "null" {
+		return errors.New("exported provenance is not a complete in-toto SLSA v1 statement")
 	}
-	if selected == "" {
-		return "", fmt.Errorf("Buildx image index omitted its attestation manifest")
-	}
-	return selected, nil
-}
-
-func selectBuildxSBOMDigest(content []byte) (string, uint64, error) {
-	var document buildxAttachmentDocument
-	if err := json.Unmarshal(content, &document); err != nil {
-		return "", 0, fmt.Errorf("parse Buildx attestation manifest: %w", err)
-	}
-	var selected string
-	var size uint64
-	for _, layer := range document.Layers {
-		if layer.MediaType != "application/vnd.in-toto+json" || layer.Annotations["in-toto.io/predicate-type"] != "https://spdx.dev/Document" {
-			continue
-		}
-		if !validSHA256(layer.Digest) || selected != "" {
-			return "", 0, fmt.Errorf("Buildx attestation manifest does not contain exactly one valid SPDX attachment")
-		}
-		selected = layer.Digest
-		size = layer.Size
-	}
-	if selected == "" {
-		return "", 0, fmt.Errorf("Buildx attestation manifest omitted its SPDX attachment")
-	}
-	return selected, size, nil
+	return nil
 }
 
 func validateInTotoSPDX(path string) error {
@@ -1190,30 +1090,30 @@ func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifes
 	if artifact.RootDisk != rootDisk {
 		return false, nil
 	}
-	localDigest, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", artifact.Reference)
-	if inspectErr != nil || strings.TrimSpace(localDigest) != artifact.Digest {
-		m.infof("restoring verified Docker Sandboxes runner template image from interrupted build evidence\n")
-		if err := m.runHost(ctx, "docker", "image", "load", "--input", archivePath); err != nil {
-			return false, fmt.Errorf("restore verified Docker Sandboxes template image: %w", err)
+	if err := m.withSandboxBackendLock(ctx, func() error {
+		if err := runtime.VerifyImportedTemplate(ctx, artifact); err != nil {
+			if !errors.Is(err, provider.ErrTemplateNotFound) {
+				return err
+			}
+			if err := m.runProgressOperation("Docker Sandboxes resumed template-cache import", nil, func() error {
+				return runtime.ImportTemplate(ctx, archivePath)
+			}); err != nil {
+				return err
+			}
 		}
-		localDigest, err = m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", artifact.Reference)
-		if err != nil || strings.TrimSpace(localDigest) != artifact.Digest {
-			return false, fmt.Errorf("restored Docker Sandboxes template image does not match verified build evidence")
+		if err := m.runProgressOperation("Docker Sandboxes resumed imported-template verification", nil, func() error {
+			return runtime.VerifyImportedTemplate(ctx, artifact)
+		}); err != nil {
+			return fmt.Errorf("verify resumed Docker Sandboxes runner template: %w", err)
 		}
-	}
-	if err := runtime.VerifyTemplate(ctx, artifact); err != nil {
-		m.infof("resuming Docker Sandboxes template import from verified build evidence\n")
-		if err := runtime.ImportTemplate(ctx, archivePath); err != nil {
-			return false, err
-		}
-	}
-	if err := runtime.VerifyTemplate(ctx, artifact); err != nil {
-		return false, fmt.Errorf("verify resumed Docker Sandboxes runner template: %w", err)
+		return nil
+	}); err != nil {
+		return false, err
 	}
 	if metadata.ManifestHash != manifestHash {
 		return false, fmt.Errorf("verified Docker Sandboxes build evidence changed during resume")
 	}
-	if err := m.activateDockerSandboxesTemplate(manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime); err != nil {
+	if err := m.activateDockerSandboxesTemplate(ctx, manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime); err != nil {
 		return false, err
 	}
 	m.infof("resumed Docker Sandboxes runner template from verified interrupted build evidence\n")
@@ -1255,7 +1155,25 @@ func verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePat
 	if archiveSHA != metadata.Template.ArchiveSHA256 || archiveBytes != metadata.Template.ArchiveBytes {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
-	requiredEvidence := []string{"buildMetadata", "provenance", "sbom", "softwareInventory", "compatibility"}
+	var buildMetadata dockerSandboxesBuildMetadata
+	buildMetadataEvidence, found := metadata.Artifacts["buildMetadata"]
+	if !found || filepath.Base(buildMetadataEvidence.Path) != buildMetadataEvidence.Path {
+		return metadata, provider.TemplateArtifact{}, "", "", false, nil
+	}
+	if err := readJSONFile(filepath.Join(artifactRoot, buildMetadataEvidence.Path), &buildMetadata); err != nil {
+		return metadata, provider.TemplateArtifact{}, "", "", false, nil
+	}
+	archiveVerification, err := verifyDockerSandboxesArchive(archivePath, metadata.Template.Tag, source.Platform, buildMetadata.ImageDigest, map[string]string{
+		"io.solutionforest.epar.schema":       "1",
+		"io.solutionforest.epar.installation": "*",
+		"io.solutionforest.epar.provider":     "docker-sandboxes",
+		"io.solutionforest.epar.role":         "template-staging",
+		"io.solutionforest.epar.manifest":     manifestHash,
+	})
+	if err != nil || archiveVerification.ArchiveSHA256 != archiveSHA || archiveVerification.ArchiveBytes != archiveBytes {
+		return metadata, provider.TemplateArtifact{}, "", "", false, nil
+	}
+	requiredEvidence := []string{"buildMetadata", "attestationMetadata", "provenance", "sbom", "softwareInventory", "compatibility"}
 	for _, name := range requiredEvidence {
 		evidence, found := metadata.Artifacts[name]
 		if !found || filepath.Base(evidence.Path) != evidence.Path || !validSHA256(evidence.SHA256) {
@@ -1287,8 +1205,19 @@ func verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePat
 	}, metadataSHA, archiveSHA, true, nil
 }
 
-func (m *Coordinator) activateDockerSandboxesTemplate(manifest Manifest, source ResolvedDockerSource, manifestHash string, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) error {
+func (m *Coordinator) activateDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash string, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) error {
 	if err := runtime.ActivateTemplate(artifact); err != nil {
+		return err
+	}
+	archiveInfo, err := os.Lstat(archivePath)
+	if err != nil {
+		return fmt.Errorf("inspect verified Docker Sandboxes archive before activation: %w", err)
+	}
+	if !archiveInfo.Mode().IsRegular() {
+		return errors.New("verified Docker Sandboxes archive is not a regular file")
+	}
+	evidence, err := m.persistDockerSandboxesCompactEvidence(manifestHash, filepath.Dir(metadataPath))
+	if err != nil {
 		return err
 	}
 	receipt := dockerSandboxesReceipt{
@@ -1297,17 +1226,80 @@ func (m *Coordinator) activateDockerSandboxesTemplate(manifest Manifest, source 
 		Manifest:       manifest,
 		Source:         source,
 		Artifact:       artifact,
-		MetadataPath:   metadataPath,
 		MetadataSHA256: metadataSHA,
-		ArchivePath:    archivePath,
 		ArchiveSHA256:  archiveSHA,
+		ArchiveBytes:   uint64(archiveInfo.Size()),
+		Evidence:       evidence,
 		ActivatedAt:    time.Now().UTC(),
 	}
-	if err := writeJSONFile(DockerSandboxesReceiptPath(m.ProjectRoot), receipt); err != nil {
+	receiptPath, err := m.dockerSandboxesReceiptPath()
+	if err != nil {
+		return err
+	}
+	if err := writeJSONFile(receiptPath, receipt); err != nil {
+		return err
+	}
+	if err := m.recordCurrentSandboxArtifact(ctx, artifact, manifestHash, receipt.ActivatedAt); err != nil {
+		return fmt.Errorf("record current Docker Sandboxes template ownership: %w", err)
+	}
+	if err := m.recordSandboxWorkspace(ctx, filepath.Dir(archivePath), manifestHash, storagecatalog.StateSuperseded, receipt.ActivatedAt); err != nil {
+		return fmt.Errorf("record Docker Sandboxes staging ownership: %w", err)
+	}
+	if err := m.cleanupSupersededCatalog(ctx); err != nil {
 		return err
 	}
 	m.infof("activated Docker Sandboxes runner template %s@%s\n", artifact.Reference, artifact.Digest)
 	return nil
+}
+
+func (m *Coordinator) persistDockerSandboxesCompactEvidence(manifestHash, artifactRoot string) (map[string]artifactEvidence, error) {
+	receiptPath, err := m.dockerSandboxesReceiptPath()
+	if err != nil {
+		return nil, err
+	}
+	evidenceRoot := filepath.Join(filepath.Dir(receiptPath), "evidence", manifestHash)
+	if err := os.MkdirAll(evidenceRoot, 0o700); err != nil {
+		return nil, err
+	}
+	result := make(map[string]artifactEvidence)
+	for name, filename := range map[string]string{
+		"buildMetadata":       "build-metadata.json",
+		"attestationMetadata": "attestation-metadata.json",
+		"provenance":          "provenance.json",
+		"softwareInventory":   "software-inventory.txt",
+		"compatibility":       "compatibility.json",
+		"templateMetadata":    "template-metadata.json",
+	} {
+		source := filepath.Join(artifactRoot, filename)
+		destination := filepath.Join(evidenceRoot, filename)
+		if err := copyFile(source, destination, 0o600); err != nil {
+			return nil, fmt.Errorf("retain Docker Sandboxes %s evidence: %w", name, err)
+		}
+		digest, _, err := hashFile(destination)
+		if err != nil {
+			return nil, err
+		}
+		result[name] = artifactEvidence{Path: filepath.ToSlash(filepath.Join("evidence", manifestHash, filename)), SHA256: digest}
+	}
+	sbomPath := filepath.Join(artifactRoot, "sbom.intoto.json")
+	sbomDigest, sbomBytes, err := hashFile(sbomPath)
+	if err != nil {
+		return nil, err
+	}
+	descriptorPath := filepath.Join(evidenceRoot, "sbom-descriptor.json")
+	if err := writeJSONFile(descriptorPath, map[string]any{
+		"schemaVersion": 1,
+		"digest":        sbomDigest,
+		"size":          sbomBytes,
+	}); err != nil {
+		return nil, err
+	}
+	descriptorDigest, _, err := hashFile(descriptorPath)
+	if err != nil {
+		return nil, err
+	}
+	result["sbomDescriptor"] = artifactEvidence{Path: filepath.ToSlash(filepath.Join("evidence", manifestHash, "sbom-descriptor.json")), SHA256: descriptorDigest, SourceDigest: sbomDigest}
+	return result, nil
 }
 
 func loadDockerSandboxesSourceLock(projectRoot, platform string) (dockerSandboxesSourceLock, error) {

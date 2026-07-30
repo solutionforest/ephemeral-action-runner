@@ -104,18 +104,27 @@ func (m *Manager) recordLifecycleJobObservation(ctx context.Context, runner gh.R
 	}
 	holder := "github-" + strconv.FormatInt(runner.ID, 10)
 	if runner.Busy {
+		started := false
 		if record.Phase == poolstate.PhaseReady {
 			if _, err := m.LifecycleState.Transition(ctx, runner.Name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
 				return err
 			}
+			started = true
 		}
-		return m.acquireLifecycleLease(ctx, runner.Name, "job", holder, 10*time.Minute)
+		if err := m.acquireLifecycleLease(ctx, runner.Name, "job", holder, 10*time.Minute); err != nil {
+			return err
+		}
+		if started {
+			m.infof("[%s] Job started; GitHub assigned work to this runner.\n", runner.Name)
+		}
+		return nil
 	}
 	if record.Phase == poolstate.PhaseBusy {
 		if _, err := m.LifecycleState.Transition(ctx, runner.Name, poolstate.Transition{Action: poolstate.ActionJobFinished}); err != nil {
 			return err
 		}
 		m.releaseLifecycleLease(ctx, runner.Name, "job", holder)
+		m.infof("[%s] Job finished; GitHub Actions has the success or failure result.\n", runner.Name)
 		return nil
 	}
 	for _, lease := range record.Leases {
@@ -135,6 +144,7 @@ func (m *Manager) recordLifecycleRemoteAbsence(ctx context.Context, name string)
 	if err != nil {
 		return err
 	}
+	jobFinished := record.Phase == poolstate.PhaseBusy
 	if record.Phase == poolstate.PhaseBusy {
 		if _, err := m.LifecycleState.Transition(ctx, name, poolstate.Transition{Action: poolstate.ActionJobFinished}); err != nil {
 			return err
@@ -142,6 +152,11 @@ func (m *Manager) recordLifecycleRemoteAbsence(ctx context.Context, name string)
 	}
 	if record.GitHub.RunnerID != 0 {
 		m.releaseLifecycleLease(ctx, name, "job", "github-"+strconv.FormatInt(record.GitHub.RunnerID, 10))
+	}
+	if jobFinished {
+		m.infof("[%s] Job finished and GitHub released the ephemeral runner; GitHub Actions has the success or failure result.\n", name)
+	} else if record.Phase == poolstate.PhaseReady {
+		m.infof("[%s] GitHub runner registration disappeared before EPAR observed a job start; starting exact cleanup.\n", name)
 	}
 	return nil
 }

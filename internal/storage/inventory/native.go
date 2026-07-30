@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,7 +63,16 @@ func collectNative(options nativeOptions) ([]storage.Artifact, []string) {
 
 	var revisions []nativeRevision
 	var artifacts []storage.Artifact
+	stable, stableNames, stableCurrentMatch, stableFound, stableErr := inspectStableNativeController(rootTarget.Locator, currentExecutable)
+	if stableFound && stableErr == nil {
+		artifacts = append(artifacts, stable)
+	} else if stableFound {
+		warnings = append(warnings, fmt.Sprintf("stable native-controller files remain ownership-unknown: %v", stableErr))
+	}
 	for _, entry := range entries {
+		if stableErr == nil && stableNames[entry.Name()] {
+			continue
+		}
 		path := filepath.Join(rootTarget.Locator, entry.Name())
 		info, infoErr := entry.Info()
 		if infoErr != nil || isRedirect(info) {
@@ -115,13 +125,122 @@ func collectNative(options nativeOptions) ([]storage.Artifact, []string) {
 			supersededAt := current.completed
 			revisions[index].artifact.SupersededAt = &supersededAt
 		}
-	} else if currentKey != "" || currentExecutable.Identity != "" {
+	} else if (currentKey != "" || currentExecutable.Identity != "") && !stableCurrentMatch {
 		warnings = append(warnings, "explicit current native-controller identity did not match a recognized revision")
 	}
 	for _, revision := range revisions {
 		artifacts = append(artifacts, revision.artifact)
 	}
 	return artifacts, warnings
+}
+
+func inspectStableNativeController(root string, currentExecutable storage.Target) (storage.Artifact, map[string]bool, bool, bool, error) {
+	manifestPath := filepath.Join(root, "ephemeral-action-runner.manifest")
+	manifestInfo, err := os.Lstat(manifestPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return storage.Artifact{}, nil, false, false, nil
+	}
+	if err != nil {
+		return storage.Artifact{}, nil, false, true, err
+	}
+	if !manifestInfo.Mode().IsRegular() || isRedirect(manifestInfo) {
+		return storage.Artifact{}, nil, false, true, fmt.Errorf("manifest is not an exact regular file")
+	}
+	fields, err := parseStableManifest(manifestPath)
+	if err != nil {
+		return storage.Artifact{}, nil, false, true, err
+	}
+	executableName := fields["executable"]
+	if executableName != "ephemeral-action-runner" && executableName != "ephemeral-action-runner.exe" {
+		return storage.Artifact{}, nil, false, true, fmt.Errorf("manifest executable is invalid")
+	}
+	binaryPath := filepath.Join(root, executableName)
+	binaryInfo, err := os.Lstat(binaryPath)
+	if err != nil {
+		return storage.Artifact{}, nil, false, true, err
+	}
+	if !binaryInfo.Mode().IsRegular() || isRedirect(binaryInfo) {
+		return storage.Artifact{}, nil, false, true, fmt.Errorf("controller executable is not an exact regular file")
+	}
+	binary, err := storage.SnapshotFilesystemTarget(binaryPath)
+	if err != nil {
+		return storage.Artifact{}, nil, false, true, err
+	}
+	manifestSHA, _, err := hashFile(manifestPath)
+	if err != nil {
+		return storage.Artifact{}, nil, false, true, err
+	}
+	completed, err := time.Parse(time.RFC3339Nano, fields["completedAtUtc"])
+	if err != nil {
+		return storage.Artifact{}, nil, false, true, fmt.Errorf("manifest completedAtUtc is invalid")
+	}
+	size := uint64(binaryInfo.Size() + manifestInfo.Size())
+	artifact := storage.Artifact{
+		ID:             "native-controller-stable:" + fields["fingerprint"],
+		SurfaceID:      ProjectSurfaceID,
+		Kind:           storage.ArtifactNativeControllerRevision,
+		RetentionGroup: "native-controller",
+		Target:         binary,
+		Ownership: storage.Ownership{
+			Kind:     storage.OwnershipExact,
+			OwnerID:  "native-controller:" + fields["fingerprint"],
+			Evidence: "ephemeral-action-runner.manifest@" + manifestSHA,
+		},
+		SizeBytes: size,
+		CreatedAt: completed.UTC(),
+		Current:   true,
+		Protections: []storage.Protection{{
+			Kind: storage.ProtectionCurrent, Detail: "stable native-controller manifest",
+		}},
+	}
+	currentMatch := currentExecutable.Identity != "" && binary.Identity == currentExecutable.Identity && binary.Fingerprint == currentExecutable.Fingerprint
+	stableNames := map[string]bool{executableName: true, filepath.Base(manifestPath): true}
+	lockPath := filepath.Join(root, ".native-controller.lock")
+	if lockInfo, lockErr := os.Lstat(lockPath); lockErr == nil && lockInfo.Mode().IsRegular() && !isRedirect(lockInfo) && lockInfo.Size() == 0 {
+		stableNames[filepath.Base(lockPath)] = true
+	}
+	return artifact, stableNames, currentMatch, true, nil
+}
+
+func parseStableManifest(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	fields := make(map[string]string, 6)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 16*1024)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), "=")
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("manifest contains an invalid field")
+		}
+		if _, exists := fields[key]; exists {
+			return nil, fmt.Errorf("manifest contains duplicate field %q", key)
+		}
+		fields[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(fields) != 6 {
+		return nil, fmt.Errorf("manifest must contain exactly six fields")
+	}
+	for _, key := range []string{"schemaVersion", "fingerprint", "executable", "toolchainImageID", "sourceRevision", "completedAtUtc"} {
+		if fields[key] == "" {
+			return nil, fmt.Errorf("manifest is missing %q", key)
+		}
+	}
+	if fields["schemaVersion"] != "2" || !cacheKeyPattern.MatchString(fields["fingerprint"]) {
+		return nil, fmt.Errorf("manifest schema or fingerprint is invalid")
+	}
+	sourceFingerprint := strings.TrimPrefix(strings.TrimPrefix(fields["sourceRevision"], "dirty:"), "sha256:")
+	sourceMatches := fields["sourceRevision"] == "unknown" || sourceFingerprint == fields["fingerprint"]
+	if !sourceMatches || !strings.HasPrefix(fields["toolchainImageID"], "sha256:") || !cacheKeyPattern.MatchString(strings.TrimPrefix(fields["toolchainImageID"], "sha256:")) {
+		return nil, fmt.Errorf("manifest source or toolchain identity is invalid")
+	}
+	return fields, nil
 }
 
 func inspectNativeRevision(path, cacheKey string) (nativeRevision, error) {

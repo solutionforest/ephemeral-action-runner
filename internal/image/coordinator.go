@@ -29,6 +29,7 @@ type Environment interface {
 	Infof(format string, args ...any)
 	Warnf(format string, args ...any)
 	RunHostLogged(ctx context.Context, logPath, name string, args ...string) error
+	RunHostBuildxLogged(ctx context.Context, logPath, name string, args ...string) error
 	RunHost(ctx context.Context, name string, args ...string) error
 	RunHostOutput(ctx context.Context, name string, args ...string) (string, error)
 	RunHostOutputTo(ctx context.Context, output io.Writer, name string, args ...string) error
@@ -44,8 +45,8 @@ type Environment interface {
 	PullDockerSource(ctx context.Context, options DockerSourcePullOptions) error
 	LogInfo(message string, args ...any)
 	LogWarn(message string, args ...any)
-	DockerPullProgressTerminal() bool
-	DockerPullProgressConsole() io.Writer
+	ProgressTerminal() bool
+	ProgressConsole() io.Writer
 	RunnerName(prefix string, sequence int, now time.Time) string
 	TranscriptComponent(path string) string
 }
@@ -55,6 +56,7 @@ type Coordinator struct {
 	Provider    provider.Provider
 	Lifecycle   provider.Lifecycle
 	ProjectRoot string
+	ConfigPath  string
 	DryRun      bool
 	environment Environment
 }
@@ -90,8 +92,16 @@ func (m *Coordinator) warnf(format string, args ...any) {
 	m.environment.Warnf(format, args...)
 }
 
+func (m *Coordinator) HousekeepStorage(ctx context.Context) error {
+	return m.cleanupSupersededCatalog(ctx)
+}
+
 func (m *Coordinator) runHostLogged(ctx context.Context, logPath, name string, args ...string) error {
 	return m.environment.RunHostLogged(ctx, logPath, name, args...)
+}
+
+func (m *Coordinator) runHostBuildxLogged(ctx context.Context, logPath, name string, args ...string) error {
+	return m.environment.RunHostBuildxLogged(ctx, logPath, name, args...)
 }
 
 func (m *Coordinator) runHost(ctx context.Context, name string, args ...string) error {

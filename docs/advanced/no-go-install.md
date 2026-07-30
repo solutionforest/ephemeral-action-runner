@@ -4,7 +4,7 @@ The standard path is to download GitHub's automatic **Source code (zip)** or **S
 
 ## Run With Docker
 
-Run `./start` at the source folder root on macOS, Linux, WSL, or Git Bash, or `./start.ps1` / `start.cmd` in native Windows PowerShell or cmd. The wrapper uses local Go when it is installed and runnable; otherwise a containerized Go toolchain cross-compiles a CGO-disabled binary for the native host, caches it by source, platform, and immutable toolchain-image hash under `.local/bin`, and executes it on the host:
+Run `./start` at the source folder root on macOS, Linux, WSL, or Git Bash, or `./start.ps1` / `start.cmd` in native Windows PowerShell or cmd. The wrapper uses local Go when it is installed and runnable; otherwise a containerized Go toolchain cross-compiles a CGO-disabled host-native binary at `.local/bin/ephemeral-action-runner` (or `.exe` on Windows). Its adjacent `ephemeral-action-runner.manifest` records the deterministic source, platform, and toolchain fingerprint:
 
 ```bash
 ./start --config .local/config.yml --instances 2
@@ -18,7 +18,7 @@ Under the hood, the wrapper calls `scripts/run-with-docker.sh` or `scripts/run-w
 
 ### Host trust
 
-The wrappers publish a short-lived `EPAR_BUILD_TRUST_FEED` from the real Windows, macOS, or Linux host for build-consuming commands, including when `image.hostTrustMode` is disabled. When runner overlay is enabled, they separately publish `EPAR_HOST_TRUST_FEED`. Native controllers can collect directly; the temporary Go toolchain container only compiles the binary and never substitutes its own trust roots for either host policy.
+Before compiling the native controller, the wrapper publishes a short-lived system-trust feed from the real Windows, macOS, or Linux host, validates its freshness, certificate hashes, CA constraints, and distrust entries in an offline container, and mounts the resulting bundle read-only into the Go toolchain container. This operational trust is automatic even when `image.hostTrustMode` is disabled and is not copied into runners. After a native controller is available, it reads the host trust stores directly; only the legacy containerized-controller path uses the separate short-lived `EPAR_BUILD_TRUST_FEED` and optional `EPAR_HOST_TRUST_FEED` bridge. If bootstrap TLS still fails, the wrapper preserves `work/logs/epar-native-controller-build.log` and prints a certificate diagnostic without disabling verification or retrying insecurely.
 
 The explicit legacy path `EPAR_LEGACY_CONTROLLER_IN_DOCKER=1` remains available only for compatible providers. That path uses the existing short-lived host-trust bridge and rejects `provider.type: docker-sandboxes`; it is not an automatic fallback.
 
@@ -35,9 +35,9 @@ scripts/run-with-docker.sh version
 scripts/run-with-docker.sh start --config .local/config.yml
 ```
 
-Set `EPAR_USE_DOCKER_RUN=1` to force `./start` to use the containerized compiler even when Go is installed, or `=0` to force local `go run` and error instead of falling back. Docker volumes cache Go modules and build output, while `.local/bin` caches the resulting native binary, so unchanged repeat starts are fast. Native-controller retention never removes active revisions, gives completed revisions a seven-day grace period, then keeps at most five previous completed revisions while the selected cache plus the current revision fits within 256 MiB. Active and grace-protected revisions may temporarily exceed those bounds. Automatic retention requires the ownership manifest written by the current wrapper; older unmanifested revisions remain for explicit review.
+Set `EPAR_USE_DOCKER_RUN=1` to force `./start` to use the containerized compiler even when Go is installed, or `=0` to force local `go run` and error instead of falling back. Docker volumes cache Go modules and build output, while unchanged source reuses the one native binary. A changed source or toolchain rebuilds it atomically. If an existing EPAR process is still using the prior binary, stop that process before retrying; the wrapper does not retain another historical binary as a fallback.
 
-Before the first containerized compilation, the wrapper requires 20 GiB free on the source-folder filesystem so bootstrap does not begin when the host is already critically constrained. `EPAR_BOOTSTRAP_MIN_FREE_BYTES` may raise this reserve for managed installations.
+Before containerized compilation, the wrapper requires 1 GiB free on the source-folder filesystem so bootstrap does not begin when the host is already critically constrained. `EPAR_BOOTSTRAP_MIN_FREE_BYTES` may raise this reserve for managed installations.
 
 The wrapper passes the real host name to the native controller as `EPAR_HOST_NAME` so first-run defaults and generated host labels describe the machine running EPAR. Set `EPAR_HOST_NAME` before launching EPAR to override that identity.
 

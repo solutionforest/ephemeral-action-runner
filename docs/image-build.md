@@ -73,11 +73,11 @@ The default source is converted from a Docker image to an intermediate rootfs ta
 
 ### Tart
 
-The output is a local Tart VM image. The default is intentionally lean; use a custom bootable Ubuntu source image or focused install scripts when a workflow needs more tooling. `provider.rosettaTag` is an opt-in, experimental Tart-only layer for selected Linux amd64 user-space workloads.
+The output is a local Tart VM image. The default is intentionally lean; use a custom bootable Ubuntu source image or focused install scripts when a workflow needs more tooling. EPAR builds and verifies a content-named candidate, keeps a rollback clone until the configured output passes immutable identity readback, and disables Tart's unrelated automatic cache pruning for its clone operations. `provider.rosettaTag` is an opt-in, experimental Tart-only layer for selected Linux amd64 user-space workloads.
 
 ### Docker Sandboxes
 
-Docker Sandboxes uses `image.sourceImage`, `image.sourcePlatform`, and `image.customInstallScripts` as the desired template inputs. `./start` and `./start image build` share the same build/import implementation. Exact Docker image and Sandbox cache identities are stored in `.local/state/image/docker-sandboxes/active.json`, not user configuration; a failed desired update leaves the previous receipt and artifact intact but does not run it as a fallback.
+Docker Sandboxes uses `image.sourceImage`, `image.sourcePlatform`, and `image.customInstallScripts` as the desired template inputs. `./start` and `./start image build` share the same build/import implementation. BuildKit writes an attestation-free Docker-compatible archive directly because that archive format cannot carry the provenance/SBOM manifest list; EPAR verifies the archive without creating a Docker staging image, imports it, and records the exact Sandbox cache identity under `.local/state/image/<config-id>/docker-sandboxes/active.json`. A separate cache-backed BuildKit evidence operation produces max-mode provenance and the SBOM without loading the runner image into Docker Engine. The large archive and full SBOM workspace are transient, while compact metadata, provenance, compatibility, inventory, and SBOM descriptor evidence remain. A failed desired update leaves the previous receipt and artifact intact but does not run it as a fallback.
 
 ## Verify A Customized Artifact
 

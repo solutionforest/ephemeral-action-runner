@@ -193,6 +193,9 @@ func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, stdoutSin
 		return provider.ExecResult{}, nil
 	}
 	cmd := exec.CommandContext(ctx, p.Binary, args...)
+	if len(args) > 0 && args[0] == "clone" {
+		cmd.Env = tartCloneEnvironment(os.Environ())
+	}
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
@@ -205,6 +208,16 @@ func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, stdoutSin
 		return result, fmt.Errorf("%s %s failed: %w: %s", p.Binary, strings.Join(args, " "), err, strings.TrimSpace(result.Stderr))
 	}
 	return result, nil
+}
+
+func tartCloneEnvironment(base []string) []string {
+	result := make([]string, 0, len(base)+1)
+	for _, value := range base {
+		if !strings.HasPrefix(value, "TART_NO_AUTO_PRUNE=") {
+			result = append(result, value)
+		}
+	}
+	return append(result, "TART_NO_AUTO_PRUNE=1")
 }
 
 func captureWriter(capture io.Writer, sink io.Writer) io.Writer {

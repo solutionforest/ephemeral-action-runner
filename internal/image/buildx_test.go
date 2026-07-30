@@ -80,8 +80,8 @@ func TestBuildRegistryHostsUsesDockerHubForUnqualifiedImages(t *testing.T) {
 }
 
 func TestBuildkitConfigIsDeterministicAndEscapesPaths(t *testing.T) {
-	first := buildkitConfig(64<<30, "generation", `C:\repo path\.local\ca.pem`, []string{"docker.io", "ghcr.io"})
-	second := buildkitConfig(64<<30, "generation", `C:\repo path\.local\ca.pem`, []string{"docker.io", "ghcr.io"})
+	first := buildkitConfig(20<<30, "generation", `C:\repo path\.local\ca.pem`, []string{"docker.io", "ghcr.io"})
+	second := buildkitConfig(20<<30, "generation", `C:\repo path\.local\ca.pem`, []string{"docker.io", "ghcr.io"})
 	if string(first) != string(second) {
 		t.Fatal("BuildKit configuration is not deterministic")
 	}
@@ -91,9 +91,29 @@ func TestBuildkitConfigIsDeterministicAndEscapesPaths(t *testing.T) {
 		`[registry."docker.io"]`,
 		`[registry."ghcr.io"]`,
 		`"C:/repo path/.local/ca.pem"`,
+		`maxUsedSpace = "21474836480B"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("BuildKit configuration omitted %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestParseBuildxUsageBytesUsesSummaryOrSumsRecords(t *testing.T) {
+	for _, test := range []struct {
+		content string
+		want    uint64
+	}{
+		{content: `[{"ID":"a","Size":1024},{"ID":"b","Size":2048}]`, want: 3072},
+		{content: "{\"ID\":\"a\",\"Size\":1024}\n{\"Total\":4096}\n", want: 4096},
+		{content: `[{"ID":"a","Size":"4.128kB"},{"ID":"b","Size":"310.8MB"},{"ID":"c","Size":"15.22GB"}]`, want: 15_530_804_128},
+	} {
+		got, err := parseBuildxUsageBytes([]byte(test.content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != test.want {
+			t.Fatalf("parseBuildxUsageBytes() = %d, want %d", got, test.want)
 		}
 	}
 }

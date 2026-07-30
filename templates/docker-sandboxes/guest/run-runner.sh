@@ -2,6 +2,7 @@
 set -euo pipefail
 
 runner_dir="${EPAR_RUNNER_WORK_DIR:-/opt/actions-runner}"
+tool_cache="${EPAR_RUNNER_TOOL_CACHE:-${runner_dir}/_work/_tool}"
 pid_file="${EPAR_RUNNER_PID_FILE:-/var/run/actions-runner.pid}"
 pid_start_file="${EPAR_RUNNER_PID_START_FILE:-${pid_file}.start}"
 log_file="${EPAR_RUNNER_LOG_FILE:-/var/log/actions-runner/run.log}"
@@ -19,7 +20,7 @@ process_start_time() {
   printf '%s\n' "${fields[19]}"
 }
 
-install -d -m 0755 -o agent -g agent "$(dirname "${log_file}")"
+install -d -m 0755 -o agent -g agent "$(dirname "${log_file}")" "${tool_cache}" "${tool_cache}/dotnet"
 old_pid="$(cat "${pid_file}" 2>/dev/null || true)"
 if [[ "${old_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${old_pid}" >/dev/null 2>&1; then
   echo "actions-runner is already running as PID ${old_pid}" >&2
@@ -58,6 +59,9 @@ PY
 )"
 runner_environment=(
   "EPAR_RUNNER_WORK_DIR=${runner_dir}"
+  "RUNNER_TOOL_CACHE=${tool_cache}"
+  "AGENT_TOOLSDIRECTORY=${tool_cache}"
+  "DOTNET_INSTALL_DIR=${tool_cache}/dotnet"
   "PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 if [[ "${trust_mode}" == "overlay" ]]; then

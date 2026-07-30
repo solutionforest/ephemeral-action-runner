@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
+
+var ErrTemplateNotFound = errors.New("imported provider template not found")
 
 type Instance struct {
 	Name           string
@@ -79,12 +82,13 @@ type RunningProcess struct {
 }
 
 type ExecOptions struct {
-	Stdin           string
-	Env             map[string]string
-	SensitiveValues []string
-	LogPath         string
-	Stdout          io.Writer
-	Stderr          io.Writer
+	Stdin              string
+	Env                map[string]string
+	SensitiveValues    []string
+	LogPath            string
+	Stdout             io.Writer
+	Stderr             io.Writer
+	SuppressTranscript bool
 }
 
 type ExecResult struct {
@@ -129,8 +133,21 @@ type TemplateArtifact struct {
 // remain owned by the shared image and storage packages.
 type TemplateArtifactRuntime interface {
 	ImportTemplate(ctx context.Context, archivePath string) error
-	VerifyTemplate(ctx context.Context, artifact TemplateArtifact) error
+	VerifyImportedTemplate(ctx context.Context, artifact TemplateArtifact) error
 	ActivateTemplate(artifact TemplateArtifact) error
+}
+
+// TemplateArtifactCleaner is an optional exact cleanup capability for
+// template-backed providers. The shared image/storage lifecycle calls it only
+// for an immutable cache identity backed by EPAR ownership evidence.
+type TemplateArtifactCleaner interface {
+	RemoveTemplate(ctx context.Context, artifact TemplateArtifact) error
+}
+
+// TemplateArtifactObserver performs an exact, read-only cache lookup for
+// catalog reconciliation without activating or deleting the template.
+type TemplateArtifactObserver interface {
+	ObserveTemplate(ctx context.Context, artifact TemplateArtifact) (bool, error)
 }
 
 // StorageContribution is required for every registered provider. It describes

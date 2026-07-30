@@ -70,7 +70,9 @@ If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.ins
 
 Storage-consuming commands fail before their provider side effects when an authoritative physical surface cannot retain `storage.minimumFree`. The one-invocation `--allow-insufficient-storage` option keeps all probes and warnings but permits only storage admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, and cleanup protections remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
 
-Press `Ctrl-C` once to stop a foreground pool and wait for cleanup confirmation. Use `--keep-on-exit` only to retain owned resources for deliberate debugging.
+Each normal start also reconciles interrupted exact-owned work and retires unreferenced superseded artifacts after replacement readback. Use `./start storage status` to inspect the result. `./start storage prune --legacy` previews prefix-era resources, which remain manual and require the displayed plan hash before execution.
+
+Press `Ctrl-C` once to stop a foreground pool, then wait for cleanup to finish before closing the terminal. Use `--keep-on-exit` only to retain owned resources for deliberate debugging.
 
 ## Verify before sending jobs
 

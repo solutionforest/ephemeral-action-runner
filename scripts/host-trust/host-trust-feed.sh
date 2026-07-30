@@ -51,13 +51,15 @@ if [[ "$config_path" != /* ]]; then
   config_path="$project_root/$config_path"
 fi
 if [[ ! -f "$config_path" ]]; then
-  # The first `start` can create config interactively. Treat missing config as
-  # disabled: native controller code will re-evaluate after init.
-  exit 0
-fi
-config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
-if command -v realpath >/dev/null 2>&1; then
-  config_path="$(realpath "$config_path")"
+  # A first `start` still needs operational system trust to compile the native
+  # controller before the wizard can create a config. Runner inheritance
+  # remains disabled until an existing config explicitly enables it.
+  if [[ "$purpose" != "build" ]]; then exit 0; fi
+else
+  config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
+  if command -v realpath >/dev/null 2>&1; then
+    config_path="$(realpath "$config_path")"
+  fi
 fi
 
 sha256_text() {
@@ -69,6 +71,7 @@ sha256_text() {
 }
 
 config_values() {
+  [[ -f "$config_path" ]] || return 0
   # Supported deliberately-small YAML subset: EPAR's own parser is flat in
   # each section and supports inline or block lists. Emit mode followed by
   # one scope per line.

@@ -186,7 +186,7 @@ func runStartWithOptions(opts startOptions) (err error) {
 	if err = manager.EnsureImage(opts.Context); err != nil {
 		return err
 	}
-	stopGuidance := "Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window."
+	stopGuidance := "Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window."
 	if opts.KeepOnExit {
 		stopGuidance = "Press Ctrl-C once to stop; --keep-on-exit will leave owned runner resources running."
 	}

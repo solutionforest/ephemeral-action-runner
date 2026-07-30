@@ -17,7 +17,9 @@ flowchart LR
 
 ## Start and stop deliberately
 
-Use `./start` for normal operation because it verifies the configured image or sandbox template before starting the pool. Press `Ctrl-C` once to request a clean stop, then wait for its cleanup confirmation before closing the terminal. `--keep-on-exit` is a debugging option that deliberately leaves owned runner resources running after the supervisor exits.
+Use `./start` for normal operation because it verifies the configured image or sandbox template before starting the pool. Press `Ctrl-C` once to request a clean stop, then wait for cleanup to finish before closing the terminal. `--keep-on-exit` is a debugging option that deliberately leaves owned runner resources running after the supervisor exits.
+
+The supervisor reports when GitHub assigns a job and when the ephemeral runner finishes or is released. GitHub Actions remains the source of truth for whether the job succeeded or failed.
 
 `pool up` is the lower-level command for a prepared image or template. While no supervisor is running, EPAR cannot retire completed ephemeral runners or create replacements.
 
@@ -58,10 +60,11 @@ Use `cleanup --no-github` only when you intentionally want to leave GitHub runne
 ephemeral-action-runner storage status
 ephemeral-action-runner storage prune
 ephemeral-action-runner storage prune --execute
+ephemeral-action-runner storage prune --legacy
 ephemeral-action-runner logs prune --dry-run
 ```
 
-`storage prune` is a preview until `--execute` is supplied. Log pruning is a separate retention operation. EPAR does not run broad Docker prune, Docker Sandboxes reset, WSL reset, Docker Desktop reset, or VHDX compaction. Read [Storage](storage.md) before reclaiming capacity.
+Normal `./start` reconciles interrupted exact-owned work and retires unreferenced superseded artifacts. `storage prune` is a preview until `--execute` is supplied. `storage prune --legacy` reports prefix-era resources and requires its displayed plan hash for execution. Log pruning is separate. EPAR does not run broad Docker prune, Docker Sandboxes reset, WSL reset, Docker Desktop reset, or VHDX compaction. Read [Storage](storage.md) before reclaiming capacity.
 
 ## Get help from the right page
 

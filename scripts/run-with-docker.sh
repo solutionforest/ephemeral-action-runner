@@ -26,7 +26,7 @@ fi
 #
 # Usage: scripts/run-with-docker.sh [epar-args...]
 
-image="${GO_DOCKER_IMAGE:-golang:1.25}"
+image="${GO_DOCKER_IMAGE:-golang:latest}"
 dev_image="${EPAR_DEV_IMAGE:-epar-dev-toolchain}"
 gomod_volume="${EPAR_GOMOD_VOLUME:-}"
 gocache_volume="${EPAR_GOCACHE_VOLUME:-}"

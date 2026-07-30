@@ -1,7 +1,9 @@
 package image
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,28 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
+
+func TestDockerSandboxesHelperChecksumsMatchGuestScripts(t *testing.T) {
+	templateRoot := filepath.Join("..", "..", "templates", "docker-sandboxes")
+	content, err := os.ReadFile(filepath.Join(templateRoot, "helpers.sha256"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for lineNumber, line := range strings.Split(strings.TrimSpace(string(content)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || len(fields[0]) != 64 || !strings.HasPrefix(fields[1], "./") {
+			t.Fatalf("helpers.sha256 line %d is malformed: %q", lineNumber+1, line)
+		}
+		guestPath := filepath.Join(templateRoot, "guest", strings.TrimPrefix(fields[1], "./"))
+		guestContent, err := os.ReadFile(guestPath)
+		if err != nil {
+			t.Fatalf("read helper on line %d: %v", lineNumber+1, err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(guestContent)); got != fields[0] {
+			t.Fatalf("helpers.sha256 line %d digest = %s, want %s for %s", lineNumber+1, fields[0], got, guestPath)
+		}
+	}
+}
 
 func TestNormalizeCatthehackerSourceProfilesAndCustomTag(t *testing.T) {
 	for _, test := range []struct {
@@ -49,6 +73,9 @@ func TestDockerSandboxesDockerfileUsesVerifiedLocalDownloadsAndInstallsTrustBefo
 		"COPY inputs/actions-runner.tar.gz /tmp/actions-runner.tar.gz",
 		`echo "${TINI_SHA256#sha256:}  /usr/local/bin/tini" | sha256sum --check -`,
 		`echo "${ACTIONS_RUNNER_SHA256#sha256:}  /tmp/actions-runner.tar.gz" | sha256sum --check -`,
+		"RUNNER_TOOL_CACHE=/opt/actions-runner/_work/_tool",
+		"AGENT_TOOLSDIRECTORY=/opt/actions-runner/_work/_tool",
+		"DOTNET_INSTALL_DIR=/opt/actions-runner/_work/_tool/dotnet",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Docker Sandboxes Dockerfile omitted %q", want)
@@ -58,6 +85,20 @@ func TestDockerSandboxesDockerfileUsesVerifiedLocalDownloadsAndInstallsTrustBefo
 	customInstall := strings.Index(text, "/opt/epar/custom-install/run.sh")
 	if trustInstall < 0 || customInstall < 0 || trustInstall >= customInstall {
 		t.Fatalf("runner trust must be installed before custom scripts:\n%s", text)
+	}
+	runnerScript, err := os.ReadFile(filepath.Join("..", "..", "templates", "docker-sandboxes", "guest", "run-runner.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`tool_cache="${EPAR_RUNNER_TOOL_CACHE:-${runner_dir}/_work/_tool}"`,
+		`"RUNNER_TOOL_CACHE=${tool_cache}"`,
+		`"AGENT_TOOLSDIRECTORY=${tool_cache}"`,
+		`"DOTNET_INSTALL_DIR=${tool_cache}/dotnet"`,
+	} {
+		if !strings.Contains(string(runnerScript), want) {
+			t.Fatalf("Docker Sandboxes runner script omitted %q", want)
+		}
 	}
 }
 
@@ -87,50 +128,44 @@ func TestDockerSandboxesDisabledTrustPolicyIsExplicit(t *testing.T) {
 	}
 }
 
-func TestSelectBuildxSBOMAttachmentUsesExactAttestationChain(t *testing.T) {
-	attestationDigest := "sha256:" + strings.Repeat("a", 64)
-	sbomDigest := "sha256:" + strings.Repeat("b", 64)
-	index := []byte(`{
-		"manifests": [
-			{"digest": "sha256:` + strings.Repeat("c", 64) + `", "annotations": {}},
-			{"digest": "` + attestationDigest + `", "annotations": {"vnd.docker.reference.type": "attestation-manifest"}}
-		]
-	}`)
-	gotAttestation, err := selectBuildxAttestationDigest(index)
+func TestReadVerifiedBuildEvidenceRequiresStableBoundedRegularFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "evidence.json")
+	if err := os.WriteFile(path, []byte(`{"ok":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content, err := readVerifiedBuildEvidence(path, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotAttestation != attestationDigest {
-		t.Fatalf("attestation digest = %q, want %q", gotAttestation, attestationDigest)
+	if string(content) != `{"ok":true}` {
+		t.Fatalf("evidence = %q", content)
 	}
-	manifest := []byte(`{
-		"layers": [
-			{"mediaType": "application/vnd.in-toto+json", "digest": "` + sbomDigest + `", "size": 216579021, "annotations": {"in-toto.io/predicate-type": "https://spdx.dev/Document"}},
-			{"mediaType": "application/vnd.in-toto+json", "digest": "sha256:` + strings.Repeat("d", 64) + `", "size": 123, "annotations": {"in-toto.io/predicate-type": "https://slsa.dev/provenance/v1"}}
-		]
-	}`)
-	gotSBOM, gotSize, err := selectBuildxSBOMDigest(manifest)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := readVerifiedBuildEvidence(path, 4); err == nil {
+		t.Fatal("oversized evidence was accepted")
 	}
-	if gotSBOM != sbomDigest || gotSize != 216579021 {
-		t.Fatalf("SBOM attachment = %q/%d, want %q/%d", gotSBOM, gotSize, sbomDigest, 216579021)
+	link := filepath.Join(root, "evidence-link.json")
+	if err := os.Symlink(path, link); err == nil {
+		if _, err := readVerifiedBuildEvidence(link, 64); err == nil {
+			t.Fatal("symlinked evidence was accepted")
+		}
 	}
 }
 
-func TestDockerContentBlobCandidatesAreExactAndContentAddressed(t *testing.T) {
-	digest := "sha256:" + strings.Repeat("a", 64)
-	candidates := dockerContentBlobCandidates(digest)
-	if len(candidates) != 2 {
-		t.Fatalf("candidate count = %d, want 2", len(candidates))
+func TestProvenanceValidatorsRequireMaxBuildxAndInTotoSLSAContracts(t *testing.T) {
+	buildx := []byte(`{"buildType":"https://mobyproject.org/buildkit@v1","materials":[{"uri":"pkg:docker/example"}],"invocation":{"parameters":{"frontend":"gateway.v0"}}}`)
+	if err := validateBuildxMaxProvenance(buildx); err != nil {
+		t.Fatal(err)
 	}
-	for _, candidate := range candidates {
-		if !strings.HasPrefix(candidate, "/var/lib/") || !strings.HasSuffix(candidate, "/blobs/sha256/"+strings.Repeat("a", 64)) {
-			t.Fatalf("unsafe Docker content candidate %q", candidate)
-		}
+	if err := validateBuildxMaxProvenance([]byte(`{"buildType":"buildkit","materials":[],"invocation":{}}`)); err == nil {
+		t.Fatal("incomplete Buildx provenance was accepted")
 	}
-	if candidates[0] == candidates[1] {
-		t.Fatal("Docker Desktop and native Engine content candidates must differ")
+	statement := []byte(`{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"software-inventory.txt"}],"predicate":{"buildDefinition":{}}}`)
+	if err := validateInTotoProvenance(statement); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInTotoProvenance([]byte(`{"_type":"https://in-toto.io/Statement/v1","predicateType":"unknown","subject":[],"predicate":{}}`)); err == nil {
+		t.Fatal("invalid in-toto provenance was accepted")
 	}
 }
 
@@ -246,11 +281,16 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 		ImmutableReference:   "ghcr.io/catthehacker/ubuntu@sha256:" + strings.Repeat("b", 64),
 		IndexDigest:          "sha256:" + strings.Repeat("b", 64),
 		PlatformDigest:       "sha256:" + strings.Repeat("c", 64),
-		Platform:             "linux/arm64",
+		Platform:             "linux/amd64",
 		CompressedLayerBytes: 123,
 	}
+	fixturePath, templateDigest, _ := writeDockerArchiveFixture(t, false, false)
 	archivePath := filepath.Join(root, "runner-template.tar")
-	if err := os.WriteFile(archivePath, []byte("verified archive"), 0o600); err != nil {
+	fixtureContent, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archivePath, fixtureContent, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	archiveSHA, archiveBytes, err := hashFile(archivePath)
@@ -265,10 +305,9 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 		Source:        source,
 		Artifacts:     make(map[string]artifactEvidence),
 	}
-	templateDigest := "sha256:" + strings.Repeat("d", 64)
-	metadata.Template.Tag = "docker.io/library/epar-docker-sandboxes-catthehacker-full-latest:test-arm64"
+	metadata.Template.Tag = "docker.io/library/epar-template:test-amd64"
 	metadata.Template.Digest = templateDigest
-	metadata.Template.CacheID = strings.Repeat("d", 12)
+	metadata.Template.CacheID = strings.TrimPrefix(templateDigest, "sha256:")[:12]
 	metadata.Template.RootDisk = "90GiB"
 	metadata.Template.Archive = filepath.Base(archivePath)
 	metadata.Template.ArchiveSHA256 = archiveSHA
@@ -277,10 +316,19 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	metadata.Compatibility.RunnerExecution = "direct-actions-listener"
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
-	for _, name := range []string{"buildMetadata", "provenance", "sbom", "softwareInventory", "compatibility"} {
+	if err := writeJSONFile(filepath.Join(root, "buildMetadata.json"), dockerSandboxesBuildMetadata{
+		ImageDigest: templateDigest,
+		Provenance:  json.RawMessage(`{}`),
+		BuildRef:    strings.Repeat("b", 12),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"buildMetadata", "attestationMetadata", "provenance", "sbom", "softwareInventory", "compatibility"} {
 		path := filepath.Join(root, name+".json")
-		if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
-			t.Fatal(err)
+		if name != "buildMetadata" {
+			if err := os.WriteFile(path, []byte(name), 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
 		digest, _, err := hashFile(path)
 		if err != nil {
@@ -296,7 +344,7 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !valid || artifact.Digest != templateDigest || artifact.Platform != "linux/arm64" || artifact.RootDisk != "90GiB" {
+	if !valid || artifact.Digest != templateDigest || artifact.Platform != "linux/amd64" || artifact.RootDisk != "90GiB" {
 		t.Fatalf("verified artifact = %+v, valid=%t", artifact, valid)
 	}
 
@@ -309,5 +357,39 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	}
 	if valid {
 		t.Fatal("corrupted evidence was accepted for interrupted-build resume")
+	}
+}
+
+func TestDockerSandboxesBuildUsesDirectArchiveAndInventoryTargets(t *testing.T) {
+	sourcePath := filepath.Join("docker_sandboxes.go")
+	content, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	for _, required := range []string{
+		`"--target", "runner-template", "--output", "type=docker,dest=" + partialArchivePath`,
+		`"--provenance=false", "--sbom=false"`,
+		`"--target", "software-inventory-export", "--output", "type=local,dest=" + evidenceExportRoot`,
+		`"--provenance", "mode=max", "--sbom", "generator=" + platformLock.SBOMGeneratorReference`,
+		`"-attestation.docker-build.log"`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Docker Sandboxes build path omitted %q", required)
+		}
+	}
+	for _, forbidden := range []string{`"--load"`, `"image", "save"`, `"image", "load"`, `"image", "inspect"`, `"type=image,push=false"`} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("Docker Sandboxes build path retained forbidden Docker staging operation %q", forbidden)
+		}
+	}
+	dockerfile, err := os.ReadFile(filepath.Join("..", "..", "templates", "docker-sandboxes", "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"AS runner-template", "ARG BUILDKIT_SBOM_SCAN_STAGE=true", "AS software-inventory-export"} {
+		if !strings.Contains(string(dockerfile), required) {
+			t.Fatalf("Dockerfile omitted %q", required)
+		}
 	}
 }

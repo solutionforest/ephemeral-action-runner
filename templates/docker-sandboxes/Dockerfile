@@ -14,8 +14,9 @@ RUN echo "${HOOK_LAUNCHER_SHA256}  /src/main.go" | sha256sum --check - \
     && install -d -m 0755 /out \
     && CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" GOTOOLCHAIN=local go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/epar-hook-bash /src/main.go
 
-FROM --platform=${TEMPLATE_PLATFORM} ${SOURCE_IMAGE}
+FROM --platform=${TEMPLATE_PLATFORM} ${SOURCE_IMAGE} AS runner-template
 
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
 ARG TEMPLATE_PLATFORM
 ARG SOURCE_IMAGE
 ARG TARGETPLATFORM
@@ -55,7 +56,7 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && /opt/epar/prepare-template.sh \
     && /opt/epar/install-trusted-ca-certificates.sh \
     && rm -rf /opt/actions-runner \
-    && install -d -m 0755 -o agent -g agent /opt/actions-runner /var/log/actions-runner \
+    && install -d -m 0755 -o agent -g agent /opt/actions-runner /opt/actions-runner/_work /opt/actions-runner/_work/_tool /var/log/actions-runner \
     && tar -xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner \
     && rm -f /tmp/actions-runner.tar.gz \
     && chown -R agent:agent /opt/actions-runner /var/log/actions-runner \
@@ -67,6 +68,9 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
 ENV HOME=/home/agent \
     USER=agent \
     LOGNAME=agent \
+    RUNNER_TOOL_CACHE=/opt/actions-runner/_work/_tool \
+    AGENT_TOOLSDIRECTORY=/opt/actions-runner/_work/_tool \
+    DOTNET_INSTALL_DIR=/opt/actions-runner/_work/_tool/dotnet \
     EPAR_ACTIONS_RUNNER_DIR=/opt/actions-runner \
     EPAR_RUNNER_WORK_DIR=/opt/actions-runner \
     EPAR_TEMPLATE_PLATFORM=${TEMPLATE_PLATFORM} \
@@ -90,3 +94,11 @@ WORKDIR /home/agent
 USER agent
 ENTRYPOINT ["/usr/local/bin/tini", "-g", "--", "/opt/epar/template-entrypoint.sh"]
 CMD ["sleep", "infinity"]
+
+FROM runner-template AS software-inventory
+USER root
+RUN install -d -m 0755 /out \
+    && /opt/epar/collect-software-inventory.sh > /out/software-inventory.txt
+
+FROM scratch AS software-inventory-export
+COPY --from=software-inventory /out/software-inventory.txt /software-inventory.txt

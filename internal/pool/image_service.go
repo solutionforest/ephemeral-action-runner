@@ -52,7 +52,9 @@ var (
 )
 
 func (m *Manager) imageCoordinator() *artifactimage.Coordinator {
-	return artifactimage.NewCoordinator(m.Config, m.Provider, m.Lifecycle, m.ProjectRoot, m.DryRun, imageEnvironment{manager: m})
+	coordinator := artifactimage.NewCoordinator(m.Config, m.Provider, m.Lifecycle, m.ProjectRoot, m.DryRun, imageEnvironment{manager: m})
+	coordinator.ConfigPath = m.ConfigPath
+	return coordinator
 }
 
 func (m *Manager) UpdateUpstream(ctx context.Context) error {
@@ -64,7 +66,29 @@ func (m *Manager) BuildImage(ctx context.Context, options ImageBuildOptions) err
 }
 
 func (m *Manager) EnsureImage(ctx context.Context) error {
-	return m.imageCoordinator().EnsureImage(ctx)
+	m.imageEnsureMu.Lock()
+	defer m.imageEnsureMu.Unlock()
+	if m.imageEnsured {
+		return nil
+	}
+	if err := m.imageCoordinator().EnsureImage(ctx); err != nil {
+		return err
+	}
+	if m.Config.Provider.Type == "docker-container" && !m.DryRun {
+		identity, err := runHostOutputCommand(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", m.Config.Image.OutputImage)
+		if err != nil {
+			return fmt.Errorf("resolve immutable Docker Container runtime image: %w", err)
+		}
+		identity = strings.TrimSpace(identity)
+		if identity == "" {
+			return fmt.Errorf("Docker Container runtime image returned an empty immutable identity")
+		}
+		// Keep user configuration as the desired mutable name while the live
+		// manager and all replacements consume the exact verified image ID.
+		m.Config.Provider.SourceImage = identity
+	}
+	m.imageEnsured = true
+	return nil
 }
 
 func (m *Manager) RefreshScripts(ctx context.Context) error {
@@ -217,6 +241,10 @@ func (environment imageEnvironment) RunHostLogged(ctx context.Context, logPath, 
 	return environment.manager.runHostLogged(ctx, logPath, name, args...)
 }
 
+func (environment imageEnvironment) RunHostBuildxLogged(ctx context.Context, logPath, name string, args ...string) error {
+	return environment.manager.runHostBuildxLogged(ctx, logPath, name, args...)
+}
+
 func (environment imageEnvironment) RunHost(ctx context.Context, name string, args ...string) error {
 	return runHostCommand(ctx, name, args...)
 }
@@ -277,11 +305,11 @@ func (environment imageEnvironment) LogWarn(message string, args ...any) {
 	environment.manager.logger().Warn(message, args...)
 }
 
-func (environment imageEnvironment) DockerPullProgressTerminal() bool {
+func (environment imageEnvironment) ProgressTerminal() bool {
 	return dockerPullProgressTerminal()
 }
 
-func (environment imageEnvironment) DockerPullProgressConsole() io.Writer {
+func (environment imageEnvironment) ProgressConsole() io.Writer {
 	return dockerPullProgressConsole
 }
 

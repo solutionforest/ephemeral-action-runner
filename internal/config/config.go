@@ -243,7 +243,7 @@ func Default() Config {
 			GracePeriod:           "168h",
 			KeepPrevious:          0,
 			AutomaticHousekeeping: StorageHousekeepingConservative,
-			BuildCacheLimit:       "64GiB",
+			BuildCacheLimit:       "20GiB",
 			GoCacheLimit:          "10GiB",
 		},
 		Logging: LoggingConfig{

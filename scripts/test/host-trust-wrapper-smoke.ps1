@@ -70,6 +70,8 @@ image:
 
     $bridge = Start-EparHostTrustBridge -ProjectRoot $ProjectRoot -Command pool -Arguments @('pool', 'up', '--config', $config)
     if (-not $bridge.WatchProcess -or $bridge.WatchProcess.HasExited) { throw 'Windows host-trust watcher did not start' }
+    $publishedFeed = Join-Path $bridge.RunnerFeedDir 'current.json'
+    $firstPublishedAt = (Get-Content -LiteralPath $publishedFeed -Raw | ConvertFrom-Json).generatedAt
     $liveLock = $bridge.FeedDir + '.lock'
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     while (-not (Test-Path -LiteralPath $liveLock -PathType Container) -and [DateTime]::UtcNow -lt $deadline) {
@@ -79,6 +81,13 @@ image:
     $lockRejected = $false
     try { & $helper sync -ProjectRoot $ProjectRoot -Config $config *> $null } catch { $lockRejected = $true }
     if (-not $lockRejected) { throw 'second controller unexpectedly acquired the live Windows wrapper lock' }
+    $refreshDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    $refreshedPublishedAt = $firstPublishedAt
+    while ($refreshedPublishedAt -eq $firstPublishedAt -and [DateTime]::UtcNow -lt $refreshDeadline) {
+        Start-Sleep -Milliseconds 250
+        $refreshedPublishedAt = (Get-Content -LiteralPath $publishedFeed -Raw | ConvertFrom-Json).generatedAt
+    }
+    if ($refreshedPublishedAt -eq $firstPublishedAt) { throw 'Windows host-trust watcher did not refresh its published feed' }
     Stop-EparHostTrustBridge -Bridge $bridge
     $bridge = $null
     if (Test-Path -LiteralPath $liveLock) { throw 'Windows wrapper shutdown left its singleton lock behind' }

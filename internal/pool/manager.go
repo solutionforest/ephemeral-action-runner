@@ -40,6 +40,7 @@ type Manager struct {
 	Logging                  *logging.Runtime
 	AllowInsufficientStorage bool
 	StorageOverrideCommand   string
+	AutomaticImageLifecycle  bool
 	// AcknowledgeFailedDiagnostics permits the explicit cleanup command to
 	// dispose an exact retained sandbox after the operator has captured the
 	// durable failed-diagnostics evidence. Normal startup and automatic cleanup
@@ -53,6 +54,8 @@ type Manager struct {
 	buildTrustResolver    func(context.Context) (hosttrust.Snapshot, error)
 	hostTrustImageEnsurer func(context.Context) error
 	hostTrustImageMu      sync.Mutex
+	imageEnsureMu         sync.Mutex
+	imageEnsured          bool
 	now                   func() time.Time
 	randomFloat64         func() float64
 }
@@ -100,6 +103,13 @@ const (
 	LifecycleCleanupPending LifecyclePhase = "cleanup-pending"
 )
 
+const (
+	runnerProcessRunningSentinel      = "EPAR_RUNNER_PROCESS=running"
+	runnerProcessStoppedSentinel      = "EPAR_RUNNER_PROCESS=stopped"
+	runnerProcessInactiveReason       = "actions runner process is confirmed inactive"
+	runnerConfirmedInactiveCheckLimit = 2
+)
+
 type ProvisionedInstance struct {
 	Name                string
 	IP                  string
@@ -142,6 +152,16 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	}
 	if controllerLock != nil {
 		defer controllerLock.Close()
+	}
+	stopStorageLease, err := m.startStorageCatalogControllerLease()
+	if err != nil {
+		return err
+	}
+	defer stopStorageLease()
+	if m.AutomaticImageLifecycle {
+		if err := m.EnsureImage(ctx); err != nil {
+			return fmt.Errorf("ensure current provider artifact before verification: %w", err)
+		}
 	}
 	opts.Instances = m.requestedInstances(opts.Instances)
 	names := RunnerNames(m.Config.Pool.NamePrefix, opts.Instances, time.Now())
@@ -226,6 +246,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		}
 		if controllerLock != nil {
 			defer controllerLock.Close()
+		}
+	}
+	stopStorageLease, err := m.startStorageCatalogControllerLease()
+	if err != nil {
+		return err
+	}
+	defer stopStorageLease()
+	if m.AutomaticImageLifecycle {
+		if err := m.EnsureImage(ctx); err != nil {
+			return fmt.Errorf("ensure current provider artifact before pool startup: %w", err)
 		}
 	}
 	opts.Instances = m.requestedInstances(opts.Instances)
@@ -314,6 +344,8 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	nextRetention := time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 	nextHostTrustCollection := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
+	hostTrustBusyHandoff := make(map[string]bool)
+	confirmedInactiveChecks := make(map[string]int)
 	retry := replacementRetryState{}
 	for {
 		select {
@@ -344,7 +376,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							// receive a mismatching lease so no subsequent job can start.
 							currentHostTrust = current
 							if !dependencyCooldown {
-								trustRetired += m.reconcileHostTrustRunners(ctx, active, current)
+								trustRetired += m.reconcileHostTrustRunners(ctx, active, current, hostTrustBusyHandoff)
 							}
 							m.infof("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
 							ready = false
@@ -380,7 +412,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					}
 				}
 				if currentHostTrust.Generation != "" && !dependencyCooldown {
-					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust)
+					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust, hostTrustBusyHandoff)
 				}
 			}
 			if dependencyCooldown {
@@ -396,11 +428,21 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				for name, vm := range active {
 					alive, reason, err := m.runnerAlive(ctx, vm)
 					if err != nil {
-						m.logger().Warn("liveness check failed", "provider", m.Config.Provider.Type, "instance", name, "operation", "liveness-check", "error", err)
+						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
+						m.warnf("[%s] runner health is temporarily unknown; keeping the runner and retrying: %v\n", name, err)
 						continue
 					}
 					if alive {
+						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, nil)
 						continue
+					}
+					confirmedCount, retire := recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, nil)
+					if !retire {
+						m.warnf("[%s] runner process is confirmed inactive (%d/%d); EPAR will verify once more before cleanup\n", name, confirmedCount, runnerConfirmedInactiveCheckLimit)
+						continue
+					}
+					if reason == runnerProcessInactiveReason {
+						m.captureRunnerReadinessDiagnostics(name, vm.GuestLogPath)
 					}
 					m.infof("[%s] runner is finished or unhealthy: %s\n", name, reason)
 					if err := m.retireInstance(context.Background(), vm, reason); err != nil {
@@ -408,6 +450,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						continue
 					}
 					delete(active, name)
+					delete(confirmedInactiveChecks, name)
 				}
 			}
 			var reconcileErr error
@@ -621,7 +664,13 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			continue
 		}
 		alive, _, processErr := m.runnerProcessAlive(ctx, vm)
-		if processErr == nil && alive {
+		if processErr != nil {
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			m.warnf("[%s] reconciliation could not verify the Actions runner process; preserving the exact instance in quarantine: %v\n", name, processErr)
+			continue
+		}
+		if alive {
 			vm.Phase = LifecycleQuarantined
 			reconciled[name] = vm
 			continue
@@ -1601,23 +1650,62 @@ func (m *Manager) runnerAlive(ctx context.Context, vm ProvisionedInstance) (bool
 	return m.runnerProcessAlive(ctx, vm)
 }
 
+func recordRunnerLiveness(confirmedInactive map[string]int, name string, alive bool, reason string, err error) (int, bool) {
+	if err != nil || alive {
+		delete(confirmedInactive, name)
+		return 0, false
+	}
+	if reason != runnerProcessInactiveReason {
+		delete(confirmedInactive, name)
+		return 0, true
+	}
+	confirmedInactive[name]++
+	return confirmedInactive[name], confirmedInactive[name] >= runnerConfirmedInactiveCheckLimit
+}
+
 func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
-	if err := m.checkRunnerProcess(ctx, vm.Name); err != nil {
-		return false, "actions runner process is no longer active", nil
+	running, err := m.probeRunnerProcess(ctx, vm.Name)
+	if err != nil {
+		return true, "runner process health could not be measured", err
+	}
+	if !running {
+		return false, runnerProcessInactiveReason, nil
 	}
 	return true, "", nil
 }
 
 func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
+	running, err := m.probeRunnerProcess(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !running {
+		return fmt.Errorf(runnerProcessInactiveReason)
+	}
+	return nil
+}
+
+func (m *Manager) probeRunnerProcess(ctx context.Context, name string) (bool, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, err := m.execGuest(checkCtx, name, provider.ShellCommand("if test -x /opt/epar/check-runner.sh; then sudo bash /opt/epar/check-runner.sh; else systemctl is-active --quiet actions-runner.service; fi"), provider.ExecOptions{})
-	return err
+	script := fmt.Sprintf("if test -x /opt/epar/check-runner.sh; then if sudo bash /opt/epar/check-runner.sh; then printf '%%s\\n' %s; else printf '%%s\\n' %s; fi; elif systemctl is-active --quiet actions-runner.service; then printf '%%s\\n' %s; else printf '%%s\\n' %s; fi", shellQuote(runnerProcessRunningSentinel), shellQuote(runnerProcessStoppedSentinel), shellQuote(runnerProcessRunningSentinel), shellQuote(runnerProcessStoppedSentinel))
+	result, err := m.execGuest(checkCtx, name, provider.ShellCommand(script), provider.ExecOptions{SuppressTranscript: true})
+	if err != nil {
+		return false, fmt.Errorf("execute runner process health probe: %w", err)
+	}
+	switch strings.TrimSpace(result.Stdout) {
+	case runnerProcessRunningSentinel:
+		return true, nil
+	case runnerProcessStoppedSentinel:
+		return false, nil
+	default:
+		return false, fmt.Errorf("runner process health probe returned an unsupported response")
+	}
 }
 
 func isTransientGitHubLivenessError(err error) bool {
 	var httpErr *gh.HTTPError
-	return errors.As(err, &httpErr) && httpErr.StatusCode >= http.StatusInternalServerError
+	return errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= http.StatusInternalServerError)
 }
 
 func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, reason string) error {
@@ -1740,15 +1828,17 @@ func (m *Manager) execGuest(ctx context.Context, name string, cmd []string, opts
 	if timeout <= 0 {
 		timeout = 15 * time.Minute
 	}
-	if opts.LogPath == "" {
-		opts.LogPath = m.instanceLogPath(name, ".guest.log")
+	if !opts.SuppressTranscript {
+		if opts.LogPath == "" {
+			opts.LogPath = m.instanceLogPath(name, ".guest.log")
+		}
+		transcript, err := m.transcript(opts.LogPath, name, transcriptComponent(opts.LogPath))
+		if err != nil {
+			return provider.ExecResult{}, err
+		}
+		opts.Stdout = transcript.Stdout
+		opts.Stderr = transcript.Stderr
 	}
-	transcript, err := m.transcript(opts.LogPath, name, transcriptComponent(opts.LogPath))
-	if err != nil {
-		return provider.ExecResult{}, err
-	}
-	opts.Stdout = transcript.Stdout
-	opts.Stderr = transcript.Stderr
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if m.Lifecycle != nil {

@@ -60,7 +60,7 @@ func TestCollectTemplatesStrictIntegrityValidation(t *testing.T) {
 	}
 }
 
-func TestCollectTemplatesConfiguredIdentityAndActivation(t *testing.T) {
+func TestCollectTemplatesDoesNotRetainArchiveForImportedTemplate(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
@@ -86,10 +86,10 @@ func TestCollectTemplatesConfiguredIdentityAndActivation(t *testing.T) {
 	}
 	currentArtifact := findArtifactByArchiveDigest(t, artifacts, current.ArchiveSHA256)
 	oldArtifact := findArtifactByArchiveDigest(t, artifacts, old.ArchiveSHA256)
-	if !currentArtifact.Current || !hasProtection(currentArtifact, storage.ProtectionConfiguration) {
-		t.Fatalf("current artifact = %+v", currentArtifact)
+	if currentArtifact.Current || hasProtection(currentArtifact, storage.ProtectionConfiguration) {
+		t.Fatalf("imported-template selection retained its transient archive = %+v", currentArtifact)
 	}
-	if oldArtifact.SupersededAt == nil || !oldArtifact.SupersededAt.Equal(now.Add(-9*24*time.Hour)) || !hasProtection(oldArtifact, storage.ProtectionPromotion) {
+	if oldArtifact.SupersededAt != nil || !hasProtection(oldArtifact, storage.ProtectionPromotion) {
 		t.Fatalf("old artifact = %+v", oldArtifact)
 	}
 }

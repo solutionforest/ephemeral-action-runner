@@ -29,12 +29,6 @@ func TestRunPreflightPassesEveryIndependentGateWithExactReadOnlyArgv(t *testing.
 			}
 			return append([]byte(nil), output...), nil
 		},
-		InspectTemplate: func(_ context.Context, reference string) (string, error) {
-			if reference != record.Template {
-				t.Fatalf("inspected template = %q, want %q", reference, record.Template)
-			}
-			return record.TemplateDigest, nil
-		},
 		HostSpace: func(path string) (HostSpace, error) {
 			if path != storageRoot {
 				t.Fatalf("capacity path = %q, want provider storage %q", path, storageRoot)
@@ -141,15 +135,6 @@ func TestRunPreflightFailsClosedForEveryAdmissionGate(t *testing.T) {
 			},
 		},
 		{
-			name: "full template evidence",
-			gate: "promoted template evidence",
-			edit: func(_ *Record, _ map[string][]byte, opts *PreflightOptions) {
-				opts.InspectTemplate = func(context.Context, string) (string, error) {
-					return "sha256:" + strings.Repeat("9", 64), nil
-				}
-			},
-		},
-		{
 			name: "policy",
 			gate: "promoted policy",
 			edit: func(record *Record, _ map[string][]byte, _ *PreflightOptions) {
@@ -170,9 +155,6 @@ func TestRunPreflightFailsClosedForEveryAdmissionGate(t *testing.T) {
 				NativeController:   true,
 				ControllerRevision: record.EPARRevision,
 				RunSBX:             fixtureCommandRunner(outputs),
-				InspectTemplate: func(context.Context, string) (string, error) {
-					return record.TemplateDigest, nil
-				},
 				HostSpace: func(string) (HostSpace, error) {
 					return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
 				},
@@ -209,9 +191,6 @@ func TestRunPreflightAcceptsDiagnosticWarningsAndSkips(t *testing.T) {
 				NativeController:   true,
 				ControllerRevision: record.EPARRevision,
 				RunSBX:             fixtureCommandRunner(outputs),
-				InspectTemplate: func(context.Context, string) (string, error) {
-					return record.TemplateDigest, nil
-				},
 				HostSpace: func(string) (HostSpace, error) {
 					return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
 				},
@@ -234,9 +213,6 @@ func TestRunPreflightDiagnosticFailureExplainsHowToInspectHints(t *testing.T) {
 		NativeController:   true,
 		ControllerRevision: record.EPARRevision,
 		RunSBX:             fixtureCommandRunner(outputs),
-		InspectTemplate: func(context.Context, string) (string, error) {
-			return record.TemplateDigest, nil
-		},
 		HostSpace: func(string) (HostSpace, error) {
 			return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
 		},
@@ -259,9 +235,6 @@ func TestRunPreflightDoesNotInferVirtualizationFromDiagnostics(t *testing.T) {
 		NativeController:   true,
 		ControllerRevision: record.EPARRevision,
 		RunSBX:             fixtureCommandRunner(outputs),
-		InspectTemplate: func(context.Context, string) (string, error) {
-			return record.TemplateDigest, nil
-		},
 		HostSpace: func(string) (HostSpace, error) {
 			return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
 		},

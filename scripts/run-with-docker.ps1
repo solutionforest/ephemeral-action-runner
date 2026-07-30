@@ -31,7 +31,7 @@ if ($env:EPAR_LEGACY_CONTROLLER_IN_DOCKER -ne '1') {
     exit $nativeExitCode
 }
 
-$Image = if ($env:GO_DOCKER_IMAGE) { $env:GO_DOCKER_IMAGE } else { "golang:1.25" }
+$Image = if ($env:GO_DOCKER_IMAGE) { $env:GO_DOCKER_IMAGE } else { "golang:latest" }
 $DevImage = if ($env:EPAR_DEV_IMAGE) { $env:EPAR_DEV_IMAGE } else { "epar-dev-toolchain" }
 $DockerSock = if ($env:EPAR_DOCKER_SOCK) { $env:EPAR_DOCKER_SOCK } else { "/var/run/docker.sock" }
 $OriginalDockerCliHintsExists = Test-Path Env:DOCKER_CLI_HINTS

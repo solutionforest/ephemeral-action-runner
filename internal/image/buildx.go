@@ -21,7 +21,10 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 )
 
-const buildxMetadataSchemaVersion = 2
+const (
+	buildxMetadataSchemaVersion = 3
+	buildkitImageReference      = "moby/buildkit:buildx-stable-1"
+)
 
 type BuildxMetadata struct {
 	SchemaVersion     int       `json:"schemaVersion"`
@@ -35,6 +38,7 @@ type BuildxMetadata struct {
 	CertificateBundle string    `json:"certificateBundle,omitempty"`
 	CertificateSHA256 string    `json:"certificateSha256,omitempty"`
 	RegistryHosts     []string  `json:"registryHosts,omitempty"`
+	BuildKitImageID   string    `json:"buildkitImageId,omitempty"`
 	CreatedAt         time.Time `json:"createdAt"`
 	LastReconciledAt  time.Time `json:"lastReconciledAt,omitempty"`
 }
@@ -52,7 +56,7 @@ func LoadBuildxMetadata(projectRoot string) (BuildxMetadata, error) {
 	if err := json.Unmarshal(content, &metadata); err != nil {
 		return BuildxMetadata{}, err
 	}
-	if (metadata.SchemaVersion != 1 && metadata.SchemaVersion != buildxMetadataSchemaVersion) || metadata.Builder == "" || metadata.Driver != "docker-container" || metadata.ProjectRoot == "" || metadata.ConfigPath == "" {
+	if (metadata.SchemaVersion < 1 || metadata.SchemaVersion > buildxMetadataSchemaVersion) || metadata.Builder == "" || metadata.Driver != "docker-container" || metadata.ProjectRoot == "" || metadata.ConfigPath == "" {
 		return BuildxMetadata{}, fmt.Errorf("invalid EPAR Buildx ownership metadata")
 	}
 	return metadata, nil
@@ -71,11 +75,19 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 	builder := buildxBuilderName(m.ProjectRoot)
 	cacheLimit := strings.TrimSpace(m.Config.Storage.BuildCacheLimit)
 	if cacheLimit == "" {
-		cacheLimit = "64GiB"
+		cacheLimit = "20GiB"
 	}
 	limitBytes, err := config.ParseByteSize(cacheLimit)
 	if err != nil {
 		return "", fmt.Errorf("parse storage.buildCacheLimit: %w", err)
+	}
+	effectiveLimit, err := m.effectiveProjectBuildCacheLimit()
+	if err != nil {
+		return "", fmt.Errorf("resolve shared EPAR BuildKit cache limit: %w", err)
+	}
+	if effectiveLimit < uint64(limitBytes) {
+		limitBytes = int64(effectiveLimit)
+		cacheLimit = strconv.FormatUint(effectiveLimit, 10) + "B"
 	}
 	registryHosts, err := buildRegistryHosts(registryReferences)
 	if err != nil {
@@ -84,6 +96,35 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 	if m.DryRun {
 		m.infof("[dry-run] ensure EPAR-owned Buildx builder %s with cache limit %s for registries %s\n", builder, cacheLimit, strings.Join(registryHosts, ", "))
 		return builder, nil
+	}
+	var buildKitImageID string
+	if err := func() error {
+		backendID, releaseBackend, acquireErr := m.acquireDockerBackendLock(ctx)
+		if acquireErr != nil {
+			return acquireErr
+		}
+		defer releaseBackend()
+		previousBuildKitImageID := ""
+		if output, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", buildkitImageReference); inspectErr == nil {
+			previousBuildKitImageID = strings.TrimSpace(output)
+		}
+		if journalErr := m.beginDockerRoleAcquisition(backendID, "buildkit-image", buildkitImageReference, previousBuildKitImageID, time.Now().UTC()); journalErr != nil {
+			return fmt.Errorf("journal EPAR BuildKit image acquisition: %w", journalErr)
+		}
+		if pullErr := m.runHost(ctx, "docker", "pull", buildkitImageReference); pullErr != nil {
+			return fmt.Errorf("resolve EPAR BuildKit image %s: %w", buildkitImageReference, pullErr)
+		}
+		output, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", buildkitImageReference)
+		if inspectErr != nil {
+			return fmt.Errorf("read EPAR BuildKit image identity: %w", inspectErr)
+		}
+		buildKitImageID = strings.TrimSpace(output)
+		if recordErr := m.recordDockerRoleAcquisition(ctx, "buildkit-image", buildkitImageReference, previousBuildKitImageID, buildKitImageID, time.Now().UTC()); recordErr != nil {
+			return fmt.Errorf("record EPAR BuildKit image acquisition: %w", recordErr)
+		}
+		return nil
+	}(); err != nil {
+		return "", err
 	}
 	trust, err := m.resolveBuildTrust(ctx)
 	if err != nil {
@@ -113,6 +154,7 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 		CertificateBundle: certificatePath,
 		CertificateSHA256: hex.EncodeToString(bundleSHA[:]),
 		RegistryHosts:     registryHosts,
+		BuildKitImageID:   buildKitImageID,
 	}
 	storageDirectory := filepath.Join(m.ProjectRoot, ".local", "storage")
 	if err := validateRegularParent(storageDirectory, m.ProjectRoot); err != nil {
@@ -158,7 +200,7 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 	}
 
 	if inspectErr != nil {
-		if err := m.runHost(ctx, "docker", "buildx", "create", "--name", builder, "--driver", "docker-container", "--buildkitd-config", configPath); err != nil {
+		if err := m.runHost(ctx, "docker", "buildx", "create", "--name", builder, "--driver", "docker-container", "--driver-opt", "image="+buildkitImageReference, "--buildkitd-config", configPath); err != nil {
 			return "", fmt.Errorf("create EPAR Buildx builder %q: %w", builder, err)
 		}
 	}
@@ -200,6 +242,7 @@ func buildxMetadataMatches(actual, expected BuildxMetadata) bool {
 		actual.TrustGeneration == expected.TrustGeneration &&
 		filepath.Clean(actual.CertificateBundle) == expected.CertificateBundle &&
 		actual.CertificateSHA256 == expected.CertificateSHA256 &&
+		actual.BuildKitImageID == expected.BuildKitImageID &&
 		sameOrderedStrings(actual.RegistryHosts, expected.RegistryHosts)
 }
 
@@ -249,7 +292,9 @@ func buildkitConfig(cacheLimit uint64, generation, certificatePath string, regis
 	fmt.Fprintf(&content, "# epar-build-trust-generation=%s\n", generation)
 	content.WriteString("[worker.oci]\n")
 	content.WriteString("  gc = true\n")
-	fmt.Fprintf(&content, "  gckeepstorage = %d\n", cacheLimit)
+	fmt.Fprintf(&content, "  reservedSpace = %s\n", strconv.Quote("2GiB"))
+	fmt.Fprintf(&content, "  maxUsedSpace = %s\n", strconv.Quote(strconv.FormatUint(cacheLimit, 10)+"B"))
+	fmt.Fprintf(&content, "  minFreeSpace = %s\n", strconv.Quote("1GiB"))
 	certificatePath = strings.ReplaceAll(filepath.Clean(certificatePath), `\`, "/")
 	for _, host := range registryHosts {
 		fmt.Fprintf(&content, "\n[registry.%s]\n", strconv.Quote(host))
@@ -260,6 +305,13 @@ func buildkitConfig(cacheLimit uint64, generation, certificatePath string, regis
 
 func (m *Coordinator) verifyBuildxConfiguration(ctx context.Context, builder string, expected BuildxMetadata) error {
 	container := buildxControlContainer(builder)
+	imageID, err := m.runHostOutput(ctx, "docker", "inspect", "--format", "{{.Image}}", container)
+	if err != nil {
+		return fmt.Errorf("verify EPAR Buildx builder %q image identity: %w", builder, err)
+	}
+	if strings.TrimSpace(imageID) != expected.BuildKitImageID {
+		return fmt.Errorf("EPAR Buildx builder %q uses image %s, expected %s", builder, strings.TrimSpace(imageID), expected.BuildKitImageID)
+	}
 	content, err := m.runHostOutput(ctx, "docker", "exec", container, "cat", "/etc/buildkit/buildkitd.toml")
 	if err != nil {
 		return fmt.Errorf("verify EPAR Buildx builder %q configuration readback: %w", builder, err)

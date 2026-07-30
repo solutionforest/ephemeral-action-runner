@@ -455,6 +455,11 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 	if err := config.Validate(cfg); err != nil {
 		return nil, err
 	}
+	if !dryRun {
+		if err := importNativeBootstrapAcquisition(projectRoot, resolvedConfigPath, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+	}
 	providerRuntime, err := registry.New(cfg, projectRoot, dryRun)
 	if err != nil {
 		return nil, err
@@ -495,17 +500,18 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 		return nil, err
 	}
 	manager := &pool.Manager{
-		Config:         cfg,
-		Provider:       providerRuntime.Legacy,
-		Lifecycle:      providerRuntime.Lifecycle,
-		PolicyManager:  providerRuntime.PolicyManager,
-		Storage:        providerRuntime.Storage,
-		LifecycleState: lifecycleState,
-		GitHub:         client,
-		ProjectRoot:    projectRoot,
-		ConfigPath:     resolvedConfigPath,
-		DryRun:         dryRun,
-		Logging:        runtime,
+		Config:                  cfg,
+		Provider:                providerRuntime.Legacy,
+		Lifecycle:               providerRuntime.Lifecycle,
+		PolicyManager:           providerRuntime.PolicyManager,
+		Storage:                 providerRuntime.Storage,
+		LifecycleState:          lifecycleState,
+		GitHub:                  client,
+		ProjectRoot:             projectRoot,
+		ConfigPath:              resolvedConfigPath,
+		DryRun:                  dryRun,
+		Logging:                 runtime,
+		AutomaticImageLifecycle: true,
 	}
 	if cfg.Logging.RetentionEnabled {
 		report, pruneErr := manager.PruneLogs(false)

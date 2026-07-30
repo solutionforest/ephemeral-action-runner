@@ -53,12 +53,10 @@ docker info --format '{{json .ServerVersion}}'`
 type Provider struct {
 	Binary string
 
-	runCommand      runCommandFunc
-	inspectImage    inspectImageFunc
-	inspectTemplate inspectLocalTemplateFunc
-	activeMu        sync.RWMutex
-	activeTemplate  provider.TemplateArtifact
-	dryRun          bool
+	runCommand     runCommandFunc
+	activeMu       sync.RWMutex
+	activeTemplate provider.TemplateArtifact
+	dryRun         bool
 }
 
 type instanceReceipt struct {
@@ -76,13 +74,6 @@ type CachedTemplate struct {
 	CacheID   string
 	CreatedAt time.Time
 	SizeBytes int64
-}
-
-// LocalTemplateImage is the independently read local Docker image identity
-// and guest platform for a repository:tag template reference.
-type LocalTemplateImage struct {
-	Digest   string
-	Platform string
 }
 
 // HostReadiness is the validated machine-readable summary returned by
@@ -106,8 +97,6 @@ type commandRequest struct {
 }
 
 type runCommandFunc func(ctx context.Context, request commandRequest) (provider.ExecResult, error)
-type inspectImageFunc func(context.Context, string) (string, error)
-type inspectLocalTemplateFunc func(context.Context, string) (LocalTemplateImage, error)
 
 func New(binary string) *Provider {
 	return NewWithDryRun(binary, false)
@@ -169,7 +158,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 	if err := p.VerifyAdmission(ctx); err != nil {
 		return provider.Instance{}, err
 	}
-	if err := p.verifyCachedTemplate(ctx, request.Template, request.TemplateDigest); err != nil {
+	if err := p.verifyImportedTemplate(ctx, request.Template, request.TemplateDigest); err != nil {
 		return provider.Instance{}, err
 	}
 	items, err := p.inventoryVerified(ctx)
@@ -279,14 +268,14 @@ func (p *Provider) ImportTemplate(ctx context.Context, archivePath string) error
 	return nil
 }
 
-func (p *Provider) VerifyTemplate(ctx context.Context, artifact provider.TemplateArtifact) error {
+func (p *Provider) VerifyImportedTemplate(ctx context.Context, artifact provider.TemplateArtifact) error {
 	if artifact.Reference == "" || !validFullTemplateDigest(artifact.Digest) {
 		return fmt.Errorf("Docker Sandboxes template reference and digest are required")
 	}
 	if artifact.CacheID != strings.TrimPrefix(artifact.Digest, "sha256:")[:12] {
 		return fmt.Errorf("Docker Sandboxes template cache ID does not match its full digest")
 	}
-	return p.verifyCachedTemplate(ctx, artifact.Reference, artifact.Digest)
+	return p.verifyImportedTemplate(ctx, artifact.Reference, artifact.Digest)
 }
 
 func (p *Provider) ActivateTemplate(artifact provider.TemplateArtifact) error {
@@ -306,6 +295,79 @@ func (p *Provider) ActivateTemplate(artifact provider.TemplateArtifact) error {
 	p.activeTemplate = artifact
 	p.activeMu.Unlock()
 	return nil
+}
+
+// RemoveTemplate removes one exact imported template cache identity. The
+// Docker-managed shell-docker base template is never an EPAR cleanup target.
+func (p *Provider) RemoveTemplate(ctx context.Context, artifact provider.TemplateArtifact) error {
+	if artifact.Reference == "docker.io/docker/sandbox-templates:shell-docker" || artifact.Reference == "docker/sandbox-templates:shell-docker" {
+		return fmt.Errorf("refusing to remove the Docker Sandboxes shell-docker base template")
+	}
+	if artifact.CacheID == "" || len(artifact.CacheID) != 12 {
+		return fmt.Errorf("Docker Sandboxes template cleanup requires an exact 12-character cache ID")
+	}
+	instances, err := p.Inventory(ctx)
+	if err != nil {
+		return fmt.Errorf("verify active Docker Sandboxes before template cleanup: %w", err)
+	}
+	if len(instances) != 0 {
+		return fmt.Errorf("refusing template cleanup while %d Docker Sandbox instance(s) exist", len(instances))
+	}
+	templates, err := p.CachedTemplates(ctx)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, item := range templates {
+		if item.CacheID != artifact.CacheID {
+			continue
+		}
+		if item.Reference != artifact.Reference {
+			return fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, item.Reference, artifact.Reference)
+		}
+		found = true
+		break
+	}
+	if !found {
+		return nil
+	}
+	if _, err := p.run(ctx, commandRequest{
+		args:        []string{"template", "rm", artifact.CacheID},
+		operation:   "remove exact Docker Sandboxes runner template",
+		outputLimit: diagnosticOutputLimit,
+	}); err != nil {
+		return err
+	}
+	templates, err = p.CachedTemplates(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range templates {
+		if item.CacheID == artifact.CacheID {
+			return fmt.Errorf("Docker Sandboxes template %s still exists after exact removal", artifact.CacheID)
+		}
+	}
+	return nil
+}
+
+func (p *Provider) ObserveTemplate(ctx context.Context, artifact provider.TemplateArtifact) (bool, error) {
+	if artifact.Reference == "" || artifact.CacheID == "" || len(artifact.CacheID) != 12 {
+		return false, fmt.Errorf("Docker Sandboxes template observation requires an exact reference and 12-character cache ID")
+	}
+	templates, err := p.CachedTemplates(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range templates {
+		if item.CacheID != artifact.CacheID {
+			continue
+		}
+		if item.Reference != artifact.Reference {
+			return false, fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, item.Reference, artifact.Reference)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // VerifyAdmission fail-closes on provider-wide channels Docker Sandboxes can
@@ -713,34 +775,7 @@ func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error
 	return templates, nil
 }
 
-// InspectLocalTemplate independently reads a local Docker image's full
-// identity and guest platform. The supplied reference must be a repository:tag
-// reference; digests, untagged repositories, and shell-style input are refused.
-func (p *Provider) InspectLocalTemplate(ctx context.Context, reference string) (LocalTemplateImage, error) {
-	if err := validateLocalTemplateReference(reference); err != nil {
-		return LocalTemplateImage{}, err
-	}
-	inspect := p.inspectTemplate
-	if inspect == nil {
-		inspect = inspectLocalDockerImage
-	}
-	image, err := inspect(ctx, reference)
-	if err != nil {
-		return LocalTemplateImage{}, err
-	}
-	if !validFullTemplateDigest(image.Digest) {
-		return LocalTemplateImage{}, fmt.Errorf("local docker image inspection did not return a full lowercase sha256 identity")
-	}
-	if image.Platform != "linux/amd64" && image.Platform != "linux/arm64" {
-		return LocalTemplateImage{}, fmt.Errorf("local docker image inspection did not return a supported linux template platform")
-	}
-	return image, nil
-}
-
-func (p *Provider) verifyCachedTemplate(ctx context.Context, reference, digest string) error {
-	if err := p.verifyLocalTemplateImage(ctx, reference, digest); err != nil {
-		return err
-	}
+func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, digest string) error {
 	result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: "verify cached docker sandbox template"})
 	if err != nil {
 		return err
@@ -757,63 +792,12 @@ func (p *Provider) verifyCachedTemplate(ctx context.Context, reference, digest s
 	for _, image := range images {
 		if image.Repository == repository && image.Tag == tag {
 			if image.ID != wantCacheID {
-				return fmt.Errorf("cached docker sandbox template cache ID did not match the first 12 hexadecimal characters of the independently verified full local image identity")
+				return fmt.Errorf("cached Docker Sandbox template ID %s does not match imported archive identity %s", image.ID, wantCacheID)
 			}
 			return nil
 		}
 	}
-	return fmt.Errorf("configured docker sandbox template was not present in the local cache")
-}
-
-func (p *Provider) verifyLocalTemplateImage(ctx context.Context, reference, expectedDigest string) error {
-	inspect := p.inspectImage
-	if inspect == nil {
-		inspect = inspectLocalDockerImageDigest
-	}
-	actualDigest, err := inspect(ctx, reference)
-	if err != nil {
-		return fmt.Errorf("verify full local docker sandbox template image identity: %w", err)
-	}
-	actualDigest = strings.TrimSpace(actualDigest)
-	if !validFullTemplateDigest(actualDigest) {
-		return fmt.Errorf("local docker image inspection did not return a full lowercase sha256 identity")
-	}
-	if actualDigest != expectedDigest {
-		return fmt.Errorf("full local docker sandbox template image identity %s did not match configured identity %s", actualDigest, expectedDigest)
-	}
-	return nil
-}
-
-func inspectLocalDockerImageDigest(ctx context.Context, reference string) (string, error) {
-	image, err := inspectLocalDockerImage(ctx, reference)
-	if err != nil {
-		return "", err
-	}
-	return image.Digest, nil
-}
-
-func inspectLocalDockerImage(ctx context.Context, reference string) (LocalTemplateImage, error) {
-	command := exec.CommandContext(ctx, "docker", localTemplateInspectArgs(reference)...)
-	command.Env = childEnvironment(nil)
-	stdout := &boundedBuffer{limit: diagnosticOutputLimit}
-	stderr := &boundedBuffer{limit: 4096}
-	command.Stdout = stdout
-	command.Stderr = stderr
-	err := command.Run()
-	if stdout.exceeded || stderr.exceeded {
-		err = errors.Join(err, fmt.Errorf("docker image inspection output limit exceeded"))
-	}
-	if err != nil {
-		if detail := strings.TrimSpace(stderr.String()); detail != "" {
-			return LocalTemplateImage{}, fmt.Errorf("docker image inspect failed: %w: %s", err, detail)
-		}
-		return LocalTemplateImage{}, fmt.Errorf("docker image inspect failed: %w", err)
-	}
-	return parseLocalTemplateImage([]byte(stdout.String()))
-}
-
-func localTemplateInspectArgs(reference string) []string {
-	return []string{"image", "inspect", "--format", "{{json .}}", reference}
+	return fmt.Errorf("%w: configured Docker Sandbox template was not present in the authoritative Sandbox cache", provider.ErrTemplateNotFound)
 }
 
 func validFullTemplateDigest(value string) bool {
@@ -1042,3 +1026,5 @@ var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)
 var _ provider.TemplateArtifactRuntime = (*Provider)(nil)
+var _ provider.TemplateArtifactCleaner = (*Provider)(nil)
+var _ provider.TemplateArtifactObserver = (*Provider)(nil)

@@ -20,13 +20,13 @@ Use `./start` for first-run provisioning or the shared image command afterward:
 ./start image build --replace
 ```
 
-EPAR resolves the configured Catthehacker tag for the native platform, checks capacity, builds with the pinned template inputs, generates metadata, provenance, an SPDX SBOM, and a software inventory, exports the archive, imports it with `sbx template load`, and reads back the exact cache identity. The active receipt is updated atomically only after every step succeeds.
+EPAR resolves the configured Catthehacker tag for the native platform, checks capacity, and has BuildKit stream one verified Docker-compatible archive directly to disk. EPAR verifies the archive tag, platform, labels, configuration, layers, and digests without loading it into Docker, imports it with `sbx template load`, and reads back the exact Sandbox-cache identity. Build metadata, provenance, an SPDX SBOM descriptor, compatibility evidence, and a software inventory are retained compactly; the active receipt is updated atomically only after every step succeeds.
 
 The compatibility scripts under `scripts/docker-sandboxes` delegate to this command. They no longer maintain a separate build or load implementation.
 
 ## Configure And Prewarm
 
-Run `./start` with no configuration. The wizard offers `full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another `catthehacker/ubuntu` tag; verifies the tag and native platform; validates optional custom install scripts; displays source, platform, size estimates, reserve, and duration; then builds and imports after one confirmation. It does not write the usable config until exact readback passes.
+Run `./start` with no configuration. The wizard offers `full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another `catthehacker/ubuntu` tag; verifies the tag and native platform; validates optional custom install scripts; displays source, platform, size estimates, reserve, and duration; then saves the desired configuration after one confirmation. Normal startup performs the build and import, and a provisioning failure leaves the configuration available for a retry.
 
 After configuration, prewarm the selected template outside the job path:
 
@@ -44,9 +44,9 @@ The template cache and archive are host-cache measurements, not each sandbox's r
 
 ## Retention And Replacement
 
-Docker Sandboxes retains loaded templates after individual sandboxes are deleted. Before deleting an obsolete EPAR template, confirm no active configuration or live sandbox references its exact tag and cache identity, run `sbx template rm <exact-tag>`, then verify absence. Do not use `sbx reset`: it removes the whole Docker Sandboxes cache.
+Docker Sandboxes retains loaded templates after individual sandboxes are deleted. At startup and after activating a replacement, EPAR removes a superseded template only when its catalog receipt, configurations, leases, and live-sandbox inventory prove it is unreferenced. It verifies absence after `sbx template rm <exact-tag>`. Do not use `sbx reset`: it removes the whole Docker Sandboxes cache.
 
-EPAR storage maintenance never broadly prunes Docker images, BuildKit state, Docker Sandboxes templates, WSL distributions, or Tart images. Use `ephemeral-action-runner storage status` and preview `storage prune` before explicit cleanup. Docker Desktop VHDX compaction is separate offline host maintenance.
+The direct build does not create a Docker staging image. Once the imported template is authoritative, EPAR removes the transient archive workspace and retains only compact evidence. A completely verified archive left by an interrupted import can resume directly; partial or malformed archives are never activated. Prefix-era or shared templates remain report-only until `storage prune --legacy` produces an approved exact plan. EPAR never broadly prunes Docker images, BuildKit state, Docker Sandboxes templates, WSL distributions, or Tart images. Docker Desktop VHDX compaction is separate offline host maintenance.
 
 ## Evidence And Certification
 

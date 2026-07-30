@@ -39,7 +39,7 @@ func TestPoolLifecycleConsoleGuidance(t *testing.T) {
 	output := console.String()
 	for _, expected := range []string{
 		"Docker Sandboxes pool is running.",
-		"Press Ctrl-C once to stop; wait for cleanup confirmation before closing this window.",
+		"Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window.",
 		"Replacement runner epar-test-002 is online; Docker Sandboxes pool is ready for the next job.",
 		"Stopping EPAR pool. Cleaning up owned runner resources.",
 		"Please wait; do not press Ctrl-C again or close this window.",

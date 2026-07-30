@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
 const (
@@ -41,6 +43,9 @@ func hostTrustMetadata(snapshot hosttrust.Snapshot) *HostTrustMetadata {
 }
 
 func (m *Coordinator) EnsureImage(ctx context.Context) error {
+	if err := m.cleanupSupersededCatalog(ctx); err != nil {
+		return fmt.Errorf("reconcile EPAR storage before image provisioning: %w", err)
+	}
 	if m.Config.Provider.Type == "docker-sandboxes" {
 		return m.ensureDockerSandboxesTemplate(ctx, false)
 	}
@@ -69,13 +74,22 @@ func (m *Coordinator) EnsureImage(ctx context.Context) error {
 	switch state {
 	case imageStateCurrent:
 		m.infof("image is current: %s\n", m.Config.Image.OutputImage)
-		return nil
+		if err := m.recordCurrentArtifact(ctx, hash); err != nil {
+			return fmt.Errorf("record current EPAR artifact ownership: %w", err)
+		}
+		return m.cleanupSupersededCatalog(ctx)
 	case imageStateMissing:
 		m.infof("image is missing; building %s\n", m.Config.Image.OutputImage)
 	case imageStateOutdated:
 		m.infof("image is outdated or not aligned with config; rebuilding %s\n", m.Config.Image.OutputImage)
 	}
-	return m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest})
+	if err := m.BuildImage(ctx, ImageBuildOptions{Replace: true, Manifest: &manifest}); err != nil {
+		return err
+	}
+	if err := m.recordCurrentArtifact(ctx, hash); err != nil {
+		return fmt.Errorf("record current EPAR artifact ownership: %w", err)
+	}
+	return m.cleanupSupersededCatalog(ctx)
 }
 
 type imageState int
@@ -113,7 +127,7 @@ func (m *Coordinator) currentImageState(ctx context.Context, wantHash string) (i
 		}
 		return imageStateCurrent, nil
 	case "tart":
-		return m.currentTartImageState(ctx)
+		return m.currentTartImageState(ctx, wantHash)
 	default:
 		return imageStateMissing, fmt.Errorf("unsupported provider.type %q", m.Config.Provider.Type)
 	}
@@ -156,17 +170,54 @@ func (m *Coordinator) currentWSLManifestHash() (string, bool, error) {
 	return stored.Hash, true, nil
 }
 
-func (m *Coordinator) currentTartImageState(ctx context.Context) (imageState, error) {
+func (m *Coordinator) currentTartImageState(ctx context.Context, wantHash string) (imageState, error) {
 	instances, err := m.Provider.List(ctx)
 	if err != nil {
 		return imageStateMissing, err
 	}
+	var current provider.Instance
 	for _, instance := range instances {
 		if instance.Name == m.Config.Image.OutputImage || instance.Source == m.Config.Image.OutputImage {
-			return imageStateCurrent, nil
+			current = instance
+			break
 		}
 	}
-	return imageStateMissing, nil
+	if current.Name == "" {
+		return imageStateMissing, nil
+	}
+	if current.ProviderID == "" {
+		return imageStateOutdated, nil
+	}
+	store, err := m.hostCatalog()
+	if err != nil {
+		return imageStateMissing, err
+	}
+	value, err := store.Load(time.Now().UTC())
+	if err != nil {
+		return imageStateMissing, err
+	}
+	configID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return imageStateMissing, err
+	}
+	if tartCatalogReferenceMatches(value, configID, strings.TrimSpace(m.Config.Image.OutputImage), current.ProviderID, wantHash) {
+		return imageStateCurrent, nil
+	}
+	return imageStateOutdated, nil
+}
+
+func tartCatalogReferenceMatches(value storagecatalog.Catalog, configID, locator, identity, manifestHash string) bool {
+	for _, resource := range value.Resources {
+		if resource.Kind != catalogTartImageKind || resource.Locator != locator || resource.Identity != identity {
+			continue
+		}
+		for _, reference := range resource.References {
+			if reference.ConfigID == configID && reference.Role == "provider-artifact" && reference.ManifestHash == manifestHash {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *Coordinator) desiredImageManifest(ctx context.Context) (ImageManifest, error) {
@@ -265,6 +316,18 @@ func (m *Coordinator) refreshDockerSourceDigestUntimed(ctx context.Context) (str
 	logPath := m.buildLogPath(imageLogStem(m.Config.Image.OutputImage) + ".source.log")
 	defer m.releaseTranscript(logPath)
 	m.infof("refreshing Docker source image %s\n", image)
+	backendID, releaseBackend, err := m.acquireDockerBackendLock(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer releaseBackend()
+	previousID := ""
+	if value, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image); inspectErr == nil {
+		previousID = strings.TrimSpace(value)
+	}
+	if err := m.beginDockerRoleAcquisition(backendID, "build-source", image, previousID, time.Now().UTC()); err != nil {
+		return "", fmt.Errorf("journal Docker source acquisition: %w", err)
+	}
 	if err := m.pullDockerSource(ctx, DockerSourcePullOptions{
 		Image:              image,
 		Platform:           platform,
@@ -272,6 +335,14 @@ func (m *Coordinator) refreshDockerSourceDigestUntimed(ctx context.Context) (str
 		AnnounceRemoteSize: true,
 	}); err != nil {
 		return "", fmt.Errorf("refresh Docker source image %s: %w", image, err)
+	}
+	currentID, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image)
+	if err != nil {
+		return "", err
+	}
+	currentID = strings.TrimSpace(currentID)
+	if err := m.recordDockerSourceAcquisition(ctx, image, previousID, currentID, time.Now().UTC()); err != nil {
+		return "", fmt.Errorf("record Docker source acquisition: %w", err)
 	}
 	digestsJSON, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)
 	if err != nil {

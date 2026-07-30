@@ -123,3 +123,19 @@ func TestReadLocalVMIdentitiesUsesStableMACAddress(t *testing.T) {
 		t.Fatalf("identity = %q", got)
 	}
 }
+
+func TestCloneEnvironmentDisablesTartAutomaticPruning(t *testing.T) {
+	environment := tartCloneEnvironment([]string{"PATH=/bin", "TART_NO_AUTO_PRUNE="})
+	if got := environment[len(environment)-1]; got != "TART_NO_AUTO_PRUNE=1" {
+		t.Fatalf("clone environment final override = %q", got)
+	}
+	count := 0
+	for _, value := range environment {
+		if strings.HasPrefix(value, "TART_NO_AUTO_PRUNE=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("clone environment contains %d TART_NO_AUTO_PRUNE entries: %#v", count, environment)
+	}
+}

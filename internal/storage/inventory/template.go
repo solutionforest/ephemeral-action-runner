@@ -104,7 +104,6 @@ func collectTemplates(options templateOptions) ([]storage.Artifact, []string, er
 		record.artifact.Protections = append(record.artifact.Protections, protections[record.metadata.Template.ArchiveSHA256]...)
 		records = append(records, record)
 	}
-	applyTemplateSelections(records, options.Selections, &warnings)
 	for index := range records {
 		sortTemplateProtections(records[index].artifact.Protections)
 		record := records[index]
@@ -246,48 +245,6 @@ func validateTemplateInputs(options templateOptions) error {
 		}
 	}
 	return nil
-}
-
-func applyTemplateSelections(records []templateRecord, selections []TemplateSelection, warnings *[]string) {
-	for _, selection := range selections {
-		var matches []int
-		for index := range records {
-			record := records[index]
-			if (selection.Profile == "" || record.metadata.Profile == selection.Profile) && (selection.Platform == "" || record.metadata.Platform == selection.Platform) && normalizedTemplateTag(record.metadata.Template.Tag) == normalizedTemplateTag(selection.Tag) && record.metadata.Template.Digest == selection.TemplateDigest && (selection.MetadataSHA256 == "" || record.metadataSHA256 == selection.MetadataSHA256) {
-				matches = append(matches, index)
-			}
-		}
-		selectionIdentity := selection.Tag + "@" + selection.TemplateDigest
-		if len(matches) == 0 {
-			*warnings = append(*warnings, fmt.Sprintf("configured Docker Sandboxes template %q did not match a verified archive", selectionIdentity))
-			continue
-		}
-		if len(matches) > 1 {
-			*warnings = append(*warnings, fmt.Sprintf("configured Docker Sandboxes template %q matched multiple archives; all are protected", selectionIdentity))
-			group := records[matches[0]].artifact.RetentionGroup
-			for index := range records {
-				if records[index].artifact.RetentionGroup == group {
-					records[index].artifact.Protections = append(records[index].artifact.Protections, storage.Protection{Kind: storage.ProtectionUncertain, Detail: "ambiguous configured template archive"})
-				}
-			}
-			continue
-		}
-		currentIndex := matches[0]
-		group := records[currentIndex].artifact.RetentionGroup
-		records[currentIndex].artifact.Current = true
-		records[currentIndex].artifact.Protections = append(records[currentIndex].artifact.Protections, storage.Protection{Kind: storage.ProtectionConfiguration, Detail: "configured Docker Sandboxes template"})
-		if selection.ActivatedAt.IsZero() {
-			continue
-		}
-		activatedAt := selection.ActivatedAt.UTC()
-		for index := range records {
-			if index == currentIndex || records[index].artifact.RetentionGroup != group || !records[index].artifact.CreatedAt.Before(activatedAt) {
-				continue
-			}
-			supersededAt := activatedAt
-			records[index].artifact.SupersededAt = &supersededAt
-		}
-	}
 }
 
 func normalizedTemplateTag(value string) string {

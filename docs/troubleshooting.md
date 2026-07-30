@@ -9,8 +9,10 @@ Start with the symptom that most closely matches the failure. EPAR is trusted-jo
 - [A Docker workload fails with an architecture error](#a-docker-workload-fails-with-an-architecture-error)
 - [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
 - [Docker Sandboxes rejects template, policy, or capacity](#docker-sandboxes-rejects-template-policy-or-capacity)
+- [An idle runner reports GitHub or Sandbox health warnings](#an-idle-runner-reports-github-or-sandbox-health-warnings)
 - [A runner is held for diagnostics or an acknowledgement](#a-runner-is-held-for-diagnostics-or-an-acknowledgement)
 - [Docker image build runs out of space](#docker-image-build-runs-out-of-space)
+- [Storage keeps growing after updates](#storage-keeps-growing-after-updates)
 - [Docker image build fails with TLS certificate errors](#docker-image-build-fails-with-tls-certificate-errors)
 - [Windows Docker Desktop WSL2 disk is smaller than expected](#windows-docker-desktop-wsl2-disk-is-smaller-than-expected)
 - [Docker Container startup fails](#docker-container-startup-fails)
@@ -20,6 +22,8 @@ Start with the symptom that most closely matches the failure. EPAR is trusted-jo
 ## Quick diagnostics
 
 EPAR writes logs under `work/logs` by default. Start with `work/logs/epar-last-error.log`, then inspect the matching build log in `work/logs/builds/` or instance transcript in `work/logs/instances/`. Manager events are console-only by default; raw transcripts are file-only unless `logging.transcriptSinks` includes `console`.
+
+Long Buildx operations show a bounded console summary with downloaded bytes, completed layers, the active BuildKit step, elapsed time, and growing direct-archive bytes when an export is in progress. The complete raw progress remains in the printed build-log path.
 
 ```bash
 ./start --help
@@ -110,7 +114,13 @@ Startup reports a template identity/digest mismatch, policy-generation drift, an
 
 Docker Sandboxes resolves the configured source selector, records the exact OCI identities in a local artifact receipt, and verifies the host-global policy fingerprint. If the desired source, platform, scripts, template inputs, runner inputs, or trust inputs change, rerun `./start`; EPAR builds and imports a replacement and activates it only after exact readback succeeds.
 
+An imported Docker Sandboxes template does not require a matching Docker image. EPAR builds directly to a verified archive, imports that archive, and then removes the transient workspace. If startup reports a missing Docker staging image, the controller is stale; rebuild the native controller and rerun `./start`. If direct archive verification or `sbx template load` fails, use the printed Buildx transcript and archive error; EPAR does not fall back to the memory-heavy Docker load/save path.
+
 Capacity admission accounts for estimated incremental physical growth on each measurable backing filesystem plus the fixed `storage.minimumFree` reserve. Docker Sandboxes root and inner-Docker sizes are independent sparse logical maxima and are not added as immediate host usage. Inspect the reported physical surface, run the matching `storage status` and prune-preview commands, or deliberately retry only that invocation with `--allow-insufficient-storage`. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
+
+## An idle runner reports GitHub or Sandbox health warnings
+
+A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR keeps the exact runner, lets a trust lease expire closed when it cannot refresh it, and retries. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
 
 `networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
 
@@ -152,6 +162,26 @@ docker system df -v
 
 Increase the relevant Docker/VM data-disk allocation or deliberately remove unneeded data after reviewing it. Docker prune commands can remove stopped containers, unused images, build cache, networks, and volumes; they are not a safe generic fix.
 
+## Storage keeps growing after updates
+
+### Symptom
+
+Old EPAR images, Docker Sandboxes templates, staging archives, or no-Go controller files remain after an update or an interrupted start.
+
+### Diagnosis and remediation
+
+Run `./start` once more. Startup reconciles incomplete exact-owned work and retires an unreferenced superseded generation after its replacement passes readback. It does not delete shared images, prefix-only historical resources, active containers, active sandboxes, or resources referenced by another configuration.
+
+Inspect the exact classification before removing anything manually:
+
+```bash
+./start storage status
+./start storage prune
+./start storage prune --legacy
+```
+
+Use normal `storage prune --execute` only for exact catalog-owned resources. Legacy prefix-era entries require the plan hash printed by `storage prune --legacy`; they are not removed automatically. Do not use broad Docker prune/reset commands or VHDX compaction as a substitute for this review.
+
 ## Docker image build fails with TLS certificate errors
 
 ### Symptom
@@ -161,6 +191,8 @@ HTTPS access fails with `curl: (60)`, `certificate verification failed`, or an u
 ### Diagnosis and remediation
 
 Do not disable certificate verification. First identify which trust boundary failed.
+
+For a no-Go native-controller build, `./start` automatically reads host system roots, excludes explicitly distrusted certificates, validates the short-lived feed in an offline container, and mounts only the resulting CA bundle into the Go compiler container. Runner CA inheritance remains independent. If the build still reports an unknown issuer, inspect `work/logs/epar-native-controller-build.log`: the wrapper prints the requested host, presented certificate subject and issuer, SHA-256 fingerprint, validity, and verification result, and on Windows it lists matching roots from `LocalMachine\Root` and `CurrentUser\Root`. A remaining failure means the expected issuer was absent, distrusted, malformed, expired, or not the certificate actually presented; EPAR never disables TLS verification or retries insecurely.
 
 For an EPAR Buildx failure, leave `image.hostTrustMode` unchanged. EPAR automatically supplies host system roots to its project-owned builder and prints the full build transcript path before `docker buildx build`. The console and error report include a bounded redacted tail. Inspect the underlying `x509` line together with the registry host, builder identity, and active trust generation:
 
@@ -189,7 +221,7 @@ Use the normal host entry point so EPAR can inspect the real Windows certificate
 go run ./cmd/ephemeral-action-runner image build --replace
 ```
 
-On no-Go Windows, use `scripts\run-with-docker.ps1 image build --replace`; on macOS/Linux, use `scripts/run-with-docker.sh image build --replace`. These wrappers publish the separate native-host build feed for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. A bare Linux toolchain container is not a replacement for that bridge.
+On no-Go Windows, use `scripts\run-with-docker.ps1 image build --replace`; on macOS/Linux, use `scripts/run-with-docker.sh image build --replace`. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. The legacy containerized controller still requires the separate native-host feed bridge. A bare Linux toolchain container is not a replacement for either path.
 
 ## Windows Docker Desktop WSL2 disk is smaller than expected
 

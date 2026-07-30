@@ -104,7 +104,7 @@ func (m *Coordinator) renderDockerPullProgress(ctx context.Context, response cli
 	if rendered {
 		m.writeDockerPullProgress(logPath, layers)
 		if m.dockerPullProgressIsInteractive() {
-			fmt.Fprintln(m.environment.DockerPullProgressConsole())
+			fmt.Fprintln(m.environment.ProgressConsole())
 		}
 	}
 	return nil
@@ -151,14 +151,14 @@ func writeDockerPullEvent(logFile io.Writer, event DockerPullEvent) {
 func (m *Coordinator) writeDockerPullProgress(logPath string, layers map[string]DockerPullProgress) {
 	line := DockerPullProgressSummary(layers)
 	if m.dockerPullProgressIsInteractive() {
-		_, _ = fmt.Fprintf(m.environment.DockerPullProgressConsole(), "\r\033[2K%s", line)
+		_, _ = fmt.Fprintf(m.environment.ProgressConsole(), "\r\033[2K%s", line)
 		return
 	}
 	m.environment.LogInfo(line, "provider", m.Config.Provider.Type, "operation", "docker-pull", "logPath", logPath)
 }
 
 func (m *Coordinator) dockerPullProgressIsInteractive() bool {
-	return m.environment.DockerPullProgressTerminal() && containsString(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text"
+	return m.environment.ProgressTerminal() && containsString(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text"
 }
 
 func containsString(values []string, wanted string) bool {

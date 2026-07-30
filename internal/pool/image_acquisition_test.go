@@ -2,16 +2,127 @@ package pool
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 )
+
+func TestBuildxProgressHeartbeatDefaultIsFiveSeconds(t *testing.T) {
+	if got, want := buildxProgressHeartbeatInterval, 5*time.Second; got != want {
+		t.Fatalf("Buildx progress heartbeat = %s, want %s", got, want)
+	}
+}
+
+func TestBuildxProgressUsesManagerLoggerAndPreservesRawTranscript(t *testing.T) {
+	root := t.TempDir()
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:       root,
+		ManagerSinks:    logging.SinkConsole,
+		TranscriptSinks: logging.SinkFile,
+		Stdout:          &console,
+		Stderr:          &console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	cfg := config.Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Logging.Directory = root
+	cfg.Logging.ManagerSinks = []string{"console"}
+	cfg.Logging.TranscriptSinks = []string{"file"}
+	manager := Manager{Config: cfg, Logging: runtime}
+	logPath := filepath.Join(root, "builds", "docker-sandboxes-test.docker-build.log")
+	previousTerminal := dockerPullProgressTerminal
+	dockerPullProgressTerminal = func() bool { return false }
+	t.Cleanup(func() { dockerPullProgressTerminal = previousTerminal })
+	previousLogged := runHostLoggedCommand
+	runHostLoggedCommand = func(_ context.Context, _ string, stdout, stderr io.Writer, name string, args ...string) error {
+		if name != "docker" || len(args) < 2 || args[0] != "buildx" || args[1] != "build" {
+			t.Fatalf("unexpected command: %s %v", name, args)
+		}
+		digest := "sha256:" + strings.Repeat("d", 64)
+		_, _ = io.WriteString(stderr, "#12 "+digest+" 1.00GB / 2.00GB 10.0s\n")
+		_, _ = io.WriteString(stdout, "#12 "+digest+" 2.00GB / 2.00GB 20.0s done\n")
+		return nil
+	}
+	t.Cleanup(func() { runHostLoggedCommand = previousLogged })
+
+	if err := manager.runHostBuildxLogged(context.Background(), logPath, "docker", "buildx", "build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.releaseTranscript(logPath); err != nil {
+		t.Fatal(err)
+	}
+
+	consoleText := console.String()
+	if !strings.Contains(consoleText, "Docker Sandboxes template build: 953.7 MiB/1.9 GiB (50%); 0/1 layer downloads complete; BuildKit step #12") {
+		t.Fatalf("manager console did not receive Buildx progress: %q", consoleText)
+	}
+	if !strings.Contains(consoleText, "Docker Sandboxes template Buildx phase complete; finalizing evidence and importing the template next") {
+		t.Fatalf("manager console did not receive Buildx completion: %q", consoleText)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "1.00GB / 2.00GB") || !strings.Contains(string(raw), "2.00GB / 2.00GB") {
+		t.Fatalf("raw Buildx transcript was not preserved: %q", raw)
+	}
+}
+
+func TestBuildxProgressHeartbeatShowsLongSilentStepIsAlive(t *testing.T) {
+	root := t.TempDir()
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:       root,
+		ManagerSinks:    logging.SinkConsole,
+		TranscriptSinks: logging.SinkFile,
+		Stdout:          &console,
+		Stderr:          &console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	cfg := config.Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Logging.Directory = root
+	cfg.Logging.ManagerSinks = []string{"console"}
+	cfg.Logging.TranscriptSinks = []string{"file"}
+	manager := Manager{Config: cfg, Logging: runtime}
+	previousTerminal := dockerPullProgressTerminal
+	dockerPullProgressTerminal = func() bool { return false }
+	t.Cleanup(func() { dockerPullProgressTerminal = previousTerminal })
+	previousInterval := buildxProgressHeartbeatInterval
+	buildxProgressHeartbeatInterval = 5 * time.Millisecond
+	t.Cleanup(func() { buildxProgressHeartbeatInterval = previousInterval })
+	previousLogged := runHostLoggedCommand
+	runHostLoggedCommand = func(_ context.Context, _ string, _, _ io.Writer, _ string, _ ...string) error {
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+	t.Cleanup(func() { runHostLoggedCommand = previousLogged })
+
+	if err := manager.runHostBuildxLogged(context.Background(), filepath.Join(root, "builds", "docker-sandboxes-heartbeat.docker-build.log"), "docker", "buildx", "build"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(console.String(), "Docker Sandboxes template build: elapsed") {
+		t.Fatalf("long silent Buildx step had no heartbeat: %q", console.String())
+	}
+}
 
 func TestDockerPullProgressUsesManagerLoggerAndPreservesSourceTranscript(t *testing.T) {
 	root := t.TempDir()
@@ -135,5 +246,20 @@ func TestDockerPullProgressUsesSingleLineTerminalDisplayForTextManagerConsole(t 
 	}
 	if got := managerConsole.String(); got != "" {
 		t.Fatalf("interactive pull progress was duplicated through manager logger: %q", got)
+	}
+}
+
+func TestBuildxDockerArchiveDestinationRecognizesDirectExporter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runner-template.tar.partial")
+	for _, args := range [][]string{
+		{"buildx", "build", "--output", "type=docker,dest=" + path},
+		{"buildx", "build", "--output=type=docker,dest=" + path},
+	} {
+		if got := buildxDockerArchiveDestination(args); got != path {
+			t.Fatalf("buildxDockerArchiveDestination(%v) = %q, want %q", args, got, path)
+		}
+	}
+	if got := buildxDockerArchiveDestination([]string{"buildx", "build", "--load"}); got != "" {
+		t.Fatalf("non-archive output returned %q", got)
 	}
 }

@@ -3,6 +3,7 @@ package image
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -74,6 +75,9 @@ func (m *Coordinator) UpdateUpstream(ctx context.Context) error {
 }
 
 func (m *Coordinator) BuildImage(ctx context.Context, opts ImageBuildOptions) error {
+	if err := m.cleanupSupersededCatalog(ctx); err != nil {
+		return fmt.Errorf("reconcile EPAR storage before image build: %w", err)
+	}
 	if m.Config.Provider.Type == "docker-sandboxes" {
 		return m.ensureDockerSandboxesTemplate(ctx, true)
 	}
@@ -193,10 +197,19 @@ func (m *Coordinator) buildDockerContainerImageAttempt(ctx context.Context, upst
 	m.infof("building Docker Container image %s from %s\n", targetImage, m.Config.Image.SourceImage)
 	m.infof("log: %s\n", buildLogPath)
 	args := []string{"buildx", "build", "--builder", builder, "--load", "-t", targetImage}
+	installationID, err := m.catalogInstallationID(time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("resolve EPAR image ownership identity: %w", err)
+	}
 	if m.Config.Provider.Platform != "" {
 		args = append(args, "--platform", m.Config.Provider.Platform)
 	}
 	args = append(args,
+		"--label", "io.solutionforest.epar.schema=1",
+		"--label", "io.solutionforest.epar.installation="+installationID,
+		"--label", "io.solutionforest.epar.provider=docker-container",
+		"--label", "io.solutionforest.epar.role=runtime-image",
+		"--label", "io.solutionforest.epar.manifest="+manifestHash,
 		"--build-arg", "BASE_IMAGE="+m.Config.Image.SourceImage,
 		"--build-arg", "RUNNER_VERSION="+m.Config.Image.RunnerVersion,
 		"--build-arg", "EPAR_IMAGE_MANIFEST_SHA256="+manifestHash,
@@ -225,12 +238,35 @@ func temporaryDockerImageTag(output, generation string, attempt int) string {
 }
 
 func (m *Coordinator) buildTartImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
+	return m.withTartBackendLock(ctx, func() error {
+		return m.buildTartImageLocked(ctx, opts, upstreamDir)
+	})
+}
+
+func (m *Coordinator) buildTartImageLocked(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
 	if opts.Manifest == nil {
 		manifest, err := m.desiredImageManifest(ctx)
 		if err != nil {
 			return err
 		}
 		opts.Manifest = &manifest
+	}
+	manifestHash, err := imageManifestHash(*opts.Manifest)
+	if err != nil {
+		return err
+	}
+	outputName := strings.TrimSpace(m.Config.Image.OutputImage)
+	buildName := tartBuildName(outputName, manifestHash)
+	existing, err := m.Provider.List(ctx)
+	if err != nil {
+		return err
+	}
+	output, outputExists := findTartImage(existing, outputName)
+	if outputExists && !opts.Replace {
+		return fmt.Errorf("Tart image %s already exists; rerun with --replace", outputName)
+	}
+	if _, exists := findTartImage(existing, buildName); exists {
+		return fmt.Errorf("Tart build candidate %q already exists from an interrupted operation; inspect it with storage status and remove it through an exact approved cleanup before retrying", buildName)
 	}
 	buildLogPath := m.buildLogPath(imageLogStem(m.Config.Image.OutputImage) + ".build.log")
 	guestLogPath := m.buildLogPath(imageLogStem(m.Config.Image.OutputImage) + ".guest.log")
@@ -239,77 +275,220 @@ func (m *Coordinator) buildTartImage(ctx context.Context, opts ImageBuildOptions
 	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
 		return err
 	}
-	m.infof("building Tart image %s from %s\n", m.Config.Image.OutputImage, m.Config.Image.SourceImage)
+	m.infof("building Tart image candidate %s from %s\n", buildName, m.Config.Image.SourceImage)
 	m.infof("logs: %s, %s\n", buildLogPath, guestLogPath)
-	if opts.Replace {
-		m.infof("replacing existing Tart image %s if present\n", m.Config.Image.OutputImage)
-		_ = m.Provider.Stop(ctx, m.Config.Image.OutputImage)
-		_ = m.Provider.Delete(ctx, m.Config.Image.OutputImage)
-	}
 	m.infof("cloning source image\n")
-	if err := m.Provider.Clone(ctx, m.Config.Image.SourceImage, m.Config.Image.OutputImage); err != nil {
+	if err := m.Provider.Clone(ctx, m.Config.Image.SourceImage, buildName); err != nil {
 		return err
 	}
+	if err := m.recordTartStagingImage(ctx, buildName, "build-candidate"); err != nil {
+		_ = m.Provider.Delete(ctx, buildName)
+		return fmt.Errorf("record Tart build candidate ownership: %w", err)
+	}
+	buildComplete := false
+	defer func() {
+		if buildComplete {
+			return
+		}
+		stopContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = m.Provider.Stop(stopContext, buildName)
+	}()
 	m.infof("starting image with Tart network mode %q\n", m.Config.Provider.Network)
-	startOptions, err := m.startOptions(buildLogPath, m.Config.Image.OutputImage)
+	startOptions, err := m.startOptions(buildLogPath, buildName)
 	if err != nil {
 		return err
 	}
-	if _, err := m.Provider.Start(ctx, m.Config.Image.OutputImage, startOptions); err != nil {
+	if _, err := m.Provider.Start(ctx, buildName, startOptions); err != nil {
 		return err
 	}
-	ip, err := m.Provider.IP(ctx, m.Config.Image.OutputImage, m.Config.Timeouts.BootSeconds)
+	ip, err := m.Provider.IP(ctx, buildName, m.Config.Timeouts.BootSeconds)
 	if err != nil {
 		return err
 	}
 	m.infof("guest reachable at %s\n", ip)
 	m.infof("copying guest scripts\n")
-	if err := m.installGuestScripts(ctx, m.Config.Image.OutputImage); err != nil {
+	if err := m.installGuestScripts(ctx, buildName); err != nil {
 		return err
 	}
-	if err := m.installTrustedCACertificates(ctx, m.Config.Image.OutputImage); err != nil {
+	if err := m.installTrustedCACertificates(ctx, buildName); err != nil {
 		return err
 	}
-	if err := m.installImageManifest(ctx, m.Config.Image.OutputImage, *opts.Manifest); err != nil {
+	if err := m.installImageManifest(ctx, buildName, *opts.Manifest); err != nil {
 		return err
 	}
 	switch m.runnerImagesCopyMode() {
 	case runnerImagesCopySubset:
 		m.infof("copying runner-images script subset\n")
-		if err := m.copyRunnerImagesSubset(ctx, m.Config.Image.OutputImage, upstreamDir); err != nil {
+		if err := m.copyRunnerImagesSubset(ctx, buildName, upstreamDir); err != nil {
 			return err
 		}
 	case runnerImagesCopyNone:
 		m.infof("skipping runner-images script subset; no selected install script requires it\n")
 	}
 	m.infof("installing base runner runtime\n")
-	if _, err := m.execBuildGuest(ctx, m.Config.Image.OutputImage, []string{"sudo", "bash", "/opt/epar/install-base.sh", "/opt/epar/upstream/runner-images"}, provider.ExecOptions{}); err != nil {
+	if _, err := m.execBuildGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-base.sh", "/opt/epar/upstream/runner-images"}, provider.ExecOptions{}); err != nil {
 		return err
 	}
 	m.infof("installing GitHub Actions runner\n")
-	if _, err := m.execBuildGuest(ctx, m.Config.Image.OutputImage, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
+	if _, err := m.execBuildGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/install-runner.sh", m.Config.Image.RunnerVersion}, provider.ExecOptions{}); err != nil {
 		return err
 	}
-	if err := m.installRosettaSupport(ctx, m.Config.Image.OutputImage); err != nil {
+	if err := m.installRosettaSupport(ctx, buildName); err != nil {
 		return err
 	}
-	if err := m.installCustomInstallScripts(ctx, m.Config.Image.OutputImage); err != nil {
+	if err := m.installCustomInstallScripts(ctx, buildName); err != nil {
 		return err
 	}
 	m.infof("validating runner runtime inside the instance\n")
-	if err := m.validateRuntime(ctx, m.Config.Image.OutputImage); err != nil {
+	if err := m.validateRuntime(ctx, buildName); err != nil {
 		return err
 	}
 	m.infof("finalizing image for clean Tart clones\n")
-	if _, err := m.execBuildGuest(ctx, m.Config.Image.OutputImage, []string{"sudo", "bash", "/opt/epar/finalize-image.sh"}, provider.ExecOptions{}); err != nil {
+	if _, err := m.execBuildGuest(ctx, buildName, []string{"sudo", "bash", "/opt/epar/finalize-image.sh"}, provider.ExecOptions{}); err != nil {
 		return err
 	}
 	m.infof("stopping image\n")
-	if err := m.Provider.Stop(ctx, m.Config.Image.OutputImage); err != nil {
+	if err := m.Provider.Stop(ctx, buildName); err != nil {
 		return err
 	}
-	m.infof("image build complete: %s is available in `tart list`\n", m.Config.Image.OutputImage)
+	if err := m.activateTartImage(ctx, output, outputExists, buildName, outputName); err != nil {
+		return err
+	}
+	buildComplete = true
+	m.infof("image build complete: %s is available in `tart list`\n", outputName)
 	return nil
+}
+
+func tartBuildName(outputName, manifestHash string) string {
+	short := manifestHash
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	return outputName + "-epar-build-" + short
+}
+
+func tartBackupName(outputName, providerID string) string {
+	replacer := strings.NewReplacer(":", "", "-", "")
+	identity := replacer.Replace(strings.ToLower(providerID))
+	if len(identity) > 12 {
+		identity = identity[len(identity)-12:]
+	}
+	return outputName + "-epar-previous-" + identity
+}
+
+func findTartImage(instances []provider.Instance, name string) (provider.Instance, bool) {
+	for _, instance := range instances {
+		if instance.Name == name {
+			return instance, true
+		}
+	}
+	return provider.Instance{}, false
+}
+
+func (m *Coordinator) activateTartImage(ctx context.Context, previous provider.Instance, previousExists bool, buildName, outputName string) error {
+	instances, err := m.Provider.List(ctx)
+	if err != nil {
+		return err
+	}
+	candidate, candidateExists := findTartImage(instances, buildName)
+	if !candidateExists || candidate.ProviderID == "" {
+		return fmt.Errorf("Tart build candidate %q has no exact immutable identity at activation", buildName)
+	}
+	if current, exists := findTartImage(instances, outputName); exists {
+		if !previousExists || previous.ProviderID == "" || current.ProviderID != previous.ProviderID {
+			return fmt.Errorf("Tart output image %q changed during replacement; refusing to delete it", outputName)
+		}
+	} else if previousExists {
+		return fmt.Errorf("Tart output image %q disappeared during replacement", outputName)
+	}
+
+	backupName := ""
+	if previousExists {
+		backupName = tartBackupName(outputName, previous.ProviderID)
+		if _, exists := findTartImage(instances, backupName); exists {
+			return fmt.Errorf("Tart rollback image %q already exists; refusing an ambiguous replacement", backupName)
+		}
+		if err := m.Provider.Clone(ctx, outputName, backupName); err != nil {
+			return fmt.Errorf("create Tart rollback image: %w", err)
+		}
+		if err := m.verifyTartImageIdentity(ctx, backupName); err != nil {
+			return fmt.Errorf("read back Tart rollback image: %w", err)
+		}
+		if err := m.recordTartStagingImage(ctx, backupName, "activation-rollback"); err != nil {
+			_ = m.Provider.Delete(ctx, backupName)
+			return fmt.Errorf("record Tart rollback image ownership: %w", err)
+		}
+		if strings.EqualFold(previous.State, "running") {
+			if err := m.Provider.Stop(ctx, outputName); err != nil {
+				return fmt.Errorf("stop previous Tart output image: %w", err)
+			}
+		}
+		if err := m.Provider.Delete(ctx, outputName); err != nil {
+			return fmt.Errorf("remove previous Tart output name after rollback copy: %w", err)
+		}
+	}
+
+	activationErr := m.Provider.Clone(ctx, buildName, outputName)
+	if activationErr == nil {
+		activationErr = m.verifyTartImageIdentity(ctx, outputName)
+	}
+	if activationErr != nil {
+		if !previousExists {
+			return fmt.Errorf("activate Tart image: %w; the verified build candidate remains available as %q", activationErr, buildName)
+		}
+		restoreErr := m.restoreTartImage(ctx, outputName, backupName)
+		if restoreErr != nil {
+			return fmt.Errorf("activate Tart image: %v; rollback also failed: %w", activationErr, restoreErr)
+		}
+		return fmt.Errorf("activate Tart image: %w; previous image was restored", activationErr)
+	}
+
+	if backupName != "" {
+		if err := m.Provider.Delete(ctx, backupName); err != nil {
+			m.warnf("EPAR Tart rollback image cleanup deferred for %s: %v\n", backupName, err)
+		}
+	}
+	if err := m.Provider.Delete(ctx, buildName); err != nil {
+		m.warnf("EPAR Tart build candidate cleanup deferred for %s: %v\n", buildName, err)
+	}
+	return nil
+}
+
+func (m *Coordinator) verifyTartImageIdentity(ctx context.Context, name string) error {
+	instances, err := m.Provider.List(ctx)
+	if err != nil {
+		return err
+	}
+	instance, exists := findTartImage(instances, name)
+	if !exists || instance.ProviderID == "" {
+		return fmt.Errorf("Tart image %q did not pass immutable identity readback", name)
+	}
+	return nil
+}
+
+func (m *Coordinator) restoreTartImage(ctx context.Context, outputName, backupName string) error {
+	if backupName == "" {
+		return errors.New("no previous Tart image exists to restore")
+	}
+	instances, err := m.Provider.List(ctx)
+	if err != nil {
+		return err
+	}
+	if current, exists := findTartImage(instances, outputName); exists {
+		if strings.EqualFold(current.State, "running") {
+			if err := m.Provider.Stop(ctx, outputName); err != nil {
+				return err
+			}
+		}
+		if err := m.Provider.Delete(ctx, outputName); err != nil {
+			return err
+		}
+	}
+	if err := m.Provider.Clone(ctx, backupName, outputName); err != nil {
+		return err
+	}
+	return m.verifyTartImageIdentity(ctx, outputName)
 }
 
 func (m *Coordinator) buildWSLImage(ctx context.Context, opts ImageBuildOptions, upstreamDir string) error {
@@ -336,27 +515,37 @@ func (m *Coordinator) buildWSLImageUntimed(ctx context.Context, opts ImageBuildO
 	if err := resetLogs(buildLogPath, guestLogPath); err != nil {
 		return err
 	}
-	if !m.DryRun {
-		if _, err := os.Stat(outputPath); err == nil && !opts.Replace {
-			return fmt.Errorf("wsl output image %s already exists; rerun with --replace", outputPath)
-		} else if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if opts.Replace {
-			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			if err := os.Remove(wslImageManifestSidecarPath(outputPath)); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
-	}
 	if opts.Manifest == nil {
 		manifest, err := m.desiredImageManifest(ctx)
 		if err != nil {
 			return err
 		}
 		opts.Manifest = &manifest
+	}
+	manifestHash, err := imageManifestHash(*opts.Manifest)
+	if err != nil {
+		return err
+	}
+	candidateOutputPath := outputPath + ".epar-candidate-" + manifestHash[:16]
+	if !m.DryRun {
+		if err := recoverWSLArtifactSwap(outputPath); err != nil {
+			return fmt.Errorf("recover interrupted WSL artifact activation: %w", err)
+		}
+		if err := removeRegularFileIfPresent(candidateOutputPath); err != nil {
+			return err
+		}
+		if err := removeRegularFileIfPresent(wslImageManifestSidecarPath(candidateOutputPath)); err != nil {
+			return err
+		}
+		if _, err := os.Stat(outputPath); err == nil && !opts.Replace {
+			return fmt.Errorf("wsl output image %s already exists; rerun with --replace", outputPath)
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		defer func() {
+			_ = removeRegularFileIfPresent(candidateOutputPath)
+			_ = removeRegularFileIfPresent(wslImageManifestSidecarPath(candidateOutputPath))
+		}()
 	}
 
 	sourceForClone := m.Config.Image.SourceImage
@@ -472,13 +661,24 @@ func (m *Coordinator) buildWSLImageUntimed(ctx context.Context, opts ImageBuildO
 	if err := m.Provider.Stop(ctx, buildName); err != nil {
 		return err
 	}
-	m.infof("exporting reusable WSL image to %s\n", outputPath)
-	if err := exporter.Export(ctx, buildName, m.Config.Image.OutputImage); err != nil {
+	m.infof("exporting reusable WSL image candidate to %s\n", candidateOutputPath)
+	if err := exporter.Export(ctx, buildName, candidateOutputPath); err != nil {
 		return err
 	}
 	if !m.DryRun {
-		if err := writeStoredImageManifest(wslImageManifestSidecarPath(outputPath), *opts.Manifest); err != nil {
+		candidateSidecarPath := wslImageManifestSidecarPath(candidateOutputPath)
+		if err := writeStoredImageManifest(candidateSidecarPath, *opts.Manifest); err != nil {
 			return err
+		}
+		stored, err := readStoredImageManifest(candidateSidecarPath)
+		if err != nil {
+			return fmt.Errorf("read back WSL image candidate manifest: %w", err)
+		}
+		if stored.Hash != manifestHash {
+			return fmt.Errorf("WSL image candidate manifest mismatch: got %s, want %s", stored.Hash, manifestHash)
+		}
+		if err := activateWSLArtifact(candidateOutputPath, outputPath); err != nil {
+			return fmt.Errorf("activate WSL image %s: %w", outputPath, err)
 		}
 	}
 	m.infof("image build complete: %s is available for WSL imports\n", outputPath)

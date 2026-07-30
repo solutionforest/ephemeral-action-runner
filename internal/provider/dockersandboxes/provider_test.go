@@ -57,6 +57,45 @@ func TestStartDaemonUsesExactDetachedCommand(t *testing.T) {
 	done()
 }
 
+func TestRemoveTemplateUsesExactCacheIDAndRefusesLiveSandboxes(t *testing.T) {
+	artifact := provider.TemplateArtifact{
+		Reference: "docker.io/library/epar-template:one",
+		CacheID:   "aaaaaaaaaaaa",
+		Digest:    "sha256:aaaaaaaaaaaa0000000000000000000000000000000000000000000000000000",
+	}
+	template := `{"images":[{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"one","flavor":"","created_at":"2026-07-29T00:00:00Z","size":1024}]}`
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: template}},
+		commandStep{args: []string{"template", "rm", "aaaaaaaaaaaa"}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[]}`}},
+	)
+	if err := p.RemoveTemplate(context.Background(), artifact); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	p, done = scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+	)
+	if err := p.RemoveTemplate(context.Background(), artifact); err == nil || !strings.Contains(err.Error(), "while 1 Docker Sandbox") {
+		t.Fatalf("RemoveTemplate() error = %v, want live Sandbox refusal", err)
+	}
+	done()
+}
+
+func TestObserveTemplateRequiresExactReferenceAndCacheID(t *testing.T) {
+	artifact := provider.TemplateArtifact{Reference: "docker.io/library/epar-template:one", CacheID: "aaaaaaaaaaaa"}
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"one","flavor":"","created_at":"2026-07-29T00:00:00Z","size":1024}]}`}},
+	)
+	exists, err := p.ObserveTemplate(context.Background(), artifact)
+	if err != nil || !exists {
+		t.Fatalf("ObserveTemplate() = %t, %v, want true", exists, err)
+	}
+	done()
+}
+
 type commandStep struct {
 	args        []string
 	result      provider.ExecResult
@@ -80,13 +119,6 @@ func (writer *cancellationSignalWriter) Write(data []byte) (int, error) {
 func scriptedProvider(t *testing.T, steps ...commandStep) (*Provider, func()) {
 	t.Helper()
 	p := New("sbx-test-double")
-	p.inspectImage = func(_ context.Context, reference string) (string, error) {
-		t.Helper()
-		if reference != testTemplate {
-			t.Fatalf("inspected image reference = %q, want %q", reference, testTemplate)
-		}
-		return testDigest, nil
-	}
 	index := 0
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 		t.Helper()
@@ -198,36 +230,26 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}},
 	)
-	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "did not match") {
+	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("err = %v", err)
 	}
 	done()
 }
 
-func TestCreateFailsClosedWhenFullLocalImageIdentityDiffersDespiteMatchingCacheID(t *testing.T) {
+func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
 	)
-	p.inspectImage = func(context.Context, string) (string, error) {
-		return "sha256:39cf20eca861ffffffffffffffffffffffffffffffffffffffffffffffffffff", nil
-	}
-	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "full local docker sandbox template image identity") {
-		t.Fatalf("err = %v", err)
-	}
-	done()
-}
-
-func TestCreateFailsClosedWhenFullLocalImageIdentityCannotBeRead(t *testing.T) {
-	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
-	)
-	p.inspectImage = func(context.Context, string) (string, error) {
-		return "", errors.New("local image missing")
-	}
-	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "local image missing") {
-		t.Fatalf("err = %v", err)
+	if _, err := p.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
 	}
 	done()
 }
@@ -397,72 +419,6 @@ func TestReadGlobalNetworkPolicyFailsClosedOnMalformedJSON(t *testing.T) {
 		t.Fatal("malformed global policy was accepted")
 	}
 	done()
-}
-
-func TestLocalTemplateInspectionUsesExactDockerImageInspectArgv(t *testing.T) {
-	if got, want := localTemplateInspectArgs(testTemplate), []string{"image", "inspect", "--format", "{{json .}}", testTemplate}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("docker image inspect args = %#v, want %#v", got, want)
-	}
-}
-
-func TestParseLocalTemplateImageValidatesFullIdentityAndPlatform(t *testing.T) {
-	valid := `{"Id":"` + testDigest + `","Os":"linux","Architecture":"amd64"}`
-	image, err := parseLocalTemplateImage([]byte(valid))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if image.Digest != testDigest || image.Platform != "linux/amd64" {
-		t.Fatalf("local template image = %#v", image)
-	}
-	for _, fixture := range []string{
-		`{"Id":"sha256:short","Os":"linux","Architecture":"amd64"}`,
-		`{"Id":"` + testDigest + `","Os":"linux","Architecture":"s390x"}`,
-		`{"Id":"` + testDigest + `","Os":"windows","Architecture":"amd64"}`,
-		`{"Id":"` + testDigest + `","Os":"linux","Architecture":"amd64"} trailing`,
-	} {
-		if _, err := parseLocalTemplateImage([]byte(fixture)); err == nil {
-			t.Fatalf("invalid local image inspection was accepted: %s", fixture)
-		}
-	}
-}
-
-func TestInspectLocalTemplateRejectsNonRepositoryTagReference(t *testing.T) {
-	p := New("sbx-test-double")
-	p.inspectTemplate = func(context.Context, string) (LocalTemplateImage, error) {
-		t.Fatal("invalid local template reference reached Docker image inspection")
-		return LocalTemplateImage{}, nil
-	}
-	for _, reference := range []string{"", "template", "template@sha256:deadbeef", "template:tag/with-slash", "-template:tag", "template:tag;other"} {
-		if _, err := p.InspectLocalTemplate(context.Background(), reference); err == nil {
-			t.Fatalf("invalid local template reference was accepted: %q", reference)
-		}
-	}
-}
-
-func TestInspectLocalTemplatePreservesValidatedIdentityAndPlatform(t *testing.T) {
-	p := New("sbx-test-double")
-	p.inspectTemplate = func(_ context.Context, reference string) (LocalTemplateImage, error) {
-		if reference != testTemplate {
-			t.Fatalf("inspected local template = %q, want %q", reference, testTemplate)
-		}
-		return LocalTemplateImage{Digest: testDigest, Platform: "linux/arm64"}, nil
-	}
-	image, err := p.InspectLocalTemplate(context.Background(), testTemplate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if image.Digest != testDigest || image.Platform != "linux/arm64" {
-		t.Fatalf("local template = %#v", image)
-	}
-	for _, invalid := range []LocalTemplateImage{
-		{Digest: "sha256:short", Platform: "linux/amd64"},
-		{Digest: testDigest, Platform: "linux/s390x"},
-	} {
-		p.inspectTemplate = func(context.Context, string) (LocalTemplateImage, error) { return invalid, nil }
-		if _, err := p.InspectLocalTemplate(context.Background(), testTemplate); err == nil {
-			t.Fatalf("invalid local template metadata was accepted: %#v", invalid)
-		}
-	}
 }
 
 func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {

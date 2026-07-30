@@ -163,7 +163,7 @@ func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 	if !strings.Contains(string(configText), "replacementRetryInitialSeconds: 15\n  replacementRetryMaxSeconds: 1800\n  replacementRetryMultiplier: 2\n  replacementRetryJitterPercent: 20\n") {
 		t.Fatalf("generated config did not include replacement retry settings:\n%s", configText)
 	}
-	if !strings.Contains(string(configText), "storage:\n  minimumFree: 1GiB\n  gracePeriod: 168h\n  keepPrevious: 0\n  automaticHousekeeping: conservative\n  buildCacheLimit: 64GiB\n  goCacheLimit: 10GiB\n") {
+	if !strings.Contains(string(configText), "storage:\n  minimumFree: 1GiB\n  gracePeriod: 168h\n  keepPrevious: 0\n  automaticHousekeeping: conservative\n  buildCacheLimit: 20GiB\n  goCacheLimit: 10GiB\n") {
 		t.Fatalf("generated config did not include bounded storage settings:\n%s", configText)
 	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-container-catthehacker-ubuntu") {

@@ -50,7 +50,6 @@ type PreflightOptions struct {
 	NativeController    bool
 	ControllerRevision  string
 	RunSBX              func(context.Context, []string) ([]byte, error)
-	InspectTemplate     func(context.Context, string) (string, error)
 	HostSpace           func(string) (HostSpace, error)
 	CheckVirtualization func() error
 }
@@ -84,7 +83,6 @@ func LocalPreflight(ctx context.Context, record Record, projectRoot string, nati
 		NativeController:    nativeController,
 		ControllerRevision:  controllerRevision,
 		RunSBX:              runSBXCommand,
-		InspectTemplate:     inspectLocalTemplateImage,
 		HostSpace:           sandboxHostSpace,
 		CheckVirtualization: sandboxVirtualizationAvailable,
 	})
@@ -163,20 +161,6 @@ func RunPreflight(ctx context.Context, record Record, opts PreflightOptions) Pre
 	} else if err := verifyPromotedTemplate(templateOutput, record.Template, record.TemplateCacheID); err != nil {
 		add("promoted template", err.Error(), fmt.Sprintf("Build and load the exact promoted template %s with cache ID %s, then rerun setup.", record.Template, record.TemplateCacheID))
 	}
-	if opts.InspectTemplate == nil {
-		add("promoted template evidence", "the independent local Docker image identity reader is unavailable", "Keep the full promoted template image in the local Docker image store, then rerun setup.")
-	} else {
-		fullIdentity, inspectErr := opts.InspectTemplate(ctx, record.Template)
-		fullIdentity = strings.TrimSpace(fullIdentity)
-		switch {
-		case inspectErr != nil:
-			add("promoted template evidence", inspectErr.Error(), "Restore the exact locally built and hash-anchored promoted template image, then rerun setup.")
-		case !validSHA256(fullIdentity):
-			add("promoted template evidence", "local Docker image inspection did not return a full lowercase sha256 identity", "Restore the exact locally built and hash-anchored promoted template image, then rerun setup.")
-		case fullIdentity != record.TemplateDigest:
-			add("promoted template evidence", fmt.Sprintf("full local Docker image identity is %s, want %s", fullIdentity, record.TemplateDigest), "Restore the exact locally built and hash-anchored promoted template image, then rerun setup.")
-		}
-	}
 
 	policyOutput, policyErr := opts.RunSBX(ctx, []string{"policy", "ls", "--include-inactive", "--json"})
 	if policyErr != nil {
@@ -219,26 +203,6 @@ func runSBXCommand(ctx context.Context, args []string) ([]byte, error) {
 		return nil, fmt.Errorf("sbx %s failed: %w", args[0], err)
 	}
 	return append([]byte(nil), stdout.Bytes()...), nil
-}
-
-func inspectLocalTemplateImage(ctx context.Context, reference string) (string, error) {
-	command := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", reference)
-	command.Env = sandboxCommandEnvironment()
-	stdout := &preflightBuffer{limit: 1024}
-	stderr := &preflightBuffer{limit: 4096}
-	command.Stdout = stdout
-	command.Stderr = stderr
-	err := command.Run()
-	if stdout.overflow || stderr.overflow {
-		err = errors.Join(err, errors.New("Docker image inspection output limit exceeded"))
-	}
-	if err != nil {
-		if detail := strings.TrimSpace(stderr.String()); detail != "" {
-			return "", fmt.Errorf("docker image inspect failed: %w: %s", err, detail)
-		}
-		return "", fmt.Errorf("docker image inspect failed: %w", err)
-	}
-	return stdout.String(), nil
 }
 
 func sandboxCommandEnvironment() []string {

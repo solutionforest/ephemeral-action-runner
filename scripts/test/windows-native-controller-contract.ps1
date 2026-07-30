@@ -51,7 +51,10 @@ $builderAst = [System.Management.Automation.Language.Parser]::ParseFile($builder
 if (@($builderParseErrors).Count -ne 0) {
     throw "build-native-controller.ps1 failed to parse: $(@($builderParseErrors).Message -join '; ')"
 }
-foreach ($functionName in @('Get-EparDirectoryBytes', 'Test-EparNativeControllerLeaseActive', 'Test-EparNativeControllerBuildLeaseValid', 'Invoke-EparNativeControllerCacheRetention', 'Get-EparGoCacheVolumeIdentity', 'Invoke-EparGoCacheLimit')) {
+if ($builderSource -notmatch 'docker build --quiet --provenance=false') {
+    throw 'native controller toolchain build must disable nondeterministic default provenance'
+}
+foreach ($functionName in @('Get-EparDirectoryBytes', 'Test-EparNativeControllerLeaseActive', 'Test-EparNativeControllerBuildLeaseValid', 'Invoke-EparNativeControllerCacheRetention', 'Get-EparGoCacheVolumeIdentity', 'Invoke-EparGoCacheLimit', 'Read-EparStableNativeControllerManifest', 'Get-EparDockerImageID', 'Get-EparTLSFailureHost', 'Get-EparCertificateSHA256', 'Find-EparWindowsIssuerRoots', 'Invoke-EparTLSFailureDiagnostic', 'Initialize-EparBootstrapBuildTrust')) {
     $function = $builderAst.Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
@@ -60,6 +63,70 @@ foreach ($functionName in @('Get-EparDirectoryBytes', 'Test-EparNativeController
         throw "native controller cache retention function is missing: $functionName"
     }
     Invoke-Expression $function.Extent.Text
+}
+$previousErrorActionPreferenceForImageProbe = $ErrorActionPreference
+try {
+    function docker {
+        Write-Error 'No such image: contract-missing'
+        $global:LASTEXITCODE = 1
+    }
+    if (Get-EparDockerImageID -Reference 'contract-missing') {
+        throw 'missing Docker image probe returned an identity'
+    }
+    if ($ErrorActionPreference -ne $previousErrorActionPreferenceForImageProbe) {
+        throw 'missing Docker image probe did not restore ErrorActionPreference'
+    }
+} finally {
+    Remove-Item Function:\docker -ErrorAction SilentlyContinue
+}
+$tlsFailureTranscript = 'module: Get "https://proxy.golang.org/example/@v/v1.0.0.zip": tls: failed to verify certificate: x509: certificate signed by unknown authority'
+if ((Get-EparTLSFailureHost -Transcript $tlsFailureTranscript) -cne 'proxy.golang.org') {
+    throw 'native-controller TLS failure host was not extracted'
+}
+if (Get-EparTLSFailureHost -Transcript 'ordinary build failure without a certificate error') {
+    throw 'ordinary native-controller failure was misclassified as a TLS certificate failure'
+}
+$tlsDiagnosticRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('epar-native-tls-diagnostic-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tlsDiagnosticRoot | Out-Null
+$previousDevImage = $DevImage
+try {
+    $tlsDiagnosticLog = Join-Path $tlsDiagnosticRoot 'build.log'
+    [System.IO.File]::WriteAllText($tlsDiagnosticLog, $tlsFailureTranscript)
+    $DevImage = 'contract-dev-image'
+    function docker {
+        Write-Output 'depth=0 CN=proxy.golang.org'
+        Write-Output 'verify error:num=20:unable to get local issuer certificate'
+        Write-Output 'subject=CN=proxy.golang.org'
+        Write-Output 'issuer=CN=EPAR contract root'
+        Write-Output 'sha256 Fingerprint=AA:BB'
+        Write-Output 'notBefore=Jul 29 00:00:00 2026 GMT'
+        Write-Output 'notAfter=Jul 29 00:00:00 2027 GMT'
+        $global:LASTEXITCODE = 0
+    }
+    Invoke-EparTLSFailureDiagnostic -Transcript $tlsFailureTranscript -LogPath $tlsDiagnosticLog
+    $tlsDiagnosticContent = Get-Content -Raw -LiteralPath $tlsDiagnosticLog
+    foreach ($required in @('EPAR TLS certificate diagnostic', 'Requested host: proxy.golang.org:443', 'Issuer: CN=EPAR contract root', 'SHA-256: AABB', 'TLS verification was not disabled')) {
+        if (-not $tlsDiagnosticContent.Contains($required)) {
+            throw "native-controller TLS diagnostic log is missing: $required"
+        }
+    }
+} finally {
+    $DevImage = $previousDevImage
+    Remove-Item Function:\docker -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tlsDiagnosticRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+$stableManifestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('epar-native-stable-manifest-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stableManifestRoot | Out-Null
+try {
+    $stableManifestPath = Join-Path $stableManifestRoot 'ephemeral-action-runner.manifest'
+    $stableFingerprint = [string]::new([char]'a', 64)
+    [System.IO.File]::WriteAllLines($stableManifestPath, @('schemaVersion=2', "fingerprint=$stableFingerprint", 'executable=ephemeral-action-runner.exe', ('toolchainImageID=sha256:' + [string]::new([char]'b', 64)), 'sourceRevision=sha256:test', 'completedAtUtc=2026-07-29T00:00:00Z'))
+    $stableManifest = Read-EparStableNativeControllerManifest -Path $stableManifestPath
+    if ($null -eq $stableManifest -or $stableManifest.fingerprint -ne $stableFingerprint) { throw 'stable native-controller manifest was not parsed' }
+    Add-Content -LiteralPath $stableManifestPath -Value 'fingerprint=duplicate'
+    if ($null -ne (Read-EparStableNativeControllerManifest -Path $stableManifestPath)) { throw 'stable native-controller manifest accepted duplicate keys' }
+} finally {
+    Remove-Item -LiteralPath $stableManifestRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 $GomodVolume = 'contract-gomod'
 $GocacheVolume = 'contract-gocache'
@@ -209,6 +276,14 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $policyRoot $policyKeys[2]))) {
         throw 'native controller retention removed a grace-protected revision beyond the byte budget'
     }
+    $migrationRoot = Join-Path $retentionRoot 'migration-contract'
+    $migrationKey = [string]::new([char]'f', 64)
+    $migrationDirectory = Join-Path $migrationRoot $migrationKey
+    New-Item -ItemType Directory -Force -Path $migrationDirectory | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $migrationDirectory 'ephemeral-action-runner.exe'), 'legacy')
+    [System.IO.File]::WriteAllLines((Join-Path $migrationDirectory 'controller-cache.manifest'), @('schemaVersion=1', "cacheKey=$migrationKey", 'executable=ephemeral-action-runner.exe'))
+    Invoke-EparNativeControllerCacheRetention -CacheRoot $migrationRoot -CurrentCacheKey $migrationKey -KeepPrevious 0 -MaxBytes 1 -GracePeriod ([TimeSpan]::Zero) -AbandonedBuildGracePeriod ([TimeSpan]::Zero) -RemoveCurrent
+    if (Test-Path -LiteralPath $migrationDirectory) { throw 'native controller legacy migration left an inactive exact revision behind' }
 } finally {
     Remove-Item -LiteralPath $retentionRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -323,7 +398,7 @@ foreach ($required in @('$env:EPAR_INVOCATION = "start"', 'if ($ControllerArgs.C
 if ($startSource.Contains('@StartArgs')) {
     throw 'start command-forwarding contract still forces the start command'
 }
-foreach ($required in @('CGO_ENABLED=0', 'GOOS=windows', 'GOARCH=amd64', '.local\bin', 'dirty:sha256:', 'EPAR_NATIVE_CONTROLLER', 'Get-EparNativeSourceHash', 'Invoke-EparNativeControllerCacheRetention', 'Test-EparNativeControllerBuildLeaseValid', 'controller-cache.manifest', 'lease-build-', '[System.IO.FileAttributes]::ReparsePoint', '$maximumAttempts = 5', 'Start-Sleep -Milliseconds')) {
+foreach ($required in @('CGO_ENABLED=0', 'GOOS=windows', 'GOARCH=amd64', '.local\bin', 'dirty:sha256:', 'EPAR_NATIVE_CONTROLLER', 'Get-EparNativeSourceHash', 'activeControllerFingerprint', 'existingManifest.toolchainImageID', 'Invoke-EparNativeControllerCacheRetention', 'Test-EparNativeControllerBuildLeaseValid', 'controller-cache.manifest', 'ephemeral-action-runner.manifest', 'schemaVersion=2', 'lease-native-', 'golang:latest', 'Write-EparBootstrapAcquisitionJournal', 'Resolve-EparGoToolchainImage', 'previousDevImageID', '$previousDevImageID = Get-EparDockerImageID', '[System.IO.FileAttributes]::ReparsePoint', '$maximumAttempts = 5', 'Start-Sleep -Milliseconds', 'epar-native-controller-build.log', 'Invoke-EparTLSFailureDiagnostic', 'TLS verification was not disabled', 'Initialize-EparBootstrapBuildTrust', '--network none', 'GO111MODULE=off', 'GOTOOLCHAIN=local', 'SSL_CERT_FILE=/run/epar-bootstrap-ca.pem', 'scripts\bootstrap-trust', ':/run/epar-bootstrap-ca.pem:ro')) {
     if (-not $builderSource.Contains($required)) {
         throw "native controller build contract is missing: $required"
     }

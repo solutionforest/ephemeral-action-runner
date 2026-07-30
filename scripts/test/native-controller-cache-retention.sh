@@ -3,7 +3,8 @@ set -euo pipefail
 
 source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 builder="${source_root}/scripts/build-native-controller.sh"
-eval "$(sed -n '/^epar_directory_mtime()/,/^case "$(uname -s)\/$(uname -m)"/p' "$builder" | sed '$d')"
+grep -q -- '--provenance=false' "$builder" || { echo 'native controller toolchain build must disable nondeterministic default provenance' >&2; exit 1; }
+eval "$(sed -n '/^epar_tls_failure_host()/,/^case "$(uname -s)\/$(uname -m)"/p' "$builder" | sed '$d')"
 
 native_cache_keep_previous=2
 native_cache_max_bytes=$((1024 * 1024))
@@ -16,6 +17,12 @@ cleanup() {
   rm -rf -- "$temporary"
 }
 trap cleanup EXIT INT TERM
+
+tls_transcript="${temporary}/tls-error.log"
+printf '%s\n' 'module: Get "https://proxy.golang.org/example/@v/v1.0.0.zip": tls: failed to verify certificate: x509: certificate signed by unknown authority' >"$tls_transcript"
+[[ "$(epar_tls_failure_host "$tls_transcript")" == 'proxy.golang.org' ]] || { echo 'native-controller TLS failure host was not extracted' >&2; exit 1; }
+printf '%s\n' 'ordinary build failure' >"$tls_transcript"
+[[ -z "$(epar_tls_failure_host "$tls_transcript")" ]] || { echo 'ordinary native-controller failure was misclassified as TLS' >&2; exit 1; }
 
 repeat_character() {
   printf '%64s' '' | tr ' ' "$1"
@@ -137,5 +144,10 @@ native_cache_grace_seconds=$((7 * 24 * 60 * 60))
 epar_prune_native_controller_cache "$policy_root" "$policy_current"
 [[ ! -e "${policy_root}/${policy_expired}" ]] || { echo "retention kept an expired revision beyond the byte budget" >&2; exit 1; }
 [[ -d "${policy_root}/${policy_grace}" ]] || { echo "retention removed a grace-protected revision beyond the byte budget" >&2; exit 1; }
+
+builder_source="$(cat "$builder")"
+for required in 'golang:latest' 'ephemeral-action-runner.manifest' 'schemaVersion=2' 'lease-native-' 'epar_write_bootstrap_acquisition_journal' 'epar_resolve_go_toolchain_image' 'previousDevImageID' 'previous_dev_image_id' 'epar-native-controller-build.log' 'epar_report_tls_failure' 'TLS verification was not disabled' 'epar_prepare_bootstrap_build_trust' '--network none' 'GO111MODULE=off' 'GOTOOLCHAIN=local' 'SSL_CERT_FILE=/run/epar-bootstrap-ca.pem' 'scripts/bootstrap-trust' ':/run/epar-bootstrap-ca.pem:ro'; do
+  [[ "$builder_source" == *"$required"* ]] || { echo "stable native-controller wrapper contract is missing: ${required}" >&2; exit 1; }
+done
 
 echo "Unix native-controller cache retention contract passed"

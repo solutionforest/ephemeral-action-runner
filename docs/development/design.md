@@ -38,6 +38,6 @@ Unknown ownership, unavailable dependencies, failed cleanup, and uncertain remot
 
 Each provider reports the storage surfaces and temporary expansion required by bootstrap, artifact builds, instance creation, and replacement. The common preflight requires enough space for the operation plus the configured free-space reserve.
 
-Artifacts are classified as active, current reusable, superseded EPAR-owned, incomplete temporary, or shared/unknown. Conservative housekeeping may remove only expired, unleased, exactly owned local artifacts and bounded dedicated caches. Removing Docker images, volumes, imported templates, WSL distributions, or Tart images requires an explicit previewed storage-prune operation.
+Artifacts are classified as active, current reusable, superseded EPAR-owned, incomplete temporary, or shared/unknown. At startup and after activation, conservative housekeeping reconciles interrupted work and removes only unreferenced, exactly owned superseded resources after live readback. It retains resources used by another configuration, lease, container, sandbox, distribution, or builder. Prefix-only and shared resources require an explicit previewed prune; cleanup never expands to a broad prune, reset, or wildcard.
 
 See [Adding a Provider](adding-provider.md) for the extension checklist.

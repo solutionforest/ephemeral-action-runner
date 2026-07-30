@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
 func TestDockerContainerBuildContextKeepsHostAndExplicitTrustSeparate(t *testing.T) {
@@ -283,7 +285,7 @@ func TestHostTrustReconciliationRevokesAndRetiresIdleOldGeneration(t *testing.T)
 		CollectedAt:  time.Now().UTC(),
 	}
 	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1"}}
-	manager.reconcileHostTrustRunners(context.Background(), active, current)
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
 	if len(active) != 0 {
 		t.Fatalf("active runners = %#v, want old idle runner retired", active)
 	}
@@ -317,7 +319,7 @@ func TestHostTrustReconciliationRevokesButDoesNotRetireBusyOldGeneration(t *test
 		CollectedAt:  time.Now().UTC(),
 	}
 	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1"}}
-	manager.reconcileHostTrustRunners(context.Background(), active, current)
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
 	if len(active) != 1 {
 		t.Fatal("busy old-generation runner was retired before its job completed")
 	}
@@ -333,6 +335,152 @@ func TestHostTrustReconciliationRevokesButDoesNotRetireBusyOldGeneration(t *test
 	if !foundRevocation {
 		t.Fatal("busy old runner did not receive a mismatching lease to block a subsequent assignment")
 	}
+}
+
+func TestHostTrustReconciliationPreservesRunnerDuringGitHub503(t *testing.T) {
+	fake := &fakeProvider{}
+	github := &fakeGitHub{runnerErr: &gh.HTTPError{StatusCode: http.StatusServiceUnavailable}}
+	manager := Manager{
+		Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
+		Provider: fake,
+		GitHub:   github,
+	}
+	current := hosttrust.Snapshot{
+		Generation:   "g1",
+		HostOS:       "linux",
+		Scopes:       []string{"system"},
+		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+		CollectedAt:  time.Now().UTC(),
+	}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1"}}
+	if retired := manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool)); retired != 0 {
+		t.Fatalf("retired runners = %d, want 0 during GitHub 503", retired)
+	}
+	if len(active) != 1 {
+		t.Fatal("GitHub 503 removed the active runner")
+	}
+	if got := atomic.LoadInt32(&fake.execCalls); got != 0 {
+		t.Fatalf("guest lease commands = %d, want 0 when GitHub status is unknown", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0 during GitHub 503", got)
+	}
+}
+
+func TestHostTrustReconciliationIssuesOneBoundedBusyHandoffLease(t *testing.T) {
+	provider := &fakeProvider{}
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: true}, found: true}
+	manager := Manager{
+		Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
+		Provider: provider,
+		GitHub:   github,
+	}
+	current := hosttrust.Snapshot{
+		Generation:   "g1",
+		HostOS:       "linux",
+		Scopes:       []string{"system"},
+		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+		CollectedAt:  time.Now().UTC(),
+	}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1"}}
+	busyHandoff := make(map[string]bool)
+
+	manager.reconcileHostTrustRunners(context.Background(), active, current, busyHandoff)
+	manager.reconcileHostTrustRunners(context.Background(), active, current, busyHandoff)
+
+	leases := hostTrustLeaseInputs(provider)
+	if len(leases) != 1 {
+		t.Fatalf("busy handoff lease writes = %d, want 1", len(leases))
+	}
+	var lease hostTrustLease
+	if err := json.Unmarshal([]byte(leases[0]), &lease); err != nil {
+		t.Fatal(err)
+	}
+	expires, err := time.Parse(time.RFC3339Nano, lease.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining := time.Until(expires); remaining < hostTrustHandoffLease-5*time.Second || remaining > hostTrustHandoffLease+time.Second {
+		t.Fatalf("busy handoff lease remaining lifetime = %s, want about %s", remaining, hostTrustHandoffLease)
+	}
+
+	github.runner.Busy = false
+	manager.reconcileHostTrustRunners(context.Background(), active, current, busyHandoff)
+	github.runner.Busy = true
+	manager.reconcileHostTrustRunners(context.Background(), active, current, busyHandoff)
+	if leases = hostTrustLeaseInputs(provider); len(leases) != 3 {
+		t.Fatalf("lease writes after idle and second busy transition = %d, want 3", len(leases))
+	}
+}
+
+func TestHostTrustLeaseUsesOneBoundedAtomicGuestCommand(t *testing.T) {
+	fake := &fakeProvider{}
+	manager := Manager{
+		Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
+		Provider: fake,
+	}
+	snapshot := hosttrust.Snapshot{
+		Generation:   "g1",
+		HostOS:       "linux",
+		Scopes:       []string{"system"},
+		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+		CollectedAt:  time.Now().UTC(),
+	}
+	if err := manager.issueHostTrustLease(context.Background(), "runner-1", snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&fake.execCalls); got != 1 {
+		t.Fatalf("guest commands = %d, want one atomic lease write", got)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.commands) != 1 || !strings.Contains(fake.commands[0], "install -d -m 0755 /run/epar") || !strings.Contains(fake.commands[0], "mv -f") {
+		t.Fatalf("lease command = %q, want directory creation and atomic rename in one command", strings.Join(fake.commands, "\n"))
+	}
+	if len(fake.execOptions) != 1 || !strings.Contains(fake.execOptions[0].Stdin, `"expiresAt"`) {
+		t.Fatal("lease payload was not supplied to the atomic guest command")
+	}
+}
+
+func TestHostTrustLeaseWriteTimeoutIsReportedWithoutBlocking(t *testing.T) {
+	oldTimeout := hostTrustWriteTimeout
+	hostTrustWriteTimeout = 5 * time.Millisecond
+	t.Cleanup(func() { hostTrustWriteTimeout = oldTimeout })
+	fake := &fakeProvider{execFunc: func(ctx context.Context, _ string, _ []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		<-ctx.Done()
+		return provider.ExecResult{}, ctx.Err()
+	}}
+	manager := Manager{
+		Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
+		Provider: fake,
+	}
+	snapshot := hosttrust.Snapshot{
+		Generation:   "g1",
+		HostOS:       "linux",
+		Scopes:       []string{"system"},
+		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+		CollectedAt:  time.Now().UTC(),
+	}
+	started := time.Now()
+	err := manager.issueHostTrustLease(context.Background(), "runner-1", snapshot)
+	if err == nil || !strings.Contains(err.Error(), "host trust lease write exceeded") {
+		t.Fatalf("issueHostTrustLease() error = %v, want bounded-timeout detail", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("lease timeout took %s, want less than one second", elapsed)
+	}
+}
+
+func hostTrustLeaseInputs(provider *fakeProvider) []string {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	var leases []string
+	for _, options := range provider.execOptions {
+		if strings.Contains(options.Stdin, `"expiresAt"`) {
+			leases = append(leases, options.Stdin)
+		}
+	}
+	return leases
 }
 
 func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.T) {

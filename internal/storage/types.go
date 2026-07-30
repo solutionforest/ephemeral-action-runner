@@ -8,7 +8,7 @@ const (
 	DefaultMinimumFreeBytes = 1 * GiB
 	DefaultGracePeriod      = 168 * time.Hour
 	DefaultKeepPrevious     = 0
-	DefaultBuildKitMaxBytes = 64 * GiB
+	DefaultBuildKitMaxBytes = 20 * GiB
 	DefaultGoCacheMaxBytes  = 10 * GiB
 )
 
@@ -190,6 +190,11 @@ type Artifact struct {
 	Active         bool         `json:"active,omitempty"`
 	Lease          *Lease       `json:"lease,omitempty"`
 	Protections    []Protection `json:"protections,omitempty"`
+	BackendID      string       `json:"backendId,omitempty"`
+	Custody        string       `json:"custody,omitempty"`
+	LifecycleState string       `json:"lifecycleState,omitempty"`
+	ConfigRefs     []string     `json:"configReferences,omitempty"`
+	CleanupError   string       `json:"cleanupError,omitempty"`
 }
 
 // Budget bounds one automatically managed artifact kind.

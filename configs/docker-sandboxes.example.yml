@@ -24,7 +24,7 @@ storage:
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
-  buildCacheLimit: 64GiB
+  buildCacheLimit: 20GiB
   goCacheLimit: 10GiB
 
 runner:

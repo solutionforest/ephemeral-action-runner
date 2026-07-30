@@ -13,6 +13,12 @@ const planSchemaVersion = 1
 var automaticKinds = map[ArtifactKind]bool{
 	ArtifactNativeControllerRevision: true,
 	ArtifactTemplateArchive:          true,
+	ArtifactDockerImage:              true,
+	ArtifactSandboxTemplate:          true,
+	ArtifactDockerVolume:             true,
+	ArtifactProviderImage:            true,
+	ArtifactProviderCache:            true,
+	ArtifactOther:                    true,
 }
 
 // Preview deterministically classifies a complete storage snapshot. It never
@@ -207,6 +213,18 @@ func classifyArtifact(now time.Time, policy Policy, artifact Artifact) (Decision
 	}
 
 	var candidateAt time.Time
+	if artifact.LifecycleState == "superseded" || artifact.LifecycleState == "cleanup-pending" {
+		if artifact.SupersededAt == nil || artifact.SupersededAt.IsZero() {
+			return add(ActionReportOnly, "superseded-state-uncertain")
+		}
+		candidateAt = artifact.SupersededAt.UTC()
+		if candidateAt.After(now) {
+			return add(ActionReportOnly, "retention-clock-skew")
+		}
+		decision.Action = ActionKeep
+		decision.Reasons = []string{"eligible-immediately"}
+		return decision, &candidateAt
+	}
 	switch artifact.Kind {
 	case ArtifactNativeControllerRevision, ArtifactTemplateArchive:
 		if artifact.RetentionGroup == "" || artifact.SupersededAt == nil || artifact.SupersededAt.IsZero() {
@@ -233,6 +251,14 @@ func automaticTargetKind(artifactKind ArtifactKind, targetKind TargetKind) bool 
 		return targetKind == TargetDirectory || targetKind == TargetFile
 	case ArtifactTemplateArchive:
 		return targetKind == TargetFile
+	case ArtifactDockerImage:
+		return targetKind == TargetDockerImageTag
+	case ArtifactSandboxTemplate:
+		return targetKind == TargetSandboxTemplate
+	case ArtifactDockerVolume:
+		return targetKind == TargetDockerVolume
+	case ArtifactProviderImage, ArtifactProviderCache, ArtifactOther:
+		return targetKind == TargetFile || targetKind == TargetDirectory || targetKind == TargetExternal || targetKind == TargetBuildKitRecord
 	default:
 		return false
 	}
@@ -245,7 +271,7 @@ func applyGenerationCount(policy Policy, decisions []Decision, candidates map[st
 			continue
 		}
 		switch decision.Artifact.Kind {
-		case ArtifactNativeControllerRevision, ArtifactTemplateArchive:
+		case ArtifactNativeControllerRevision, ArtifactTemplateArchive, ArtifactDockerImage, ArtifactSandboxTemplate, ArtifactDockerVolume, ArtifactProviderImage, ArtifactProviderCache, ArtifactOther:
 			key := string(decision.Artifact.Kind) + "\x00" + decision.Artifact.RetentionGroup
 			groups[key] = append(groups[key], index)
 		}
@@ -266,7 +292,11 @@ func applyGenerationCount(policy Policy, decisions []Decision, candidates map[st
 				continue
 			}
 			decisions[index].Action = ActionRemove
-			decisions[index].Reasons = []string{"superseded", "grace-period-expired"}
+			if decisions[index].Artifact.LifecycleState == "superseded" || decisions[index].Artifact.LifecycleState == "cleanup-pending" {
+				decisions[index].Reasons = []string{"superseded", "immediate-retirement"}
+			} else {
+				decisions[index].Reasons = []string{"superseded", "grace-period-expired"}
+			}
 		}
 	}
 }

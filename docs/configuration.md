@@ -80,10 +80,10 @@ GitHub `429` and `5xx` responses and transient network failures back off replace
 | Property | Type and default | Required or applies when | Effect and caution |
 | --- | --- | --- | --- |
 | `minimumFree` | positive byte size; `1GiB` | All providers. | Fixed provider-neutral physical free-space reserve. Existing explicit values remain authoritative; the default does not scale with volume size. |
-| `gracePeriod` | positive Go duration; `168h` | Conservative housekeeping. | Minimum age before eligible EPAR-owned artifacts can be considered for removal. |
-| `keepPrevious` | integer; `0` | Conservative housekeeping. Must be non-negative. | Number of prior reusable artifact generations to retain. |
-| `automaticHousekeeping` | `conservative` or `disabled`; `conservative` | All providers. | Conservative mode touches only expired, unleased, exactly owned artifacts; it does not run a broad Docker or WSL prune. |
-| `buildCacheLimit` | positive byte size; `64GiB` | Image-building cache. | Bounded EPAR build cache target. |
+| `gracePeriod` | positive Go duration; `168h` | Conservative housekeeping. | Minimum age before abandoned or incomplete EPAR temporary work can be removed. It does not delay cleanup of a verified superseded generation. |
+| `keepPrevious` | integer; `0` | Conservative housekeeping. Must be non-negative. | `0` allows immediate exact retirement after replacement. A positive value defers automatic artifact retirement to the explicit storage-prune retention preview. |
+| `automaticHousekeeping` | `conservative` or `disabled`; `conservative` | All providers. | Conservative mode reconciles interrupted exact-owned work at startup and removes unreferenced superseded resources after readback. It never runs a broad Docker or WSL prune. |
+| `buildCacheLimit` | positive byte size; `20GiB` | Image-building cache. | Bounded EPAR BuildKit cache target. Existing explicit values remain authoritative. |
 | `goCacheLimit` | positive byte size; `10GiB` | Native/no-Go Go build cache. | Bounded EPAR Go cache target. |
 
 ### `logging`

@@ -118,7 +118,7 @@ func TestStorageDefaultsAreBoundedAndConservative(t *testing.T) {
 		storage.GracePeriod != "168h" ||
 		storage.KeepPrevious != 0 ||
 		storage.AutomaticHousekeeping != StorageHousekeepingConservative ||
-		storage.BuildCacheLimit != "64GiB" ||
+		storage.BuildCacheLimit != "20GiB" ||
 		storage.GoCacheLimit != "10GiB" {
 		t.Fatalf("unexpected storage defaults: %+v", storage)
 	}

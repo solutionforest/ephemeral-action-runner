@@ -13,6 +13,7 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
+	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	providerregistry "github.com/solutionforest/ephemeral-action-runner/internal/provider/registry"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
@@ -23,6 +24,7 @@ type storageCommandReport struct {
 	Inventory storageInventorySummary  `json:"inventory"`
 	Plan      storage.Plan             `json:"plan"`
 	Execution *storage.ExecutionReport `json:"execution,omitempty"`
+	Legacy    bool                     `json:"legacy,omitempty"`
 }
 
 type storageInventorySummary struct {
@@ -49,6 +51,8 @@ func runStorage(args []string) error {
 	providerFlag := fs.String("provider", "", "limit provider-specific inventory")
 	jsonOutput := fs.Bool("json", false, "write the complete storage report as JSON")
 	execute := fs.Bool("execute", false, "execute the exact policy-selected prune plan")
+	legacy := fs.Bool("legacy", false, "include prefix-era EPAR resources in an operator-approved exact preview")
+	approvedPlan := fs.String("plan", "", "approved legacy preview plan hash")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -57,6 +61,15 @@ func runStorage(args []string) error {
 	}
 	if subcommand == "status" && *execute {
 		return fmt.Errorf("storage status does not support --execute")
+	}
+	if subcommand == "status" && (*legacy || strings.TrimSpace(*approvedPlan) != "") {
+		return fmt.Errorf("storage status does not support --legacy or --plan")
+	}
+	if !*legacy && strings.TrimSpace(*approvedPlan) != "" {
+		return fmt.Errorf("--plan is valid only with storage prune --legacy --execute")
+	}
+	if *legacy && *execute && strings.TrimSpace(*approvedPlan) == "" {
+		return fmt.Errorf("legacy cleanup requires the exact preview hash: storage prune --legacy --execute --plan <hash>")
 	}
 	if *providerFlag != "" {
 		if _, found := providerregistry.DescriptorFor(*providerFlag); !found {
@@ -69,10 +82,21 @@ func runStorage(args []string) error {
 		return err
 	}
 	now := time.Now().UTC()
+	if configPath != "" {
+		if err := importNativeBootstrapAcquisition(projectRoot, configPath, now); err != nil {
+			return err
+		}
+	}
 	var selections []inventory.TemplateSelection
 	activeTemplateRootDisk := ""
+	legacyTemplateReceiptProtected := false
+	staleTemplateReceiptWarning := ""
 	if cfg.Provider.Type == "docker-sandboxes" {
-		artifact, metadataSHA256, activatedAt, receiptErr := artifactimage.LoadDockerSandboxesReceipt(projectRoot)
+		artifact, metadataSHA256, activatedAt, receiptErr := artifactimage.LoadDockerSandboxesReceiptForConfig(projectRoot, configPath)
+		if errors.Is(receiptErr, os.ErrNotExist) {
+			artifact, metadataSHA256, activatedAt, receiptErr = artifactimage.LoadDockerSandboxesReceipt(projectRoot)
+			legacyTemplateReceiptProtected = receiptErr == nil
+		}
 		if receiptErr == nil {
 			activeTemplateRootDisk = artifact.RootDisk
 			selections = append(selections, inventory.TemplateSelection{
@@ -83,7 +107,7 @@ func runStorage(args []string) error {
 				ActivatedAt:    activatedAt,
 			})
 		} else if !errors.Is(receiptErr, os.ErrNotExist) {
-			return fmt.Errorf("read Docker Sandboxes active artifact receipt: %w", receiptErr)
+			staleTemplateReceiptWarning = fmt.Sprintf("The unpublished Docker Sandboxes receipt is stale and is not treated as active ownership evidence: %v. Normal startup will rebuild and replace it after exact Sandbox-cache readback.", receiptErr)
 		}
 	}
 	currentExecutable, _ := os.Executable()
@@ -102,7 +126,22 @@ func runStorage(args []string) error {
 	if err != nil {
 		return err
 	}
+	if legacyTemplateReceiptProtected {
+		snapshot.Warnings = append(snapshot.Warnings, "The exact template in the retired shared Docker Sandboxes receipt remains protected for legacy cleanup; normal startup still requires regeneration into per-config state.")
+	}
+	if staleTemplateReceiptWarning != "" {
+		snapshot.Warnings = append(snapshot.Warnings, staleTemplateReceiptWarning)
+	}
 	collectExternalStorage(&snapshot, *providerFlag)
+	protectConfiguredSandboxTemplates(&snapshot, selections)
+	catalogValue, catalogErr := addCatalogStorage(&snapshot, *providerFlag, now)
+	if catalogErr != nil {
+		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("EPAR host resource catalog is unavailable; catalog-owned resources remain report-only: %v", catalogErr))
+	}
+	if *legacy {
+		selectLegacyStorage(&snapshot, catalogValue, now)
+		snapshot.Warnings = append(snapshot.Warnings, "Legacy preview is limited to resources visible on this host. Unregistered old EPAR checkouts and their intended references cannot be inferred.")
+	}
 	if cfg.Storage.AutomaticHousekeeping == config.StorageHousekeepingDisabled {
 		for index := range snapshot.Artifacts {
 			snapshot.Artifacts[index].Protections = append(snapshot.Artifacts[index].Protections, storage.Protection{
@@ -199,7 +238,8 @@ func runStorage(args []string) error {
 			Provider:    *providerFlag,
 			Warnings:    snapshot.Warnings,
 		},
-		Plan: plan,
+		Plan:   plan,
+		Legacy: *legacy,
 	}
 
 	if subcommand == "prune" && *execute {
@@ -209,15 +249,21 @@ func runStorage(args []string) error {
 			}
 		}
 		if plan.RemovalCount > 0 {
-			executor, err := storage.NewFilesystemExecutor(
-				filepath.Join(projectRoot, ".local", "bin"),
-				filepath.Join(projectRoot, "work", "template-builds", "docker-sandboxes"),
-			)
+			executor, err := newHostStorageExecutor(projectRoot)
 			if err != nil {
 				return err
 			}
-			execution, err := storage.Execute(context.Background(), plan, plan.Hash, executor)
+			planApproval := plan.Hash
+			if *legacy {
+				planApproval = strings.TrimSpace(*approvedPlan)
+			}
+			execution, err := storage.Execute(context.Background(), plan, planApproval, executor)
 			report.Execution = &execution
+			if catalogErr == nil {
+				if updateErr := removeExecutedCatalogEntries(execution, time.Now().UTC()); updateErr != nil {
+					report.Inventory.Warnings = append(report.Inventory.Warnings, fmt.Sprintf("exact removals completed but the host catalog could not be compacted: %v", updateErr))
+				}
+			}
 			if err != nil {
 				if *jsonOutput {
 					_ = writeStorageJSON(report)
@@ -252,9 +298,14 @@ func runEffectiveGoCacheLimit(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("storage effective-go-cache-limit does not accept positional arguments")
 	}
-	_, cfg, _, _, err := loadStorageConfig(*projectRootFlag, *configPathFlag)
+	projectRoot, cfg, configPath, _, err := loadStorageConfig(*projectRootFlag, *configPathFlag)
 	if err != nil {
 		return err
+	}
+	if configPath != "" {
+		if err := importNativeBootstrapAcquisition(projectRoot, configPath, time.Now().UTC()); err != nil {
+			return err
+		}
 	}
 	if err := config.ValidateStorage(cfg.Storage); err != nil {
 		return err
@@ -369,7 +420,11 @@ func printStorageReport(subcommand string, report storageCommandReport) {
 	}
 	fmt.Fprintln(os.Stdout)
 	if subcommand == "prune" && report.Execution == nil {
-		fmt.Fprintln(os.Stdout, "Preview only. Re-run with --execute to apply only the exact identities marked remove.")
+		if report.Legacy {
+			fmt.Fprintf(os.Stdout, "Preview only. Legacy execution requires this exact plan:\n  %s\n", invocation.Command("storage", "prune", "--legacy", "--execute", "--plan", report.Plan.Hash))
+		} else {
+			fmt.Fprintln(os.Stdout, "Preview only. Re-run with --execute to apply only the exact identities marked remove.")
+		}
 	}
 }
 

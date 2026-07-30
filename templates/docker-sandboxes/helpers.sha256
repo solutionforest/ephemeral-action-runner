@@ -5,6 +5,6 @@
 90a13d73f74e7628f1b7c4c768d300d2a4620387061c056dd67ca42692180e2b  ./configure-runner.sh
 32bc68fe28dbbe9eb6947a1023606c32fc9b20088efcb90b5c543d0fa3db1218  ./install-trusted-ca-certificates.sh
 a32f6bdb3b883272172e2d7318feb40d88e3ebfaffa909527ca57a3c06773ae1  ./prepare-template.sh
-051fe7b5eb3c522da10c2ead6c0a8f4bae0963dc40f432c7dcc562dc07e73969  ./run-runner.sh
+647fd19d18e608cb794f2b08be3019bd8e6243009aea8b9308703a465f0089a3  ./run-runner.sh
 0746da2abc0a1033ecdad83ec6e432c7a006c83fefd2ce5424d3932c8f38d9aa  ./template-entrypoint.sh
 d1e3b6808118e4c04bfff8db2b42228cb7a376910874b4a1fb486eaaa55d5d5f  ./verify-template.sh

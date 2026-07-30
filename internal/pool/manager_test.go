@@ -217,7 +217,12 @@ func TestRetirementSuccessIsNotReversedByTranscriptCloseFailure(t *testing.T) {
 }
 
 func TestRunnerAliveRetiresIdleRunnerWhenServiceIsInactive(t *testing.T) {
-	provider := &fakeProvider{execErr: errors.New("inactive")}
+	provider := &fakeProvider{execFunc: func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), runnerProcessRunningSentinel) {
+			return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+		}
+		return provider.ExecResult{}, nil
+	}}
 	github := &fakeGitHub{
 		runner: gh.Runner{Name: "epar-test-1", Status: "online", Busy: false},
 		found:  true,
@@ -231,11 +236,65 @@ func TestRunnerAliveRetiresIdleRunnerWhenServiceIsInactive(t *testing.T) {
 	if alive {
 		t.Fatal("runnerAlive() alive = true, want false")
 	}
-	if reason != "actions runner process is no longer active" {
+	if reason != runnerProcessInactiveReason {
 		t.Fatalf("reason = %q", reason)
 	}
 	if got := atomic.LoadInt32(&provider.execCalls); got != 1 {
 		t.Fatalf("service check ran %d time(s), want 1", got)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.execOptions) != 1 || !provider.execOptions[0].SuppressTranscript {
+		t.Fatal("machine-readable health probe was not excluded from the guest transcript")
+	}
+}
+
+func TestRunnerAlivePreservesRunnerWhenProcessProbeIsUnavailable(t *testing.T) {
+	provider := &fakeProvider{execErr: context.DeadlineExceeded}
+	github := &fakeGitHub{
+		runner: gh.Runner{Name: "epar-test-1", Status: "online", Busy: false},
+		found:  true,
+	}
+	manager := Manager{Provider: provider, GitHub: github}
+
+	alive, reason, err := manager.runnerAlive(context.Background(), ProvisionedInstance{Name: "epar-test-1"})
+	if err == nil {
+		t.Fatal("runnerAlive() error = nil, want unavailable process-probe error")
+	}
+	if !alive {
+		t.Fatalf("runnerAlive() alive = false, reason = %q; an unavailable probe must preserve the runner", reason)
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", got)
+	}
+}
+
+func TestRunnerProcessProbeRejectsUnsupportedOutput(t *testing.T) {
+	provider := &fakeProvider{execFunc: func(context.Context, string, []string, provider.ExecOptions) (provider.ExecResult, error) {
+		return provider.ExecResult{Stdout: "unexpected\n"}, nil
+	}}
+	manager := Manager{Provider: provider}
+	if _, err := manager.probeRunnerProcess(context.Background(), "epar-test-1"); err == nil || !strings.Contains(err.Error(), "unsupported response") {
+		t.Fatalf("probeRunnerProcess() error = %v, want unsupported-response error", err)
+	}
+}
+
+func TestRunnerLivenessRequiresConsecutiveConfirmedInactiveProbes(t *testing.T) {
+	counts := make(map[string]int)
+	if count, retire := recordRunnerLiveness(counts, "runner-1", false, runnerProcessInactiveReason, nil); count != 1 || retire {
+		t.Fatalf("first confirmed inactive probe = count %d retire %t, want 1 false", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-1", true, "", context.DeadlineExceeded); count != 0 || retire {
+		t.Fatalf("unavailable probe = count %d retire %t, want 0 false", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-1", false, runnerProcessInactiveReason, nil); count != 1 || retire {
+		t.Fatalf("first probe after uncertainty = count %d retire %t, want 1 false", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-1", false, runnerProcessInactiveReason, nil); count != 2 || !retire {
+		t.Fatalf("second consecutive confirmed inactive probe = count %d retire %t, want 2 true", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-2", false, "GitHub runner record is gone", nil); count != 0 || !retire {
+		t.Fatalf("authoritative remote absence = count %d retire %t, want 0 true", count, retire)
 	}
 }
 
@@ -1341,6 +1400,9 @@ func (p *fakeProvider) Exec(ctx context.Context, name string, command []string, 
 	}
 	if int(call) <= len(p.execErrs) {
 		return provider.ExecResult{}, p.execErrs[call-1]
+	}
+	if p.execErr == nil && strings.Contains(commandText, runnerProcessRunningSentinel) {
+		return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
 	}
 	return provider.ExecResult{}, p.execErr
 }

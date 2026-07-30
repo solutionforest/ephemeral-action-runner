@@ -60,20 +60,8 @@ if (-not $goUsable) {
     exit 1
 }
 
-$bridge = Start-EparHostTrustBridge -ProjectRoot $Root -Command $ControllerCommand -Arguments $ControllerArgs
-$previousHostOS = $env:EPAR_CONTROLLER_HOST_OS
-$previousFeed = $env:EPAR_HOST_TRUST_FEED
-$previousBuildFeed = $env:EPAR_BUILD_TRUST_FEED
+$bridge = if ($ControllerCommand -eq "init") { Start-EparHostTrustBridge -ProjectRoot $Root -Command $ControllerCommand -Arguments $ControllerArgs } else { $null }
 try {
-    if ($bridge.BuildFeedDir -or $bridge.RunnerFeedDir) {
-        $env:EPAR_CONTROLLER_HOST_OS = Get-EparHostTrustHostOS
-    }
-    if ($bridge.BuildFeedDir) {
-        $env:EPAR_BUILD_TRUST_FEED = Join-Path $bridge.BuildFeedDir "current.json"
-    }
-    if ($bridge.RunnerFeedDir) {
-        $env:EPAR_HOST_TRUST_FEED = Join-Path $bridge.RunnerFeedDir "current.json"
-    }
     & $GoBin run ./cmd/ephemeral-action-runner @ControllerArgs
     $exitCode = $LASTEXITCODE
     if ($exitCode -eq 0 -and $ControllerCommand -eq "init") {
@@ -81,9 +69,6 @@ try {
     }
 } finally {
     Stop-EparHostTrustBridge -Bridge $bridge
-    if ($null -eq $previousHostOS) { Remove-Item Env:EPAR_CONTROLLER_HOST_OS -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_HOST_OS = $previousHostOS }
-    if ($null -eq $previousFeed) { Remove-Item Env:EPAR_HOST_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_TRUST_FEED = $previousFeed }
-    if ($null -eq $previousBuildFeed) { Remove-Item Env:EPAR_BUILD_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_BUILD_TRUST_FEED = $previousBuildFeed }
     if ($OriginalInvocationExists) { $env:EPAR_INVOCATION = $OriginalInvocation } else { Remove-Item Env:EPAR_INVOCATION -ErrorAction SilentlyContinue }
 }
 exit $exitCode

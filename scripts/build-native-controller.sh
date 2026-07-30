@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 EPAR_HOST_TRUST_HELPER="${repo_root}/scripts/host-trust/host-trust-feed.sh"
 source "${repo_root}/scripts/host-trust/wrapper-lib.sh"
-go_image="${GO_DOCKER_IMAGE:-golang:1.25}"
+go_image="${GO_DOCKER_IMAGE:-golang:latest}"
 dev_image="${EPAR_DEV_IMAGE:-epar-dev-toolchain}"
 native_cache_keep_previous=5
 native_cache_max_bytes=$((256 * 1024 * 1024))
@@ -79,6 +79,139 @@ epar_enforce_go_cache_limit() {
     sh -ceu 'mod_kib="$(du -sk /go/pkg/mod | awk "{print \$1}")"; build_kib="$(du -sk /root/.cache/go-build | awk "{print \$1}")"; used_bytes="$(((mod_kib + build_kib) * 1024))"; if [ "$used_bytes" -gt "$EPAR_GO_CACHE_LIMIT_BYTES" ]; then go clean -cache -modcache; fi'
 }
 
+epar_write_bootstrap_acquisition_journal() {
+  local phase="$1"
+  local previous_id="${2:-}"
+  local resolved_go_id="${3:-}"
+  local resolved_dev_id="${4:-}"
+  local previous_dev_id="${5:-}"
+  local journal_directory="${repo_root}/.local/storage/bootstrap"
+  local journal_path="${journal_directory}/native-controller-acquisition.json"
+  local temporary_path
+  epar_bootstrap_json_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+  }
+  mkdir -p "$journal_directory"
+  temporary_path="$(mktemp "${journal_directory}/.native-controller-acquisition.XXXXXX")"
+  printf '{"schemaVersion":1,"projectID":"%s","projectRoot":"%s","phase":"%s","goImage":"%s","devImage":"%s","previousGoImageID":"%s","previousDevImageID":"%s","resolvedGoImageID":"%s","resolvedDevImageID":"%s","updatedAtUnix":%s}\n' \
+    "$(epar_bootstrap_json_escape "$project_id")" "$(epar_bootstrap_json_escape "$repo_root")" "$(epar_bootstrap_json_escape "$phase")" "$(epar_bootstrap_json_escape "$go_image")" "$(epar_bootstrap_json_escape "$dev_image")" "$(epar_bootstrap_json_escape "$previous_id")" "$(epar_bootstrap_json_escape "$previous_dev_id")" "$(epar_bootstrap_json_escape "$resolved_go_id")" "$(epar_bootstrap_json_escape "$resolved_dev_id")" "$(date +%s)" >"$temporary_path"
+  mv -f -- "$temporary_path" "$journal_path"
+}
+
+epar_docker_image_id() {
+  local reference="$1"
+  local image_id
+  image_id="$(docker image inspect --format '{{.Id}}' "$reference" 2>/dev/null || true)"
+  if [[ -z "$image_id" ]]; then return 0; fi
+  [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Docker returned an invalid immutable image ID for ${reference}" >&2; return 1; }
+  printf '%s\n' "$image_id"
+}
+
+epar_resolve_go_toolchain_image() {
+  local previous_id resolved_id
+  previous_id="$(epar_docker_image_id "$go_image")"
+  epar_write_bootstrap_acquisition_journal pulling-go-toolchain "$previous_id" '' '' "$previous_dev_image_id"
+  docker pull "$go_image" >&2
+  resolved_id="$(epar_docker_image_id "$go_image")"
+  [[ -n "$resolved_id" ]] || { echo "could not resolve the immutable Docker image ID for ${go_image} after pull" >&2; return 1; }
+  epar_write_bootstrap_acquisition_journal go-toolchain-resolved "$previous_id" "$resolved_id" '' "$previous_dev_image_id"
+  EPAR_GO_PREVIOUS_IMAGE_ID="$previous_id"
+  EPAR_GO_RESOLVED_IMAGE_ID="$resolved_id"
+}
+
+epar_prepare_bootstrap_build_trust() {
+  local config_path feed_path config_id bundle_directory validator_output host_os
+  config_path="$(epar_host_trust_config_path "$repo_root" "$@")"
+  feed_path="$("$EPAR_HOST_TRUST_HELPER" sync --project-root "$repo_root" --config "$config_path" --purpose build)"
+  [[ -n "$feed_path" && -f "$feed_path" && ! -L "$feed_path" ]] || { echo "the host trust publisher did not return a regular build feed" >&2; return 1; }
+  config_id="$(printf '%s' "$config_path" | shasum -a 256 | awk '{print substr($1,1,32)}')"
+  bundle_directory="${repo_root}/.local/storage/bootstrap-trust/${config_id}"
+  mkdir -p "$bundle_directory"
+  [[ -d "$bundle_directory" && ! -L "$bundle_directory" ]] || { echo "bootstrap build trust directory must be a regular directory: ${bundle_directory}" >&2; return 1; }
+  bootstrap_trust_bundle="${bundle_directory}/ca.pem"
+  if [[ -e "$bootstrap_trust_bundle" && (! -f "$bootstrap_trust_bundle" || -L "$bootstrap_trust_bundle") ]]; then
+    echo "bootstrap build trust output must be a regular non-symlink file: ${bootstrap_trust_bundle}" >&2
+    return 1
+  fi
+  host_os="$(epar_host_trust_host_os)"
+  validator_output="$(
+    docker run --rm \
+      --network none \
+      -e GO111MODULE=off \
+      -e GOTOOLCHAIN=local \
+      -v "${repo_root}/scripts/bootstrap-trust:/bootstrap:ro" \
+      -v "${feed_path}:/feed/current.json:ro" \
+      -v "${bundle_directory}:/out" \
+      "$dev_image" \
+      /usr/local/go/bin/go run /bootstrap/main.go --feed /feed/current.json --output /out/ca.pem --expected-host-os "$host_os"
+  )"
+  [[ -s "$bootstrap_trust_bundle" && ! -L "$bootstrap_trust_bundle" ]] || { echo "bootstrap build trust validator did not produce a regular nonempty bundle" >&2; return 1; }
+  bootstrap_trust_summary="$(printf '%s\n' "$validator_output" | sed -n '$p')"
+}
+
+epar_tls_failure_host() {
+  local transcript="$1"
+  grep -Eqi 'x509: certificate signed by unknown authority|certificate verify failed|unable to (get local issuer certificate|verify the first certificate)' "$transcript" || return 0
+  sed -nE 's#.*https://([A-Za-z0-9.-]+)([:/"].*)?#\1#p' "$transcript" | sed -n '1p' | tr '[:upper:]' '[:lower:]'
+}
+
+epar_report_tls_failure() {
+  local transcript="$1"
+  local log_path="$2"
+  local host_name diagnostic_output subject issuer fingerprint not_before not_after
+  host_name="$(epar_tls_failure_host "$transcript")"
+  [[ -n "$host_name" ]] || return 0
+  diagnostic_output="$(
+    docker run --rm \
+      -e "EPAR_TLS_DIAGNOSTIC_HOST=${host_name}" \
+      "$dev_image" \
+      sh -c '
+        set -u
+        raw="$(mktemp)"
+        leaf="$(mktemp)"
+        cleanup() { rm -f -- "$raw" "$leaf"; }
+        trap cleanup EXIT
+        openssl s_client -connect "${EPAR_TLS_DIAGNOSTIC_HOST}:443" -servername "${EPAR_TLS_DIAGNOSTIC_HOST}" -showcerts </dev/null >"$raw" 2>&1 || true
+        awk '"'"'/-----BEGIN CERTIFICATE-----/{capture=1} capture{print} /-----END CERTIFICATE-----/{exit}'"'"' "$raw" >"$leaf"
+        grep -E "verify error|Verify return code" "$raw" || true
+        if [ -s "$leaf" ]; then
+          openssl x509 -in "$leaf" -noout -subject -issuer -fingerprint -sha256 -dates
+        fi
+      ' 2>&1
+  )" || true
+  subject="$(printf '%s\n' "$diagnostic_output" | sed -n 's/^subject=//p' | sed -n '1p')"
+  issuer="$(printf '%s\n' "$diagnostic_output" | sed -n 's/^issuer=//p' | sed -n '1p')"
+  fingerprint="$(printf '%s\n' "$diagnostic_output" | sed -n 's/^sha256 Fingerprint=//p' | sed -n '1p' | tr -d ':')"
+  not_before="$(printf '%s\n' "$diagnostic_output" | sed -n 's/^notBefore=//p' | sed -n '1p')"
+  not_after="$(printf '%s\n' "$diagnostic_output" | sed -n 's/^notAfter=//p' | sed -n '1p')"
+  {
+    printf '\n%s\n' 'EPAR TLS certificate diagnostic'
+    printf '  Requested host: %s:443\n' "$host_name"
+    printf '  Toolchain image: %s\n' "$dev_image"
+    if [[ -z "$subject" ]]; then
+      printf '%s\n' '  Certificate inspection: unavailable; see the raw build error above.'
+    else
+      printf '%s\n' '  Certificate presented to the build container:'
+      printf '    Subject: %s\n' "$subject"
+      printf '    Issuer: %s\n' "$issuer"
+      [[ -z "$fingerprint" ]] || printf '    SHA-256: %s\n' "$fingerprint"
+      [[ -z "$not_before" ]] || printf '    Valid from: %s\n' "$not_before"
+      [[ -z "$not_after" ]] || printf '    Valid until: %s\n' "$not_after"
+      printf '%s\n' "$diagnostic_output" | grep -E 'verify error|Verify return code' | sed 's/^/    OpenSSL: /' || true
+      printf '%s\n' '  Interpretation: the host network presented a certificate whose issuer is unavailable to the Linux bootstrap container.'
+      printf '%s\n' '  Check the host system or user trust store for a root matching the issuer above.'
+    fi
+    printf '%s\n' '  TLS verification was not disabled, and EPAR did not retry the download insecurely.'
+    printf '  Full native-controller build log: %s\n' "$log_path"
+  } | tee -a "$log_path" >&2
+}
+
 epar_directory_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
 }
@@ -126,6 +259,7 @@ epar_native_controller_build_lease_valid() {
 epar_prune_native_controller_cache() {
   local cache_root="$1"
   local current_cache_key="$2"
+  local remove_current="${3:-0}"
   local now path name mtime bytes manifest unexpected lease valid_build_leases executable
   local retained_count=0
   local retained_bytes=0
@@ -158,7 +292,7 @@ epar_prune_native_controller_cache() {
     [[ ! -L "$path" ]] || continue
     name="${path##*/}"
     [[ "$name" =~ ^[0-9a-f]{64}$ ]] || continue
-    [[ "$name" != "$current_cache_key" ]] || continue
+    [[ "$name" != "$current_cache_key" || "$remove_current" == 1 ]] || continue
     epar_native_controller_lease_active "$path" && continue
     manifest="${path}/controller-cache.manifest"
     [[ -f "$manifest" && ! -L "$manifest" ]] || continue
@@ -202,13 +336,19 @@ case "$(uname -s)/$(uname -m)" in
   *) echo "unsupported native EPAR controller platform: $(uname -s)/$(uname -m)" >&2; exit 1 ;;
 esac
 
+previous_dev_image_id="$(epar_docker_image_id "$dev_image")"
+epar_resolve_go_toolchain_image
+go_toolchain_previous_id="$EPAR_GO_PREVIOUS_IMAGE_ID"
+go_toolchain_resolved_id="$EPAR_GO_RESOLVED_IMAGE_ID"
 docker build --quiet \
+  --provenance=false \
   --build-arg "GO_IMAGE=${go_image}" \
   -t "$dev_image" \
   -f "${repo_root}/scripts/docker/dev.Dockerfile" \
   "${repo_root}/scripts/docker" >/dev/null
-dev_image_id="$(docker image inspect --format '{{.Id}}' "$dev_image")"
+dev_image_id="$(epar_docker_image_id "$dev_image")"
 [[ "$dev_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "could not resolve the immutable Docker toolchain image ID for ${dev_image}" >&2; exit 1; }
+epar_write_bootstrap_acquisition_journal toolchain-built "$go_toolchain_previous_id" "$go_toolchain_resolved_id" "$dev_image_id" "$previous_dev_image_id"
 if ((manage_go_cache == 1)); then
   epar_ensure_go_cache_volume "$gomod_volume" gomod
   epar_ensure_go_cache_volume "$gocache_volume" gobuild
@@ -238,57 +378,130 @@ source_manifest="$(
     shasum -a 256 "$file" | awk '{print $1}'
   done
 )"
-cache_key="$(printf '%s' "$source_manifest" | shasum -a 256 | awk '{print $1}')"
+fingerprint="$(printf '%s' "$source_manifest" | shasum -a 256 | awk '{print $1}')"
 case "$source_state" in
-  clean) controller_source_revision="sha256:${cache_key}" ;;
-  dirty) controller_source_revision="dirty:sha256:${cache_key}" ;;
+  clean) controller_source_revision="sha256:${fingerprint}" ;;
+  dirty) controller_source_revision="dirty:sha256:${fingerprint}" ;;
   *) controller_source_revision=unknown ;;
 esac
 cache_root="${repo_root}/.local/bin"
-cache_directory="${cache_root}/${cache_key}"
-binary="${cache_directory}/ephemeral-action-runner"
+binary="${cache_root}/ephemeral-action-runner"
+manifest_path="${cache_root}/ephemeral-action-runner.manifest"
+lock_directory="${cache_root}/.native-controller.lock"
 
 temporary_directory=""
 lease_file=""
 build_lease_file=""
 retention_inventory_file=""
 manifest_temporary=""
+lock_lease_file=""
 cleanup_build() {
   if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then rm -rf -- "$temporary_directory"; fi
   if [[ -n "$lease_file" && -f "$lease_file" ]]; then rm -f -- "$lease_file"; fi
   if [[ -n "$build_lease_file" && -f "$build_lease_file" ]]; then rm -f -- "$build_lease_file"; fi
   if [[ -n "$retention_inventory_file" && -f "$retention_inventory_file" ]]; then rm -f -- "$retention_inventory_file"; fi
   if [[ -n "$manifest_temporary" && -f "$manifest_temporary" ]]; then rm -f -- "$manifest_temporary"; fi
+  if [[ -n "$lock_lease_file" && -f "$lock_lease_file" ]]; then rm -f -- "$lock_lease_file"; fi
+  if [[ -n "$lock_directory" && -d "$lock_directory" ]]; then rmdir -- "$lock_directory" 2>/dev/null || true; fi
 }
 trap cleanup_build EXIT INT TERM
 
-if [[ ! -x "$binary" ]]; then
-  mkdir -p "$cache_root"
-  temporary_directory="$(mktemp -d "${cache_root}/.build.XXXXXX")"
-  build_lease_file="$(mktemp "${temporary_directory}/lease-build-$$.XXXXXX")"
-  printf '%s\n' \
-    'schemaVersion=1' \
-    "host=$(hostname 2>/dev/null || true)" \
-    "pid=$$" \
-    "startedAtUnix=$(date +%s)" >"$build_lease_file"
-  docker run --rm \
-    -e CGO_ENABLED=0 \
-    -e "GOOS=${goos}" \
-    -e "GOARCH=${goarch}" \
-    -v "${repo_root}:/src:ro" \
-    -v "${temporary_directory}:/out" \
-    -v "${gomod_volume}:/go/pkg/mod" \
-    -v "${gocache_volume}:/root/.cache/go-build" \
-    -w /src \
-    "$dev_image" \
-    go build -trimpath -ldflags "-X main.sourceRevision=${controller_source_revision}" -o /out/ephemeral-action-runner ./cmd/ephemeral-action-runner
-  [[ -f "${temporary_directory}/ephemeral-action-runner" ]] || { echo "native EPAR build did not produce the expected binary" >&2; exit 1; }
-  chmod 0755 "${temporary_directory}/ephemeral-action-runner"
-  if [[ ! -e "$cache_directory" ]]; then
-    rm -f -- "$build_lease_file"
-    build_lease_file=""
-    mv -- "$temporary_directory" "$cache_directory"
-    temporary_directory=""
+mkdir -p "$cache_root"
+# Retire only old hash-directory revisions whose manifest and inactive lease
+# prove ownership. Unknown paths remain available to storage's legacy preview.
+native_cache_keep_previous=0
+native_cache_max_bytes=1
+native_cache_grace_seconds=0
+if ! epar_prune_native_controller_cache "$cache_root" "$(printf '%064d' 0)" 1; then
+  echo "warning: native-controller legacy revision cleanup skipped after an error" >&2
+fi
+
+epar_stable_manifest_matches() {
+  [[ -f "$manifest_path" && ! -L "$manifest_path" && -x "$binary" && ! -L "$binary" ]] || return 1
+  grep -Fqx 'schemaVersion=2' "$manifest_path" && grep -Fqx "fingerprint=${fingerprint}" "$manifest_path" && grep -Fqx 'executable=ephemeral-action-runner' "$manifest_path" && grep -Fqx "toolchainImageID=${dev_image_id}" "$manifest_path"
+}
+
+epar_acquire_stable_build_lock() {
+  local deadline=$(( $(date +%s) + 120 ))
+  while ! mkdir "$lock_directory" 2>/dev/null; do
+    if [[ -d "$lock_directory" && ! -L "$lock_directory" ]]; then
+      local valid=0 candidate unexpected
+      for candidate in "$lock_directory"/lease-build-*; do
+        epar_native_controller_build_lease_valid "$candidate" && valid=$((valid + 1))
+      done
+      unexpected="$(find "$lock_directory" -mindepth 1 -maxdepth 1 ! \( -type f -name 'lease-build-*' \) -print -quit)"
+      if ((valid == 1)) && [[ -z "$unexpected" ]] && ! epar_native_controller_lease_active "$lock_directory"; then
+        rm -rf -- "$lock_directory"
+        continue
+      fi
+    fi
+    (( $(date +%s) < deadline )) || { echo 'another EPAR native-controller build is still in progress; wait for it to finish and retry.' >&2; return 1; }
+    sleep 0.2
+  done
+  lock_lease_file="$(mktemp "${lock_directory}/lease-build-$$.XXXXXX")"
+  printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$lock_lease_file"
+}
+
+if ! epar_stable_manifest_matches; then
+  epar_acquire_stable_build_lock
+  if ! epar_stable_manifest_matches; then
+    if epar_native_controller_lease_active "$cache_root"; then
+      echo 'EPAR source or its Go toolchain changed while a native EPAR controller is running. Stop the running EPAR process, then run ./start again; EPAR keeps one stable native controller binary and will not create another versioned copy.' >&2
+      exit 1
+    fi
+    epar_prepare_bootstrap_build_trust "$@"
+    build_log_directory="${repo_root}/work/logs"
+    build_log_path="${build_log_directory}/epar-native-controller-build.log"
+    mkdir -p "$build_log_directory"
+    printf '%s\n' \
+      "EPAR native-controller build started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "Toolchain image: ${dev_image}" \
+      "Target: ${goos}/${goarch}" \
+      "Bootstrap build trust: ${bootstrap_trust_summary}" \
+      '' >"$build_log_path"
+    printf 'Native controller build log: %s\n' "$build_log_path"
+    temporary_directory="$(mktemp -d "${cache_root}/.build.XXXXXX")"
+    build_stderr="${temporary_directory}/native-controller-build.stderr"
+    build_lease_file="$(mktemp "${temporary_directory}/lease-build-$$.XXXXXX")"
+    printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$build_lease_file"
+    set +e
+    docker run --rm \
+      -e CGO_ENABLED=0 \
+      -e "GOOS=${goos}" \
+      -e "GOARCH=${goarch}" \
+      -e GOTOOLCHAIN=local \
+      -e SSL_CERT_FILE=/run/epar-bootstrap-ca.pem \
+      -v "${repo_root}:/src:ro" \
+      -v "${temporary_directory}:/out" \
+      -v "${gomod_volume}:/go/pkg/mod" \
+      -v "${gocache_volume}:/root/.cache/go-build" \
+      -v "${bootstrap_trust_bundle}:/run/epar-bootstrap-ca.pem:ro" \
+      -w /src \
+      "$dev_image" \
+      go build -trimpath -ldflags "-X main.sourceRevision=${controller_source_revision}" -o /out/ephemeral-action-runner ./cmd/ephemeral-action-runner 2>"$build_stderr"
+    native_build_exit_code=$?
+    set -e
+    if [[ -s "$build_stderr" ]]; then cat "$build_stderr" >>"$build_log_path"; fi
+    if ((native_build_exit_code != 0)); then
+      tls_failure_host="$(epar_tls_failure_host "$build_stderr")"
+      if [[ -n "$tls_failure_host" ]]; then
+        printf 'Native controller build failed while downloading dependencies from https://%s.\n' "$tls_failure_host" >&2
+        printf '%s\n' '  The build container rejected the presented TLS certificate as an unknown issuer.' >&2
+        printf '  Full compiler output: %s\n' "$build_log_path" >&2
+      elif [[ -s "$build_stderr" ]]; then
+        cat "$build_stderr" >&2
+      fi
+      epar_report_tls_failure "$build_stderr" "$build_log_path"
+      exit "$native_build_exit_code"
+    fi
+    if [[ -s "$build_stderr" ]]; then cat "$build_stderr" >&2; fi
+    [[ -f "${temporary_directory}/ephemeral-action-runner" ]] || { echo "native EPAR build did not produce the expected binary" >&2; exit 1; }
+    chmod 0755 "${temporary_directory}/ephemeral-action-runner"
+    mv -f -- "${temporary_directory}/ephemeral-action-runner" "$binary"
+    manifest_temporary="$(mktemp "${cache_root}/.native-controller-manifest.XXXXXX")"
+    printf '%s\n' 'schemaVersion=2' "fingerprint=${fingerprint}" 'executable=ephemeral-action-runner' "toolchainImageID=${dev_image_id}" "sourceRevision=${controller_source_revision}" "completedAtUnix=$(date +%s)" >"$manifest_temporary"
+    mv -f -- "$manifest_temporary" "$manifest_path"
+    manifest_temporary=""
   fi
 fi
 if ((manage_go_cache == 1)); then
@@ -297,25 +510,12 @@ if ((manage_go_cache == 1)); then
   epar_enforce_go_cache_limit
 fi
 
-manifest_temporary="$(mktemp "${cache_directory}/.manifest.XXXXXX")"
-printf '%s\n' \
-  'schemaVersion=1' \
-  "cacheKey=${cache_key}" \
-  'executable=ephemeral-action-runner' \
-  "completedAtUnix=$(date +%s)" >"$manifest_temporary"
-mv -f -- "$manifest_temporary" "${cache_directory}/controller-cache.manifest"
-manifest_temporary=""
-
-lease_file="$(mktemp "${cache_directory}/lease.$$.XXXXXX")"
+lease_file="$(mktemp "${cache_root}/lease-native-$$.XXXXXX")"
 printf '%s\n' \
   'schemaVersion=1' \
   "host=$(hostname 2>/dev/null || true)" \
   "pid=$$" \
   "startedAtUnix=$(date +%s)" >"$lease_file"
-if ! epar_prune_native_controller_cache "$cache_root" "$cache_key"; then
-  echo "warning: native-controller cache retention skipped after an error" >&2
-fi
-
 export EPAR_NATIVE_CONTROLLER=1
 export EPAR_CONTROLLER_HOST_OS="$goos"
 export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"

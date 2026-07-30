@@ -1183,18 +1183,11 @@ func discoverDockerSandboxes(ctx context.Context, projectRoot, guestPlatform str
 		if !found {
 			continue
 		}
-		identity, inspectErr := adapter.InspectLocalTemplate(ctx, template.Reference)
-		if inspectErr != nil || identity.Platform != guestPlatform {
-			continue
-		}
-		if !strings.HasPrefix(identity.Digest, "sha256:") || len(identity.Digest) != len("sha256:")+64 || template.CacheID != strings.TrimPrefix(identity.Digest, "sha256:")[:12] {
-			continue
-		}
 		templates = append(templates, initDockerSandboxesTemplate{
 			Reference:     template.Reference,
-			Digest:        identity.Digest,
+			Digest:        "",
 			CacheID:       template.CacheID,
-			Platform:      identity.Platform,
+			Platform:      guestPlatform,
 			Size:          template.SizeBytes,
 			Label:         profile.DisplayLabel,
 			SourceChannel: profile.ObservedTag,
@@ -1747,7 +1740,7 @@ storage:
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
-  buildCacheLimit: 64GiB
+  buildCacheLimit: 20GiB
   goCacheLimit: 10GiB
 
 logging:
@@ -1854,7 +1847,7 @@ storage:
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
-  buildCacheLimit: 64GiB
+  buildCacheLimit: 20GiB
   goCacheLimit: 10GiB
 
 logging:
@@ -1956,7 +1949,7 @@ storage:
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
-  buildCacheLimit: 64GiB
+  buildCacheLimit: 20GiB
   goCacheLimit: 10GiB
 
 logging:
@@ -2043,7 +2036,7 @@ storage:
   gracePeriod: 168h
   keepPrevious: 0
   automaticHousekeeping: conservative
-  buildCacheLimit: 64GiB
+  buildCacheLimit: 20GiB
   goCacheLimit: 10GiB
 
 logging:
