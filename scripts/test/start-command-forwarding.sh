@@ -5,9 +5,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 
+test_uname="$(uname -s)"
+case "$test_uname" in
+  MINGW*|MSYS*|CYGWIN*) test_uname=Linux ;;
+esac
 cat >"$test_root/uname" <<'SCRIPT'
 #!/usr/bin/env bash
-printf 'Linux\n'
+printf '%s\n' "$EPAR_TEST_UNAME"
 SCRIPT
 cat >"$test_root/go" <<'SCRIPT'
 #!/usr/bin/env bash
@@ -19,6 +23,7 @@ SCRIPT
 chmod +x "$test_root/uname" "$test_root/go"
 
 export PATH="$test_root:$PATH"
+export EPAR_TEST_UNAME="$test_uname"
 export EPAR_GO_BIN=go
 export EPAR_USE_DOCKER_RUN=0
 export EPAR_START_FORWARD_LOG="$test_root/arguments"
