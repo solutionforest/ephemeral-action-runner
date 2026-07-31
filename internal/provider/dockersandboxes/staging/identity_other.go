@@ -19,3 +19,7 @@ func platformDirectoryIdentity(path string) (string, error) {
 	}
 	return fmt.Sprintf("unix:%x:%x", uint64(stat.Dev), uint64(stat.Ino)), nil
 }
+
+func isPlatformRedirect(info os.FileInfo) bool { return info.Mode()&os.ModeSymlink != 0 }
+
+func platformCanonicalPathSpelling(path string) (string, error) { return path, nil }

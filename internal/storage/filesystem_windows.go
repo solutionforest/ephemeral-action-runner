@@ -50,3 +50,22 @@ func isFilesystemRedirect(info os.FileInfo) bool {
 	data, ok := info.Sys().(*syscall.Win32FileAttributeData)
 	return ok && data.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
+
+func platformCanonicalFilesystemPath(path string) (string, error) {
+	pointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", err
+	}
+	size := uint32(len(path) + 1)
+	for {
+		buffer := make([]uint16, size)
+		length, err := windows.GetLongPathName(pointer, &buffer[0], size)
+		if err != nil {
+			return "", err
+		}
+		if length < size {
+			return windows.UTF16ToString(buffer[:length]), nil
+		}
+		size = length + 1
+	}
+}

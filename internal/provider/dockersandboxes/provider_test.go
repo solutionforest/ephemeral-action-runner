@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,17 +22,26 @@ import (
 const (
 	testName            = "epar-sandbox-1"
 	testID              = "9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b"
-	testWorkspace       = "/var/lib/epar/staging/job-1"
 	testTemplate        = "docker.io/docker/sandbox-templates:shell-docker"
 	testDigest          = "sha256:39cf20eca8610000000000000000000000000000000000000000000000000000"
-	readyListJSON       = `{"sandboxes":[{"id":"9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b","name":"epar-sandbox-1","status":"running","workspaces":["/var/lib/epar/staging/job-1"],"agent":"shell","additive_field":true}]}`
 	emptyPortsJSON      = `[]`
 	templateListJSON    = `{"images":[{"id":"39cf20eca861","repository":"docker.io/docker/sandbox-templates","tag":"shell-docker","flavor":"shell-docker","created_at":"2026-07-22T07:13:19Z","size":599103243}]}`
-	inspectionJSON      = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":"/var/lib/epar/staging/job-1","network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","mcp_gateway":false,"sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
 	healthyDiagnoseJSON = `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""}],"summary":{"pass":1,"warn":0,"fail":0,"skip":0}}`
 )
 
-var testInstance = provider.Instance{Name: testName, ProviderID: testID, Source: "shell", State: "running"}
+var (
+	testWorkspace  = providerTestWorkspace()
+	readyListJSON  = `{"sandboxes":[{"id":"9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b","name":"epar-sandbox-1","status":"running","workspaces":[` + strconv.Quote(testWorkspace) + `],"agent":"shell","additive_field":true}]}`
+	inspectionJSON = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":` + strconv.Quote(testWorkspace) + `,"network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","mcp_gateway":false,"sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
+	testInstance   = provider.Instance{Name: testName, ProviderID: testID, Source: "shell", State: "running"}
+)
+
+func providerTestWorkspace() string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(filepath.VolumeName(os.TempDir())+string(filepath.Separator), "var", "lib", "epar", "staging", "job-1")
+	}
+	return filepath.Join(string(filepath.Separator), "var", "lib", "epar", "staging", "job-1")
+}
 
 func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
 	p := NewWithDryRun("sbx", true)

@@ -125,6 +125,13 @@ func TestParseListParsesVerboseOutput(t *testing.T) {
 
 func TestNoInstalledDistrosReturnsEmptyList(t *testing.T) {
 	p := New("wsl.exe", t.TempDir(), t.TempDir(), true)
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
+		if !reflect.DeepEqual(args, []string{"--list", "--verbose"}) {
+			t.Fatalf("args = %#v", args)
+		}
+		message := "Windows Subsystem for Linux has no installed distributions."
+		return provider.ExecResult{Stderr: message}, errors.New(message)
+	}
 	out, err := p.List(context.Background())
 	if err != nil {
 		t.Fatalf("dry-run list failed: %v", err)

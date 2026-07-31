@@ -73,7 +73,7 @@ func TestRunnerInstallScriptRequiresVerifiedLocalPackage(t *testing.T) {
 			t.Fatalf("install-runner.sh still performs guest-side remote resolution: found %q", forbidden)
 		}
 	}
-	for _, required := range []string{"<verified-package-path>", "sha256sum --check", "Runner.Listener --version"} {
+	for _, required := range []string{"<verified-package-path>", "sha256sum --check", "sudo -u runner -H ./bin/Runner.Listener --version"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("install-runner.sh omitted %q", required)
 		}

@@ -32,7 +32,7 @@ tar xzf "${RUNNER_PACKAGE}"
 rm -f "${RUNNER_PACKAGE}"
 chown -R runner:runner /opt/actions-runner
 
-INSTALLED_RUNNER_VERSION="$(./bin/Runner.Listener --version | tr -d '\r' | tail -n 1)"
+INSTALLED_RUNNER_VERSION="$(sudo -u runner -H ./bin/Runner.Listener --version | tr -d '\r' | tail -n 1)"
 if [[ "${INSTALLED_RUNNER_VERSION}" != "${RUNNER_VERSION}" ]]; then
   echo "Actions runner package version ${INSTALLED_RUNNER_VERSION:-<empty>} does not match expected version ${RUNNER_VERSION}" >&2
   exit 1

@@ -51,7 +51,11 @@ func Open(root string) (*Staging, error) {
 	if err := validateDirectory(absRoot, false); err != nil {
 		return nil, fmt.Errorf("validate Docker Sandboxes staging root: %w", err)
 	}
-	return &Staging{root: absRoot}, nil
+	canonicalRoot, err := platformCanonicalPathSpelling(absRoot)
+	if err != nil {
+		return nil, fmt.Errorf("normalize Docker Sandboxes staging root: %w", err)
+	}
+	return &Staging{root: filepath.Clean(canonicalRoot)}, nil
 }
 
 func (s *Staging) Root() string {
@@ -265,7 +269,11 @@ func validateDirectory(path string, requireEmpty bool) error {
 	if err != nil {
 		return fmt.Errorf("resolve Docker Sandboxes staging path %q: %w", path, err)
 	}
-	if !samePath(filepath.Clean(absPath), filepath.Clean(absEvaluated)) {
+	canonicalPath, err := platformCanonicalPathSpelling(filepath.Clean(absPath))
+	if err != nil {
+		return fmt.Errorf("normalize Docker Sandboxes staging path %q: %w", path, err)
+	}
+	if !samePath(filepath.Clean(canonicalPath), filepath.Clean(absEvaluated)) {
 		return fmt.Errorf("Docker Sandboxes staging path %q contains a symlink, junction, or reparse redirection", path)
 	}
 	if requireEmpty {
@@ -318,7 +326,7 @@ func validateNoRedirectDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+	if isPlatformRedirect(info) || !info.IsDir() {
 		return fmt.Errorf("Docker Sandboxes staging path %q is not a real directory", path)
 	}
 	evaluated, err := filepath.EvalSymlinks(path)
@@ -333,7 +341,11 @@ func validateNoRedirectDirectory(path string) error {
 	if err != nil {
 		return fmt.Errorf("resolve Docker Sandboxes staging path %q: %w", path, err)
 	}
-	if !samePath(filepath.Clean(absPath), filepath.Clean(absEvaluated)) {
+	canonicalPath, err := platformCanonicalPathSpelling(filepath.Clean(absPath))
+	if err != nil {
+		return fmt.Errorf("normalize Docker Sandboxes staging path %q: %w", path, err)
+	}
+	if !samePath(filepath.Clean(canonicalPath), filepath.Clean(absEvaluated)) {
 		return fmt.Errorf("Docker Sandboxes staging path %q contains a symlink, junction, or reparse redirection", path)
 	}
 	return nil

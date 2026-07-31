@@ -2134,13 +2134,18 @@ func stubWSL2Available(t *testing.T) {
 	stubDockerSandboxesUnavailable(t)
 	oldGOOS := initGOOS
 	oldWSLStatus := initWSLStatus
+	oldPlatform := initSandboxPromotionPlatform
 	initGOOS = "windows"
 	initWSLStatus = func(context.Context) ([]byte, error) {
 		return []byte("Default Distribution: Ubuntu\nDefault Version: 2\n"), nil
 	}
+	initSandboxPromotionPlatform = func() sandboxpromotion.Platform {
+		return sandboxpromotion.WindowsAMD64
+	}
 	t.Cleanup(func() {
 		initGOOS = oldGOOS
 		initWSLStatus = oldWSLStatus
+		initSandboxPromotionPlatform = oldPlatform
 	})
 }
 

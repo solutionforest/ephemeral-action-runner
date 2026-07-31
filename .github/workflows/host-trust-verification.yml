@@ -61,7 +61,12 @@ jobs:
 
       - name: Run Go tests
         shell: bash
-        run: go test ./...
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            export TMPDIR="$(cd "${RUNNER_TEMP}" && pwd -P)"
+          fi
+          go test ./...
 
       - name: Smoke-test native host root collection without trust-store mutations
         shell: bash

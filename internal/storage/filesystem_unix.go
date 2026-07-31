@@ -36,3 +36,5 @@ func platformFilesystemIdentity(path string, _ bool) (string, error) {
 }
 
 func isFilesystemRedirect(info os.FileInfo) bool { return info.Mode()&os.ModeSymlink != 0 }
+
+func platformCanonicalFilesystemPath(path string) (string, error) { return path, nil }

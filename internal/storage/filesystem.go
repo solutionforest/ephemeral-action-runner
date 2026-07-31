@@ -101,10 +101,15 @@ func inspectFilesystemPath(path string) (string, os.FileInfo, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	if !sameFilesystemPath(absolute, filepath.Clean(evaluated)) {
+	canonicalSpelling, err := platformCanonicalFilesystemPath(absolute)
+	if err != nil {
+		return "", nil, fmt.Errorf("normalize storage filesystem path %q: %w", absolute, err)
+	}
+	canonicalSpelling = filepath.Clean(canonicalSpelling)
+	if !sameFilesystemPath(canonicalSpelling, filepath.Clean(evaluated)) {
 		return "", nil, fmt.Errorf("storage filesystem path %q contains a symlink, junction, or reparse redirection", absolute)
 	}
-	return absolute, info, nil
+	return canonicalSpelling, info, nil
 }
 
 func rejectRedirectedAncestors(path string) error {
