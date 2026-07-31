@@ -19,6 +19,7 @@ import (
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -872,6 +873,68 @@ func TestProvisionOneCapturesReadinessTimeoutAndPreservesCause(t *testing.T) {
 	}
 }
 
+func TestRunPoolCancellationAfterListenerStartCleansExactRunner(t *testing.T) {
+	state, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var deleted atomic.Bool
+	var lookupCalls atomic.Int32
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), "run-runner.sh") {
+			cancel()
+		}
+		return provider.ExecResult{}, nil
+	}
+	github := &fakeGitHub{
+		runnerByNameFunc: func(_ context.Context, name string) (gh.Runner, bool, error) {
+			if lookupCalls.Add(1) == 1 || deleted.Load() {
+				return gh.Runner{}, false, nil
+			}
+			return gh.Runner{Name: name, ID: 718}, true, nil
+		},
+		deleteFunc: func(context.Context, int64) error {
+			deleted.Store(true)
+			return nil
+		},
+		waitFunc: func(ctx context.Context, _ string, _ time.Duration) (gh.Runner, error) {
+			<-ctx.Done()
+			return gh.Runner{}, ctx.Err()
+		},
+	}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.LifecycleState = state
+
+	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, ReplaceCompleted: true, PoolLockHeld: true, HostTrustLockHeld: true}); err != nil {
+		t.Fatalf("RunPool() cancellation error = %v, want exact cleanup", err)
+	}
+	records, err := state.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("lifecycle records = %#v, want one tombstoned candidate", records)
+	}
+	record := records[0]
+	if record.Phase != poolstate.PhaseTombstoned || record.GitHub.RunnerID != 718 {
+		t.Fatalf("lifecycle after cancellation = phase %q runner id %d, want tombstoned with id 718", record.Phase, record.GitHub.RunnerID)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("remote delete calls = %d, want 1", got)
+	}
+	github.mu.Lock()
+	defer github.mu.Unlock()
+	if len(github.deletedIDs) != 1 || github.deletedIDs[0] != 718 {
+		t.Fatalf("deleted remote IDs = %v, want [718]", github.deletedIDs)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("local delete calls = %d, want 1", got)
+	}
+}
+
 func TestCommonLifecycleOwnsGuestTranscriptPath(t *testing.T) {
 	fake := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-1", State: "running"}}}
 	manager := newRegisteredTestManager(t, fake, nil)
@@ -1522,12 +1585,14 @@ func (p *fakeProvider) List(ctx context.Context) ([]provider.Instance, error) {
 
 type fakeGitHub struct {
 	runner              gh.Runner
+	runnerByNameFunc    func(context.Context, string) (gh.Runner, bool, error)
 	waitRunner          gh.Runner
 	waitErr             error
 	waitFunc            func(context.Context, string, time.Duration) (gh.Runner, error)
 	found               bool
 	runnerErr           error
 	deleteErr           error
+	deleteFunc          func(context.Context, int64) error
 	waitOnlineCalls     int32
 	waitOnlineIdleCalls int32
 	listRunners         []gh.Runner
@@ -1572,8 +1637,11 @@ func (g *fakeGitHub) ListRunners(ctx context.Context) ([]gh.Runner, error) {
 	return append([]gh.Runner(nil), g.listRunners...), g.listErr
 }
 
-func (g *fakeGitHub) RunnerByName(context.Context, string) (gh.Runner, bool, error) {
+func (g *fakeGitHub) RunnerByName(ctx context.Context, name string) (gh.Runner, bool, error) {
 	atomic.AddInt32(&g.runnerByNameCalls, 1)
+	if g.runnerByNameFunc != nil {
+		return g.runnerByNameFunc(ctx, name)
+	}
 	return g.runner, g.found, g.runnerErr
 }
 
@@ -1600,11 +1668,14 @@ func (g *fakeGitHub) waitReady(ctx context.Context, name string, timeout time.Du
 	return g.runner, nil
 }
 
-func (g *fakeGitHub) DeleteRunnerIfExists(_ context.Context, id int64) error {
+func (g *fakeGitHub) DeleteRunnerIfExists(ctx context.Context, id int64) error {
 	atomic.AddInt32(&g.deleteCalls, 1)
 	g.mu.Lock()
 	g.deletedIDs = append(g.deletedIDs, id)
 	g.mu.Unlock()
+	if g.deleteFunc != nil {
+		return g.deleteFunc(ctx, id)
+	}
 	return g.deleteErr
 }
 

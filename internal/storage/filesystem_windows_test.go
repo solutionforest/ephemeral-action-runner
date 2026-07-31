@@ -28,8 +28,12 @@ func TestSnapshotFilesystemTargetAcceptsWindowsShortPathAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotFilesystemTarget() rejected a Windows short path alias: %v", err)
 	}
-	if !strings.EqualFold(target.Locator, longPath) {
-		t.Fatalf("SnapshotFilesystemTarget() locator = %q, want canonical spelling %q", target.Locator, longPath)
+	want, err := platformCanonicalFilesystemPath(longPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(target.Locator, want) {
+		t.Fatalf("SnapshotFilesystemTarget() locator = %q, want canonical spelling %q", target.Locator, want)
 	}
 }
 

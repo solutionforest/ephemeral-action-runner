@@ -75,8 +75,12 @@ func TestCollectNativeRecognizesStableControllerLayout(t *testing.T) {
 	if len(warnings) != 0 || len(artifacts) != 1 {
 		t.Fatalf("collectNative() artifacts=%+v warnings=%v", artifacts, warnings)
 	}
+	expectedTarget, err := storage.SnapshotFilesystemTarget(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
 	stable := findArtifact(t, artifacts, "native-controller-stable:"+fingerprint)
-	if !stable.Current || stable.Ownership.Kind != storage.OwnershipExact || !hasProtection(stable, storage.ProtectionCurrent) || stable.Target.Locator != executable {
+	if !stable.Current || stable.Ownership.Kind != storage.OwnershipExact || !hasProtection(stable, storage.ProtectionCurrent) || stable.Target.Locator != expectedTarget.Locator {
 		t.Fatalf("stable native controller = %+v", stable)
 	}
 }

@@ -212,7 +212,7 @@ fake_go="$temporary/fake-go"
 fake_go_log="$temporary/fake-go.log"
 mkdir -p "$native_project/scripts/host-trust"
 cp "$project_root/start" "$native_project/start"
-cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$native_project/scripts/host-trust/"
+cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$project_root/scripts/host-trust/macos-trust-settings.js" "$native_project/scripts/host-trust/"
 cat >"$fake_go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail

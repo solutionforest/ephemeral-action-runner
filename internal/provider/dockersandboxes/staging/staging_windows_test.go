@@ -46,7 +46,10 @@ func TestOpenAcceptsWindowsShortPathAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() rejected a Windows short path alias: %v", err)
 	}
-	want := filepath.Join(longParent, "staging")
+	want, err := platformCanonicalPathSpelling(filepath.Join(longParent, "staging"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.EqualFold(staging.Root(), want) {
 		t.Fatalf("Root() = %q, want canonical spelling %q", staging.Root(), want)
 	}

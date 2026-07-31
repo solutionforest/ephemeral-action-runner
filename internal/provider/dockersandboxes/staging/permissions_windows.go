@@ -5,10 +5,12 @@ package staging
 import (
 	"fmt"
 	"os"
-	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+const windowsFileAllAccess = windows.ACCESS_MASK(windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff)
 
 func restrictPlatformPermissions(path string) error {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
@@ -43,39 +45,41 @@ func validatePlatformPermissions(path string, _ os.FileInfo) error {
 	if control&windows.SE_DACL_PROTECTED == 0 {
 		return fmt.Errorf("DACL inherits access from a parent")
 	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return fmt.Errorf("read staging DACL: %w", err)
+	}
+	if dacl == nil {
+		return fmt.Errorf("DACL is absent")
+	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return fmt.Errorf("get current process user: %w", err)
 	}
-	sddl := descriptor.String()
-	currentSID := user.User.Sid.String()
-	remaining := sddl
+	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return fmt.Errorf("create SYSTEM SID: %w", err)
+	}
 	seenCurrent := false
 	seenSystem := false
-	aceCount := 0
-	for {
-		start := strings.IndexByte(remaining, '(')
-		if start < 0 {
-			break
+	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, index, &ace); err != nil {
+			return fmt.Errorf("read DACL access rule %d: %w", index, err)
 		}
-		remaining = remaining[start+1:]
-		end := strings.IndexByte(remaining, ')')
-		if end < 0 {
-			return fmt.Errorf("DACL contains malformed SDDL")
-		}
-		fields := strings.Split(remaining[:end], ";")
-		remaining = remaining[end+1:]
-		if len(fields) != 6 || fields[0] != "A" || fields[2] != "FA" {
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
+			ace.Header.AceFlags != windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE ||
+			ace.Mask != windowsFileAllAccess {
 			return fmt.Errorf("DACL contains an unexpected access rule")
 		}
-		aceCount++
-		switch fields[5] {
-		case currentSID:
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		switch {
+		case sid.Equals(user.User.Sid):
 			if seenCurrent {
 				return fmt.Errorf("DACL contains duplicate current-user access")
 			}
 			seenCurrent = true
-		case "SY", "S-1-5-18":
+		case sid.Equals(systemSID):
 			if seenSystem {
 				return fmt.Errorf("DACL contains duplicate SYSTEM access")
 			}
@@ -84,7 +88,7 @@ func validatePlatformPermissions(path string, _ os.FileInfo) error {
 			return fmt.Errorf("DACL grants an unexpected trustee")
 		}
 	}
-	if aceCount != 2 || !seenCurrent || !seenSystem {
+	if dacl.AceCount != 2 || !seenCurrent || !seenSystem {
 		return fmt.Errorf("DACL must grant full access only to the current process identity and SYSTEM")
 	}
 	return nil

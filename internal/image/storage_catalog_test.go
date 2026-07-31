@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
@@ -138,8 +139,16 @@ func TestSandboxWorkspaceIsCatalogedBeforeBuildAndSupersededExactly(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstResource := findCatalogResourceByLocator(t, value.Resources, first)
-	secondResource := findCatalogResourceByLocator(t, value.Resources, second)
+	firstTarget, err := storage.SnapshotFilesystemTarget(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTarget, err := storage.SnapshotFilesystemTarget(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResource := findCatalogResourceByLocator(t, value.Resources, firstTarget.Locator)
+	secondResource := findCatalogResourceByLocator(t, value.Resources, secondTarget.Locator)
 	if firstResource.State != storagecatalog.StateSuperseded || len(firstResource.References) != 0 || firstResource.SupersededAt == nil {
 		t.Fatalf("replaced staging workspace = %#v", firstResource)
 	}
@@ -153,7 +162,7 @@ func TestSandboxWorkspaceIsCatalogedBeforeBuildAndSupersededExactly(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondResource = findCatalogResourceByLocator(t, value.Resources, second)
+	secondResource = findCatalogResourceByLocator(t, value.Resources, secondTarget.Locator)
 	if secondResource.State != storagecatalog.StateSuperseded || len(secondResource.References) != 0 || secondResource.SupersededAt == nil {
 		t.Fatalf("completed staging workspace = %#v", secondResource)
 	}

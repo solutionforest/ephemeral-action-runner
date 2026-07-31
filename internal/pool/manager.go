@@ -1328,11 +1328,6 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			vm.Phase = LifecycleReady
 			return
 		}
-		if listenerMayBeRunning {
-			m.quarantineLifecycle(context.Background(), name, err)
-			vm.Phase = LifecycleQuarantined
-			return
-		}
 		remoteKnownAbsent := !configureAttempted
 		if configureAttempted && m.GitHub != nil {
 			runner, found, lookupErr := m.GitHub.RunnerByName(context.Background(), name)
@@ -1350,6 +1345,11 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 					return
 				}
 			}
+		}
+		if listenerMayBeRunning {
+			m.quarantineLifecycle(context.Background(), name, err)
+			vm.Phase = LifecycleQuarantined
+			return
 		}
 		if m.LifecycleState == nil {
 			if vm.RunnerID != 0 && m.GitHub != nil {
