@@ -221,10 +221,12 @@ if [[ "${1:-}" == version ]]; then
   exit 0
 fi
 printf '%s\n' "$*" >>"$FAKE_GO_LOG"
+printf 'trust build=<%s> runner=<%s> os=<%s> deferred=<%s>\n' "${EPAR_BUILD_TRUST_FEED:-}" "${EPAR_HOST_TRUST_FEED:-}" "${EPAR_CONTROLLER_HOST_OS:-}" "${EPAR_HOST_TRUST_INIT_DEFERRED:-}" >>"$FAKE_GO_LOG"
 SH
 chmod +x "$fake_go"
-(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" ./start)
+(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" EPAR_BUILD_TRUST_FEED=stale-build EPAR_HOST_TRUST_FEED=stale-runner EPAR_CONTROLLER_HOST_OS=darwin EPAR_HOST_TRUST_INIT_DEFERRED=1 ./start)
 grep -Fxq 'run ./cmd/ephemeral-action-runner start' "$fake_go_log"
+grep -Fxq 'trust build=<> runner=<> os=<> deferred=<>' "$fake_go_log"
 
 nested_root="$temporary/nested-project"
 mkdir -p "$nested_root/.local"

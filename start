@@ -51,16 +51,23 @@ if ! go_usable "${GO_BIN}"; then
   exit 1
 fi
 
-epar_host_trust_prepare "${script_dir}" "${controller_command}" "${epar_args[@]}"
-trap epar_host_trust_cleanup EXIT INT TERM
-if [[ -n "${EPAR_BUILD_TRUST_FEED_DIR}" || -n "${EPAR_RUNNER_TRUST_FEED_DIR}" ]]; then
-  export EPAR_CONTROLLER_HOST_OS="$(epar_host_trust_host_os)"
+# The local controller reads the host trust stores itself. Feed variables are
+# exclusively for the legacy controller-in-Docker bridge, so do not let a
+# caller's bridge state bypass native first-run preflight or stale its build.
+unset EPAR_BUILD_TRUST_FEED EPAR_HOST_TRUST_FEED EPAR_CONTROLLER_HOST_OS EPAR_HOST_TRUST_INIT_DEFERRED
+
+# The native controller resolves operational and runner trust directly. Keep
+# the established explicit-init post-write verification, but never prepare a
+# pre-wizard feed for the embedded first-run start continuation.
+if [[ "$controller_command" != "init" ]]; then
+  exec "${GO_BIN}" run ./cmd/ephemeral-action-runner "${epar_args[@]}"
 fi
-if [[ -n "${EPAR_BUILD_TRUST_FEED_DIR}" ]]; then export EPAR_BUILD_TRUST_FEED="${EPAR_BUILD_TRUST_FEED_DIR}/current.json"; fi
-if [[ -n "${EPAR_RUNNER_TRUST_FEED_DIR}" ]]; then export EPAR_HOST_TRUST_FEED="${EPAR_RUNNER_TRUST_FEED_DIR}/current.json"; fi
+
+epar_host_trust_prepare "${script_dir}" "$controller_command" "${epar_args[@]}"
+trap epar_host_trust_cleanup EXIT INT TERM
 status=0
 "${GO_BIN}" run ./cmd/ephemeral-action-runner "${epar_args[@]}" || status=$?
-if [[ "$status" == "0" && "$controller_command" == "init" ]]; then
+if [[ "$status" == "0" ]]; then
   epar_host_trust_post_init "${script_dir}" || status=$?
 fi
 epar_host_trust_cleanup

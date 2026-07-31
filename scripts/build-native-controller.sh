@@ -517,15 +517,25 @@ printf '%s\n' \
   "pid=$$" \
   "startedAtUnix=$(date +%s)" >"$lease_file"
 export EPAR_NATIVE_CONTROLLER=1
-export EPAR_CONTROLLER_HOST_OS="$goos"
 export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"
 export EPAR_HOST_NAME="${EPAR_HOST_NAME:-$(hostname 2>/dev/null || true)}"
 controller_command="${1:-start}"
-epar_host_trust_prepare "$repo_root" "$controller_command" "$@"
-if [[ -n "${EPAR_BUILD_TRUST_FEED_DIR}" ]]; then export EPAR_BUILD_TRUST_FEED="${EPAR_BUILD_TRUST_FEED_DIR}/current.json"; fi
-if [[ -n "${EPAR_RUNNER_TRUST_FEED_DIR}" ]]; then export EPAR_HOST_TRUST_FEED="${EPAR_RUNNER_TRUST_FEED_DIR}/current.json"; fi
+
+# Bootstrap trust is mounted only into the compiler container above. The cached
+# native controller reads the host stores directly, so legacy bridge state must
+# not survive into first-run continuation or suppress its native preflight.
+unset EPAR_BUILD_TRUST_FEED EPAR_HOST_TRUST_FEED EPAR_CONTROLLER_HOST_OS EPAR_HOST_TRUST_INIT_DEFERRED
+
+# Keep explicit-init's post-write verification. Ordinary starts must not create
+# a pre-wizard feed because the native controller resolves the new config itself.
+if [[ "$controller_command" == "init" ]]; then
+  epar_host_trust_prepare "$repo_root" "$controller_command" "$@"
+fi
 status=0
 "$binary" "$@" || status=$?
+if [[ "$status" == "0" && "$controller_command" == "init" ]]; then
+  epar_host_trust_post_init "$repo_root" || status=$?
+fi
 epar_host_trust_cleanup
 cleanup_build
 trap - EXIT INT TERM

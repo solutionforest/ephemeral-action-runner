@@ -150,4 +150,115 @@ for required in 'golang:latest' 'ephemeral-action-runner.manifest' 'schemaVersio
   [[ "$builder_source" == *"$required"* ]] || { echo "stable native-controller wrapper contract is missing: ${required}" >&2; exit 1; }
 done
 
+native_smoke_root="${temporary}/native-runtime-smoke"
+native_smoke_project="${native_smoke_root}/project"
+native_smoke_bin="${native_smoke_root}/bin"
+mkdir -p "${native_smoke_project}/scripts/host-trust" "${native_smoke_project}/scripts/docker" "${native_smoke_project}/scripts/bootstrap-trust" "${native_smoke_project}/cmd" "${native_smoke_project}/internal" "$native_smoke_bin"
+cp "$builder" "${native_smoke_project}/scripts/build-native-controller.sh"
+: >"${native_smoke_project}/scripts/docker/dev.Dockerfile"
+: >"${native_smoke_project}/go.mod"
+: >"${native_smoke_project}/go.sum"
+cat >"${native_smoke_project}/scripts/host-trust/wrapper-lib.sh" <<'SH'
+#!/usr/bin/env bash
+EPAR_HOST_TRUST_POST_INIT_CONFIG=""
+EPAR_BUILD_TRUST_FEED_DIR=""
+EPAR_RUNNER_TRUST_FEED_DIR=""
+epar_host_trust_config_path() { printf '%s/.local/config.yml\n' "$1"; }
+epar_host_trust_prepare() { EPAR_HOST_TRUST_POST_INIT_CONFIG="$(epar_host_trust_config_path "$1")"; }
+epar_host_trust_post_init() { [[ -n "$EPAR_HOST_TRUST_POST_INIT_CONFIG" ]] && "$EPAR_HOST_TRUST_HELPER" sync --project-root "$1" --config "$EPAR_HOST_TRUST_POST_INIT_CONFIG" >/dev/null; }
+epar_host_trust_cleanup() { :; }
+epar_host_trust_host_os() { printf '%s\n' linux; }
+SH
+cat >"${native_smoke_project}/scripts/host-trust/host-trust-feed.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  sync)
+    if [[ " $* " == *" --purpose build "* ]]; then
+      printf 'bootstrap\n' >>"$FAKE_HELPER_LOG"
+      printf '{}\n' >"$FAKE_BOOTSTRAP_FEED"
+      printf '%s\n' "$FAKE_BOOTSTRAP_FEED"
+    else
+      printf 'post-init\n' >>"$FAKE_HELPER_LOG"
+    fi
+    ;;
+  watch)
+    trap 'exit 0' INT TERM
+    while :; do sleep 1; done
+    ;;
+  *)
+    echo "unexpected host-trust helper command: $*" >&2
+    exit 1
+    ;;
+esac
+SH
+cat >"${native_smoke_bin}/docker" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'CALL' >>"$FAKE_DOCKER_LOG"
+printf ' <%s>' "$@" >>"$FAKE_DOCKER_LOG"
+printf '\n' >>"$FAKE_DOCKER_LOG"
+case "${1:-}" in
+  image)
+    printf 'sha256:%064d\n' 0
+    ;;
+  pull|build)
+    ;;
+  run)
+    output_directory=""
+    for argument in "$@"; do
+      case "$argument" in
+        *:/out) output_directory="${argument%:/out}" ;;
+      esac
+    done
+    if [[ " $* " == *' /bootstrap/main.go '* ]]; then
+      printf 'bootstrap trust\n'
+      printf 'fake bootstrap trust\n' >"${output_directory}/ca.pem"
+    elif [[ " $* " == *' go build '* ]]; then
+      cat >"${output_directory}/ephemeral-action-runner" <<'NATIVE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'runtime build=<%s> runner=<%s> os=<%s> deferred=<%s> args=<%s>\n' "${EPAR_BUILD_TRUST_FEED:-}" "${EPAR_HOST_TRUST_FEED:-}" "${EPAR_CONTROLLER_HOST_OS:-}" "${EPAR_HOST_TRUST_INIT_DEFERRED:-}" "$*" >>"${FAKE_NATIVE_LOG:?}"
+if [[ "${1:-}" == init ]]; then
+  mkdir -p .local
+  printf '%s\n' 'image:' '  hostTrustMode: overlay' '  hostTrustScopes: [system, user]' >.local/config.yml
+fi
+NATIVE
+      chmod +x "${output_directory}/ephemeral-action-runner"
+    fi
+    ;;
+  *)
+    echo "unexpected fake Docker command: $*" >&2
+    exit 1
+    ;;
+esac
+SH
+chmod +x "${native_smoke_project}/scripts/build-native-controller.sh" "${native_smoke_project}/scripts/host-trust/host-trust-feed.sh" "${native_smoke_bin}/docker"
+
+native_smoke_env=(
+  "PATH=${native_smoke_bin}:$PATH"
+  "EPAR_GOMOD_VOLUME=native-smoke-gomod"
+  "EPAR_GOCACHE_VOLUME=native-smoke-gocache"
+  'EPAR_BOOTSTRAP_MIN_FREE_BYTES=1'
+  "FAKE_HELPER_LOG=${native_smoke_root}/helper.log"
+  "FAKE_BOOTSTRAP_FEED=${native_smoke_root}/bootstrap-feed.json"
+  "FAKE_DOCKER_LOG=${native_smoke_root}/docker.log"
+  "FAKE_NATIVE_LOG=${native_smoke_root}/native.log"
+  'EPAR_BUILD_TRUST_FEED=stale-build'
+  'EPAR_HOST_TRUST_FEED=stale-runner'
+  'EPAR_CONTROLLER_HOST_OS=darwin'
+  'EPAR_HOST_TRUST_INIT_DEFERRED=1'
+)
+(cd "$native_smoke_project" && env "${native_smoke_env[@]}" scripts/build-native-controller.sh start)
+grep -Fxq 'runtime build=<> runner=<> os=<> deferred=<> args=<start>' "${native_smoke_root}/native.log"
+grep -Fxq 'bootstrap' "${native_smoke_root}/helper.log"
+[[ "$(wc -l <"${native_smoke_root}/helper.log" | tr -d ' ')" == 1 ]] || { echo 'ordinary cached-native start unexpectedly used a runtime trust bridge' >&2; exit 1; }
+grep -Fq ':/feed/current.json:ro>' "${native_smoke_root}/docker.log"
+grep -Fq ' <SSL_CERT_FILE=/run/epar-bootstrap-ca.pem>' "${native_smoke_root}/docker.log"
+
+: >"${native_smoke_root}/helper.log"
+(cd "$native_smoke_project" && env "${native_smoke_env[@]}" scripts/build-native-controller.sh init)
+grep -Fxq 'runtime build=<> runner=<> os=<> deferred=<> args=<init>' "${native_smoke_root}/native.log"
+grep -Fxq 'post-init' "${native_smoke_root}/helper.log"
+
 echo "Unix native-controller cache retention contract passed"
