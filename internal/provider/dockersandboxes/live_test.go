@@ -2,6 +2,9 @@ package dockersandboxes
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -105,6 +108,9 @@ printf '\n'`}, provider.ExecOptions{})
 	if _, err := p.Exec(ctx, instance, []string{"bash", "/opt/epar/verify-template.sh"}, provider.ExecOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	if err := verifyAuthenticatedRegistryLifecycle(ctx, p, instance); err != nil {
+		t.Fatal(err)
+	}
 	diskUsage, err := p.Exec(ctx, instance, []string{"df", "-B1", "--output=used,target", "/", "/var/lib/docker"}, provider.ExecOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -197,4 +203,90 @@ rm -rf -- "$workdir"
 	} else if !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
+}
+
+func verifyAuthenticatedRegistryLifecycle(ctx context.Context, p *Provider, instance provider.Instance) error {
+	registryImage := strings.TrimSpace(os.Getenv("EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE"))
+	htpasswdImage := strings.TrimSpace(os.Getenv("EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE"))
+	if !strings.Contains(registryImage, "@sha256:") || !strings.Contains(htpasswdImage, "@sha256:") {
+		return errors.New("EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE and EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE must be immutable digest references")
+	}
+	username, err := randomLiveCredential("epar-")
+	if err != nil {
+		return err
+	}
+	password, err := randomLiveCredential("")
+	if err != nil {
+		return err
+	}
+	script := `set -euo pipefail
+registry_image="$1"
+htpasswd_image="$2"
+IFS= read -r username
+IFS= read -r password
+auth_dir="$(mktemp -d)"
+registry_name="epar-auth-registry-$$"
+registry_ref=""
+probe_image=""
+cleanup() {
+  if [[ -n "${registry_ref}" ]]; then docker logout "${registry_ref}" >/dev/null 2>&1 || true; fi
+  docker rm -f "${registry_name}" >/dev/null 2>&1 || true
+  if [[ -n "${probe_image}" ]]; then docker image rm "${probe_image}" >/dev/null 2>&1 || true; fi
+  rm -rf -- "${auth_dir}"
+}
+trap cleanup EXIT
+printf '%s\n' "${password}" | docker run --rm -i -v "${auth_dir}:/auth" "${htpasswd_image}" htpasswd -B -i -c /auth/htpasswd "${username}" >/dev/null
+docker run --name "${registry_name}" --detach --publish 127.0.0.1::5000 --env REGISTRY_AUTH=htpasswd --env REGISTRY_AUTH_HTPASSWD_REALM='EPAR live proof' --env REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd --volume "${auth_dir}:/auth:ro" "${registry_image}" >/dev/null
+registry_port="$(docker port "${registry_name}" 5000/tcp | awk -F: 'NR == 1 { print $NF }')"
+[[ "${registry_port}" =~ ^[0-9]+$ ]]
+registry_ref="127.0.0.1:${registry_port}"
+probe_image="${registry_ref}/epar/private-pull-proof:latest"
+login_succeeded=false
+for attempt in $(seq 1 30); do
+  if printf '%s\n' "${password}" | docker login --username "${username}" --password-stdin "${registry_ref}" >/dev/null 2>&1; then login_succeeded=true; break; fi
+  if [[ "${attempt}" == 30 ]]; then echo 'authenticated registry did not become ready' >&2; exit 1; fi
+  sleep 1
+done
+[[ "${login_succeeded}" == true ]]
+python3 - "${DOCKER_CONFIG}/config.json" "${registry_ref}" <<'PY'
+import json
+import pathlib
+import sys
+config = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if sys.argv[2] not in config.get("auths", {}):
+    raise SystemExit("login did not create the expected Docker auth entry")
+PY
+docker pull docker.io/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce >/dev/null
+docker tag docker.io/library/alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce "${probe_image}"
+docker push "${probe_image}" >/dev/null
+docker image rm "${probe_image}" >/dev/null
+docker pull "${probe_image}" >/dev/null
+docker logout "${registry_ref}" >/dev/null
+python3 - "${DOCKER_CONFIG}/config.json" "${registry_ref}" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+if sys.argv[2] in config.get("auths", {}):
+    raise SystemExit("Docker auth entry survived logout")
+PY
+printf 'authenticated registry login, separate-command pull, and credential cleanup passed\n'
+`
+	result, err := p.Exec(ctx, instance, []string{"bash", "-lc", script, "--", registryImage, htpasswdImage}, provider.ExecOptions{
+		Stdin:           username + "\n" + password + "\n",
+		SensitiveValues: []string{username, password},
+	})
+	if err != nil {
+		return fmt.Errorf("authenticated local registry proof: %w: %s", err, strings.TrimSpace(result.Stderr))
+	}
+	return nil
+}
+
+func randomLiveCredential(prefix string) (string, error) {
+	value := make([]byte, 24)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("generate live registry credential: %w", err)
+	}
+	return prefix + hex.EncodeToString(value), nil
 }

@@ -24,9 +24,9 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage/inventory"
 )
 
-func collectExternalStorage(snapshot *inventory.Snapshot, providerFilter string) {
+func collectExternalStorage(snapshot *inventory.Snapshot, providerFilter, configPath string) {
 	if providerFilter == "" || providerFilter == "docker-container" || providerFilter == "docker-sandboxes" || providerFilter == "wsl" {
-		collectDockerStorage(snapshot, providerFilter)
+		collectDockerStorage(snapshot, providerFilter, configPath)
 	}
 	if providerFilter == "" || providerFilter == "docker-sandboxes" {
 		collectDockerSandboxesStorage(snapshot)
@@ -39,7 +39,7 @@ func collectExternalStorage(snapshot *inventory.Snapshot, providerFilter string)
 	}
 }
 
-func collectDockerStorage(snapshot *inventory.Snapshot, providerFilter string) {
+func collectDockerStorage(snapshot *inventory.Snapshot, providerFilter, configPath string) {
 	const surfaceID = "docker-engine"
 	snapshot.Surfaces = append(snapshot.Surfaces, storage.Surface{
 		ID:       surfaceID,
@@ -93,7 +93,7 @@ func collectDockerStorage(snapshot *inventory.Snapshot, providerFilter string) {
 			collectDockerVolumeRecords(snapshot, surfaceID, volumes)
 		}
 	}
-	collectDedicatedBuildxStorage(snapshot, surfaceID)
+	collectDedicatedBuildxStorage(snapshot, surfaceID, configPath)
 }
 
 type dockerDiskUsageVolume struct {
@@ -196,14 +196,27 @@ func sameStorageProjectRoot(labelRoot, projectRoot string) bool {
 	return left == right
 }
 
-func collectDedicatedBuildxStorage(snapshot *inventory.Snapshot, surfaceID string) {
-	metadata, err := artifactimage.LoadBuildxMetadata(snapshot.ProjectRoot)
+func collectDedicatedBuildxStorage(snapshot *inventory.Snapshot, surfaceID, configPath string) {
+	metadata, err := artifactimage.LoadBuildxMetadataForConfig(snapshot.ProjectRoot, configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("EPAR Buildx ownership metadata is invalid; no builder cache is trusted: %v", err))
 		}
+	} else {
+		collectBuildxMetadataStorage(snapshot, surfaceID, metadata, metadata.ConfigID, metadata.EPARConfigPath, false)
+	}
+	legacy, legacyErr := artifactimage.LoadLegacyBuildxMetadata(snapshot.ProjectRoot)
+	if legacyErr != nil {
+		if !os.IsNotExist(legacyErr) {
+			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Legacy EPAR Buildx ownership metadata is invalid and was left untouched: %v", legacyErr))
+		}
 		return
 	}
+	snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Legacy project-scoped EPAR Buildx builder %q is retained for explicit cleanup and is not reused by config-scoped controllers", legacy.Builder))
+	collectBuildxMetadataStorage(snapshot, surfaceID, legacy, legacy.ProjectRoot, artifactimage.LegacyBuildxMetadataPath(snapshot.ProjectRoot), true)
+}
+
+func collectBuildxMetadataStorage(snapshot *inventory.Snapshot, surfaceID string, metadata artifactimage.BuildxMetadata, ownerID, evidence string, legacy bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, "docker", "buildx", "du", "--builder", metadata.Builder, "--format", "json").Output()
@@ -221,14 +234,17 @@ func collectDedicatedBuildxStorage(snapshot *inventory.Snapshot, surfaceID strin
 		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("EPAR Buildx cache limit for %q is invalid: %v", metadata.Builder, limitErr))
 	}
 	artifact := storage.Artifact{
-		ID:          externalStorageID("buildx-cache", metadata.Builder, metadata.ProjectRoot),
+		ID:          externalStorageID("buildx-cache", metadata.Builder, ownerID),
 		SurfaceID:   surfaceID,
 		Kind:        storage.ArtifactBuildKitCache,
-		Target:      storage.Target{Kind: storage.TargetBuildKitRecord, Locator: metadata.Builder, Identity: metadata.Builder, Fingerprint: metadata.ProjectRoot + "\x00" + metadata.CacheLimit, Match: storage.MatchExact},
-		Ownership:   storage.Ownership{Kind: storage.OwnershipExact, OwnerID: metadata.ProjectRoot, Evidence: artifactimage.BuildxMetadataPath(snapshot.ProjectRoot)},
+		Target:      storage.Target{Kind: storage.TargetBuildKitRecord, Locator: metadata.Builder, Identity: metadata.Builder, Fingerprint: ownerID + "\x00" + metadata.CacheLimit, Match: storage.MatchExact},
+		Ownership:   storage.Ownership{Kind: storage.OwnershipExact, OwnerID: ownerID, Evidence: evidence},
 		SizeBytes:   total,
 		LastUsedAt:  snapshot.CollectedAt,
 		Protections: []storage.Protection{{Kind: storage.ProtectionLock, Detail: "dedicated BuildKit enforces its configured garbage-collection ceiling"}},
+	}
+	if legacy {
+		artifact.Protections = append(artifact.Protections, storage.Protection{Kind: storage.ProtectionOperator, Detail: "legacy project-scoped builder requires explicit operator cleanup"})
 	}
 	snapshot.Artifacts = append(snapshot.Artifacts, artifact)
 	if limitErr == nil && total > uint64(cacheLimit) {

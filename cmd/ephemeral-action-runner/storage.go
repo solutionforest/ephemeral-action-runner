@@ -132,7 +132,7 @@ func runStorage(args []string) error {
 	if staleTemplateReceiptWarning != "" {
 		snapshot.Warnings = append(snapshot.Warnings, staleTemplateReceiptWarning)
 	}
-	collectExternalStorage(&snapshot, *providerFlag)
+	collectExternalStorage(&snapshot, *providerFlag, configPath)
 	protectConfiguredSandboxTemplates(&snapshot, selections)
 	catalogValue, catalogErr := addCatalogStorage(&snapshot, *providerFlag, now)
 	if catalogErr != nil {

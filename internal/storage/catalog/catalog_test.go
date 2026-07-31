@@ -9,6 +9,29 @@ import (
 	"time"
 )
 
+func TestConfigIDResolvesConfigurationSymlinks(t *testing.T) {
+	project := t.TempDir()
+	realPath := filepath.Join(project, "config.yml")
+	linkPath := filepath.Join(project, "config-link.yml")
+	if err := os.WriteFile(realPath, []byte("provider: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	realID, err := ConfigID(project, realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkID, err := ConfigID(project, linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realID != linkID {
+		t.Fatalf("one configuration received split identities through a symlink: %q != %q", realID, linkID)
+	}
+}
+
 func TestMultipleConfigsShareResourceUntilLastReferenceIsRemoved(t *testing.T) {
 	root := t.TempDir()
 	project := filepath.Join(root, "project")

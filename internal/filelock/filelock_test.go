@@ -57,3 +57,26 @@ func TestCloseAllowsReacquireAndIsIdempotent(t *testing.T) {
 		t.Fatalf("Close second: %v", err)
 	}
 }
+
+func TestReplaceContentUsesHeldLockFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.lock")
+	lock, err := Acquire(path)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer lock.Close()
+
+	if err := lock.ReplaceContent([]byte("first payload that is longer\n")); err != nil {
+		t.Fatalf("ReplaceContent first: %v", err)
+	}
+	if err := lock.ReplaceContent([]byte("short\n")); err != nil {
+		t.Fatalf("ReplaceContent second: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if got, want := string(content), "short\n"; got != want {
+		t.Fatalf("lock metadata = %q, want %q", got, want)
+	}
+}

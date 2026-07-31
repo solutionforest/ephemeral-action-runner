@@ -118,7 +118,31 @@ func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, i
 			if _, err := m.LifecycleState.Transition(ctx, record.Name, poolstate.Transition{Action: poolstate.ActionResumeCleanup}); err != nil {
 				return err
 			}
-		case poolstate.PhaseCreated, poolstate.PhaseValidating, poolstate.PhaseStandby, poolstate.PhaseRegistering, poolstate.PhaseReady, poolstate.PhaseBusy, poolstate.PhaseDraining, poolstate.PhaseQuarantined:
+		case poolstate.PhaseQuarantined:
+			if record.ProviderID == "" {
+				if len(sameName) != 0 {
+					for _, item := range sameName {
+						if reportErr := m.reportUnknownInventory(ctx, item); reportErr != nil {
+							return reportErr
+						}
+					}
+					return fmt.Errorf("unidentified same-name instance is quarantined and was not deleted")
+				}
+				if m.GitHub == nil {
+					return fmt.Errorf("record has no immutable provider identity and GitHub absence cannot be verified")
+				}
+				if _, found, err := m.GitHub.RunnerByName(ctx, record.GitHub.ExactName); err != nil {
+					return err
+				} else if found {
+					return fmt.Errorf("unidentified same-name GitHub runner is quarantined and was not deleted")
+				}
+				_, err = m.LifecycleState.Transition(ctx, record.Name, poolstate.Transition{Action: poolstate.ActionAbandonCreate})
+				return err
+			}
+			if _, err := m.LifecycleState.Transition(ctx, record.Name, poolstate.Transition{Action: poolstate.ActionFenceIntent}); err != nil {
+				return err
+			}
+		case poolstate.PhaseCreated, poolstate.PhaseValidating, poolstate.PhaseStandby, poolstate.PhaseRegistering, poolstate.PhaseReady, poolstate.PhaseBusy, poolstate.PhaseDraining:
 			if record.ProviderID == "" {
 				return fmt.Errorf("record has no immutable provider identity and remains report-only")
 			}

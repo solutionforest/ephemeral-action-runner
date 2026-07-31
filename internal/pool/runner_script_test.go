@@ -431,7 +431,10 @@ func TestHostTrustGenerationHookAcceptsCurrentLease(t *testing.T) {
 		t.Skip("the guest hook requires the Linux image's python3 runtime")
 	}
 	marker := `{"schemaVersion":1,"generation":"g1","hostOS":"windows","mode":"overlay","scopes":["system","user"]}`
-	lease := fmt.Sprintf(`{"schemaVersion":1,"generation":"g1","hostOS":"windows","mode":"overlay","scopes":["system","user"],"expiresAt":%q}`, time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano))
+	// The host test invokes macOS's system Python, whose fromisoformat support is
+	// older than the Python shipped in the Linux runner image. Whole-second
+	// RFC3339 still exercises the production timezone and expiry checks.
+	lease := fmt.Sprintf(`{"schemaVersion":1,"generation":"g1","hostOS":"windows","mode":"overlay","scopes":["system","user"],"expiresAt":%q}`, time.Now().Add(time.Minute).UTC().Format(time.RFC3339))
 	output, err := runHostTrustGenerationHook(t, marker, lease)
 	if err != nil {
 		t.Fatalf("current host-trust lease rejected: %v\n%s", err, output)
@@ -501,8 +504,8 @@ func TestHostTrustGenerationHookRejectsMismatchAndExpiry(t *testing.T) {
 	for _, tc := range []struct {
 		name, lease, want string
 	}{
-		{name: "generation mismatch", lease: fmt.Sprintf(`{"generation":"g2","hostOS":"linux","mode":"overlay","scopes":["system"],"expiresAt":%q}`, time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)), want: "generation mismatch"},
-		{name: "expired", lease: fmt.Sprintf(`{"generation":"g1","hostOS":"linux","mode":"overlay","scopes":["system"],"expiresAt":%q}`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)), want: "lease expired"},
+		{name: "generation mismatch", lease: fmt.Sprintf(`{"generation":"g2","hostOS":"linux","mode":"overlay","scopes":["system"],"expiresAt":%q}`, time.Now().Add(time.Minute).UTC().Format(time.RFC3339)), want: "generation mismatch"},
+		{name: "expired", lease: fmt.Sprintf(`{"generation":"g1","hostOS":"linux","mode":"overlay","scopes":["system"],"expiresAt":%q}`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)), want: "lease expired"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			output, err := runHostTrustGenerationHook(t, marker, tc.lease)

@@ -27,7 +27,9 @@ The supervisor reports when GitHub assigns a job and when the ephemeral runner f
 
 `pool.instances` is a strict cap on local physical instances, not just ready GitHub runners. Provisioning, ready, draining, quarantined, and cleanup-pending instances all consume a slot. A busy runner retained during a trust-generation change also keeps its slot until it finishes or can be safely removed.
 
-Only one controller may manage a canonical configuration, provider, and `pool.namePrefix` on a host. Use a distinct unique prefix for an intentionally independent pool; never start a second controller with the same identity.
+Only one controller may manage a canonical configuration path on a host, even if that file is edited to select a different provider or prefix while the first controller is running. A second host-wide lock also reserves the normalized `pool.namePrefix`, so separate configs and projects can run concurrently only when every independent pool has a distinct prefix. Lock failures report the current owner metadata without exposing configuration contents.
+
+Before upgrading an existing checkout to a release that introduces or changes controller locking or lifecycle-state identity, stop the older controller for that same project/config and wait for its normal shutdown to finish. A pre-change process cannot participate in a lock protocol it does not implement, so starting the new binary concurrently could migrate state beneath it. This restriction is per managed config and prefix; an unrelated controller in another checkout with a distinct prefix does not need to be stopped.
 
 At startup and before a replacement, EPAR compares provider inventory with exact GitHub runner records. Healthy pairs are adopted. Proven stopped or unregistered resources are removed. An ambiguous resource is quarantined and consumes capacity instead of being deleted or replaced.
 
@@ -42,6 +44,8 @@ ephemeral-action-runner logs list
 ```
 
 Add `--no-github` to `status` when you need a local-only view. By default, host logs live under `work/logs`; manager events are console-first and instance/build transcripts are file artifacts. A failed launch or readiness check appends bounded guest diagnostics to the relevant instance log. See [Logging](logging.md) for locations, formats, retention, and shipping.
+
+When multiple configs run concurrently, give each one a distinct `logging.directory` as well as a distinct prefix and workflow-routing label. Config-specific lifecycle state and build workspaces remain isolated, while the host resource catalog retains exact shared-artifact references.
 
 ## Clean up safely
 

@@ -3,6 +3,7 @@ package dockersandboxes
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -216,6 +217,35 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	done()
 }
 
+func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}, err: errors.New("workspace verification failed")},
+	)
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || !strings.Contains(err.Error(), "workspace verification failed") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("Create() partial instance = %#v, want exact receipted identity", instance)
+	}
+	var receipt instanceReceipt
+	if err := json.Unmarshal(instance.Receipt, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.StagingPath != testWorkspace || receipt.StagingIdentity == "" || receipt.Template != testTemplate || receipt.TemplateDigest != testDigest {
+		t.Fatalf("Create() receipt = %#v", receipt)
+	}
+	done()
+}
+
 func TestSplitTemplateReferenceCanonicalizesDockerHubNames(t *testing.T) {
 	tests := map[string]string{
 		"epar-template:version":                       "docker.io/library/epar-template",
@@ -343,13 +373,39 @@ func TestInstanceAdmissionRejectsPublishedPortInventory(t *testing.T) {
 
 func TestChildEnvironmentStripsHostSSHAgent(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "/host/agent.sock")
+	t.Setenv("SSH_AUTH_SOCK_GATEWAY", "gateway.example.test:3129")
 	t.Setenv("SSH_AGENT_PID", "4242")
 	environment := childEnvironment(nil)
 	for _, item := range environment {
 		key, _, _ := strings.Cut(item, "=")
-		if strings.EqualFold(key, "SSH_AUTH_SOCK") || strings.EqualFold(key, "SSH_AGENT_PID") {
+		if strings.EqualFold(key, "SSH_AUTH_SOCK") || strings.EqualFold(key, "SSH_AUTH_SOCK_GATEWAY") || strings.EqualFold(key, "SSH_AGENT_PID") {
 			t.Fatalf("host SSH agent variable survived child environment filtering: %q", key)
 		}
+	}
+}
+
+func TestDirectWorkspaceVerificationRejectsSSHAgentForwardingWithRemediation(t *testing.T) {
+	for _, required := range []string{"SSH_AUTH_SOCK", "SSH_AUTH_SOCK_GATEWAY", "SSH_AGENT_PID", "restart it with SSH_AUTH_SOCK"} {
+		if !strings.Contains(directWorkspaceVerificationScript, required) {
+			t.Fatalf("direct workspace verification omitted SSH-agent guardrail %q", required)
+		}
+	}
+	for name, environment := range map[string]string{
+		"socket":  "SSH_AUTH_SOCK=/tmp/host-agent.sock",
+		"gateway": "SSH_AUTH_SOCK_GATEWAY=gateway.example.test:3129",
+		"pid":     "SSH_AGENT_PID=4242",
+	} {
+		t.Run(name, func(t *testing.T) {
+			command := exec.Command("bash", "-c", directWorkspaceVerificationScript)
+			command.Env = append(childEnvironment(nil), environment)
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatal("workspace verification accepted host SSH-agent forwarding")
+			}
+			if !strings.Contains(string(output), "Docker Sandboxes exposed host SSH-agent forwarding") {
+				t.Fatalf("workspace verification output = %q, want actionable SSH-agent diagnostic", output)
+			}
+		})
 	}
 }
 

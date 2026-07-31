@@ -27,6 +27,8 @@ The normal path is a source archive plus Docker. EPAR's first run opens a guided
 - Install and start Docker.
 - For stronger isolation, also install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) to enable the Docker Sandboxes provider.
 
+On macOS or Linux, the first Docker Sandboxes runner may trigger operating-system or security-tool prompts for runtime helpers such as `mkfs.ext4`, `mkfs.erofs`, and `containerd-shim-nerdbox-v1`; macOS may say the helper “is an app downloaded from the Internet.” These are used to create the runner's private Docker filesystem, unpack its read-only template filesystem, and launch the sandbox VM. Confirm that each executable belongs to the installed Docker Sandboxes runtime and that any displayed file target is sandbox-owned before approving it. Denying a required helper prevents that sandbox from starting, and EPAR fails closed without registering it; preserve and clean any diagnostic runtime state through EPAR's exact cleanup path. See the [Docker Sandboxes provider guide](docs/providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) and [troubleshooting](docs/troubleshooting.md#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt).
+
 ### 2. Download EPAR
 
 From the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), download GitHub's **Source code (zip)** or **Source code (tar.gz)** for the release you want. Extract it and open a terminal in the extracted folder.

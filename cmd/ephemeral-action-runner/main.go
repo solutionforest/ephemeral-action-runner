@@ -17,7 +17,6 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
-	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/registry"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
@@ -504,13 +503,6 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 		}
 		client = gh.New(cfg.GitHub)
 	}
-	var lifecycleState *poolstate.Store
-	if !dryRun && openLifecycleState {
-		lifecycleState, err = pool.OpenLifecycleState(projectRoot, resolvedConfigPath)
-		if err != nil {
-			return nil, err
-		}
-	}
 	runtime, err := logging.NewRuntime(logging.Options{
 		Directory:                   config.ProjectPath(projectRoot, cfg.Logging.Directory),
 		ManagerSinks:                loggingSinks(cfg.Logging.ManagerSinks),
@@ -535,7 +527,7 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 		Lifecycle:               providerRuntime.Lifecycle,
 		PolicyManager:           providerRuntime.PolicyManager,
 		Storage:                 providerRuntime.Storage,
-		LifecycleState:          lifecycleState,
+		LifecycleStateEnabled:   !dryRun && openLifecycleState,
 		GitHub:                  client,
 		ProjectRoot:             projectRoot,
 		ConfigPath:              resolvedConfigPath,

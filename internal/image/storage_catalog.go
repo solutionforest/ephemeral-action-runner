@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
@@ -25,11 +26,15 @@ import (
 var buildxUsageSizePattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([kMGTPE]?i?B)$`)
 
 const (
-	catalogDockerImageKind     = "docker-image"
-	catalogSandboxTemplateKind = "sandbox-template"
-	catalogWSLArtifactKind     = "provider-image"
-	catalogTartImageKind       = "tart-image"
-	catalogTemplateStagingKind = "template-staging-directory"
+	catalogDockerImageKind          = "docker-image"
+	catalogSandboxTemplateKind      = "sandbox-template"
+	catalogWSLArtifactKind          = "provider-image"
+	catalogTartImageKind            = "tart-image"
+	catalogTemplateStagingKind      = "template-staging-directory"
+	catalogDockerOutputTagClaimKind = "docker-output-tag-claim"
+	dockerOutputTagClaimLifetime    = 2 * time.Minute
+	dockerOutputTagClaimRefresh     = 30 * time.Second
+	dockerOutputTagClaimLockTimeout = 15 * time.Second
 )
 
 func (m *Coordinator) effectiveConfigPath() string {
@@ -114,6 +119,211 @@ func (m *Coordinator) acquireDockerBackendLock(ctx context.Context) (string, fun
 			m.warnf("EPAR Docker backend lock release warning: %v\n", closeErr)
 		}
 	}, nil
+}
+
+// claimDockerOutputTag records a short-lived, exact intent to publish a Docker
+// image tag. The catalog claim closes the window between checking active
+// configuration references and mutating Docker's globally shared tag. A
+// different configuration may share the tag only when it requests the exact
+// same immutable manifest.
+func (m *Coordinator) claimDockerOutputTag(ctx context.Context, tag, manifestHash string) (context.Context, func() error, error) {
+	tag = normalizedDockerTag(tag)
+	if tag == "" || strings.TrimSpace(manifestHash) == "" {
+		return nil, nil, errors.New("Docker output tag and manifest hash are required")
+	}
+	backendID, releaseBackend, err := m.acquireDockerBackendLock(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	claimErr := m.claimDockerOutputTagLocked(backendID, tag, manifestHash, time.Now().UTC())
+	releaseBackend()
+	if claimErr != nil {
+		return nil, nil, claimErr
+	}
+	claimContext, cancelClaim := context.WithCancelCause(ctx)
+	stopRefresh := make(chan struct{})
+	refreshDone := make(chan struct{})
+	var refreshOnce sync.Once
+	var refreshErr error
+	go func() {
+		defer close(refreshDone)
+		ticker := time.NewTicker(dockerOutputTagClaimRefresh)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopRefresh:
+				return
+			case now := <-ticker.C:
+				refreshLockContext, cancelRefreshLock := context.WithTimeout(claimContext, dockerOutputTagClaimLockTimeout)
+				refreshBackendID, releaseRefreshLock, refreshLockErr := m.acquireDockerBackendLock(refreshLockContext)
+				cancelRefreshLock()
+				if refreshLockErr != nil {
+					refreshErr = fmt.Errorf("refresh Docker output-tag claim lock: %w", refreshLockErr)
+					cancelClaim(refreshErr)
+					return
+				}
+				if refreshBackendID != backendID {
+					releaseRefreshLock()
+					refreshErr = fmt.Errorf("Docker backend changed while publishing output tag %s", tag)
+					cancelClaim(refreshErr)
+					return
+				}
+				refreshErr = m.claimDockerOutputTagLocked(backendID, tag, manifestHash, now.UTC())
+				releaseRefreshLock()
+				if refreshErr != nil {
+					refreshErr = fmt.Errorf("refresh Docker output-tag claim: %w", refreshErr)
+					cancelClaim(refreshErr)
+					return
+				}
+			}
+		}
+	}()
+	return claimContext, func() error {
+		refreshOnce.Do(func() { close(stopRefresh) })
+		<-refreshDone
+		cancelClaim(nil)
+		releaseContext, cancelRelease := context.WithTimeout(context.Background(), dockerOutputTagClaimLockTimeout)
+		defer cancelRelease()
+		backendID, releaseBackend, err := m.acquireDockerBackendLock(releaseContext)
+		if err != nil {
+			return errors.Join(refreshErr, err)
+		}
+		defer releaseBackend()
+		return errors.Join(refreshErr, m.releaseDockerOutputTagClaim(backendID, tag, time.Now().UTC()))
+	}, nil
+}
+
+func (m *Coordinator) claimDockerOutputTagLocked(backendID, tag, manifestHash string, now time.Time) error {
+	tag = normalizedDockerTag(tag)
+	if tag == "" || strings.TrimSpace(manifestHash) == "" {
+		return errors.New("Docker output tag and manifest hash are required")
+	}
+	store, err := m.hostCatalog()
+	if err != nil {
+		return err
+	}
+	_, err = store.WithLock(now, func(value *storagecatalog.Catalog) error {
+		configRecord, err := storagecatalog.RegisterConfig(value, m.ProjectRoot, m.effectiveConfigPath(), now)
+		if err != nil {
+			return err
+		}
+		if err := m.applyCatalogConfigSettings(value, configRecord.ID); err != nil {
+			return err
+		}
+		for _, resource := range value.Resources {
+			if resource.BackendID != backendID || resource.Kind != catalogDockerImageKind || normalizedDockerTag(resource.Locator) != tag {
+				continue
+			}
+			for _, reference := range resource.References {
+				if reference.ConfigID == configRecord.ID || reference.Role != "provider-artifact" {
+					continue
+				}
+				referencedManifest := reference.ManifestHash
+				if referencedManifest == "" {
+					referencedManifest = resource.ManifestHash
+				}
+				if referencedManifest != "" && referencedManifest != manifestHash {
+					return dockerOutputTagConflict(value, reference.ConfigID, tag, referencedManifest, manifestHash)
+				}
+			}
+		}
+		claimIdentity := "tag:" + tag
+		claimKey := storagecatalog.ResourceKey(backendID, catalogDockerOutputTagClaimKind, claimIdentity)
+		var existingReferences []storagecatalog.Reference
+		for resourceIndex := range value.Resources {
+			resource := &value.Resources[resourceIndex]
+			if resource.Key != claimKey {
+				continue
+			}
+			activeReferences := resource.References[:0]
+			for _, reference := range resource.References {
+				if !reference.UpdatedAt.Add(dockerOutputTagClaimLifetime).After(now) {
+					continue
+				}
+				activeReferences = append(activeReferences, reference)
+				if reference.ConfigID == configRecord.ID || reference.ManifestHash == manifestHash {
+					continue
+				}
+				return dockerOutputTagConflict(value, reference.ConfigID, tag, reference.ManifestHash, manifestHash)
+			}
+			resource.References = activeReferences
+			existingReferences = append(existingReferences, activeReferences...)
+		}
+		claim := storagecatalog.Resource{
+			Key: claimKey, BackendID: backendID, Kind: catalogDockerOutputTagClaimKind,
+			Provider: "docker-container", Role: "runtime-image-tag-claim", Locator: tag, Identity: claimIdentity,
+			Custody: storagecatalog.CustodyGenerated, ManifestHash: manifestHash, State: storagecatalog.StateCurrent,
+			References: existingReferences, CreatedAt: now, LastSeenAt: now,
+		}
+		if err := storagecatalog.UpsertResource(value, claim); err != nil {
+			return err
+		}
+		storagecatalog.ReplaceConfigRoleReferences(value, configRecord.ID, "docker-output-tag-claim", map[string]storagecatalog.Reference{
+			claimKey: {ManifestHash: manifestHash},
+		}, now)
+		return nil
+	})
+	return err
+}
+
+func (m *Coordinator) releaseDockerOutputTagClaim(backendID, tag string, now time.Time) error {
+	if strings.TrimSpace(backendID) == "" || normalizedDockerTag(tag) == "" {
+		return errors.New("Docker backend and output tag are required to release an output-tag claim")
+	}
+	store, err := m.hostCatalog()
+	if err != nil {
+		return err
+	}
+	_, err = store.WithLock(now, func(value *storagecatalog.Catalog) error {
+		configRecord, err := storagecatalog.RegisterConfig(value, m.ProjectRoot, m.effectiveConfigPath(), now)
+		if err != nil {
+			return err
+		}
+		storagecatalog.ReplaceConfigRoleReferences(value, configRecord.ID, "docker-output-tag-claim", nil, now)
+		return nil
+	})
+	return err
+}
+
+func normalizedDockerTag(tag string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" || strings.Contains(tag, "@") {
+		return tag
+	}
+	if strings.LastIndex(tag, ":") <= strings.LastIndex(tag, "/") {
+		tag += ":latest"
+	}
+	tagSeparator := strings.LastIndex(tag, ":")
+	name, suffix := tag[:tagSeparator], tag[tagSeparator:]
+	parts := strings.Split(name, "/")
+	hasRegistry := len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") || parts[0] == "localhost")
+	if !hasRegistry {
+		if len(parts) == 1 {
+			name = "docker.io/library/" + name
+		} else {
+			name = "docker.io/" + name
+		}
+	} else {
+		if parts[0] == "index.docker.io" || parts[0] == "registry-1.docker.io" {
+			parts[0] = "docker.io"
+		}
+		if parts[0] == "docker.io" && len(parts) == 2 {
+			parts = []string{"docker.io", "library", parts[1]}
+		}
+		name = strings.Join(parts, "/")
+	}
+	return strings.ToLower(name) + suffix
+}
+
+func dockerOutputTagConflict(value *storagecatalog.Catalog, configID, tag, existingManifest, requestedManifest string) error {
+	path := configID
+	for _, configRecord := range value.Configs {
+		if configRecord.ID == configID {
+			path = configRecord.Path
+			break
+		}
+	}
+	return fmt.Errorf("Docker output image tag %q is actively claimed by configuration %s with manifest %s; requested manifest %s differs. Configure a unique image.outputImage or use matching immutable image inputs", tag, path, existingManifest, requestedManifest)
 }
 
 func backendPathID(kind, path string) (string, error) {
@@ -929,6 +1139,10 @@ func (m *Coordinator) catalogResourceExists(ctx context.Context, resource storag
 			return false, err
 		}
 		return target.Identity == resource.Identity && target.Fingerprint == resource.Fingerprint, nil
+	case catalogDockerOutputTagClaimKind:
+		// Claims are catalog-only intent records. They have no Docker object to
+		// inspect and are removed exactly when their reference is released.
+		return true, nil
 	case catalogTartImageKind:
 		if m.Config.Provider.Type != "tart" {
 			return true, nil
@@ -949,14 +1163,14 @@ func (m *Coordinator) catalogResourceExists(ctx context.Context, resource storag
 }
 
 func (m *Coordinator) enforceDedicatedBuildxCache(ctx context.Context) error {
-	metadata, err := LoadBuildxMetadata(m.ProjectRoot)
+	metadata, err := LoadBuildxMetadataForConfig(m.ProjectRoot, m.effectiveConfigPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	limitBytes, err := m.effectiveProjectBuildCacheLimit()
+	limitBytes, err := m.effectiveBuildCacheLimit()
 	if err != nil {
 		return err
 	}
@@ -977,7 +1191,7 @@ func (m *Coordinator) enforceDedicatedBuildxCache(ctx context.Context) error {
 	return m.runHostQuiet(ctx, "docker", "buildx", "prune", "--builder", metadata.Builder, "--force", "--max-used-space", strconv.FormatUint(limitBytes, 10)+"B")
 }
 
-func (m *Coordinator) effectiveProjectBuildCacheLimit() (uint64, error) {
+func (m *Coordinator) effectiveBuildCacheLimit() (uint64, error) {
 	configured := strings.TrimSpace(m.Config.Storage.BuildCacheLimit)
 	if configured == "" {
 		configured = "20GiB"
@@ -986,29 +1200,7 @@ func (m *Coordinator) effectiveProjectBuildCacheLimit() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	limit := uint64(current)
-	store, err := m.hostCatalog()
-	if err != nil {
-		return 0, err
-	}
-	value, err := store.Load(time.Now().UTC())
-	if err != nil {
-		return 0, err
-	}
-	root, err := filepath.Abs(m.ProjectRoot)
-	if err != nil {
-		return 0, err
-	}
-	for _, configRecord := range value.Configs {
-		sameRoot := filepath.Clean(configRecord.ProjectRoot) == filepath.Clean(root)
-		if runtime.GOOS == "windows" {
-			sameRoot = strings.EqualFold(filepath.Clean(configRecord.ProjectRoot), filepath.Clean(root))
-		}
-		if sameRoot && configRecord.BuildCacheLimitBytes > 0 && configRecord.BuildCacheLimitBytes < limit {
-			limit = configRecord.BuildCacheLimitBytes
-		}
-	}
-	return limit, nil
+	return uint64(current), nil
 }
 
 func parseBuildxUsageBytes(content []byte) (uint64, error) {
@@ -1201,6 +1393,8 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 			return errors.New("Tart image is running")
 		}
 		return m.Lifecycle.Delete(ctx, *exact)
+	case catalogDockerOutputTagClaimKind:
+		return nil
 	default:
 		return fmt.Errorf("automatic cleanup is not implemented for catalog resource kind %q", resource.Kind)
 	}

@@ -487,6 +487,7 @@ func hostTrustLeaseInputs(provider *fakeProvider) []string {
 }
 
 func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", filepath.Join(t.TempDir(), "host-state"))
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),

@@ -1044,6 +1044,59 @@ func TestProvisioningFailureRollbackBoundary(t *testing.T) {
 	}
 }
 
+func TestProvisioningRecordsPartialCreateIdentityBeforeExactRollback(t *testing.T) {
+	const name = "epar-test-partial-create"
+	partial := provider.Instance{
+		Name:           name,
+		ProviderID:     "fake:partial-create-id",
+		Source:         "image",
+		State:          "running",
+		ReceiptVersion: "v1",
+		Receipt:        json.RawMessage(`{"providerId":"fake:partial-create-id","source":"image"}`),
+	}
+	fake := &fakeProvider{}
+	baseLifecycle := provider.AdaptLegacy(fake)
+	lifecycle := &partialCreateLifecycle{
+		Lifecycle: baseLifecycle,
+		create: func() (provider.Instance, error) {
+			fake.mu.Lock()
+			fake.instances = append(fake.instances, partial)
+			fake.mu.Unlock()
+			return partial, errors.New("post-create verification failed")
+		},
+	}
+	manager := newRegisteredTestManager(t, fake, nil)
+	manager.Lifecycle = lifecycle
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.LifecycleState = store
+
+	if _, err := manager.provisionOne(context.Background(), name, false, false); err == nil || !strings.Contains(err.Error(), "post-create verification failed") {
+		t.Fatalf("provisionOne() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("exact provider delete calls = %d, want 1", got)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ProviderID != partial.ProviderID || record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("lifecycle record = %#v, want exact provider identity tombstoned", record)
+	}
+}
+
+type partialCreateLifecycle struct {
+	provider.Lifecycle
+	create func() (provider.Instance, error)
+}
+
+func (l *partialCreateLifecycle) Create(context.Context, provider.CreateRequest) (provider.Instance, error) {
+	return l.create()
+}
+
 func TestConfigureFailureDeletesExactLocalAndRemoteCandidate(t *testing.T) {
 	p := &fakeProvider{ip: "127.0.0.1"}
 	p.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {

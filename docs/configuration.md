@@ -15,6 +15,8 @@ EPAR reads a small, strict YAML subset: indentation uses spaces, unknown section
 
 EPAR chooses the first available configuration path in this order: `--config <path>`, `EPAR_CONFIG`, `./.local/config.yml`, then `~/.config/ephemeral-action-runner/config.yml`. A relative file path in configuration is resolved from the project root when EPAR consumes it. `~` and `~/...` are expanded for the configuration path, `github.privateKeyPath`, and each `image.trustedCaCertificatePaths` entry; do not assume they expand in other configuration properties.
 
+The canonical config path owns its lifecycle-state namespace and may have only one active controller, even if its contents change while that controller runs. A separate host-wide prefix reservation prevents another config or project from using the same normalized `pool.namePrefix`. Distinct configs with distinct prefixes may run concurrently; use unique routing labels and separate log directories so jobs and diagnostics remain unambiguous.
+
 `github`, `image`, `pool`, `storage`, `logging`, `runner`, `security`, `provider`, `docker`, `dockerSandboxes`, and `timeouts` are the only accepted top-level sections. `security` contains only the `runnerGroup` subsection. Values are strings unless this reference says integer, number, boolean, or list. Quote a value when it needs YAML-like punctuation; EPAR removes one matching pair of single or double quotes.
 
 `pool.logDir` is a deprecated compatibility input. If `logging.directory` is absent, EPAR uses it and emits a warning; using both is rejected. `pool.vmPrefix` is an accepted alias for `pool.namePrefix`. `image.profile` and the old `docker-socket` provider are rejected rather than silently migrated.
@@ -187,7 +189,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 - Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, a valid desired Catthehacker image, policy generation, resource values, and a lowercase-compatible pool prefix.
 - `image.sourcePlatform` requires `image.sourceType: docker-image`; all byte-size fields require a positive `B`, `KiB`, `MiB`, `GiB`, or `TiB` value.
 - Host-trust overlay requires a non-empty, duplicate-free scope list and `runner.ephemeral: true`; `user` is not supported on Linux.
-- `pool.namePrefix` is an ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses its durable ledger of exact owned identities. Do not share a prefix between controllers or assume broad prefix cleanup is safe.
+- `pool.namePrefix` is a host-wide controller and ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses its durable ledger of exact owned identities. EPAR rejects concurrent reuse across configs, projects, and providers; do not assume broad prefix cleanup is safe.
 - `runner.labels` must never be empty, even when `runner.noDefaultLabels` is false.
 
 ## Provider defaults

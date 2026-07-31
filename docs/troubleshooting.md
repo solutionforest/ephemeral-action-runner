@@ -9,6 +9,9 @@ Start with the symptom that most closely matches the failure. Regardless of prov
 - [A Docker workload fails with an architecture error](#a-docker-workload-fails-with-an-architecture-error)
 - [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
 - [Docker Sandboxes rejects template, policy, or capacity](#docker-sandboxes-rejects-template-policy-or-capacity)
+- [Docker Sandboxes creation fails after a runtime-helper prompt](#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt)
+- [Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present](#docker-sandboxes-rejects-a-staging-workspace-because-ssh-agent-forwarding-is-present)
+- [Docker Hub login succeeds but a private pull is denied in Docker Sandboxes](#docker-hub-login-succeeds-but-a-private-pull-is-denied-in-docker-sandboxes)
 - [An idle runner reports GitHub or Sandbox health warnings](#an-idle-runner-reports-github-or-sandbox-health-warnings)
 - [A scheduled image check or update fails](#a-scheduled-image-check-or-update-fails)
 - [A runner is held for diagnostics or an acknowledgement](#a-runner-is-held-for-diagnostics-or-an-acknowledgement)
@@ -119,6 +122,53 @@ An imported Docker Sandboxes template does not require a matching Docker image. 
 
 Capacity admission accounts for estimated incremental physical growth on each measurable backing filesystem plus the fixed `storage.minimumFree` reserve. Docker Sandboxes root and inner-Docker sizes are independent sparse logical maxima and are not added as immediate host usage. Inspect the reported physical surface, run the matching `storage status` and prune-preview commands, or deliberately retry only that invocation with `--allow-insufficient-storage`. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
 
+## Docker Sandboxes creation fails after a runtime-helper prompt
+
+### Symptom
+
+On macOS or Linux, host security asks whether to allow a Docker Sandboxes helper such as `mkfs.ext4`, `mkfs.erofs`, or `containerd-shim-nerdbox-v1`; macOS may say that the helper “is an app downloaded from the Internet.” After a required prompt is denied or blocked, EPAR reports `create docker sandbox failed`, and `sbx` may report `500 Internal Server Error: failed to run sandbox container`. The runner is neither registered nor marked ready.
+
+### Diagnosis and remediation
+
+Docker Sandboxes uses `mkfs.ext4` to create an ext4 filesystem inside each sandbox's private Docker disk-image file, `mkfs.erofs` to construct the read-only template snapshot, and `containerd-shim-nerdbox-v1` to launch and manage the sandbox VM. Expected file targets are regular sandbox-owned files beneath the Docker Sandboxes runtime data directory—for example, current macOS releases may use `~/.sbx/run/d/containerd/.../images/<runner>-docker.img` and `~/.sbx/run/d/containerd/.../snapshots/<id>/layer.erofs`. With the current Homebrew `sbx` package, the runtime and shim are beneath `/opt/homebrew/Caskroom/sbx/<version>/`. A formatter must not target a physical device such as `/dev/disk*`, an EPAR checkout, a home-directory document, or another unrelated path.
+
+If each executable belongs to the Docker Sandboxes installation you intentionally installed and any displayed target is the expected sandbox-owned file, allow the operation through the host's security or application-control prompt, then rerun the same EPAR start or verification command if creation already failed. Do not invoke a formatter or shim yourself, disable host security broadly, or approve a command with an unfamiliar target. The configured private Docker disk is sparse, so its logical maximum does not mean the formatter immediately consumes that amount of physical storage.
+
+If no prompt appeared, or approval still produces the 500 error, preserve the failed runner evidence and inspect the Docker Sandboxes daemon/client logs and `sbx diagnose --output json`; the same top-level error can also represent a runtime, capacity, or host-policy failure. See [Private Filesystem and VM Helper Approval](providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) for the provider contract.
+
+## Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present
+
+### Symptom
+
+Sandbox creation reaches `verify dedicated docker sandbox staging workspace` and fails with a message that host SSH-agent forwarding is not permitted. Diagnostics may show `SSH_AUTH_SOCK=/run/ssh-agent.sock` or `SSH_AUTH_SOCK_GATEWAY=...` inside the guest even though the imported template does not define them.
+
+### Diagnosis and remediation
+
+Docker Sandboxes may forward the host SSH agent when its shared daemon inherits the host's agent environment. EPAR rejects the resulting sandbox because the forwarded socket or gateway could let a workflow use host SSH credentials. This is not evidence that the staging mount is missing or read-only, and deleting only `/run/ssh-agent.sock` is insufficient when the forwarding gateway remains configured.
+
+Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then restart it with all forwarding variables removed and retry EPAR:
+
+```sh
+sbx daemon stop
+env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
+```
+
+EPAR strips these variables from Docker Sandboxes commands it launches, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
+
+## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
+
+### Symptom
+
+A workflow's Docker login step reports `Login Succeeded`, but a later pull of a private Docker Hub image fails with `insufficient_scope: authorization failed`, `pull access denied`, or an equivalent authorization response. The same workflow and credentials may succeed with Docker Container or a GitHub-hosted runner. Using `docker --config /home/agent/.docker pull ...` produces the same denial.
+
+### Diagnosis and remediation
+
+First verify only metadata, never credential contents: the listener should run as `agent` with `HOME=/home/agent` and `DOCKER_CONFIG=/home/agent/.docker`, and a post-login config should be owned by `agent` with restrictive permissions. If Docker reaches the registry and returns an authorization response, do not investigate CA copying unless an `x509` or TLS error is also present.
+
+Inspect the host Docker Sandboxes daemon log for a message that the proxy is overriding a client-supplied registry credential with a host credential. When that message is present, the workflow credential was written correctly but cannot control the pull: Docker Sandboxes intentionally substitutes the host-side credential. An explicit guest config path cannot bypass that policy.
+
+Use Docker Container for workflows that require independent, per-job Docker Hub credentials. On a trusted single-tenant Docker Sandboxes host, an operator can instead choose one least-privilege Docker Hub identity with access to every required image and authenticate Docker Sandboxes with `sbx login`; this changes shared host runtime behavior, so coordinate it with every controller that uses the same `sbx` daemon. EPAR rejects global `sbx` secrets and never copies GitHub Actions secrets back to the host. See [Docker Hub Credentials and the Host Proxy](providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).
+
 ## An idle runner reports GitHub or Sandbox health warnings
 
 A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR keeps the exact runner, lets a trust lease expire closed when it cannot refresh it, and retries. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
@@ -199,12 +249,12 @@ Do not disable certificate verification. First identify which trust boundary fai
 
 For a no-Go native-controller build, `./start` automatically reads host system roots, excludes explicitly distrusted certificates, validates the short-lived feed in an offline container, and mounts only the resulting CA bundle into the Go compiler container. Runner CA inheritance remains independent. If the build still reports an unknown issuer, inspect `work/logs/epar-native-controller-build.log`: the wrapper prints the requested host, presented certificate subject and issuer, SHA-256 fingerprint, validity, and verification result, and on Windows it lists matching roots from `LocalMachine\Root` and `CurrentUser\Root`. A remaining failure means the expected issuer was absent, distrusted, malformed, expired, or not the certificate actually presented; EPAR never disables TLS verification or retries insecurely.
 
-For an EPAR Buildx failure, leave `image.hostTrustMode` unchanged. EPAR automatically supplies host system roots to its project-owned builder and prints the full build transcript path before `docker buildx build`. The console and error report include a bounded redacted tail. Inspect the underlying `x509` line together with the registry host, builder identity, and active trust generation:
+For an EPAR Buildx failure, leave `image.hostTrustMode` unchanged. EPAR automatically supplies host system roots to its config-owned builder and prints the full build transcript path before `docker buildx build`. The console and error report include a bounded redacted tail. Inspect the underlying `x509` line together with the registry host, builder identity, and active trust generation:
 
 ```powershell
 docker buildx ls
-Get-Content .local/storage/buildx.json
-Get-Content .local/storage/buildkitd.toml
+Get-ChildItem .local/storage/buildx -Recurse -Filter metadata.json | Get-Content
+Get-ChildItem .local/storage/buildkit -Recurse -Filter buildkitd.toml | Get-Content
 ```
 
 The owned metadata records the exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in the host daemon because builder trust cannot repair host-daemon trust.

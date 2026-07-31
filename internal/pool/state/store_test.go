@@ -112,6 +112,41 @@ func TestAbandonCreateRequiresNoProviderIdentityAndRecordsExactAbsence(t *testin
 	}
 }
 
+func TestAbandonCreateAllowsOnlyIdentitylessQuarantine(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := reserve(t, store, "quarantined-create")
+	record, err = store.Transition(context.Background(), record.Name, Transition{Action: ActionQuarantine, Reason: "create outcome was uncertain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.Transition(context.Background(), record.Name, Transition{Action: ActionAbandonCreate})
+	if err != nil {
+		t.Fatalf("abandon identityless quarantine: %v", err)
+	}
+	if record.Phase != PhaseTombstoned || record.Cleanup.RemoteAbsentAt == nil || record.Cleanup.LocalAbsentAt == nil {
+		t.Fatalf("abandoned quarantine = %#v", record)
+	}
+
+	identified := reserve(t, store, "identified-quarantine")
+	if _, err := store.Transition(context.Background(), identified.Name, Transition{Action: ActionCreateIntent}); err != nil {
+		t.Fatal(err)
+	}
+	identified, err = store.Transition(context.Background(), identified.Name, Transition{Action: ActionCreated, ProviderID: "provider:identified", Receipt: receipt(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identified, err = store.Transition(context.Background(), identified.Name, Transition{Action: ActionQuarantine, Reason: "identified quarantine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(context.Background(), identified.Name, Transition{Action: ActionAbandonCreate}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("identified quarantine abandon error = %v, want invalid transition", err)
+	}
+}
+
 func TestProviderReceiptAndUnknownDiscoveryRoundTrip(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {

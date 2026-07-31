@@ -102,6 +102,137 @@ func TestDockerSandboxesDockerfileUsesVerifiedLocalDownloadsAndInstallsTrustBefo
 	}
 }
 
+func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T) {
+	templateRoot := filepath.Join("..", "..", "templates", "docker-sandboxes")
+	readTemplateFile := func(t *testing.T, relativePath string) string {
+		t.Helper()
+		content, err := os.ReadFile(filepath.Join(templateRoot, relativePath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(content)
+	}
+
+	t.Run("environment normalization", func(t *testing.T) {
+		dockerfile := readTemplateFile(t, "Dockerfile")
+		for _, required := range []string{
+			"HOME=/home/agent",
+			"USER=agent",
+			"LOGNAME=agent",
+			"SSH_AUTH_SOCK=",
+			"SSH_AUTH_SOCK_GATEWAY=",
+			"SSH_AGENT_PID=",
+			"XDG_CONFIG_HOME=/home/agent/.config",
+			"XDG_CACHE_HOME=/home/agent/.cache",
+			"XDG_DATA_HOME=/home/agent/.local/share",
+			"XDG_STATE_HOME=/home/agent/.local/state",
+			"XDG_RUNTIME_DIR=/run/user/1000",
+			"DOCKER_CONFIG=/home/agent/.docker",
+		} {
+			if !strings.Contains(dockerfile, required) {
+				t.Fatalf("Docker Sandboxes Dockerfile omitted normalized environment %q", required)
+			}
+		}
+
+		runner := readTemplateFile(t, filepath.Join("guest", "run-runner.sh"))
+		for _, required := range []string{
+			"unset SSH_AUTH_SOCK SSH_AUTH_SOCK_GATEWAY SSH_AGENT_PID",
+			"env -i",
+			`"HOME=${agent_home}"`,
+			`"USER=agent"`,
+			`"LOGNAME=agent"`,
+			`"XDG_CONFIG_HOME=${agent_home}/.config"`,
+			`"XDG_CACHE_HOME=${agent_home}/.cache"`,
+			`"XDG_DATA_HOME=${agent_home}/.local/share"`,
+			`"XDG_STATE_HOME=${agent_home}/.local/state"`,
+			`"XDG_RUNTIME_DIR=${agent_runtime_dir}"`,
+			`"DOCKER_CONFIG=${agent_home}/.docker"`,
+		} {
+			if !strings.Contains(runner, required) {
+				t.Fatalf("Docker Sandboxes listener environment omitted %q", required)
+			}
+		}
+
+		entrypoint := readTemplateFile(t, filepath.Join("guest", "template-entrypoint.sh"))
+		for _, required := range []string{
+			`-n "${SSH_AUTH_SOCK:-}"`,
+			`-n "${SSH_AUTH_SOCK_GATEWAY:-}"`,
+			"-e /run/ssh-agent.sock",
+			"host SSH-agent forwarding is not permitted",
+		} {
+			if !strings.Contains(entrypoint, required) {
+				t.Fatalf("Docker Sandboxes entrypoint omitted SSH-agent isolation contract %q", required)
+			}
+		}
+		verify := readTemplateFile(t, filepath.Join("guest", "verify-template.sh"))
+		for _, required := range []string{`[[ -z "${SSH_AUTH_SOCK:-}" ]]`, `[[ -z "${SSH_AUTH_SOCK_GATEWAY:-}" ]]`, `[[ -z "${SSH_AGENT_PID:-}" ]]`, `[[ ! -e /run/ssh-agent.sock && ! -L /run/ssh-agent.sock ]]`} {
+			if !strings.Contains(verify, required) {
+				t.Fatalf("Docker Sandboxes template verification omitted SSH-agent isolation contract %q", required)
+			}
+		}
+	})
+
+	t.Run("private directory ownership", func(t *testing.T) {
+		prepare := readTemplateFile(t, filepath.Join("guest", "prepare-template.sh"))
+		for _, required := range []string{
+			"install -d -m 0700 -o agent -g agent",
+			"/home/agent/.docker",
+			"/home/agent/.config",
+			"/home/agent/.cache",
+			"/home/agent/.local/share",
+			"/home/agent/.local/state",
+			"/run/user/1000",
+		} {
+			if !strings.Contains(prepare, required) {
+				t.Fatalf("Docker Sandboxes template preparation omitted private-directory contract %q", required)
+			}
+		}
+
+		verify := readTemplateFile(t, filepath.Join("guest", "verify-template.sh"))
+		if !strings.Contains(verify, `stat -c '%U:%G:%a'`) || !strings.Contains(verify, `"agent:agent:700"`) {
+			t.Fatal("Docker Sandboxes template verification does not enforce restrictive agent directory ownership and mode")
+		}
+		entrypoint := readTemplateFile(t, filepath.Join("guest", "template-entrypoint.sh"))
+		if !strings.Contains(entrypoint, "sudo -n install -d -m 0700 -o agent -g agent /run/user/1000") {
+			t.Fatal("Docker Sandboxes entrypoint does not recreate the agent runtime directory after a boot-time /run reset")
+		}
+		configure := readTemplateFile(t, filepath.Join("guest", "configure-runner.sh"))
+		if !strings.Contains(configure, "install -d -m 0700 -o agent -g agent") || !strings.Contains(configure, "/run/user/1000") {
+			t.Fatal("Docker Sandboxes runner configuration does not ensure the agent runtime directory exists")
+		}
+	})
+
+	t.Run("source credential scrubbing", func(t *testing.T) {
+		prepare := readTemplateFile(t, filepath.Join("guest", "prepare-template.sh"))
+		for _, required := range []string{
+			"rm -rf -- /root/.docker /home/runner/.docker /home/agent/.docker",
+			"failed to scrub source Docker client configuration",
+		} {
+			if !strings.Contains(prepare, required) {
+				t.Fatalf("Docker Sandboxes template preparation omitted credential-scrubbing contract %q", required)
+			}
+		}
+		for _, forbidden := range []string{"cat /root/.docker", "cat /home/runner/.docker", "cat /home/agent/.docker", "cp /root/.docker", "cp /home/runner/.docker"} {
+			if strings.Contains(prepare, forbidden) {
+				t.Fatalf("Docker Sandboxes credential hygiene exposes or copies source credential material via %q", forbidden)
+			}
+		}
+	})
+
+	t.Run("foreign runner config rejection", func(t *testing.T) {
+		for _, relativePath := range []string{
+			filepath.Join("guest", "template-entrypoint.sh"),
+			filepath.Join("guest", "run-runner.sh"),
+			filepath.Join("guest", "verify-template.sh"),
+		} {
+			content := readTemplateFile(t, relativePath)
+			if !strings.Contains(content, "/home/runner/.docker") {
+				t.Fatalf("%s does not reject stale foreign Docker client configuration", relativePath)
+			}
+		}
+	})
+}
+
 func TestDockerSandboxesDisabledTrustPolicyIsExplicit(t *testing.T) {
 	root := t.TempDir()
 	coordinator := &Coordinator{ProjectRoot: root}

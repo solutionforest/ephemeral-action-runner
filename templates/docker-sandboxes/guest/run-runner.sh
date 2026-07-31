@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset SSH_AUTH_SOCK SSH_AUTH_SOCK_GATEWAY SSH_AGENT_PID
 
 runner_dir="${EPAR_RUNNER_WORK_DIR:-/opt/actions-runner}"
 tool_cache="${EPAR_RUNNER_TOOL_CACHE:-${runner_dir}/_work/_tool}"
@@ -7,6 +8,8 @@ pid_file="${EPAR_RUNNER_PID_FILE:-/var/run/actions-runner.pid}"
 pid_start_file="${EPAR_RUNNER_PID_START_FILE:-${pid_file}.start}"
 log_file="${EPAR_RUNNER_LOG_FILE:-/var/log/actions-runner/run.log}"
 startup_check_seconds="${EPAR_RUNNER_STARTUP_CHECK_SECONDS:-1}"
+agent_home="/home/agent"
+agent_runtime_dir="/run/user/1000"
 
 process_start_time() {
   local pid="$1"
@@ -21,6 +24,18 @@ process_start_time() {
 }
 
 install -d -m 0755 -o agent -g agent "$(dirname "${log_file}")" "${tool_cache}" "${tool_cache}/dotnet"
+install -d -m 0700 -o agent -g agent \
+  "${agent_home}/.docker" \
+  "${agent_home}/.config" \
+  "${agent_home}/.cache" \
+  "${agent_home}/.local" \
+  "${agent_home}/.local/share" \
+  "${agent_home}/.local/state" \
+  "${agent_runtime_dir}"
+if [[ -e /home/runner/.docker || -L /home/runner/.docker ]]; then
+  echo "refusing to start the runner with stale Docker client configuration under /home/runner" >&2
+  exit 1
+fi
 old_pid="$(cat "${pid_file}" 2>/dev/null || true)"
 if [[ "${old_pid}" =~ ^[1-9][0-9]*$ ]] && kill -0 "${old_pid}" >/dev/null 2>&1; then
   echo "actions-runner is already running as PID ${old_pid}" >&2
@@ -58,16 +73,31 @@ print(mode)
 PY
 )"
 runner_environment=(
+  "HOME=${agent_home}"
+  "USER=agent"
+  "LOGNAME=agent"
+  "XDG_CONFIG_HOME=${agent_home}/.config"
+  "XDG_CACHE_HOME=${agent_home}/.cache"
+  "XDG_DATA_HOME=${agent_home}/.local/share"
+  "XDG_STATE_HOME=${agent_home}/.local/state"
+  "XDG_RUNTIME_DIR=${agent_runtime_dir}"
+  "DOCKER_CONFIG=${agent_home}/.docker"
   "EPAR_RUNNER_WORK_DIR=${runner_dir}"
   "RUNNER_TOOL_CACHE=${tool_cache}"
   "AGENT_TOOLSDIRECTORY=${tool_cache}"
   "DOTNET_INSTALL_DIR=${tool_cache}/dotnet"
   "PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  "LANG=C.UTF-8"
 )
+for environment_name in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
+  if [[ -n "${!environment_name+x}" ]]; then
+    runner_environment+=("${environment_name}=${!environment_name}")
+  fi
+done
 if [[ "${trust_mode}" == "overlay" ]]; then
   runner_environment+=("ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/check-host-trust-generation.sh")
 fi
-sudo -u agent -H env "${runner_environment[@]}" /bin/bash -c 'cd "$1" || exit 1; nohup ./run.sh >>"$2" 2>&1 </dev/null & printf "%s\n" "$!"' bash "${runner_dir}" "${log_file}" >"${pid_file}"
+sudo -u agent -H env -i "${runner_environment[@]}" /bin/bash -c 'cd "$1" || exit 1; nohup ./run.sh >>"$2" 2>&1 </dev/null & printf "%s\n" "$!"' bash "${runner_dir}" "${log_file}" >"${pid_file}"
 sleep "${startup_check_seconds}"
 pid="$(cat "${pid_file}" 2>/dev/null || true)"
 if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]] || ! kill -0 "${pid}" >/dev/null 2>&1; then

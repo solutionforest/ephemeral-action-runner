@@ -6,7 +6,7 @@ if [[ "$(id -u)" != "0" ]]; then
   exit 1
 fi
 
-for command_name in bash cut docker dockerd dpkg-query find getent grep groupadd groupmod head install nohup pgrep ps readlink seq sha256sum sort sudo tar tr useradd usermod wc; do
+for command_name in bash cut docker dockerd dpkg-query find getent grep groupadd groupmod head install nohup pgrep ps readlink seq sha256sum sort stat sudo tar tr useradd usermod wc; do
   command -v "${command_name}" >/dev/null 2>&1 || {
     echo "pinned source image is missing required command: ${command_name}" >&2
     exit 1
@@ -50,6 +50,10 @@ if [[ "$(id -u agent)" != "1000" || "$(id -g agent)" != "1000" ]]; then
   echo "agent identity must resolve to UID/GID 1000" >&2
   exit 1
 fi
+if [[ "$(getent passwd agent | cut -d: -f6)" != "/home/agent" ]]; then
+  echo "agent home must resolve to /home/agent" >&2
+  exit 1
+fi
 
 getent group docker >/dev/null 2>&1 || groupadd docker
 getent group sudo >/dev/null 2>&1 || {
@@ -58,7 +62,28 @@ getent group sudo >/dev/null 2>&1 || {
 }
 usermod --append --groups docker,sudo agent
 
-install -d -m 0755 -o agent -g agent /home/agent /home/agent/.docker /home/agent/.docker/sandbox /home/agent/.docker/sandbox/locks
+# Never carry registry credentials from the pinned source image into a reusable
+# runner template. Remove complete Docker client directories at the explicit
+# source identities so symlinked or helper-backed configuration cannot survive.
+rm -rf -- /root/.docker /home/runner/.docker /home/agent/.docker
+for stale_docker_config in /root/.docker /home/runner/.docker /home/agent/.docker; do
+  if [[ -e "${stale_docker_config}" || -L "${stale_docker_config}" ]]; then
+    echo "failed to scrub source Docker client configuration at ${stale_docker_config}" >&2
+    exit 1
+  fi
+done
+
+install -d -m 0755 -o agent -g agent /home/agent
+install -d -m 0700 -o agent -g agent \
+  /home/agent/.docker \
+  /home/agent/.docker/sandbox \
+  /home/agent/.docker/sandbox/locks \
+  /home/agent/.config \
+  /home/agent/.cache \
+  /home/agent/.local \
+  /home/agent/.local/share \
+  /home/agent/.local/state \
+  /run/user/1000
 install -d -m 0755 /etc/sudoers.d /etc/apt/apt.conf.d
 printf '%s\n' 'agent ALL=(ALL:ALL) NOPASSWD:ALL' > /etc/sudoers.d/epar-agent
 printf '%s\n' 'Defaults:agent env_keep += "http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS"' > /etc/sudoers.d/epar-proxy

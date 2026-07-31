@@ -19,11 +19,13 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/filelock"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
 const (
-	buildxMetadataSchemaVersion = 3
-	buildkitImageReference      = "moby/buildkit:buildx-stable-1"
+	buildxMetadataSchemaVersion  = 4
+	legacyBuildxMaxSchemaVersion = 3
+	buildkitImageReference       = "moby/buildkit:buildx-stable-1"
 )
 
 type BuildxMetadata struct {
@@ -31,6 +33,8 @@ type BuildxMetadata struct {
 	Builder           string    `json:"builder"`
 	Driver            string    `json:"driver"`
 	ProjectRoot       string    `json:"projectRoot"`
+	ConfigID          string    `json:"configId,omitempty"`
+	EPARConfigPath    string    `json:"eparConfigPath,omitempty"`
 	CacheLimit        string    `json:"cacheLimit"`
 	ConfigPath        string    `json:"configPath"`
 	ConfigSHA256      string    `json:"configSha256,omitempty"`
@@ -43,12 +47,36 @@ type BuildxMetadata struct {
 	LastReconciledAt  time.Time `json:"lastReconciledAt,omitempty"`
 }
 
+// BuildxMetadataPath returns the dedicated Buildx metadata path for the
+// project's default configuration. Callers that accept --config must use
+// BuildxMetadataPathForConfig so independent controllers never share mutable
+// BuildKit state.
 func BuildxMetadataPath(projectRoot string) string {
+	path, err := BuildxMetadataPathForConfig(projectRoot, filepath.Join(projectRoot, ".local", "config.yml"))
+	if err != nil {
+		return filepath.Join(projectRoot, ".local", "storage", "buildx", "invalid", "metadata.json")
+	}
+	return path
+}
+
+func BuildxMetadataPathForConfig(projectRoot, configPath string) (string, error) {
+	scope, err := resolveBuildxScope(projectRoot, configPath)
+	if err != nil {
+		return "", err
+	}
+	return scope.metadataPath, nil
+}
+
+// LegacyBuildxMetadataPath identifies the project-scoped metadata used before
+// Buildx resources became config-scoped. It remains discoverable for exact
+// inventory and operator-directed cleanup; current controllers never mutate
+// or adopt the legacy builder implicitly.
+func LegacyBuildxMetadataPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".local", "storage", "buildx.json")
 }
 
-func LoadBuildxMetadata(projectRoot string) (BuildxMetadata, error) {
-	content, err := os.ReadFile(BuildxMetadataPath(projectRoot))
+func LoadLegacyBuildxMetadata(projectRoot string) (BuildxMetadata, error) {
+	content, err := os.ReadFile(LegacyBuildxMetadataPath(projectRoot))
 	if err != nil {
 		return BuildxMetadata{}, err
 	}
@@ -56,13 +84,60 @@ func LoadBuildxMetadata(projectRoot string) (BuildxMetadata, error) {
 	if err := json.Unmarshal(content, &metadata); err != nil {
 		return BuildxMetadata{}, err
 	}
-	if (metadata.SchemaVersion < 1 || metadata.SchemaVersion > buildxMetadataSchemaVersion) || metadata.Builder == "" || metadata.Driver != "docker-container" || metadata.ProjectRoot == "" || metadata.ConfigPath == "" {
+	canonicalRoot, err := storagecatalog.CanonicalPath(projectRoot)
+	if err != nil {
+		return BuildxMetadata{}, err
+	}
+	metadataRoot, err := storagecatalog.CanonicalPath(metadata.ProjectRoot)
+	if err != nil {
+		return BuildxMetadata{}, fmt.Errorf("invalid legacy EPAR Buildx ownership metadata")
+	}
+	if metadata.SchemaVersion < 1 || metadata.SchemaVersion > legacyBuildxMaxSchemaVersion || metadata.Builder != legacyBuildxBuilderName(metadata.ProjectRoot) || metadata.Driver != "docker-container" || metadataRoot != canonicalRoot || strings.TrimSpace(metadata.ConfigPath) == "" {
+		return BuildxMetadata{}, fmt.Errorf("invalid legacy EPAR Buildx ownership metadata")
+	}
+	return metadata, nil
+}
+
+func LoadBuildxMetadata(projectRoot string) (BuildxMetadata, error) {
+	return LoadBuildxMetadataForConfig(projectRoot, filepath.Join(projectRoot, ".local", "config.yml"))
+}
+
+func LoadBuildxMetadataForConfig(projectRoot, configPath string) (BuildxMetadata, error) {
+	scope, err := resolveBuildxScope(projectRoot, configPath)
+	if err != nil {
+		return BuildxMetadata{}, err
+	}
+	content, err := os.ReadFile(scope.metadataPath)
+	if err != nil {
+		return BuildxMetadata{}, err
+	}
+	var metadata BuildxMetadata
+	if err := json.Unmarshal(content, &metadata); err != nil {
+		return BuildxMetadata{}, err
+	}
+	if metadata.SchemaVersion != buildxMetadataSchemaVersion || metadata.Builder != "epar-"+scope.configID || metadata.Driver != "docker-container" || filepath.Clean(metadata.ProjectRoot) != scope.projectRoot || metadata.ConfigID != scope.configID || filepath.Clean(metadata.EPARConfigPath) != scope.configPath || filepath.Clean(metadata.ConfigPath) != scope.buildkitConfig {
 		return BuildxMetadata{}, fmt.Errorf("invalid EPAR Buildx ownership metadata")
 	}
 	return metadata, nil
 }
 
 func buildxBuilderName(projectRoot string) string {
+	builder, err := buildxBuilderNameForConfig(projectRoot, filepath.Join(projectRoot, ".local", "config.yml"))
+	if err != nil {
+		return "epar-invalid"
+	}
+	return builder
+}
+
+func buildxBuilderNameForConfig(projectRoot, configPath string) (string, error) {
+	scope, err := resolveBuildxScope(projectRoot, configPath)
+	if err != nil {
+		return "", err
+	}
+	return "epar-" + scope.configID, nil
+}
+
+func legacyBuildxBuilderName(projectRoot string) string {
 	canonical := filepath.Clean(projectRoot)
 	if runtime.GOOS == "windows" {
 		canonical = strings.ToLower(canonical)
@@ -71,8 +146,60 @@ func buildxBuilderName(projectRoot string) string {
 	return "epar-" + hex.EncodeToString(sum[:6])
 }
 
+type buildxScope struct {
+	configID       string
+	projectRoot    string
+	configPath     string
+	metadataPath   string
+	lockPath       string
+	buildkitConfig string
+	certificateDir string
+}
+
+func resolveBuildxScope(projectRoot, configPath string) (buildxScope, error) {
+	if strings.TrimSpace(configPath) == "" {
+		configPath = filepath.Join(projectRoot, ".local", "config.yml")
+	}
+	configID, err := storagecatalog.ConfigID(projectRoot, configPath)
+	if err != nil {
+		return buildxScope{}, err
+	}
+	canonicalRoot, err := canonicalBuildxPath(projectRoot)
+	if err != nil {
+		return buildxScope{}, err
+	}
+	canonicalConfig, err := canonicalBuildxPath(configPath)
+	if err != nil {
+		return buildxScope{}, err
+	}
+	storageRoot := filepath.Join(canonicalRoot, ".local", "storage")
+	buildxRoot := filepath.Join(storageRoot, "buildx", configID)
+	return buildxScope{
+		configID:       configID,
+		projectRoot:    canonicalRoot,
+		configPath:     canonicalConfig,
+		metadataPath:   filepath.Join(buildxRoot, "metadata.json"),
+		lockPath:       filepath.Join(buildxRoot, "reconcile.lock"),
+		buildkitConfig: filepath.Join(storageRoot, "buildkit", configID, "buildkitd.toml"),
+		certificateDir: filepath.Join(storageRoot, "buildkit-certs", configID),
+	}, nil
+}
+
+func canonicalBuildxPath(path string) (string, error) {
+	return storagecatalog.CanonicalPath(path)
+}
+
 func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReferences []string) (string, error) {
-	builder := buildxBuilderName(m.ProjectRoot)
+	scope, err := resolveBuildxScope(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return "", fmt.Errorf("resolve Buildx configuration scope: %w", err)
+	}
+	builder := "epar-" + scope.configID
+	if legacy, legacyErr := LoadLegacyBuildxMetadata(m.ProjectRoot); legacyErr == nil {
+		m.warnf("Legacy project-scoped EPAR Buildx builder %q remains recorded at %s; it is not reused by config-scoped controllers and remains visible to storage inventory for explicit cleanup.\n", legacy.Builder, LegacyBuildxMetadataPath(m.ProjectRoot))
+	} else if !os.IsNotExist(legacyErr) {
+		m.warnf("Legacy EPAR Buildx metadata at %s is invalid and was left untouched: %v\n", LegacyBuildxMetadataPath(m.ProjectRoot), legacyErr)
+	}
 	cacheLimit := strings.TrimSpace(m.Config.Storage.BuildCacheLimit)
 	if cacheLimit == "" {
 		cacheLimit = "20GiB"
@@ -80,14 +207,6 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 	limitBytes, err := config.ParseByteSize(cacheLimit)
 	if err != nil {
 		return "", fmt.Errorf("parse storage.buildCacheLimit: %w", err)
-	}
-	effectiveLimit, err := m.effectiveProjectBuildCacheLimit()
-	if err != nil {
-		return "", fmt.Errorf("resolve shared EPAR BuildKit cache limit: %w", err)
-	}
-	if effectiveLimit < uint64(limitBytes) {
-		limitBytes = int64(effectiveLimit)
-		cacheLimit = strconv.FormatUint(effectiveLimit, 10) + "B"
 	}
 	registryHosts, err := buildRegistryHosts(registryReferences)
 	if err != nil {
@@ -138,15 +257,17 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 		return "", err
 	}
 	bundleSHA := sha256.Sum256(bundle)
-	certificatePath := filepath.Join(m.ProjectRoot, ".local", "storage", "buildkit-certs", trust.Generation, "ca.pem")
-	configPath := filepath.Join(m.ProjectRoot, ".local", "storage", "buildkitd.toml")
+	certificatePath := filepath.Join(scope.certificateDir, trust.Generation, "ca.pem")
+	configPath := scope.buildkitConfig
 	configContent := buildkitConfig(uint64(limitBytes), trust.Generation, certificatePath, registryHosts)
 	configSHA := sha256.Sum256(configContent)
 	expected := BuildxMetadata{
 		SchemaVersion:     buildxMetadataSchemaVersion,
 		Builder:           builder,
 		Driver:            "docker-container",
-		ProjectRoot:       filepath.Clean(m.ProjectRoot),
+		ProjectRoot:       scope.projectRoot,
+		ConfigID:          scope.configID,
+		EPARConfigPath:    scope.configPath,
 		CacheLimit:        cacheLimit,
 		ConfigPath:        configPath,
 		ConfigSHA256:      hex.EncodeToString(configSHA[:]),
@@ -156,11 +277,17 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 		RegistryHosts:     registryHosts,
 		BuildKitImageID:   buildKitImageID,
 	}
-	storageDirectory := filepath.Join(m.ProjectRoot, ".local", "storage")
+	storageDirectory := filepath.Join(scope.projectRoot, ".local", "storage")
 	if err := validateRegularParent(storageDirectory, m.ProjectRoot); err != nil {
 		return "", fmt.Errorf("validate EPAR storage directory: %w", err)
 	}
-	reconcileLock, err := filelock.Acquire(filepath.Join(storageDirectory, "buildx.lock"))
+	if err := validateRegularParent(filepath.Dir(scope.lockPath), storageDirectory); err != nil {
+		return "", fmt.Errorf("validate EPAR Buildx lock directory: %w", err)
+	}
+	if err := validateRegularParent(filepath.Dir(configPath), storageDirectory); err != nil {
+		return "", fmt.Errorf("validate EPAR BuildKit configuration directory: %w", err)
+	}
+	reconcileLock, err := filelock.Acquire(scope.lockPath)
 	if err != nil {
 		if errors.Is(err, filelock.ErrLocked) {
 			return "", fmt.Errorf("another EPAR process is reconciling the project Buildx builder")
@@ -179,7 +306,7 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 		return "", fmt.Errorf("write EPAR BuildKit configuration: %w", err)
 	}
 
-	metadata, metadataErr := LoadBuildxMetadata(m.ProjectRoot)
+	metadata, metadataErr := LoadBuildxMetadataForConfig(m.ProjectRoot, m.effectiveConfigPath())
 	_, inspectErr := m.runHostOutput(ctx, "docker", "buildx", "inspect", builder)
 	if inspectErr == nil {
 		if metadataErr != nil {
@@ -221,7 +348,7 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 	if err != nil {
 		return "", err
 	}
-	if err := writeAtomicFile(BuildxMetadataPath(m.ProjectRoot), append(content, '\n'), 0o600); err != nil {
+	if err := writeAtomicFile(scope.metadataPath, append(content, '\n'), 0o600); err != nil {
 		return "", fmt.Errorf("publish EPAR Buildx ownership metadata: %w", err)
 	}
 	return builder, nil
@@ -231,6 +358,8 @@ func buildxOwnershipMatches(actual, expected BuildxMetadata) bool {
 	return actual.Builder == expected.Builder &&
 		actual.Driver == expected.Driver &&
 		filepath.Clean(actual.ProjectRoot) == expected.ProjectRoot &&
+		actual.ConfigID == expected.ConfigID &&
+		filepath.Clean(actual.EPARConfigPath) == expected.EPARConfigPath &&
 		filepath.Clean(actual.ConfigPath) == expected.ConfigPath
 }
 

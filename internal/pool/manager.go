@@ -33,6 +33,7 @@ type Manager struct {
 	PolicyManager            provider.PolicyManager
 	Storage                  provider.StorageContribution
 	LifecycleState           *poolstate.Store
+	LifecycleStateEnabled    bool
 	GitHub                   GitHubClient
 	ProjectRoot              string
 	ConfigPath               string
@@ -1402,25 +1403,47 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	}
 	m.logger().Info("cloning instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "clone", "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
 	var created provider.Instance
-	if err := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
+	createStageErr := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
 		var createErr error
 		created, createErr = m.createProviderInstance(ctx, name)
 		return createErr
-	}); err != nil {
-		return vm, err
+	})
+	if created.Name != "" || created.ProviderID != "" || created.ReceiptVersion != "" || len(created.Receipt) != 0 {
+		if created.Name != name || created.ProviderID == "" {
+			identityErr := fmt.Errorf("provider create returned an incomplete immutable identity for %q", name)
+			if createStageErr != nil {
+				return vm, errors.Join(createStageErr, identityErr)
+			}
+			return vm, identityErr
+		}
+		if created.ReceiptVersion == "" || len(created.Receipt) == 0 {
+			receiptErr := fmt.Errorf("provider create returned an incomplete versioned receipt for %q", name)
+			if createStageErr != nil {
+				return vm, errors.Join(createStageErr, receiptErr)
+			}
+			return vm, receiptErr
+		}
+		var providerReceipt map[string]any
+		if json.Unmarshal(created.Receipt, &providerReceipt) != nil || providerReceipt == nil {
+			receiptErr := fmt.Errorf("provider create returned an invalid versioned receipt for %q", name)
+			if createStageErr != nil {
+				return vm, errors.Join(createStageErr, receiptErr)
+			}
+			return vm, receiptErr
+		}
+		vm.ProviderID = created.ProviderID
+		if recordErr := m.recordLifecycleCreated(context.WithoutCancel(ctx), created); recordErr != nil {
+			if createStageErr != nil {
+				return vm, errors.Join(createStageErr, recordErr)
+			}
+			return vm, recordErr
+		}
+	}
+	if createStageErr != nil {
+		return vm, createStageErr
 	}
 	if created.Name != name || created.ProviderID == "" {
 		return vm, fmt.Errorf("provider create returned no immutable identity for %q", name)
-	}
-	vm.ProviderID = created.ProviderID
-	if created.ReceiptVersion != "" && len(created.Receipt) != 0 {
-		var providerReceipt map[string]any
-		if json.Unmarshal(created.Receipt, &providerReceipt) != nil || providerReceipt == nil {
-			return vm, fmt.Errorf("provider create returned an invalid versioned receipt for %q", name)
-		}
-	}
-	if err := m.recordLifecycleCreated(ctx, created); err != nil {
-		return vm, err
 	}
 	if err := m.recordLifecycleValidationIntent(ctx, name); err != nil {
 		return vm, fmt.Errorf("record runtime validation intent: %w", err)

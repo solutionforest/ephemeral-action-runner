@@ -388,7 +388,8 @@ func applyTransition(record *Record, transition Transition, now time.Time) error
 	case ActionCreateIntent:
 		return move(record, PhaseReserved, PhaseCreating, transition.Action)
 	case ActionAbandonCreate:
-		if record.Phase != PhaseReserved && record.Phase != PhaseCreating {
+		identitylessQuarantine := record.Phase == PhaseQuarantined && record.ProviderID == "" && emptyReceipt(record.Receipt)
+		if record.Phase != PhaseReserved && record.Phase != PhaseCreating && !identitylessQuarantine {
 			return invalid(record, transition.Action)
 		}
 		if record.ProviderID != "" || !emptyReceipt(record.Receipt) || len(activeLeases(record.Leases, now)) != 0 {

@@ -97,6 +97,114 @@ func TestLifecycleCleanupRefusesActiveLeaseBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestLifecycleCleanupTombstonesIdentitylessQuarantineAfterExactAbsence(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "epar-test-identityless"
+	if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-container", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionQuarantine, Reason: "post-create identity was lost"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{}
+	manager := Manager{
+		Config:         config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-test"}, Logging: config.LoggingConfig{Directory: t.TempDir()}},
+		Provider:       fake,
+		Lifecycle:      provider.AdaptLegacy(fake),
+		LifecycleState: store,
+		GitHub:         &fakeGitHub{},
+		ProjectRoot:    t.TempDir(),
+	}
+	if err := manager.cleanupOwnedLifecycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseTombstoned || record.Cleanup.RemoteAbsentAt == nil || record.Cleanup.LocalAbsentAt == nil {
+		t.Fatalf("cleanup record = %#v, want exact absence tombstone", record)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("delete calls = %d, want no name-only deletion", got)
+	}
+}
+
+func TestLifecycleCleanupKeepsIdentitylessQuarantineWhenSameNameExists(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "epar-test-identityless-present"
+	if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-container", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionQuarantine, Reason: "post-create identity was lost"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:unknown-same-name", State: "running"}}}
+	manager := Manager{
+		Config:         config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-test"}, Logging: config.LoggingConfig{Directory: t.TempDir()}},
+		Provider:       fake,
+		Lifecycle:      provider.AdaptLegacy(fake),
+		LifecycleState: store,
+		GitHub:         &fakeGitHub{},
+		ProjectRoot:    t.TempDir(),
+	}
+	err = manager.cleanupOwnedLifecycle(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "same-name instance is quarantined") {
+		t.Fatalf("cleanup error = %v, want same-name refusal", err)
+	}
+	record, readErr := store.Read(context.Background(), name)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if record.Phase != poolstate.PhaseQuarantined {
+		t.Fatalf("phase = %s, want %s", record.Phase, poolstate.PhaseQuarantined)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("delete calls = %d, want no name-only deletion", got)
+	}
+}
+
+func TestIdentitylessQuarantineAlwaysVerifiesGitHubAbsence(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "epar-test-identityless-remote"
+	if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-container", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionQuarantine, Reason: "post-create identity was lost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{}
+	manager := Manager{
+		Config:         config.Config{Provider: config.ProviderConfig{Type: "docker-container"}, Pool: config.PoolConfig{NamePrefix: "epar-test"}, Logging: config.LoggingConfig{Directory: t.TempDir()}},
+		Provider:       fake,
+		Lifecycle:      provider.AdaptLegacy(fake),
+		LifecycleState: store,
+		GitHub:         &fakeGitHub{runner: gh.Runner{Name: name, ID: 9123}, found: true},
+		ProjectRoot:    t.TempDir(),
+	}
+	err = manager.cleanupLifecycleRecordWithRemoteAbsence(context.Background(), record, nil, true)
+	if err == nil || !strings.Contains(err.Error(), "same-name GitHub runner") {
+		t.Fatalf("cleanup error = %v, want GitHub absence refusal", err)
+	}
+	record, readErr := store.Read(context.Background(), name)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if record.Phase != poolstate.PhaseQuarantined {
+		t.Fatalf("phase = %s, want %s", record.Phase, poolstate.PhaseQuarantined)
+	}
+}
+
 func TestCleanupRecoversInterruptedProvisionLeaseAfterExclusiveLock(t *testing.T) {
 	store, err := poolstate.Open(t.TempDir())
 	if err != nil {

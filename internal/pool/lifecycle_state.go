@@ -7,26 +7,99 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"time"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/filelock"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
 // OpenLifecycleState opens the provider-neutral state namespace for one exact
 // configuration file. The namespace hash prevents two configurations in the
-// same checkout from claiming each other's instances.
+// same checkout from claiming each other's instances. Production callers must
+// hold the canonical configuration and normalized prefix controller locks so a
+// legacy namespace cannot be renamed beneath another active controller.
 func OpenLifecycleState(projectRoot, configPath string) (*poolstate.Store, error) {
-	absoluteConfig, err := filepath.Abs(configPath)
+	legacyConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve legacy lifecycle config path: %w", err)
+	}
+	legacyConfig = filepath.Clean(legacyConfig)
+	canonicalConfig, err := storagecatalog.CanonicalPath(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve lifecycle config path: %w", err)
 	}
-	sum := sha256.Sum256([]byte(filepath.Clean(absoluteConfig)))
+	legacyDirectory := lifecycleStateDirectory(projectRoot, legacyConfig)
+	canonicalDirectory := lifecycleStateDirectory(projectRoot, canonicalConfig)
+	if err := os.MkdirAll(filepath.Dir(canonicalDirectory), 0o700); err != nil {
+		return nil, fmt.Errorf("create lifecycle state root: %w", err)
+	}
+	migrationLock, err := acquireLifecycleMigrationLock(canonicalDirectory + ".migration.lock")
+	if err != nil {
+		return nil, err
+	}
+	defer migrationLock.Close()
+	if legacyDirectory != canonicalDirectory {
+		if err := migrateLegacyLifecycleState(legacyDirectory, canonicalDirectory); err != nil {
+			return nil, err
+		}
+	}
+	return poolstate.Open(canonicalDirectory)
+}
+
+func acquireLifecycleMigrationLock(path string) (*filelock.Lock, error) {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		lock, err := filelock.Acquire(path)
+		if err == nil {
+			return lock, nil
+		}
+		if !errors.Is(err, filelock.ErrLocked) {
+			return nil, fmt.Errorf("acquire lifecycle migration lock %s: %w", path, err)
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("timed out waiting for lifecycle migration lock %s", path)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func lifecycleStateDirectory(projectRoot, canonicalConfig string) string {
+	sum := sha256.Sum256([]byte(canonicalConfig))
 	namespace := hex.EncodeToString(sum[:8])
-	return poolstate.Open(filepath.Join(projectRoot, ".local", "state", "pools", namespace))
+	return filepath.Join(projectRoot, ".local", "state", "pools", namespace)
+}
+
+func migrateLegacyLifecycleState(legacyDirectory, canonicalDirectory string) error {
+	legacyInfo, legacyErr := os.Lstat(legacyDirectory)
+	if errors.Is(legacyErr, os.ErrNotExist) {
+		return nil
+	}
+	if legacyErr != nil {
+		return fmt.Errorf("inspect legacy lifecycle state %s: %w", legacyDirectory, legacyErr)
+	}
+	if !legacyInfo.IsDir() || legacyInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("legacy lifecycle state is not a real directory: %s", legacyDirectory)
+	}
+	if _, canonicalErr := os.Lstat(canonicalDirectory); canonicalErr == nil {
+		return fmt.Errorf("both legacy and canonical lifecycle state exist; refusing to choose between %s and %s", legacyDirectory, canonicalDirectory)
+	} else if !errors.Is(canonicalErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect canonical lifecycle state %s: %w", canonicalDirectory, canonicalErr)
+	}
+	if err := os.Rename(legacyDirectory, canonicalDirectory); err != nil {
+		_, legacyRetryErr := os.Lstat(legacyDirectory)
+		_, canonicalRetryErr := os.Lstat(canonicalDirectory)
+		if errors.Is(legacyRetryErr, os.ErrNotExist) && canonicalRetryErr == nil {
+			return nil
+		}
+		return fmt.Errorf("migrate legacy lifecycle state %s to %s: %w", legacyDirectory, canonicalDirectory, err)
+	}
+	return nil
 }
 
 func (m *Manager) reserveLifecycle(ctx context.Context, name string) error {

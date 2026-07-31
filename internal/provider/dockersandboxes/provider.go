@@ -28,8 +28,10 @@ const (
 )
 
 const directWorkspaceVerificationScript = `set -euo pipefail
-test -z "${SSH_AUTH_SOCK:-}"
-test -z "${SSH_AGENT_PID:-}"
+if test -n "${SSH_AUTH_SOCK:-}" || test -n "${SSH_AUTH_SOCK_GATEWAY:-}" || test -n "${SSH_AGENT_PID:-}" || test -e /run/ssh-agent.sock || test -L /run/ssh-agent.sock; then
+  echo "Docker Sandboxes exposed host SSH-agent forwarding; stop the daemon and restart it with SSH_AUTH_SOCK, SSH_AUTH_SOCK_GATEWAY, and SSH_AGENT_PID unset" >&2
+  exit 1
+fi
 workspace="$(pwd -P)"
 test -n "${workspace}"
 source_options="$(findmnt -T "${workspace}" -n -o OPTIONS)"
@@ -217,15 +219,6 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			if item.Source != "shell" || !containsExactWorkspace(item.Workspaces, request.StagingPath) {
 				return provider.Instance{}, fmt.Errorf("docker sandbox inventory did not bind the exact shell workspace")
 			}
-			if err := p.verifyNoPublishedPorts(ctx, item.Instance); err != nil {
-				return provider.Instance{}, err
-			}
-			if err := p.verifyInspection(ctx, item.Instance, &request); err != nil {
-				return provider.Instance{}, err
-			}
-			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
-				return provider.Instance{}, err
-			}
 			receipt, encodeErr := json.Marshal(instanceReceipt{
 				SchemaVersion:   1,
 				StagingPath:     ownedStaging.Path,
@@ -239,6 +232,15 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			instance := item.Instance
 			instance.ReceiptVersion = "v1"
 			instance.Receipt = receipt
+			if err := p.verifyNoPublishedPorts(ctx, item.Instance); err != nil {
+				return instance, err
+			}
+			if err := p.verifyInspection(ctx, item.Instance, &request); err != nil {
+				return instance, err
+			}
+			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
+				return instance, err
+			}
 			return instance, nil
 		}
 	}
@@ -955,7 +957,7 @@ func childEnvironment(additions map[string]string) []string {
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
 		upperKey := strings.ToUpper(key)
-		if strings.HasPrefix(upperKey, "DOCKER_SANDBOXES_") || upperKey == "SSH_AUTH_SOCK" || upperKey == "SSH_AGENT_PID" {
+		if strings.HasPrefix(upperKey, "DOCKER_SANDBOXES_") || upperKey == "SSH_AUTH_SOCK" || upperKey == "SSH_AUTH_SOCK_GATEWAY" || upperKey == "SSH_AGENT_PID" {
 			continue
 		}
 		environment = append(environment, item)

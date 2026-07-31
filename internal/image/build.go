@@ -154,31 +154,75 @@ func (m *Coordinator) buildDockerContainerImageUntimed(ctx context.Context, opts
 			value.HostTrust = hostTrustMetadata(snapshot)
 			manifest = &value
 		}
+		manifestHash, err := ManifestHash(*manifest)
+		if err != nil {
+			return err
+		}
+		var releaseOutputClaim func() error
+		claimContext := ctx
+		if !m.DryRun {
+			claimContext, releaseOutputClaim, err = m.claimDockerOutputTag(ctx, m.Config.Image.OutputImage, manifestHash)
+			if err != nil {
+				return err
+			}
+		}
+		releaseClaim := func() error {
+			if releaseOutputClaim == nil {
+				return nil
+			}
+			err := releaseOutputClaim()
+			releaseOutputClaim = nil
+			return err
+		}
 		targetImage := m.Config.Image.OutputImage
 		if m.hostTrustEnabled() {
 			targetImage = temporaryDockerImageTag(targetImage, snapshot.Generation, attempt)
 		}
-		if err := m.buildDockerContainerImageAttempt(ctx, upstreamDir, buildLogPath, builder, targetImage, *manifest, snapshot); err != nil {
-			return err
+		if err := m.buildDockerContainerImageAttempt(claimContext, upstreamDir, buildLogPath, builder, targetImage, *manifest, snapshot); err != nil {
+			return errors.Join(err, releaseClaim())
+		}
+		if cause := context.Cause(claimContext); cause != nil {
+			return errors.Join(cause, releaseClaim())
 		}
 		if m.DryRun || !m.hostTrustEnabled() {
+			if !m.DryRun {
+				if err := m.recordCurrentArtifact(claimContext, manifestHash); err != nil {
+					return errors.Join(fmt.Errorf("record current Docker Container artifact ownership: %w", err), releaseClaim())
+				}
+			}
+			if err := releaseClaim(); err != nil {
+				return fmt.Errorf("release Docker output image tag claim: %w", err)
+			}
 			return nil
 		}
-		current, err := m.resolveHostTrust(ctx)
+		current, err := m.resolveHostTrust(claimContext)
 		if err != nil {
 			_ = m.runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
-			return err
+			return errors.Join(err, releaseClaim())
 		}
 		if current.Generation != snapshot.Generation {
 			m.infof("host trust changed during image build (%s -> %s); discarding attempt %d/%d\n", snapshot.Generation, current.Generation, attempt, attempts)
 			_ = m.runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+			if err := releaseClaim(); err != nil {
+				return fmt.Errorf("release Docker output image tag claim: %w", err)
+			}
 			continue
 		}
-		if err := m.runHost(ctx, "docker", "image", "tag", targetImage, m.Config.Image.OutputImage); err != nil {
+		if cause := context.Cause(claimContext); cause != nil {
 			_ = m.runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
-			return err
+			return errors.Join(cause, releaseClaim())
+		}
+		if err := m.runHost(claimContext, "docker", "image", "tag", targetImage, m.Config.Image.OutputImage); err != nil {
+			_ = m.runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+			return errors.Join(err, releaseClaim())
 		}
 		_ = m.runHostQuiet(context.Background(), "docker", "image", "rm", "-f", targetImage)
+		if err := m.recordCurrentArtifact(claimContext, manifestHash); err != nil {
+			return errors.Join(fmt.Errorf("record current Docker Container artifact ownership: %w", err), releaseClaim())
+		}
+		if err := releaseClaim(); err != nil {
+			return fmt.Errorf("release Docker output image tag claim: %w", err)
+		}
 		m.infof("image build complete: %s is available in `docker image ls`\n", m.Config.Image.OutputImage)
 		return nil
 	}

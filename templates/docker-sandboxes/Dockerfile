@@ -70,6 +70,15 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
 ENV HOME=/home/agent \
     USER=agent \
     LOGNAME=agent \
+    SSH_AUTH_SOCK= \
+    SSH_AUTH_SOCK_GATEWAY= \
+    SSH_AGENT_PID= \
+    XDG_CONFIG_HOME=/home/agent/.config \
+    XDG_CACHE_HOME=/home/agent/.cache \
+    XDG_DATA_HOME=/home/agent/.local/share \
+    XDG_STATE_HOME=/home/agent/.local/state \
+    XDG_RUNTIME_DIR=/run/user/1000 \
+    DOCKER_CONFIG=/home/agent/.docker \
     RUNNER_TOOL_CACHE=/opt/actions-runner/_work/_tool \
     AGENT_TOOLSDIRECTORY=/opt/actions-runner/_work/_tool \
     DOTNET_INSTALL_DIR=/opt/actions-runner/_work/_tool/dotnet \

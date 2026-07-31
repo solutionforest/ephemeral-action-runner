@@ -275,11 +275,11 @@ func (s *Store) writeUnlocked(value Catalog) error {
 }
 
 func ConfigID(projectRoot, configPath string) (string, error) {
-	root, err := canonicalPath(projectRoot)
+	root, err := CanonicalPath(projectRoot)
 	if err != nil {
 		return "", err
 	}
-	path, err := canonicalPath(configPath)
+	path, err := CanonicalPath(configPath)
 	if err != nil {
 		return "", err
 	}
@@ -297,11 +297,11 @@ func RegisterConfig(value *Catalog, projectRoot, configPath string, now time.Tim
 	if err != nil {
 		return Config{}, err
 	}
-	root, err := canonicalPath(projectRoot)
+	root, err := CanonicalPath(projectRoot)
 	if err != nil {
 		return Config{}, err
 	}
-	path, err := canonicalPath(configPath)
+	path, err := CanonicalPath(configPath)
 	if err != nil {
 		return Config{}, err
 	}
@@ -497,10 +497,17 @@ func normalize(value *Catalog) {
 	sort.Slice(value.Journals, func(i, j int) bool { return value.Journals[i].ID < value.Journals[j].ID })
 }
 
-func canonicalPath(path string) (string, error) {
+// CanonicalPath returns the stable identity used by controller locks, catalog
+// records, lifecycle state, and build workspaces. Existing symlinks are
+// resolved so alternate spellings of the same configuration cannot split
+// ownership state.
+func CanonicalPath(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+		absolute = resolved
 	}
 	absolute = filepath.Clean(absolute)
 	if runtime.GOOS == "windows" {

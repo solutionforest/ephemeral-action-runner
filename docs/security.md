@@ -32,6 +32,8 @@ Docker Container uses a privileged outer container with a private inner Docker d
 
 Docker Sandboxes places the listener, guest filesystem, and private Docker daemon inside a dedicated microVM sandbox. It provides EPAR's strongest current host boundary and materially strengthens host isolation relative to Docker Container. The first-run wizard recommends it when the supported-platform, Docker, and machine-readable `sbx` readiness checks pass; startup then performs the remaining storage, template, policy-rule, runtime, and registration admission checks and fails closed. This selection rule is separate from independent platform certification and does not claim that every host combination has received the same real-host validation.
 
+Docker Sandboxes may forward a host SSH agent when its shared daemon inherits `SSH_AUTH_SOCK`. EPAR strips SSH-agent variables from child commands and rejects any sandbox exposing the socket, gateway, or agent PID; operators must restart an already-running daemon with those variables unset rather than weakening the check.
+
 Tart runs jobs inside VMs on Apple Silicon macOS. That is a stronger host boundary than Docker Container, but workflows still control the guest and any secrets exposed to the job.
 
 WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provider as trusted-job infrastructure unless your environment has reviewed and accepted that model.
@@ -54,4 +56,4 @@ Docker registry mirrors are optional infrastructure outside EPAR. Treat them as 
 
 Do not assume a mirror makes private image pulls safe or anonymous. A private image still needs authorization from the workflow's `docker login` or from credentials configured on the mirror itself. If the mirror is configured with upstream registry credentials, secure the mirror because it may be able to serve private images that credential can access.
 
-Host-side Docker login state is not copied into EPAR instances. Keep Docker Hub, cloud registry, and package registry credentials in GitHub secrets or in a deliberately secured mirror service.
+Host-side Docker login state is not copied into EPAR instances. Keep Docker Hub, cloud registry, and package registry credentials in GitHub secrets or in a deliberately secured mirror service. Docker Sandboxes is an exception at the authorization boundary: its host security proxy may replace a guest's Docker Hub authorization with the host `sbx login` identity without copying that credential into the guest. Use Docker Container when each job must supply an independent Docker Hub identity; see the [Docker Sandboxes provider guide](providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).

@@ -730,7 +730,10 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	architecture := strings.TrimPrefix(source.Platform, "linux/")
 	tagProfile := sanitizeTemplateTag(profile)
 	templateTag := fmt.Sprintf("epar-docker-sandboxes-catthehacker-%s:%s-%s", tagProfile, manifestHash[:16], architecture)
-	artifactRoot := filepath.Join(m.ProjectRoot, "work", "template-builds", "docker-sandboxes", manifestHash)
+	artifactRoot, err := m.dockerSandboxesArtifactRoot(manifestHash)
+	if err != nil {
+		return fmt.Errorf("resolve Docker Sandboxes template workspace: %w", err)
+	}
 	if err := os.MkdirAll(artifactRoot, 0o755); err != nil {
 		return err
 	}
@@ -1055,6 +1058,14 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		return err
 	}
 	return m.activateDockerSandboxesTemplate(ctx, manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+}
+
+func (m *Coordinator) dockerSandboxesArtifactRoot(manifestHash string) (string, error) {
+	configID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(m.ProjectRoot, "work", "template-builds", "docker-sandboxes", configID, manifestHash), nil
 }
 
 func readVerifiedBuildEvidence(path string, maximumBytes uint64) ([]byte, error) {
