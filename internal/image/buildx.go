@@ -278,7 +278,7 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 		BuildKitImageID:   buildKitImageID,
 	}
 	storageDirectory := filepath.Join(scope.projectRoot, ".local", "storage")
-	if err := validateRegularParent(storageDirectory, m.ProjectRoot); err != nil {
+	if err := validateRegularParent(storageDirectory, scope.projectRoot); err != nil {
 		return "", fmt.Errorf("validate EPAR storage directory: %w", err)
 	}
 	if err := validateRegularParent(filepath.Dir(scope.lockPath), storageDirectory); err != nil {

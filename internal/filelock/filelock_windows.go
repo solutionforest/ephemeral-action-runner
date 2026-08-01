@@ -12,6 +12,7 @@ import (
 const (
 	lockfileFailImmediately = 0x00000001
 	lockfileExclusiveLock   = 0x00000002
+	lockfileOffsetHigh      = 1
 )
 
 var (
@@ -22,7 +23,10 @@ var (
 )
 
 func lockFile(file *os.File) error {
-	var overlapped syscall.Overlapped
+	// Keep the lock range outside the metadata payload. Windows enforces byte
+	// range locks for ordinary reads, so locking byte zero would prevent another
+	// process from reading owner diagnostics while the lock is held.
+	overlapped := syscall.Overlapped{OffsetHigh: lockfileOffsetHigh}
 	result, _, callErr := procLockFileEx.Call(file.Fd(), lockfileExclusiveLock|lockfileFailImmediately, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
 	if result != 0 {
 		return nil
@@ -34,7 +38,7 @@ func lockFile(file *os.File) error {
 }
 
 func unlockFile(file *os.File) error {
-	var overlapped syscall.Overlapped
+	overlapped := syscall.Overlapped{OffsetHigh: lockfileOffsetHigh}
 	result, _, callErr := procUnlockFileEx.Call(file.Fd(), 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
 	if result != 0 {
 		return nil

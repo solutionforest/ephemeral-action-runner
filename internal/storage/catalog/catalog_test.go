@@ -108,6 +108,25 @@ func TestDifferentProjectRootsHaveDifferentInstallationIdentities(t *testing.T) 
 	}
 }
 
+func TestRegisterConfigPreservesActionablePathSpelling(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "Config.yml")
+	if err := os.WriteFile(configPath, []byte("provider: test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := RegisterConfig(&Catalog{InstallationID: "host-catalog"}, root, configPath, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.DisplayPath != filepath.Clean(want) {
+		t.Fatalf("display path = %q, want %q", record.DisplayPath, filepath.Clean(want))
+	}
+}
+
 func TestBackendLocksAreSeparatedAndSerializeTheSameBackend(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {

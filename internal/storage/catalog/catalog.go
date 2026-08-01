@@ -71,6 +71,7 @@ type Config struct {
 	ID                   string     `json:"id"`
 	InstallationID       string     `json:"installationId"`
 	Path                 string     `json:"path"`
+	DisplayPath          string     `json:"displayPath,omitempty"`
 	ProjectRoot          string     `json:"projectRoot"`
 	BuildCacheLimitBytes uint64     `json:"buildCacheLimitBytes,omitempty"`
 	ControllerLeaseUntil *time.Time `json:"controllerLeaseUntil,omitempty"`
@@ -305,8 +306,13 @@ func RegisterConfig(value *Catalog, projectRoot, configPath string, now time.Tim
 	if err != nil {
 		return Config{}, err
 	}
+	displayPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return Config{}, err
+	}
+	displayPath = filepath.Clean(displayPath)
 	installationSum := sha256.Sum256([]byte(value.InstallationID + "\x00" + root))
-	record := Config{ID: id, InstallationID: hex.EncodeToString(installationSum[:12]), Path: path, ProjectRoot: root, LastSeenAt: now.UTC()}
+	record := Config{ID: id, InstallationID: hex.EncodeToString(installationSum[:12]), Path: path, DisplayPath: displayPath, ProjectRoot: root, LastSeenAt: now.UTC()}
 	for index := range value.Configs {
 		if value.Configs[index].ID == id {
 			if value.Configs[index].InstallationID != "" {

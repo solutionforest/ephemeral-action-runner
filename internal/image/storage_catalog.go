@@ -319,7 +319,10 @@ func dockerOutputTagConflict(value *storagecatalog.Catalog, configID, tag, exist
 	path := configID
 	for _, configRecord := range value.Configs {
 		if configRecord.ID == configID {
-			path = configRecord.Path
+			path = configRecord.DisplayPath
+			if path == "" {
+				path = configRecord.Path
+			}
 			break
 		}
 	}

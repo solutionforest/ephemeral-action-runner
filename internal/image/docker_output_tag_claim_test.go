@@ -138,6 +138,14 @@ func TestDockerOutputTagClaimRejectsOtherActiveArtifactManifest(t *testing.T) {
 	}
 }
 
+func TestDockerOutputTagConflictFallsBackToCanonicalPath(t *testing.T) {
+	value := &storagecatalog.Catalog{Configs: []storagecatalog.Config{{ID: "legacy-config", Path: "canonical-config.yml"}}}
+	err := dockerOutputTagConflict(value, "legacy-config", "docker.io/example/runner:current", "manifest-one", "manifest-two")
+	if !strings.Contains(err.Error(), "canonical-config.yml") {
+		t.Fatalf("legacy catalog conflict omitted canonical configuration path: %v", err)
+	}
+}
+
 func TestDockerOutputTagClaimExpiresAfterPublisherCrash(t *testing.T) {
 	t.Setenv("EPAR_STATE_HOME", filepath.Join(t.TempDir(), "host-state"))
 	project := t.TempDir()
