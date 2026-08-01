@@ -64,6 +64,8 @@ if ($Forwarded.Count -eq 1 -and $Forwarded[0] -eq 'version') {
     if ($grepExitCode -ne 1) {
         throw "git grep for removed CMD wrapper references exited $grepExitCode"
     }
+    # A no-match result is expected, so do not leak git grep's exit code to the workflow shell.
+    $global:LASTEXITCODE = 0
 
     Write-Output 'Windows start.ps1 command-forwarding smoke passed'
 } finally {
