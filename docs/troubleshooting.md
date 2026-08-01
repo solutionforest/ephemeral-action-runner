@@ -165,21 +165,15 @@ A workflow's Docker login step reports `Login Succeeded`, but a later pull of a 
 
 First verify only metadata, never credential contents: the listener should run as `agent` with `HOME=/home/agent` and `DOCKER_CONFIG=/home/agent/.docker`, and a post-login config should be owned by `agent` with restrictive permissions. If Docker reaches the registry and returns an authorization response, do not investigate CA copying unless an `x509` or TLS error is also present.
 
-Inspect the host Docker Sandboxes daemon log for a message that the proxy is overriding a client-supplied registry credential with a host credential. When that message is present, the workflow credential was written correctly but cannot control the pull: Docker Sandboxes intentionally substitutes the host-side credential. An explicit guest config path cannot bypass that policy.
+Inspect the host Docker Sandboxes daemon log for a message that the proxy is overriding a client-supplied registry credential with a host credential. When that message is present, the workflow credential was written correctly but dockerd used the credential-injecting forward path. An explicit guest config path cannot bypass that path.
 
-Run `sbx login` on the host to display the current Docker Sandboxes username when it is already signed in. Do not assume that a successful host Docker CLI pull means `sbx` uses the same account: Docker's ordinary credential store and the Docker Sandboxes login session can contain different identities. Likewise, `sbx diagnose --output json` can prove that authentication is valid but cannot prove private-repository scope.
+On a current EPAR template, `docker info --format '{{.NoProxy}}'` must print `*`, `/etc/docker/daemon.json` must be a root-owned regular file, and `sbx policy log <sandbox-name>` must report `transparent` for `registry-1.docker.io`, `auth.docker.io`, and the blob host used by the pull. Docker Sandboxes documents transparent traffic as policy-enforced without credential injection. If dockerd reports another no-proxy value or the policy log reports `forward`, stop the workspace controller, let its exact cleanup finish, rerun `./start` to build and import the changed template, and test on a newly created runner. Do not reuse the old sandbox.
 
-On a trusted single-tenant host, stop every controller and sandbox that shares the runtime, authenticate `sbx` as one least-privilege account that can read every required image, restart the daemon, and create a fresh runner. Pass the token only through standard input from a protected local source:
+Do not set `DOCKER_SANDBOXES_NO_PROXY` expecting it to disable credential injection. That host variable only excludes destinations from an optional upstream proxy used after traffic reaches the mandatory Sandbox proxy. Replacing `docker/login-action` with `docker login`, combining login and pull in one shell step, or changing `DOCKER_CONFIG` also leaves an old daemon's forward route unchanged.
 
-```sh
-printf '%s' "$DOCKERHUB_TOKEN" | sbx login --username "$DOCKERHUB_USERNAME" --password-stdin
-sbx daemon stop
-env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
-```
+Keep the host `sbx login` identity intentionally different from the workflow identity when proving this fix. A successful private pull together with transparent policy-log entries proves that the guest credential is authoritative. Changing the host login to match the workflow can diagnose the old interception behavior, but it is a shared-identity workaround rather than the fix.
 
-First run a fresh Sandbox job that performs only `docker manifest inspect <private-reference>` without a guest login. If it succeeds, the host proxy identity has repository scope; run the original workflow next. A manual guest `docker login`, putting login and pull in one shell step, or changing `DOCKER_CONFIG` cannot bypass the proxy override.
-
-Use Docker Container for workflows that require independent, per-job Docker Hub credentials. EPAR rejects global `sbx` secrets and never copies GitHub Actions secrets back to the host. See [Docker Hub Credentials and the Host Proxy](providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).
+EPAR rejects global `sbx` secrets and removes inherited proxy variables from runner registration and the Actions listener. A root-capable workflow can still deliberately reconnect a client to Docker Sandboxes' forward proxy, and v0.37.1 has no documented per-sandbox switch that disables the interceptor. Use a least-privilege host `sbx` account and choose Docker Container if that residual capability is outside the trust boundary. See [Docker Hub Credentials and Transparent Egress](providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
 ## An idle runner reports GitHub or Sandbox health warnings
 

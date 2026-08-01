@@ -89,7 +89,7 @@ runner_environment=(
   "PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   "LANG=C.UTF-8"
 )
-for environment_name in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
+for environment_name in SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
   if [[ -n "${!environment_name+x}" ]]; then
     runner_environment+=("${environment_name}=${!environment_name}")
   fi

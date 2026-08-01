@@ -10,6 +10,7 @@ if [[ -n "${SSH_AUTH_SOCK:-}" || -n "${SSH_AUTH_SOCK_GATEWAY:-}" || -n "${SSH_AG
   exit 1
 fi
 unset SSH_AUTH_SOCK SSH_AUTH_SOCK_GATEWAY SSH_AGENT_PID
+unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
 sudo -n install -d -m 0700 -o agent -g agent /run/user/1000
 if [[ "${XDG_CONFIG_HOME:-}" != "/home/agent/.config" || "${XDG_CACHE_HOME:-}" != "/home/agent/.cache" || "${XDG_DATA_HOME:-}" != "/home/agent/.local/share" || "${XDG_STATE_HOME:-}" != "/home/agent/.local/state" || "${XDG_RUNTIME_DIR:-}" != "/run/user/1000" || "${DOCKER_CONFIG:-}" != "/home/agent/.docker" ]]; then
   echo "EPAR Docker Sandboxes template: agent configuration-path contract is not satisfied" >&2
@@ -25,6 +26,10 @@ if [[ "${EPAR_SKIP_DOCKER_READY_CHECK:-0}" != "1" ]]; then
   for attempt in $(seq 1 120); do
     daemon_count="$( (pgrep -x dockerd 2>/dev/null || true) | wc -l | tr -d '[:space:]')"
     if [[ "${daemon_count}" == "1" ]] && docker info >/dev/null 2>&1; then
+      if [[ "$(docker info --format '{{.NoProxy}}')" != "*" ]]; then
+        echo "EPAR Docker Sandboxes template: sandbox-private Docker daemon is not using policy-enforced transparent egress" >&2
+        exit 1
+      fi
       echo "EPAR Docker Sandboxes template: one sandbox-private Docker daemon is ready"
       break
     fi

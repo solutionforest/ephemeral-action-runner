@@ -14,8 +14,8 @@ flowchart LR
 
 ## Why EPAR
 
-- Keep ready capacity available for private-repository CI without a long-lived runner workspace.
-- Give each runner its own disposable container, WSL distribution, or microVM, depending on the provider.
+- Keep private-repository CI ready without maintaining a long-lived runner workspace.
+- Protect the host with [Docker Sandboxes](docs/providers/docker-sandboxes.md): each runner gets a dedicated microVM and private Docker daemon, then is removed after one job.
 - Run Docker-friendly Linux jobs from a Windows, macOS, Linux, or other Docker-capable host.
 
 ## Quick Start
@@ -29,7 +29,7 @@ The normal path is a source archive plus Docker. EPAR's first run opens a guided
 
 On macOS or Linux, the first Docker Sandboxes runner may trigger operating-system or security-tool prompts for runtime helpers such as `mkfs.ext4`, `mkfs.erofs`, and `containerd-shim-nerdbox-v1`; macOS may say the helper “is an app downloaded from the Internet.” These are used to create the runner's private Docker filesystem, unpack its read-only template filesystem, and launch the sandbox VM. Confirm that each executable belongs to the installed Docker Sandboxes runtime and that any displayed file target is sandbox-owned before approving it. Denying a required helper prevents that sandbox from starting, and EPAR fails closed without registering it; preserve and clean any diagnostic runtime state through EPAR's exact cleanup path. See the [Docker Sandboxes provider guide](docs/providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) and [troubleshooting](docs/troubleshooting.md#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt).
 
-Docker Sandboxes also controls Docker Hub authorization at its host proxy. A workflow's guest `docker login` can report success while the proxy replaces that credential with the host `sbx login` identity. Use an authorized least-privilege host identity on a trusted single-tenant Sandbox host, or choose Docker Container when each job must control its own Docker Hub identity. See [Docker Hub Credentials and the Host Proxy](docs/providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).
+Docker Sandboxes has a host credential-injecting forward proxy. EPAR's Docker Sandboxes template keeps the private Docker daemon and Actions listener on Docker Sandboxes' policy-enforced transparent egress path by default, so a workflow's own `docker login` remains authoritative instead of being replaced by the host `sbx login` identity. Rebuild older templates after upgrading EPAR. See [Docker Hub Credentials and Transparent Egress](docs/providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
 ### 2. Download EPAR
 

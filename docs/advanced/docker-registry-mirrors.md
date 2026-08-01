@@ -141,7 +141,7 @@ docker:
 
 A mirror cannot bypass registry authorization.
 
-For Docker Hub private images, keep doing `docker login` inside the GitHub Actions job with repository or organization secrets when the provider honors guest-scoped Docker credentials. Host-side `docker login` is not copied into EPAR runners, and EPAR does not bake Docker credentials into images. Docker Sandboxes' host security proxy may instead replace the guest's Docker Hub authorization with the host `sbx login` identity; see [Docker Hub Credentials and the Host Proxy](../providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).
+For Docker Hub private images, keep doing `docker login` inside the GitHub Actions job with repository or organization secrets. Host-side `docker login` is not copied into EPAR runners, and EPAR does not bake Docker credentials into images. EPAR's current Docker Sandboxes template routes its private Docker daemon transparently so the host forward proxy cannot replace the job's registry authorization during normal operation; see [Docker Hub Credentials and Transparent Egress](../providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
 Private pulls can use a mirror in two common ways:
 

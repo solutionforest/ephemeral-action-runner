@@ -152,6 +152,18 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 				t.Fatalf("Docker Sandboxes listener environment omitted %q", required)
 			}
 		}
+		for _, forbidden := range []string{"http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
+			if strings.Contains(runner, forbidden) {
+				t.Fatalf("Docker Sandboxes listener still inherits host forward-proxy variables via %q", forbidden)
+			}
+		}
+
+		configure := readTemplateFile(t, filepath.Join("guest", "configure-runner.sh"))
+		for _, forbidden := range []string{"http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
+			if strings.Contains(configure, forbidden) {
+				t.Fatalf("Docker Sandboxes registration still inherits host forward-proxy variables via %q", forbidden)
+			}
+		}
 
 		entrypoint := readTemplateFile(t, filepath.Join("guest", "template-entrypoint.sh"))
 		for _, required := range []string{
@@ -159,6 +171,9 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			`-n "${SSH_AUTH_SOCK_GATEWAY:-}"`,
 			"-e /run/ssh-agent.sock",
 			"host SSH-agent forwarding is not permitted",
+			"unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY",
+			`docker info --format '{{.NoProxy}}'`,
+			"policy-enforced transparent egress",
 		} {
 			if !strings.Contains(entrypoint, required) {
 				t.Fatalf("Docker Sandboxes entrypoint omitted SSH-agent isolation contract %q", required)
@@ -205,7 +220,12 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 	t.Run("source credential scrubbing", func(t *testing.T) {
 		prepare := readTemplateFile(t, filepath.Join("guest", "prepare-template.sh"))
 		for _, required := range []string{
-			"rm -rf -- /root/.docker /home/runner/.docker /home/agent/.docker",
+			`passwd_entries="$(getent passwd)"`,
+			`[[ -z "${passwd_entries}" ]]`,
+			`done <<<"${passwd_entries}"`,
+			"for root_home_docker_config in /.docker /.dockercfg",
+			`rm -rf -- "${credential_home}/.docker"`,
+			`rm -f -- "${credential_home}/.dockercfg"`,
 			"failed to scrub source Docker client configuration",
 		} {
 			if !strings.Contains(prepare, required) {
@@ -215,6 +235,17 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 		for _, forbidden := range []string{"cat /root/.docker", "cat /home/runner/.docker", "cat /home/agent/.docker", "cp /root/.docker", "cp /home/runner/.docker"} {
 			if strings.Contains(prepare, forbidden) {
 				t.Fatalf("Docker Sandboxes credential hygiene exposes or copies source credential material via %q", forbidden)
+			}
+		}
+		verify := readTemplateFile(t, filepath.Join("guest", "verify-template.sh"))
+		for _, required := range []string{
+			`passwd_entries="$(getent passwd)"`,
+			`done <<<"${passwd_entries}"`,
+			`sudo -n test ! -e "${normalized_home}/.dockercfg"`,
+			`sudo -n test ! -e "${normalized_home}/.docker"`,
+		} {
+			if !strings.Contains(verify, required) {
+				t.Fatalf("Docker Sandboxes template verification omitted foreign-home credential check %q", required)
 			}
 		}
 	})
@@ -231,6 +262,60 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			}
 		}
 	})
+}
+
+func TestDockerSandboxesDockerDaemonUsesPolicyEnforcedTransparentRegistryPath(t *testing.T) {
+	templateRoot := filepath.Join("..", "..", "templates", "docker-sandboxes")
+	content, err := os.ReadFile(filepath.Join(templateRoot, "guest", "docker-daemon.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var configuration struct {
+		Proxies struct {
+			HTTPProxy  string `json:"http-proxy"`
+			HTTPSProxy string `json:"https-proxy"`
+			NoProxy    string `json:"no-proxy"`
+		} `json:"proxies"`
+	}
+	if err := json.Unmarshal(content, &configuration); err != nil {
+		t.Fatalf("parse Docker daemon proxy configuration: %v", err)
+	}
+	if configuration.Proxies.HTTPProxy != "http://gateway.docker.internal:3128" || configuration.Proxies.HTTPSProxy != "http://gateway.docker.internal:3128" || configuration.Proxies.NoProxy != "*" {
+		t.Fatalf("Docker daemon proxy configuration = %#v, want Sandbox forward proxy with daemon-wide transparent routing", configuration.Proxies)
+	}
+	prepareContent, err := os.ReadFile(filepath.Join(templateRoot, "guest", "prepare-template.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepare := string(prepareContent)
+	for _, required := range []string{
+		"pinned source image unexpectedly supplies /etc/docker/daemon.json",
+		"install -m 0644 -o root -g root /opt/epar/docker-daemon.json /etc/docker/daemon.json",
+		"cmp -s /opt/epar/docker-daemon.json /etc/docker/daemon.json",
+		"rm -f /etc/sudoers.d/epar-proxy",
+	} {
+		if !strings.Contains(prepare, required) {
+			t.Fatalf("Docker Sandboxes template preparation omitted daemon proxy contract %q", required)
+		}
+	}
+	verifyContent, err := os.ReadFile(filepath.Join(templateRoot, "guest", "verify-template.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify := string(verifyContent)
+	for _, required := range []string{
+		"test ! -L /etc/docker/daemon.json",
+		`stat -c '%U:%G:%a' /etc/docker/daemon.json`,
+		`"root:root:644"`,
+		`.proxies == {`,
+		`(keys - ["proxies", "registry-mirrors"])`,
+		`has("registry-mirrors")`,
+		`docker info --format '{{.NoProxy}}'`,
+	} {
+		if !strings.Contains(verify, required) {
+			t.Fatalf("Docker Sandboxes template verification omitted daemon proxy contract %q", required)
+		}
+	}
 }
 
 func TestDockerSandboxesDisabledTrustPolicyIsExplicit(t *testing.T) {

@@ -6,7 +6,7 @@ if [[ "$(id -u)" != "0" ]]; then
   exit 1
 fi
 
-for command_name in bash cut docker dockerd dpkg-query find getent grep groupadd groupmod head install nohup pgrep ps readlink seq sha256sum sort stat sudo tar tr useradd usermod wc; do
+for command_name in bash cmp cut docker dockerd dpkg-query find getent grep groupadd groupmod head install jq nohup pgrep ps readlink seq sha256sum sort stat sudo tar tr useradd usermod wc; do
   command -v "${command_name}" >/dev/null 2>&1 || {
     echo "pinned source image is missing required command: ${command_name}" >&2
     exit 1
@@ -63,14 +63,41 @@ getent group sudo >/dev/null 2>&1 || {
 usermod --append --groups docker,sudo agent
 
 # Never carry registry credentials from the pinned source image into a reusable
-# runner template. Remove complete Docker client directories at the explicit
-# source identities so symlinked or helper-backed configuration cannot survive.
-rm -rf -- /root/.docker /home/runner/.docker /home/agent/.docker
-for stale_docker_config in /root/.docker /home/runner/.docker /home/agent/.docker; do
-  if [[ -e "${stale_docker_config}" || -L "${stale_docker_config}" ]]; then
-    echo "failed to scrub source Docker client configuration at ${stale_docker_config}" >&2
+# runner template. Scrub current and legacy Docker client configuration from
+# every absolute passwd home, including source identities renamed to agent.
+credential_homes=(/root /home/runner /home/agent)
+if ! passwd_entries="$(getent passwd)" || [[ -z "${passwd_entries}" ]]; then
+  echo "failed to enumerate pinned source image passwd homes" >&2
+  exit 1
+fi
+while IFS=: read -r _ _ _ _ _ account_home _; do
+  if [[ -z "${account_home}" || "${account_home}" != /* ]]; then
+    echo "pinned source image contains an invalid passwd home ${account_home:-<empty>}" >&2
     exit 1
   fi
+  normalized_home="$(readlink -m -- "${account_home}")"
+  if [[ "${normalized_home}" == "/" ]]; then
+    continue
+  fi
+  credential_homes+=("${normalized_home}")
+done <<<"${passwd_entries}"
+
+for root_home_docker_config in /.docker /.dockercfg; do
+  if [[ -e "${root_home_docker_config}" || -L "${root_home_docker_config}" ]]; then
+    echo "pinned source image contains Docker client configuration in a root-filesystem passwd home at ${root_home_docker_config}" >&2
+    exit 1
+  fi
+done
+
+for credential_home in "${credential_homes[@]}"; do
+  rm -rf -- "${credential_home}/.docker"
+  rm -f -- "${credential_home}/.dockercfg"
+  for stale_docker_config in "${credential_home}/.docker" "${credential_home}/.dockercfg"; do
+    if [[ -e "${stale_docker_config}" || -L "${stale_docker_config}" ]]; then
+      echo "failed to scrub source Docker client configuration at ${stale_docker_config}" >&2
+      exit 1
+    fi
+  done
 done
 
 install -d -m 0755 -o agent -g agent /home/agent
@@ -86,8 +113,8 @@ install -d -m 0700 -o agent -g agent \
   /run/user/1000
 install -d -m 0755 /etc/sudoers.d /etc/apt/apt.conf.d
 printf '%s\n' 'agent ALL=(ALL:ALL) NOPASSWD:ALL' > /etc/sudoers.d/epar-agent
-printf '%s\n' 'Defaults:agent env_keep += "http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS"' > /etc/sudoers.d/epar-proxy
-chmod 0440 /etc/sudoers.d/epar-agent /etc/sudoers.d/epar-proxy
+rm -f /etc/sudoers.d/epar-proxy
+chmod 0440 /etc/sudoers.d/epar-agent
 printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' 'APT::Periodic::Unattended-Upgrade "0";' > /etc/apt/apt.conf.d/99epar-disable-periodic
 rm -f /etc/systemd/system/timers.target.wants/apt-daily.timer /etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer
 
@@ -101,3 +128,17 @@ if [[ -n "$(find /var/lib/docker -mindepth 1 -print -quit)" ]]; then
 fi
 
 sudo -u agent -H true
+
+# Docker Sandboxes' forward proxy can replace registry Authorization headers
+# with a host credential. Keep the sandbox-private daemon's registry traffic on
+# the transparent, policy-enforced path so workflow-scoped Docker credentials
+# remain authoritative. The Actions listener also starts from a clean
+# environment without inherited proxy variables, so ordinary job traffic uses
+# Docker Sandboxes' policy-enforced transparent path by default.
+install -d -m 0755 -o root -g root /etc/docker
+if [[ -e /etc/docker/daemon.json || -L /etc/docker/daemon.json ]]; then
+  echo "pinned source image unexpectedly supplies /etc/docker/daemon.json" >&2
+  exit 1
+fi
+install -m 0644 -o root -g root /opt/epar/docker-daemon.json /etc/docker/daemon.json
+cmp -s /opt/epar/docker-daemon.json /etc/docker/daemon.json
