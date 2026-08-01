@@ -234,6 +234,11 @@ jobs:
         if: runner.os == 'Windows'
         run: scripts/test/windows-native-controller-contract.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
 
+      - name: Verify Windows start command forwarding
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: scripts/test/start-command-forwarding.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+
       - name: Verify Docker Sandboxes plan-only contracts
         shell: pwsh
         if: runner.os == 'Windows'

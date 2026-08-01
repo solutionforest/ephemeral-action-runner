@@ -41,8 +41,8 @@ Scripts run as root in listed order after the Actions runner is installed and be
 The built-in `install-web-e2e.sh` adds browser/E2E tooling. It needs EPAR's pinned `actions/runner-images` checkout:
 
 ```bash
-ephemeral-action-runner image update-upstream
-ephemeral-action-runner image build --replace
+./start image update-upstream
+./start image build --replace
 ```
 
 The default Catthehacker sources and runner-only Tart builds do not require that checkout. Use the exact configuration and provider guide to decide whether a selected script needs it.
@@ -84,8 +84,8 @@ Docker Sandboxes uses `image.sourceImage`, `image.sourcePlatform`, and `image.cu
 ## Verify A Customized Artifact
 
 ```bash
-ephemeral-action-runner pool verify --instances 1 --cleanup
-ephemeral-action-runner pool verify --instances 1 --register-only --cleanup
+./start pool verify --instances 1 --cleanup
+./start pool verify --instances 1 --register-only --cleanup
 ```
 
 The first command checks an unregistered disposable instance. The second also checks GitHub registration. Provider-specific runtime checks run when their feature markers are present; for example, Docker-enabled images validate Docker, Compose, Buildx, and a real container.

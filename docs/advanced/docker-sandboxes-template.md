@@ -26,12 +26,12 @@ The compatibility scripts under `scripts/docker-sandboxes` delegate to this comm
 
 ## Configure And Prewarm
 
-Run `./start` with no configuration. The wizard offers `full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another `catthehacker/ubuntu` tag; verifies the tag and native platform; validates optional custom install scripts; displays source, platform, size estimates, reserve, and duration; then saves the desired configuration after one confirmation. Normal startup performs the build and import, and a provisioning failure leaves the configuration available for a retry.
+Run `./start` with no configuration. The wizard offers `full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another `catthehacker/ubuntu` tag; verifies the tag and native platform; validates optional custom install scripts; displays source, platform, size estimates, and reserve in the final review; then saves the desired configuration after one confirmation. Normal startup performs the build and import, and a provisioning failure leaves the configuration available for a retry.
 
 After configuration, prewarm the selected template outside the job path:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-native-controller.ps1 pool verify --config .local/docker-sandboxes.yml --project-root . --instances 1 --cleanup
+.\start.ps1 pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
 ```
 
 Do not add `--register-only`. This creates, verifies, and exactly removes one unregistered sandbox without requesting a GitHub registration token. The first create can still be slow; later creates reuse the host-level template cache.

@@ -38,9 +38,9 @@ For transient GitHub or network failures during replacement, including `429` and
 ## Inspect status and logs
 
 ```bash
-ephemeral-action-runner status
-ephemeral-action-runner logs path
-ephemeral-action-runner logs list
+./start status
+./start logs path
+./start logs list
 ```
 
 Add `--no-github` to `status` when you need a local-only view. By default, host logs live under `work/logs`; manager events are console-first and instance/build transcripts are file artifacts. A failed launch or readiness check appends bounded guest diagnostics to the relevant instance log. See [Logging](logging.md) for locations, formats, retention, and shipping.
@@ -50,8 +50,8 @@ When multiple configs run concurrently, give each one a distinct `logging.direct
 ## Clean up safely
 
 ```bash
-ephemeral-action-runner cleanup
-ephemeral-action-runner pool down
+./start cleanup
+./start pool down
 ```
 
 `pool down` is an alias for `cleanup`. Cleanup is intentionally bounded: Docker Sandboxes uses the durable ledger of exact owned identities, while legacy providers use the configured `pool.namePrefix` boundary. Unknown, shared, or identity-drifted resources are report-only rather than broad deletion targets. Do not reuse a prefix across machines or independent supervisors in the same GitHub organization.
@@ -61,11 +61,11 @@ Use `cleanup --no-github` only when you intentionally want to leave GitHub runne
 ## Maintain storage and retention
 
 ```bash
-ephemeral-action-runner storage status
-ephemeral-action-runner storage prune
-ephemeral-action-runner storage prune --execute
-ephemeral-action-runner storage prune --legacy
-ephemeral-action-runner logs prune --dry-run
+./start storage status
+./start storage prune
+./start storage prune --execute
+./start storage prune --legacy
+./start logs prune --dry-run
 ```
 
 Normal `./start` reconciles interrupted exact-owned work and retires unreferenced superseded artifacts. `storage prune` is a preview until `--execute` is supplied. `storage prune --legacy` reports prefix-era resources and requires its displayed plan hash for execution. Log pruning is separate. EPAR does not run broad Docker prune, Docker Sandboxes reset, WSL reset, Docker Desktop reset, or VHDX compaction. Read [Storage](storage.md) before reclaiming capacity.

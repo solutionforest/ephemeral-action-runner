@@ -56,8 +56,8 @@ The outer container has no host Docker socket mount and does not publish host po
 ## Verification
 
 ```bash
-ephemeral-action-runner pool verify --instances 1 --cleanup
-ephemeral-action-runner pool verify --instances 1 --register-only --cleanup
+./start pool verify --instances 1 --cleanup
+./start pool verify --instances 1 --register-only --cleanup
 ```
 
 For an ARM64 host that must run amd64 Docker images, verify execution inside a live EPAR runner rather than relying on image pull success:

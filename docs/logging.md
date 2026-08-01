@@ -1,6 +1,6 @@
 # Logging
 
-EPAR writes logs under `work/logs` by default. Use `ephemeral-action-runner logs path` to print the resolved directory.
+EPAR writes logs under `work/logs` by default. Use `./start logs path` to print the resolved directory.
 
 ```text
 work/logs/
@@ -58,8 +58,8 @@ EPAR rotates active manager and transcript files at `logging.maxFileSizeMiB`, re
 Inspect or preview recognized log maintenance with:
 
 ```bash
-ephemeral-action-runner logs list
-ephemeral-action-runner logs prune --dry-run
+./start logs list
+./start logs prune --dry-run
 ```
 
 Remove `--dry-run` only after reviewing the exact retention plan.

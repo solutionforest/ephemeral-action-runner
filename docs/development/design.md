@@ -4,7 +4,7 @@ EPAR has one provider-neutral control flow:
 
 ```mermaid
 flowchart LR
-  CLI["CLI and ./start wizard"] --> Pool["Common pool lifecycle"]
+  CLI["Universal start wrapper and CLI"] --> Pool["Common pool lifecycle"]
   Pool --> Provider["Provider contracts"]
   Pool --> GitHub["GitHub runner API"]
   Pool --> Storage["Capacity and retention"]
@@ -20,6 +20,8 @@ flowchart LR
 - `internal/storage` owns storage measurements, artifact ownership, retention plans, and exact cleanup execution.
 
 Provider code must not implement a second pool lifecycle. A capability that every provider needs belongs in a common contract; genuinely optional behavior uses an explicit capability interface.
+
+The first-run wizard follows the same rule. Its section state, Back history, review, and rendering are provider-neutral. Provider descriptors declare prerequisite, onboarding, host-trust, and review contributions; shared strategies implement reusable flows such as Catthehacker image selection. A new provider may reuse an existing strategy, while a genuinely new capability adds one typed strategy instead of inserting provider-name branches throughout the wizard.
 
 ## Instance Lifecycle
 

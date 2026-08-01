@@ -8,7 +8,7 @@ GitHub decides which repositories can route jobs to a self-hosted runner through
 2. Create a dedicated group for EPAR runners.
 3. Choose **Selected repositories** and add only repositories whose workflows are trusted to run on the EPAR host.
 4. Keep public repository access disabled.
-5. Run `./start` or `ephemeral-action-runner init` and select that group when the wizard lists the organization’s live runner groups.
+5. Run `./start` and select that group when the wizard lists the organization’s live runner groups.
 
 See GitHub’s [runner-group access documentation](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access) for the organization and enterprise controls.
 

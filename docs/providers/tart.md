@@ -53,7 +53,7 @@ Tart clones the reusable image, starts the VM headless, uses the guest agent for
 ## Verification
 
 ```bash
-ephemeral-action-runner pool verify --instances 1 --cleanup
+./start pool verify --instances 1 --cleanup
 ```
 
 For the optional Rosetta experiment, use `configs/tart.web-e2e.example.yml` or set a distinct `provider.rosettaTag`. Verify a real container execution before routing amd64 workflows:

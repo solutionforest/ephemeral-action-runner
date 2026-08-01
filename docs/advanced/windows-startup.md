@@ -6,11 +6,7 @@ Use the Startup folder for a personal machine where a visible foreground window 
 
 Run EPAR manually once first so `.local\config.yml` exists. The first run can take a while because `start` may build or refresh the configured image before starting runners.
 
-For startup automation, build a local binary from the source folder once:
-
-```powershell
-go build -o .\bin\ephemeral-action-runner.exe .\cmd\ephemeral-action-runner
-```
+Startup automation must use the same wrapper as a manual launch so first-run handling, local-Go and no-Go selection, argument forwarding, trust setup, and controller updates stay consistent. The examples below run `start.cmd` through `cmd.exe`; a PowerShell-based task may instead run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\path\to\ephemeral-action-runner\start.ps1 --config .local\config.yml`.
 
 ## Startup Folder Shortcut
 
@@ -20,10 +16,11 @@ Open the current user's Startup folder:
 Start-Process shell:startup
 ```
 
-Create a shortcut to the local binary:
+Create a shortcut to the wrapper through `cmd.exe`:
 
 ```text
-Target:   D:\path\to\ephemeral-action-runner\bin\ephemeral-action-runner.exe
+Target:   C:\Windows\System32\cmd.exe
+Arguments: /d /s /c ""D:\path\to\ephemeral-action-runner\start.cmd" --config .local\config.yml"
 Start in: D:\path\to\ephemeral-action-runner
 ```
 
@@ -35,9 +32,9 @@ You can also create the shortcut from PowerShell:
 $root = "D:\path\to\ephemeral-action-runner"
 $startup = [Environment]::GetFolderPath("Startup")
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("$startup\EPAR.lnk")
-$shortcut.TargetPath = Join-Path $root "bin\ephemeral-action-runner.exe"
+$shortcut.TargetPath = $env:ComSpec
 $shortcut.WorkingDirectory = $root
-$shortcut.Arguments = "start --config .local\config.yml"
+$shortcut.Arguments = '/d /s /c ""{0}" --config .local\config.yml"' -f (Join-Path $root "start.cmd")
 $shortcut.Save()
 ```
 
@@ -49,8 +46,8 @@ Create a user logon task:
 2. Choose **Create Task**.
 3. On **Triggers**, add **At log on**. Add a short delay if Docker needs time to start.
 4. On **Actions**, choose **Start a program**.
-5. Set **Program/script** to `D:\path\to\ephemeral-action-runner\bin\ephemeral-action-runner.exe`.
-6. Set **Add arguments** to `start --config .local\config.yml`.
+5. Set **Program/script** to `C:\Windows\System32\cmd.exe`.
+6. Set **Add arguments** to `/d /s /c ""D:\path\to\ephemeral-action-runner\start.cmd" --config .local\config.yml"`.
 7. Set **Start in** to `D:\path\to\ephemeral-action-runner`.
 
 If the host runtime is tied to the user session, keep the task as a user logon task. A boot-time system task may start too early or without the expected Docker context.
@@ -59,9 +56,10 @@ PowerShell equivalent:
 
 ```powershell
 $root = "D:\path\to\ephemeral-action-runner"
+$arguments = '/d /s /c ""{0}" --config .local\config.yml"' -f (Join-Path $root "start.cmd")
 $action = New-ScheduledTaskAction `
-  -Execute (Join-Path $root "bin\ephemeral-action-runner.exe") `
-  -Argument "start --config .local\config.yml" `
+  -Execute $env:ComSpec `
+  -Argument $arguments `
   -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $trigger.Delay = "PT1M"

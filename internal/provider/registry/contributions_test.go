@@ -22,6 +22,9 @@ func TestEveryProviderRegistersRequiredContributions(t *testing.T) {
 		if descriptor.WizardNumber == "" || descriptor.WizardLabel == "" || len(descriptor.WizardAliases) == 0 {
 			t.Errorf("%s has an incomplete ./start wizard contribution", descriptor.Type)
 		}
+		if err := provider.ValidateWizardContributions(descriptor); err != nil {
+			t.Errorf("%s has incomplete wizard contributions: %v", descriptor.Type, err)
+		}
 		if !descriptor.ConfigurationDecoder || !descriptor.ConfigurationDefaults || !descriptor.ConfigurationValidator {
 			t.Errorf("%s has an incomplete configuration contribution", descriptor.Type)
 		}
@@ -36,9 +39,9 @@ func TestEveryProviderRegistersRequiredContributions(t *testing.T) {
 		default:
 			t.Errorf("%s has unsupported image mode %q", descriptor.Type, descriptor.ImageMode)
 		}
-		if descriptor.ImageMode == provider.ImageModeTemplate {
+		if descriptor.WizardOnboarding == provider.WizardOnboardingCatthehackerDocker {
 			if !descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0 {
-				t.Errorf("%s has no guided template provisioning contribution", descriptor.Type)
+				t.Errorf("%s has no guided Docker-image provisioning contribution", descriptor.Type)
 			}
 			if descriptor.WizardImageProfiles[0].Name != "full" || descriptor.WizardImageProfiles[0].Tag != "full-latest" {
 				t.Errorf("%s does not register its default image profile first", descriptor.Type)

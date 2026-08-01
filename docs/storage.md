@@ -15,12 +15,12 @@ storage:
 `storage status` reports capacity, exact ownership, references, live blockers, cleanup-pending work, and reclaimable estimates. `storage prune` is always a preview unless `--execute` is supplied.
 
 ```text
-ephemeral-action-runner storage status
-ephemeral-action-runner storage status --json
-ephemeral-action-runner storage prune
-ephemeral-action-runner storage prune --execute
-ephemeral-action-runner storage prune --legacy
-ephemeral-action-runner storage prune --legacy --execute --plan <hash>
+./start storage status
+./start storage status --json
+./start storage prune
+./start storage prune --execute
+./start storage prune --legacy
+./start storage prune --legacy --execute --plan <hash>
 ```
 
 With `automaticHousekeeping: conservative`, EPAR reconciles interrupted work at startup and after successful artifact activation. It immediately retires an unreferenced, superseded resource only when its catalog receipt and live readback prove that EPAR created or introduced it. The grace period applies to abandoned or incomplete temporary work, not to a successfully replaced generation. A resource referenced by another configuration, lease, container, sandbox, distribution, or builder remains protected.

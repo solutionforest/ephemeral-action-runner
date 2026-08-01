@@ -28,7 +28,7 @@ On Windows the helper reads local-machine and current-user root stores and exclu
 
 Do not replace the official wrapper with a bare `docker run` for Docker Sandboxes. EPAR rejects the legacy controller-in-Docker path for that provider.
 
-You can run the Docker wrapper directly instead of through `./start`:
+For wrapper-development diagnostics, you can run the Docker helper directly. Normal manual and automatic operation should continue to use `./start`, `start.ps1`, or `start.cmd`:
 
 ```bash
 scripts/run-with-docker.sh version

@@ -31,13 +31,13 @@ On native Windows PowerShell, run:
 .\start.ps1
 ```
 
-The wrapper uses local Go when available, otherwise it uses Docker to build and cache a native controller under `.local/bin`. See [Running EPAR Without Installing Go](advanced/no-go-install.md) for the fallback details. The equivalent direct source command is:
+The wrapper uses local Go when available, otherwise it uses Docker to build and cache a native controller under `.local/bin`. See [Running EPAR Without Installing Go](advanced/no-go-install.md) for the fallback details. Direct `go run` commands are development and diagnostic equivalents rather than the normal operator interface:
 
 ```bash
 go run ./cmd/ephemeral-action-runner start
 ```
 
-When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group. The runner-group list orders GitHub's Default group first, hides blocked groups and policy details initially, and lets you reveal either from the menu. The provider list shows every provider with its prerequisite status and refuses unavailable selections. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share one Catthehacker image/profile and custom-script flow, followed by an informational physical-growth estimate and confirmation. The wizard writes the desired configuration first; direct `init` then exits, while embedded `./start` continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
+When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group. The runner-group list orders GitHub's Default group first, hides blocked groups and policy details initially, and lets you reveal either from the menu. The provider list shows every provider with its prerequisite status and refuses unavailable selections. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share one Catthehacker image/profile and custom-script flow. Later option lists use `0` to go back, text prompts use `/back`, and a final provider-neutral review shows the applicable artifact estimate before one creation decision. Running `./start init` exits after writing, while an embedded first run continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
 
 See [Docker Sandboxes](providers/docker-sandboxes.md) for source profiles, capacity, local receipts, and platform validation status.
 
@@ -46,7 +46,7 @@ See [Docker Sandboxes](providers/docker-sandboxes.md) for source profiles, capac
 Create configuration without starting runners:
 
 ```bash
-go run ./cmd/ephemeral-action-runner init
+./start init
 ```
 
 Pass a config path and an instance count through the wrapper:
@@ -55,13 +55,13 @@ Pass a config path and an instance count through the wrapper:
 ./start --config .local/ci.yml --instances 2
 ```
 
-Equivalent direct command:
+Development/diagnostic equivalent:
 
 ```bash
 go run ./cmd/ephemeral-action-runner start --config .local/ci.yml --instances 2
 ```
 
-On Windows PowerShell, use backslash paths when that is clearer:
+On Windows PowerShell, use backslash paths when that is clearer. The second command is the development/diagnostic equivalent:
 
 ```powershell
 .\start.ps1 --config .local\ci.yml --instances 2
@@ -95,13 +95,13 @@ Manual policy means this command triggers remote checks. `./start image build` r
 Verify one disposable runner without GitHub registration:
 
 ```bash
-go run ./cmd/ephemeral-action-runner pool verify --instances 1 --cleanup
+./start pool verify --instances 1 --cleanup
 ```
 
 Verify registration and online/idle state:
 
 ```bash
-go run ./cmd/ephemeral-action-runner pool verify --instances 2 --register-only --cleanup
+./start pool verify --instances 2 --register-only --cleanup
 ```
 
 `--cleanup` removes verification resources after the check. Docker Sandboxes uses its exact ownership records; legacy providers use the configured pool-name boundary. Use [Operations](operations.md) for the distinction and recovery guidance.
@@ -111,9 +111,9 @@ go run ./cmd/ephemeral-action-runner pool verify --instances 2 --register-only -
 `start` is the normal command because it checks the reusable image or template first. `pool up` is for a pool you have deliberately prepared:
 
 ```bash
-go run ./cmd/ephemeral-action-runner pool up --instances 2
-go run ./cmd/ephemeral-action-runner status
-go run ./cmd/ephemeral-action-runner cleanup
+./start pool up --instances 2
+./start status
+./start cleanup
 ```
 
 Use `status --no-github` or `cleanup --no-github` when you intentionally need to skip GitHub runner status or deletion. `pool down` is an alias for cleanup.
@@ -121,7 +121,7 @@ Use `status --no-github` or `cleanup --no-github` when you intentionally need to
 For a command-construction preview on compatible providers, add `--dry-run`:
 
 ```bash
-go run ./cmd/ephemeral-action-runner pool verify --dry-run --instances 1
+./start pool verify --dry-run --instances 1
 ```
 
 Docker Sandboxes intentionally does not support dry-run instance creation because EPAR must read back the exact active template-cache identity. Use its admission and template checks instead.

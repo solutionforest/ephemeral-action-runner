@@ -119,6 +119,19 @@ func TestMatchingStartCommandPreservesWrapperEntryPoint(t *testing.T) {
 	}
 }
 
+func assertSingleFinalInitReview(t *testing.T, output string) {
+	t.Helper()
+	if got := strings.Count(output, "Configuration review:"); got != 1 {
+		t.Fatalf("configuration review count = %d, want exactly one:\n%s", got, output)
+	}
+	if !strings.Contains(output, "1. Looks good, proceed to create configuration (default)") {
+		t.Fatalf("configuration review omitted the forward action:\n%s", output)
+	}
+	if strings.Contains(output, "Create this configuration?") {
+		t.Fatalf("provider setup retained an early creation decision:\n%s", output)
+	}
+}
+
 func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	stubNoWSL2(t)
@@ -162,6 +175,7 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 			t.Fatalf("output missing %q:\n%s", want, out.String())
 		}
 	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
 	}
@@ -189,7 +203,7 @@ func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\nn\n\n\nn\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\n\n\n\nn\n"),
 		Out:         &out,
 		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
 			t.Fatal("manager factory should not run after choosing to review the new config")
@@ -253,6 +267,7 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	if !strings.Contains(out.String(), "Continuing with") {
 		t.Fatalf("output missing continuation message:\n%s", out.String())
 	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
 	}
@@ -317,6 +332,7 @@ func TestStartInteractiveMissingConfigCanSelectDockerSandboxes(t *testing.T) {
 	if !strings.Contains(out.String(), "Docker Sandboxes — recommended") || !strings.Contains(out.String(), "Continuing with") {
 		t.Fatalf("output did not include capability-ready Docker Sandboxes selection and start continuation:\n%s", out.String())
 	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
 	}
@@ -364,6 +380,7 @@ func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	if !strings.Contains(out.String(), "Continuing with") {
 		t.Fatalf("output missing continuation message:\n%s", out.String())
 	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
 	}

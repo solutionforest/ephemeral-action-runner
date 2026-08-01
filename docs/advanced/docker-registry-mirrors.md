@@ -165,7 +165,7 @@ EPAR intentionally does not rewrite Docker image names inside workflows. That av
 Start a runner instance with mirrors configured:
 
 ```bash
-./bin/ephemeral-action-runner pool verify --instances 1 --cleanup
+./start pool verify --instances 1 --cleanup
 ```
 
 For Docker Container, inspect the inner daemon:

@@ -172,7 +172,7 @@ func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 	if !strings.Contains(out.String(), "start") || !strings.Contains(out.String(), "pool up --instances 2") {
 		t.Fatalf("init output did not include next steps:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "Pool name prefix (press Enter to use build-box-01-a4f9c2):") {
+	if !strings.Contains(out.String(), "Pool name prefix (press Enter to use build-box-01-a4f9c2; /back to return):") {
 		t.Fatalf("init output did not explain default prefix acceptance:\n%s", out.String())
 	}
 	hostTrustExplanation := "Runners need this host's trusted TLS roots to access services that this machine trusts."
@@ -194,6 +194,160 @@ func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 		if strings.Contains(out.String(), hidden) {
 			t.Fatalf("init output included runner-group details before D was selected %q:\n%s", hidden, out.String())
 		}
+	}
+}
+
+func TestInitWizardCanBackAcrossSectionsAndPreservesCompletedAnswers(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	input := strings.Join([]string{
+		"123456", "solutionforest", ".local/github-app.pem", "1",
+		"", "2", "n", "custom-prefix", "y", "2", "06:30",
+		"0", "0", "/back", "/back", "0", "0",
+		"1", "", "1", "", "", "", "", "",
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Image.SourceImage != "ghcr.io/catthehacker/ubuntu:act-latest" || cfg.Pool.NamePrefix != "custom-prefix" || cfg.Image.UpdateFrequency != config.ImageUpdateFrequencyDaily || cfg.Image.UpdateTime != "06:30" {
+		t.Fatalf("answers were not preserved after repeated Back: image=%q prefix=%q updates=%s@%s", cfg.Image.SourceImage, cfg.Pool.NamePrefix, cfg.Image.UpdateFrequency, cfg.Image.UpdateTime)
+	}
+	for _, want := range []string{"0. Back", "/back to return", "Current runner artifact setup:", "Configuration review:"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("wizard transcript omitted %q:\n%s", want, out.String())
+		}
+	}
+	if got := strings.Count(out.String(), "Configuration review:"); got != 2 {
+		t.Fatalf("review count = %d, want 2 after returning from the first review", got)
+	}
+}
+
+func TestInitWizardQuitAtReviewWritesNoConfig(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	input := strings.Join([]string{"123456", "solutionforest", ".local/github-app.pem", "1", "", "", "", "", "", "", "", "q"}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("config exists after review quit: %v", err)
+	}
+	if !strings.Contains(out.String(), "Q. Quit without writing a config") || !strings.Contains(out.String(), "Setup cancelled. No config was written.") {
+		t.Fatalf("review quit was not explained:\n%s", out.String())
+	}
+}
+
+func TestInitWizardReviewCanEditPoolDirectly(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	input := strings.Join([]string{
+		"123456", "solutionforest", ".local/github-app.pem", "1",
+		"", "", "", "", "", "", "",
+		"5", "edited-prefix", "",
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pool.NamePrefix != "edited-prefix" {
+		t.Fatalf("pool.namePrefix = %q, want direct review edit", cfg.Pool.NamePrefix)
+	}
+	if got := strings.Count(out.String(), "Configuration review:"); got != 2 {
+		t.Fatalf("review count = %d, want initial and edited reviews", got)
+	}
+}
+
+func TestInitWizardBackAfterDirectEditUsesNaturalHistory(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	input := strings.Join([]string{
+		"123456", "solutionforest", ".local/github-app.pem", "1",
+		"", "", "", "", "", "", "",
+		"5", "edited-prefix",
+		"0", "0", "/back", "", "", "", "", "q",
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("config exists after review quit: %v", err)
+	}
+	transcript := out.String()
+	firstReview := strings.Index(transcript, "Configuration review:")
+	secondRelative := strings.Index(transcript[firstReview+1:], "Configuration review:")
+	if firstReview < 0 || secondRelative < 0 {
+		t.Fatalf("expected two reviews after direct edit:\n%s", transcript)
+	}
+	secondReview := firstReview + 1 + secondRelative
+	afterSecondReview := transcript[secondReview:]
+	updates := strings.Index(afterSecondReview, "Automatic image and Actions runner updates:")
+	pool := strings.Index(afterSecondReview, "Pool name prefix must be unique")
+	if updates < 0 || pool < 0 || updates > pool {
+		t.Fatalf("Back after direct edit did not resume the natural history at updates:\n%s", afterSecondReview)
+	}
+}
+
+func TestInitWizardProviderEditInvalidatesProviderSpecificDraft(t *testing.T) {
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	stubNoWSL2(t)
+	stubTartAvailable(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".local", "config.yml")
+	input := strings.Join([]string{
+		"123456", "solutionforest", ".local/github-app.pem", "1",
+		"", "2", "n", "custom-prefix", "y", "", "",
+		"3", "4", "",
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Type != "tart" || cfg.Pool.NamePrefix != "custom-prefix" {
+		t.Fatalf("provider edit produced provider=%q prefix=%q, want Tart with preserved pool", cfg.Provider.Type, cfg.Pool.NamePrefix)
+	}
+	reviews := strings.Split(out.String(), "Configuration review:")
+	if len(reviews) != 3 {
+		t.Fatalf("review count = %d, want 2", len(reviews)-1)
+	}
+	if !strings.Contains(reviews[1], "Runner artifact estimate:") || strings.Contains(reviews[2], "Runner artifact estimate:") {
+		t.Fatalf("provider-specific estimate was not invalidated after switching to Tart:\n%s", out.String())
+	}
+}
+
+func TestInitWizardFreeTextZeroIsNotBack(t *testing.T) {
+	var out bytes.Buffer
+	result, err := promptPoolNamePrefixWizard(&out, bufio.NewReader(strings.NewReader("0\nvalid-prefix\n")), "default-prefix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != initWizardNext || result.Value != "valid-prefix" {
+		t.Fatalf("pool result = %+v, want valid-prefix after rejecting literal zero", result)
+	}
+	if !strings.Contains(out.String(), "Pool name prefix is invalid") {
+		t.Fatalf("literal zero was treated as navigation instead of text validation:\n%s", out.String())
 	}
 }
 
@@ -558,7 +712,7 @@ func TestInitCanDisableHostTrustOverlay(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\nn\n\n\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -586,7 +740,7 @@ func TestInitDoesNotWriteEnabledConfigWhenHostTrustPreflightFails(t *testing.T) 
 		ProjectRoot:     dir,
 		ConfigPath:      path,
 		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n"),
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n\n"),
 		Out:             &bytes.Buffer{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "collector unavailable") {
@@ -608,7 +762,7 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\ncustom-prefix\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\ncustom-prefix\n\n\n\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -634,7 +788,7 @@ func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n\n-bad\nfixed-prefix\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n-bad\nfixed-prefix\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -851,7 +1005,7 @@ func TestInitWSL2ChoiceDefaultsToDockerContainerAndRepromptsInvalidValues(t *tes
 	if !strings.Contains(string(configBytes), "type: docker-container") {
 		t.Fatalf("config did not use the default Docker Container provider:\n%s", configBytes)
 	}
-	if !strings.Contains(out.String(), "Choose an available provider number or name shown above, or R to refresh.") {
+	if !strings.Contains(out.String(), "Choose an available provider number or name shown above, R to refresh, or 0 to go back when shown.") {
 		t.Fatalf("init output did not explain invalid provider input:\n%s", out.String())
 	}
 	if strings.Contains(out.String(), "Start runners now?") {
@@ -1110,7 +1264,7 @@ func TestDockerSandboxesWizardAllowsEmptyCustomInstallScriptChoice(t *testing.T)
 	if len(profile.CustomScripts) != 0 {
 		t.Fatalf("custom scripts = %#v, want none", profile.CustomScripts)
 	}
-	for _, want := range []string{"Custom install script path (press Enter for none):", "Custom install scripts: none"} {
+	for _, want := range []string{"Custom install script path (press Enter for none; /back to return):", "Custom install scripts: none"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("wizard output omitted %q:\n%s", want, out.String())
 		}
@@ -1144,16 +1298,20 @@ func TestDockerSandboxesWizardRepromptsAfterUnresolvableTag(t *testing.T) {
 	}
 }
 
-func TestDockerSandboxesWizardConfirmationRefusalReturnsNoProfile(t *testing.T) {
+func TestDockerSandboxesWizardBackReturnsNoProfile(t *testing.T) {
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 	}, nil)
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, io.Discard, bufio.NewReader(strings.NewReader("1\nn\nn\n")))
+	var out bytes.Buffer
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("/back\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if profile != nil || accepted {
-		t.Fatalf("confirmation refusal returned profile=%+v accepted=%t", profile, accepted)
+		t.Fatalf("back returned profile=%+v accepted=%t", profile, accepted)
+	}
+	if strings.Contains(out.String(), "Create this configuration?") {
+		t.Fatalf("provider setup retained an early create confirmation:\n%s", out.String())
 	}
 }
 
@@ -2045,6 +2203,9 @@ func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "2. Docker Sandboxes — recommended when ready") || !strings.Contains(out.String(), "3. WSL2") || !strings.Contains(out.String(), "4. Tart (experimental)") || !strings.Contains(out.String(), "Docker CLI or daemon check failed: Docker is unavailable on this Mac") {
 		t.Fatalf("init output did not offer Tart:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Configuration review:") || !strings.Contains(out.String(), "Runner image: ghcr.io/cirruslabs/ubuntu:latest") || !strings.Contains(out.String(), "Reusable artifact: epar-ubuntu-24-arm64") || strings.Contains(out.String(), "Runner artifact estimate:") || strings.Contains(out.String(), "Create this configuration?") {
+		t.Fatalf("Tart review was missing or contained Docker-specific setup output:\n%s", out.String())
 	}
 }
 

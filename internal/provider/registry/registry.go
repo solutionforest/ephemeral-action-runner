@@ -34,7 +34,7 @@ type entry struct {
 
 var entries = []entry{
 	{
-		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles()},
+		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
 			environment := map[string]string{
@@ -61,6 +61,10 @@ var entries = []entry{
 			ImageMode:              provider.ImageModeTemplate,
 			GuidedArtifacts:        true,
 			WizardImageProfiles:    catthehackerProfiles(),
+			WizardPrerequisite:     provider.WizardPrerequisiteDockerSandboxes,
+			WizardOnboarding:       provider.WizardOnboardingCatthehackerDocker,
+			WizardHostTrust:        provider.WizardHostTrustOverlay,
+			WizardReview:           provider.WizardReviewDockerImage,
 		},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			sandboxes := dockersandboxes.NewWithDryRun("", dryRun)
@@ -68,14 +72,14 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles()},
+		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			installRoot := config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)
 			return adaptLegacy(wsl.New("", installRoot, projectRoot, dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (experimental)", WizardSupported: true, WizardNumber: "4", WizardLabel: "Tart (experimental)", WizardAliases: []string{"tart"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative},
+		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (experimental)", WizardSupported: true, WizardNumber: "4", WizardLabel: "Tart (experimental)", WizardAliases: []string{"tart"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative, WizardPrerequisite: provider.WizardPrerequisiteTart, WizardOnboarding: provider.WizardOnboardingNone, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewNativeImage, WizardReviewSource: "ghcr.io/cirruslabs/ubuntu:latest", WizardReviewOutput: "epar-ubuntu-24-arm64"},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			return adaptLegacy(tart.New("", dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},
@@ -135,11 +139,11 @@ func New(cfg config.Config, projectRoot string, dryRun bool) (Runtime, error) {
 		return Runtime{}, provider.UnsupportedTypeError(cfg.Provider.Type)
 	}
 	descriptor := registered.descriptor
-	if !descriptor.WizardSupported || descriptor.WizardNumber == "" || descriptor.WizardLabel == "" || len(descriptor.WizardAliases) == 0 || !descriptor.ConfigurationDecoder || !descriptor.ConfigurationDefaults || !descriptor.ConfigurationValidator || !descriptor.LifecycleSupported || !descriptor.StorageSupported || descriptor.ImageMode == "" {
+	if !descriptor.ConfigurationDecoder || !descriptor.ConfigurationDefaults || !descriptor.ConfigurationValidator || !descriptor.LifecycleSupported || !descriptor.StorageSupported || descriptor.ImageMode == "" {
 		return Runtime{}, fmt.Errorf("provider %q has an incomplete registry entry", cfg.Provider.Type)
 	}
-	if (descriptor.ImageMode == provider.ImageModeTemplate || descriptor.Type == "docker-container" || descriptor.Type == "wsl") && (!descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0) {
-		return Runtime{}, fmt.Errorf("Docker-image-capable provider %q has no guided artifact onboarding contribution", cfg.Provider.Type)
+	if err := provider.ValidateWizardContributions(descriptor); err != nil {
+		return Runtime{}, fmt.Errorf("provider %q has incomplete wizard contributions: %w", cfg.Provider.Type, err)
 	}
 	runtime := registered.factory(cfg, projectRoot, dryRun)
 	if runtime.Lifecycle == nil || runtime.Storage == nil {

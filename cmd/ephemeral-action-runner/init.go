@@ -27,6 +27,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	imageartifact "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes"
 	sandboxcapacity "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/capacity"
 	sandboxpolicy "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/policy"
@@ -139,7 +140,7 @@ type initDockerSandboxesCapacityResult struct {
 	CapacityStatus storage.CapacityStatus
 }
 
-type initDockerSandboxesProfile struct {
+type initDockerImageProfile struct {
 	Provider          string
 	HostPlatform      sandboxpromotion.Platform
 	GuestPlatform     string
@@ -149,6 +150,10 @@ type initDockerSandboxesProfile struct {
 	RootDisk          string
 	DockerDisk        string
 }
+
+// Retain the established helper name while generated-config renderers and
+// provider tests migrate to the provider-neutral Docker image profile name.
+type initDockerSandboxesProfile = initDockerImageProfile
 
 type initImageUpdatePolicy struct {
 	Frequency string
@@ -268,7 +273,7 @@ func runInitWithOptions(opts initOptions) error {
 	}
 	fmt.Fprintln(opts.Out, "EPAR first-run setup")
 	fmt.Fprintln(opts.Out, "")
-	fmt.Fprintln(opts.Out, "This creates .local/config.yml for an EPAR runner.")
+	fmt.Fprintln(opts.Out, "This creates an EPAR runner configuration.")
 	fmt.Fprintln(opts.Out, "Before continuing, create a GitHub App with organization self-hosted runner read/write access.")
 	fmt.Fprintln(opts.Out, "See README.md and docs/github-app.md for the GitHub App steps.")
 	fmt.Fprintln(opts.Out, "")
@@ -296,77 +301,21 @@ func runInitWithOptions(opts initOptions) error {
 		APIBaseURL:     "https://api.github.com",
 		WebBaseURL:     "https://github.com",
 	}
-	runnerGroup, err := promptRunnerGroup(opts.Context, opts.Out, reader, newInitRunnerGroupClient(githubConfig))
-	if err != nil {
-		return err
-	}
-	providerType, _, selectedProfile, err := promptInitProvider(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck)
-	if err != nil {
-		return err
-	}
 	defaultPrefix, err := generatedPoolNamePrefix()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(opts.Out, "")
-	fmt.Fprintln(opts.Out, "Pool name prefix must be unique for this machine/config within the GitHub organization.")
-	fmt.Fprintln(opts.Out, "EPAR cleanup deletes GitHub runner records matching this prefix.")
-	poolNamePrefix, err := promptPoolNamePrefix(opts.Out, reader, defaultPrefix)
+	outcome, err := runInitConfigurationWizard(opts, reader, githubConfig, appID, organization, privateKeyPath, defaultPrefix)
 	if err != nil {
 		return err
 	}
-
-	hostTrustMode := config.HostTrustModeDisabled
-	hostTrustScopes := []string{config.HostTrustScopeSystem}
-	if providerType == "docker-container" || providerType == "docker-sandboxes" {
-		fmt.Fprintln(opts.Out, "Runners need this host's trusted TLS roots to access services that this machine trusts.")
-		enabled, promptErr := promptYesNo(opts.Out, reader, "Inherit this host's trusted TLS roots into disposable runners?", true)
-		if promptErr != nil {
-			return promptErr
-		}
-		if enabled {
-			hostTrustMode = config.HostTrustModeOverlay
-			hostTrustScopes = hostTrustScopesForOS(initHostTrustOS)
-			deferred := os.Getenv("EPAR_HOST_TRUST_INIT_DEFERRED") == "1"
-			if !opts.SkipHostTrustCheck && !deferred {
-				preflightCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				_, collectErr := initResolveHostTrust(preflightCtx, hosttrust.Options{
-					Mode:             hostTrustMode,
-					Scopes:           hostTrustScopes,
-					ControllerHostOS: initHostTrustOS,
-				})
-				cancel()
-				if collectErr != nil {
-					return fmt.Errorf("collect host trusted TLS roots before writing config: %w", collectErr)
-				}
-			}
-		}
+	if !outcome.Create {
+		fmt.Fprintln(opts.Out, "Setup cancelled. No config was written.")
+		return nil
 	}
-	updatePolicy, err := promptImageUpdatePolicy(opts.Out, reader)
+	content, err := renderInitWizardConfig(outcome.Draft)
 	if err != nil {
 		return err
-	}
-
-	profile := selectedProfile
-	if providerType != "tart" && profile == nil {
-		return fmt.Errorf("%s image selection did not produce a provisioning profile", providerType)
-	}
-	var content string
-	switch providerType {
-	case "docker-container":
-		content = defaultDockerContainerConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, updatePolicy)
-	case "wsl":
-		content = defaultWSLConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup, *profile, updatePolicy)
-	case "tart":
-		content = defaultTartConfig(appID, organization, privateKeyPath, poolNamePrefix, runnerGroup, updatePolicy)
-	case "docker-sandboxes":
-		guestPlatform, runnerArchitectureLabel, platformErr := dockerSandboxesPlatform(profile.HostPlatform)
-		if platformErr != nil {
-			return platformErr
-		}
-		content = defaultDockerSandboxesConfig(appID, organization, privateKeyPath, poolNamePrefix, hostTrustMode, hostTrustScopes, runnerGroup, *profile, updatePolicy, guestPlatform, runnerArchitectureLabel)
-	default:
-		return fmt.Errorf("unsupported provider.type %q", providerType)
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.ConfigPath), 0755); err != nil {
 		return err
@@ -380,15 +329,19 @@ func runInitWithOptions(opts initOptions) error {
 		fmt.Fprintln(opts.Out, "Initialization succeeded. Startup will now provision the selected runner artifact and apply storage admission before side effects.")
 		return nil
 	}
+	startCommand := "./start"
+	if initGOOS == "windows" {
+		startCommand = `.\start.ps1`
+	}
 	fmt.Fprintf(opts.Out, `
 Next:
-  %s start
+  %s
 
 Manual/advanced:
   %s image build --replace
   %s pool verify --instances 2 --register-only --cleanup
   %s pool up --instances 2
-`, binaryName, binaryName, binaryName, binaryName)
+`, startCommand, startCommand, startCommand, startCommand)
 	return nil
 }
 
@@ -398,6 +351,17 @@ type initRunnerGroupSelection struct {
 }
 
 func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader, client initRunnerGroupClient) (initRunnerGroupSelection, error) {
+	result, err := promptRunnerGroupWizard(ctx, out, reader, client, false)
+	if err != nil {
+		return initRunnerGroupSelection{}, err
+	}
+	if result.Action == initWizardQuit {
+		return initRunnerGroupSelection{}, fmt.Errorf("runner-group selection cancelled; no config was written")
+	}
+	return result.Value, nil
+}
+
+func promptRunnerGroupWizard(ctx context.Context, out io.Writer, reader *bufio.Reader, client initRunnerGroupClient, allowBack bool) (initWizardResult[initRunnerGroupSelection], error) {
 	var groups []gh.RunnerGroup
 	var repositories map[int64][]gh.RunnerGroupRepository
 	showBlockedGroups := false
@@ -407,7 +371,7 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 			var err error
 			groups, repositories, err = loadInitRunnerGroups(ctx, client)
 			if err != nil {
-				return initRunnerGroupSelection{}, fmt.Errorf("load GitHub runner groups: %w", err)
+				return initWizardResult[initRunnerGroupSelection]{}, fmt.Errorf("load GitHub runner groups: %w", err)
 			}
 		}
 		fmt.Fprintln(out, "")
@@ -441,13 +405,20 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 		} else {
 			fmt.Fprintln(out, "  D. Show runner group details")
 		}
+		if allowBack {
+			fmt.Fprintln(out, "  0. Back")
+		}
 		fmt.Fprintln(out, "  Q. Quit without writing a config")
 
 		choice, err := promptRequired(out, reader, "Runner group choice")
 		if err != nil {
-			return initRunnerGroupSelection{}, err
+			return initWizardResult[initRunnerGroupSelection]{}, err
 		}
 		switch strings.ToLower(choice) {
+		case "0", "back":
+			if allowBack {
+				return initWizardResult[initRunnerGroupSelection]{Action: initWizardBack}, nil
+			}
 		case "r", "refresh":
 			groups = nil
 			repositories = nil
@@ -459,11 +430,11 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 			showGroupDetails = !showGroupDetails
 			continue
 		case "q", "quit":
-			return initRunnerGroupSelection{}, fmt.Errorf("runner-group selection cancelled; no config was written")
+			return initWizardResult[initRunnerGroupSelection]{Action: initWizardQuit}, nil
 		}
 		index, parseErr := strconv.Atoi(choice)
 		if parseErr != nil || index < 1 || index > len(visibleGroups) {
-			fmt.Fprintln(out, "Choose a runner group number, R to refresh, B for blocked groups, D for details, or Q to quit.")
+			fmt.Fprintln(out, "Choose a runner group number, R to refresh, B for blocked groups, D for details, 0 to go back when shown, or Q to quit.")
 			continue
 		}
 		group := visibleGroups[index-1]
@@ -476,7 +447,7 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 			fmt.Fprintln(out, "RECOMMENDED ACTION: Do not select this group. Review its policy in GitHub, update EPAR if support is available, and choose Refresh; otherwise choose another documented group.")
 			refresh, err := promptBackRefreshQuit(out, reader)
 			if err != nil {
-				return initRunnerGroupSelection{}, err
+				return initWizardResult[initRunnerGroupSelection]{}, err
 			}
 			if refresh {
 				groups = nil
@@ -492,7 +463,7 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 			fmt.Fprintln(out, "If you intentionally operate a separately reviewed public-project deployment, finish initialization with a secure group first and document any manual policy override afterward.")
 			refresh, err := promptBackRefreshQuit(out, reader)
 			if err != nil {
-				return initRunnerGroupSelection{}, err
+				return initWizardResult[initRunnerGroupSelection]{}, err
 			}
 			if refresh {
 				groups = nil
@@ -508,7 +479,7 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 			fmt.Fprintln(out, "For regular use, a custom group limited to selected trusted repositories offers better security.")
 			continueSelection, err := promptContinueOrBack(out, reader, "Continue with Default runner group")
 			if err != nil {
-				return initRunnerGroupSelection{}, err
+				return initWizardResult[initRunnerGroupSelection]{}, err
 			}
 			if !continueSelection {
 				continue
@@ -535,14 +506,14 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 				}
 				continueSelection, err := promptContinueOrBack(out, reader, continueLabel)
 				if err != nil {
-					return initRunnerGroupSelection{}, err
+					return initWizardResult[initRunnerGroupSelection]{}, err
 				}
 				if !continueSelection {
 					continue
 				}
 			}
 		}
-		return initRunnerGroupSelection{
+		return initWizardResult[initRunnerGroupSelection]{Action: initWizardNext, Value: initRunnerGroupSelection{
 			Group: group,
 			Policy: config.RunnerGroupSecurityConfig{
 				Enforcement:                       config.RunnerGroupEnforcementEnforce,
@@ -551,7 +522,7 @@ func promptRunnerGroup(ctx context.Context, out io.Writer, reader *bufio.Reader,
 				RequiredRepositoryAccess:          group.Visibility,
 				RequirePublicRepositoriesDisabled: true,
 			},
-		}, nil
+		}}, nil
 	}
 }
 
@@ -709,7 +680,7 @@ func runnerGroupDoesNotMeetRecommendedPolicy(group gh.RunnerGroup) bool {
 
 func promptContinueOrBack(out io.Writer, reader *bufio.Reader, continueLabel string) (bool, error) {
 	fmt.Fprintf(out, "  1. %s\n", continueLabel)
-	fmt.Fprintln(out, "  2. Back to group selection")
+	fmt.Fprintln(out, "  0. Back to group selection")
 	for {
 		choice, err := promptRequired(out, reader, "Choice")
 		if err != nil {
@@ -718,32 +689,32 @@ func promptContinueOrBack(out io.Writer, reader *bufio.Reader, continueLabel str
 		switch strings.ToLower(choice) {
 		case "1", "continue":
 			return true, nil
-		case "2", "back":
+		case "0", "2", "back":
 			return false, nil
 		default:
-			fmt.Fprintln(out, "Choose 1 to continue or 2 to go back.")
+			fmt.Fprintln(out, "Choose 1 to continue or 0 to go back.")
 		}
 	}
 }
 
 func promptBackRefreshQuit(out io.Writer, reader *bufio.Reader) (bool, error) {
-	fmt.Fprintln(out, "  1. Back to group selection")
-	fmt.Fprintln(out, "  2. Refresh runner groups")
-	fmt.Fprintln(out, "  3. Quit without writing a config")
+	fmt.Fprintln(out, "  0. Back to group selection")
+	fmt.Fprintln(out, "  R. Refresh runner groups")
+	fmt.Fprintln(out, "  Q. Quit without writing a config")
 	for {
 		choice, err := promptRequired(out, reader, "Choice")
 		if err != nil {
 			return false, err
 		}
 		switch strings.ToLower(choice) {
-		case "1", "back":
+		case "0", "1", "back":
 			return false, nil
-		case "2", "refresh":
+		case "2", "r", "refresh":
 			return true, nil
-		case "3", "quit":
+		case "3", "q", "quit":
 			return false, fmt.Errorf("runner-group selection cancelled; no config was written")
 		default:
-			fmt.Fprintln(out, "Choose 1 to go back, 2 to refresh, or 3 to quit.")
+			fmt.Fprintln(out, "Choose 0 to go back, R to refresh, or Q to quit.")
 		}
 	}
 }
@@ -845,10 +816,14 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 			fmt.Fprintln(out, "Refreshing provider prerequisites...")
 			continue
 		}
-		if providerType == "tart" {
-			return providerType, sandboxpromotion.Record{}, nil, nil
+		descriptor, found := providerregistry.DescriptorFor(providerType)
+		if !found {
+			return "", sandboxpromotion.Record{}, nil, fmt.Errorf("provider %q has no registry contribution", providerType)
 		}
-		if providerType == "docker-container" || providerType == "docker-sandboxes" || providerType == "wsl" {
+		switch descriptor.WizardOnboarding {
+		case provider.WizardOnboardingNone:
+			return providerType, sandboxpromotion.Record{}, nil, nil
+		case provider.WizardOnboardingCatthehackerDocker:
 			profile, accepted, profileErr := promptDockerImageProfile(ctx, projectRoot, providerType, hostPlatform, out, reader)
 			if profileErr != nil {
 				return "", sandboxpromotion.Record{}, nil, profileErr
@@ -857,12 +832,21 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 				return "", sandboxpromotion.Record{}, nil, fmt.Errorf("%s image setup did not complete; no config was written", providerType)
 			}
 			return providerType, sandboxpromotion.Record{}, profile, nil
+		default:
+			return "", sandboxpromotion.Record{}, nil, fmt.Errorf("provider %q has unsupported image onboarding strategy %q", providerType, descriptor.WizardOnboarding)
 		}
-		return "", sandboxpromotion.Record{}, nil, fmt.Errorf("provider %q has no registered image onboarding flow", providerType)
 	}
 }
 
 func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, bool, bool, error) {
+	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false, "")
+	if err != nil {
+		return "", false, false, err
+	}
+	return result.Value, promotionPassed, result.Action == initWizardRefresh, nil
+}
+
+func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool, preferredProvider string) (initWizardResult[string], bool, error) {
 	prerequisites := detectInitProviderPrerequisites(ctx, hostPlatform, skipDockerCheck)
 	operationalDefault := !promoted && prerequisites.DockerSandboxesAvailable
 	promotionPassed := false
@@ -911,11 +895,11 @@ func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatf
 	} else if promoted || !prerequisites.DockerAvailable {
 		defaultProvider = ""
 	}
-	providerType, refresh, err := promptProviderOptions(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider)
+	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider, allowBack, preferredProvider)
 	if err != nil {
-		return "", false, false, err
+		return initWizardResult[string]{}, false, err
 	}
-	return providerType, promotionPassed, refresh, nil
+	return result, promotionPassed, nil
 }
 
 func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
@@ -972,18 +956,18 @@ func promptImageUpdatePolicy(out io.Writer, reader *bufio.Reader) (initImageUpda
 	}
 }
 
-func promptDockerImageProfile(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
+func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (initWizardResult[*initDockerSandboxesProfile], *initArtifactEstimate, error) {
 	guestPlatform, err := initDockerGuestPlatform(providerType, hostPlatform)
 	if err != nil {
-		return nil, false, fmt.Errorf("%s image setup is unavailable: %w", providerType, err)
+		return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("%s image setup is unavailable: %w", providerType, err)
 	}
 	descriptor, found := providerregistry.DescriptorFor(providerType)
 	if !found || !descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0 {
-		return nil, false, fmt.Errorf("%s has no registered guided image onboarding contribution", providerType)
+		return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("%s has no registered guided image onboarding contribution", providerType)
 	}
 	fmt.Fprintln(out, "")
 	fmt.Fprintf(out, "%s image setup:\n", descriptor.DisplayName)
-	fmt.Fprintln(out, "  Choose the desired Catthehacker Ubuntu image. EPAR will create the configuration now and provision or update the reusable runner artifact during startup.")
+	fmt.Fprintln(out, "  Choose the Catthehacker Ubuntu image for this runner. EPAR will provision or update the reusable runner artifact during startup.")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Runner base image:")
 	for index, profile := range descriptor.WizardImageProfiles {
@@ -996,12 +980,20 @@ func promptDockerImageProfile(ctx context.Context, projectRoot, providerType str
 	customChoice := strconv.Itoa(len(descriptor.WizardImageProfiles) + 1)
 	fmt.Fprintf(out, "  %s. Another catthehacker/ubuntu tag, such as go-24.04\n", customChoice)
 	fmt.Fprintln(out, "  Image catalog: https://github.com/catthehacker/docker_images#images-available")
+	fmt.Fprintln(out, "  0. Back")
 
 	var source imageartifact.ResolvedDockerSource
 	for {
-		choice, hitEOF, promptErr := promptDefault(out, reader, "Runner base image", "1")
+		choiceResult, hitEOF, promptErr := promptWizardDefault(out, reader, "Runner base image", "1")
 		if promptErr != nil {
-			return nil, false, promptErr
+			return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
+		}
+		if choiceResult.Action == initWizardBack {
+			return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
+		}
+		choice := choiceResult.Value
+		if choice == "0" {
+			return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
 		}
 		normalizedChoice := strings.ToLower(choice)
 		input := ""
@@ -1012,15 +1004,20 @@ func promptDockerImageProfile(ctx context.Context, projectRoot, providerType str
 			}
 		}
 		if normalizedChoice == customChoice {
-			input, promptErr = promptRequired(out, reader, "catthehacker/ubuntu tag")
+			var requiredResult initWizardResult[string]
+			requiredResult, promptErr = promptWizardRequired(out, reader, "catthehacker/ubuntu tag")
 			if promptErr != nil {
-				return nil, false, promptErr
+				return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
 			}
+			if requiredResult.Action == initWizardBack {
+				return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
+			}
+			input = requiredResult.Value
 		}
 		if input == "" {
-			fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, or %s for another catthehacker/ubuntu tag.\n", len(descriptor.WizardImageProfiles), customChoice)
+			fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, %s for another catthehacker/ubuntu tag, or 0 to go back.\n", len(descriptor.WizardImageProfiles), customChoice)
 			if hitEOF {
-				return nil, false, fmt.Errorf("invalid runner base image %q", choice)
+				return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("invalid runner base image %q", choice)
 			}
 			continue
 		}
@@ -1033,22 +1030,29 @@ func promptDockerImageProfile(ctx context.Context, projectRoot, providerType str
 		fmt.Fprintf(out, "  That image cannot be used for %s: %v\n", guestPlatform, err)
 		fmt.Fprintln(out, "  Choose an existing ghcr.io/catthehacker/ubuntu tag that publishes this platform.")
 		if hitEOF {
-			return nil, false, fmt.Errorf("resolve runner source image: %w", err)
+			return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("resolve runner source image: %w", err)
 		}
 	}
 
 	var customScripts []string
-	addScripts, err := promptYesNo(out, reader, "Run custom install scripts while building the runner artifact?", false)
+	addScriptsResult, err := promptWizardYesNo(out, reader, "Run custom install scripts while building the runner artifact?", false)
 	if err != nil {
-		return nil, false, err
+		return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 	}
-	if addScripts {
+	if addScriptsResult.Action == initWizardBack {
+		return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
+	}
+	if addScriptsResult.Value {
 		fmt.Fprintln(out, "  Scripts run as root during the image build. Do not put secrets in scripts or build inputs.")
 		for {
-			script, promptErr := promptOptional(out, reader, "Custom install script path")
+			scriptResult, promptErr := promptWizardOptional(out, reader, "Custom install script path")
 			if promptErr != nil {
-				return nil, false, promptErr
+				return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
 			}
+			if scriptResult.Action == initWizardBack {
+				return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
+			}
+			script := scriptResult.Value
 			if script == "" {
 				break
 			}
@@ -1058,11 +1062,14 @@ func promptDockerImageProfile(ctx context.Context, projectRoot, providerType str
 				continue
 			}
 			customScripts = append(customScripts, normalized)
-			another, promptErr := promptYesNo(out, reader, "Add another custom install script?", false)
+			anotherResult, promptErr := promptWizardYesNo(out, reader, "Add another custom install script?", false)
 			if promptErr != nil {
-				return nil, false, promptErr
+				return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
 			}
-			if !another {
+			if anotherResult.Action == initWizardBack {
+				return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
+			}
+			if !anotherResult.Value {
 				break
 			}
 		}
@@ -1072,49 +1079,37 @@ func promptDockerImageProfile(ctx context.Context, projectRoot, providerType str
 	if providerType == "docker-sandboxes" {
 		policyFingerprint, err = initDockerSandboxesPolicyFingerprint(ctx)
 		if err != nil {
-			return nil, false, err
+			return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 		}
 	}
 	sourceEstimate, err := imageartifact.EstimateSourceSize(source.CompressedLayerBytes, 0)
 	if err != nil {
-		return nil, false, err
+		return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 	}
 	const dockerDisk = config.DockerSandboxesDefaultDockerDisk
 	dockerDiskBytes, _ := config.ParseByteSize(dockerDisk)
 	artifactPlan, err := imageartifact.PlanArtifactStorage(providerType, sourceEstimate, false, uint64(dockerDiskBytes))
 	if err != nil {
-		return nil, false, err
+		return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 	}
 	var availableText = "unknown"
 	if capacity, probeErr := storage.ProbeFilesystemCapacity(projectRoot, time.Now()); probeErr == nil && capacity.Known {
 		availableText = formatInitUintByteCount(capacity.AvailableBytes)
 	}
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Runner artifact estimate:")
-	fmt.Fprintf(out, "  Source: %s\n", source.Reference)
-	fmt.Fprintf(out, "  Platform: %s\n", source.Platform)
-	if len(customScripts) == 0 {
-		fmt.Fprintln(out, "  Custom install scripts: none")
-	} else {
-		fmt.Fprintf(out, "  Custom install scripts: %s\n", strings.Join(customScripts, ", "))
+	estimate := &initArtifactEstimate{
+		Source:                 source.Reference,
+		Platform:               source.Platform,
+		CustomScripts:          append([]string(nil), customScripts...),
+		DownloadBytes:          source.CompressedLayerBytes,
+		ExpandedBytes:          sourceEstimate.ExpandedBytes,
+		IncrementalPeakBytes:   artifactPlan.EstimatedIncrementalPeak,
+		AvailablePhysicalSpace: availableText,
 	}
-	fmt.Fprintf(out, "  Estimated download: %s compressed layers\n", formatInitUintByteCount(source.CompressedLayerBytes))
-	fmt.Fprintf(out, "  Estimated expanded source: %s\n", formatInitUintByteCount(sourceEstimate.ExpandedBytes))
-	fmt.Fprintf(out, "  Estimated incremental physical peak: %s\n", formatInitUintByteCount(artifactPlan.EstimatedIncrementalPeak))
-	fmt.Fprintf(out, "  Available physical space: %s\n", availableText)
-	fmt.Fprintln(out, "  Fixed free-space reserve: 1GiB")
 	if providerType == "docker-sandboxes" {
-		fmt.Fprintf(out, "  Automatic sandbox root limit: %s (sparse logical maximum)\n", formatInitUintByteCount(artifactPlan.LogicalRootMaximumBytes))
-		fmt.Fprintf(out, "  Inner Docker limit: %s (independent sparse logical maximum)\n", formatInitUintByteCount(artifactPlan.LogicalDockerMaximumBytes))
+		estimate.LogicalRootMaximumBytes = artifactPlan.LogicalRootMaximumBytes
+		estimate.LogicalDockerMaximumBytes = artifactPlan.LogicalDockerMaximumBytes
 	}
-	confirmed, err := promptYesNo(out, reader, "Create this configuration?", true)
-	if err != nil {
-		return nil, false, err
-	}
-	if !confirmed {
-		return nil, false, nil
-	}
-	return &initDockerSandboxesProfile{
+	profile := &initDockerSandboxesProfile{
 		Provider:          providerType,
 		HostPlatform:      hostPlatform,
 		GuestPlatform:     guestPlatform,
@@ -1123,7 +1118,20 @@ func promptDockerImageProfile(ctx context.Context, projectRoot, providerType str
 		PolicyFingerprint: policyFingerprint,
 		RootDisk:          config.DockerSandboxesAutomaticRootDisk,
 		DockerDisk:        dockerDisk,
-	}, true, nil
+	}
+	return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardNext, Value: profile}, estimate, nil
+}
+
+func promptDockerImageProfile(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
+	result, estimate, err := promptDockerImageProfileWizard(ctx, projectRoot, providerType, hostPlatform, out, reader)
+	if err != nil {
+		return nil, false, err
+	}
+	if result.Action == initWizardBack {
+		return nil, false, nil
+	}
+	renderInitArtifactEstimate(out, estimate)
+	return result.Value, true, nil
 }
 
 func initDockerGuestPlatform(providerType string, hostPlatform sandboxpromotion.Platform) (string, error) {
@@ -1467,6 +1475,14 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 }
 
 func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string) (string, bool, error) {
+	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider, false, "")
+	if err != nil {
+		return "", false, err
+	}
+	return result.Value, result.Action == initWizardRefresh, nil
+}
+
+func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string, allowBack bool, preferredProvider string) (initWizardResult[string], error) {
 	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
 	for _, descriptor := range providerregistry.Descriptors() {
 		option := initProviderOption{
@@ -1475,11 +1491,11 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			Label:   descriptor.WizardLabel,
 			Aliases: append([]string(nil), descriptor.WizardAliases...),
 		}
-		switch descriptor.Type {
-		case "docker-container":
+		switch descriptor.WizardPrerequisite {
+		case provider.WizardPrerequisiteDocker:
 			option.Available = prerequisites.DockerAvailable
 			option.Status = prerequisites.DockerStatus
-		case "docker-sandboxes":
+		case provider.WizardPrerequisiteDockerSandboxes:
 			option.Available = prerequisites.DockerSandboxesAvailable && (!promoted || promotionPassed)
 			option.Status = prerequisites.DockerSandboxesStatus
 			if operationalDefault {
@@ -1487,19 +1503,22 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			} else if promoted {
 				option.Label = "Docker Sandboxes (independently certified for this exact platform)"
 			}
-		case "wsl":
+		case provider.WizardPrerequisiteWSL2:
 			option.Available = prerequisites.WSLAvailable
 			option.Status = prerequisites.WSLStatus
-		case "tart":
+		case provider.WizardPrerequisiteTart:
 			option.Available = prerequisites.TartAvailable
 			option.Status = prerequisites.TartStatus
 		default:
-			return "", false, fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
+			return initWizardResult[string]{}, fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
 		}
 		options = append(options, option)
 	}
 	if err := validateWizardProviderOptions(options); err != nil {
-		return "", false, err
+		return initWizardResult[string]{}, err
+	}
+	if preferredProvider != "" {
+		defaultProvider = preferredProvider
 	}
 	defaultNumber := prioritizeDefaultProviderOption(options, defaultProvider)
 
@@ -1518,6 +1537,9 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 		fmt.Fprintf(out, "     Prerequisites: %s\n", option.Status)
 	}
 	fmt.Fprintln(out, "  R. Refresh provider prerequisites")
+	if allowBack {
+		fmt.Fprintln(out, "  0. Back")
+	}
 	for {
 		var value string
 		var hitEOF bool
@@ -1526,7 +1548,7 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			fmt.Fprint(out, "Runner provider: ")
 			value, err = reader.ReadString('\n')
 			if err != nil && !errors.Is(err, io.EOF) {
-				return "", false, err
+				return initWizardResult[string]{}, err
 			}
 			hitEOF = errors.Is(err, io.EOF)
 			if hitEOF {
@@ -1537,11 +1559,14 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			value, hitEOF, err = promptDefault(out, reader, "Runner provider", defaultNumber)
 		}
 		if err != nil {
-			return "", false, err
+			return initWizardResult[string]{}, err
 		}
 		normalized := strings.ToLower(value)
 		if normalized == "r" || normalized == "refresh" {
-			return "", true, nil
+			return initWizardResult[string]{Action: initWizardRefresh}, nil
+		}
+		if allowBack && (normalized == "0" || normalized == "back") {
+			return initWizardResult[string]{Action: initWizardBack}, nil
 		}
 		var selected *initProviderOption
 		for index := range options {
@@ -1561,18 +1586,18 @@ func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites in
 			}
 		}
 		if selected != nil && selected.Available {
-			return selected.Type, false, nil
+			return initWizardResult[string]{Action: initWizardNext, Value: selected.Type}, nil
 		}
 		if selected != nil {
 			fmt.Fprintf(out, "%s is unavailable: %s\n", selected.Label, selected.Status)
 		} else {
-			fmt.Fprintln(out, "Choose an available provider number or name shown above, or R to refresh.")
+			fmt.Fprintln(out, "Choose an available provider number or name shown above, R to refresh, or 0 to go back when shown.")
 		}
 		if hitEOF {
 			if selected != nil {
-				return "", false, fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
+				return initWizardResult[string]{}, fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
 			}
-			return "", false, fmt.Errorf("invalid runner provider %q", value)
+			return initWizardResult[string]{}, fmt.Errorf("invalid runner provider %q", value)
 		}
 	}
 }
@@ -1613,6 +1638,9 @@ func validateWizardProviderOptions(options []initProviderOption) error {
 		}
 		if option.Number != descriptor.WizardNumber || option.Label == "" || len(option.Aliases) == 0 {
 			return fmt.Errorf("wizard provider %q does not use its complete registry contribution", option.Type)
+		}
+		if err := provider.ValidateWizardContributions(descriptor); err != nil {
+			return fmt.Errorf("wizard provider %q has incomplete contributions: %w", option.Type, err)
 		}
 		if _, duplicate := registered[option.Type]; duplicate {
 			return fmt.Errorf("wizard provider %q is duplicated", option.Type)

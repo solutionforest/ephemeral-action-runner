@@ -84,12 +84,12 @@ dockerSandboxes:
 
 ## Normal Workflow
 
-1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose a Catthehacker profile or tag and optional custom install scripts; review the non-blocking physical-growth estimate, sparse logical limits, reserve, confidence, and expected duration.
+1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose a Catthehacker profile or tag and optional custom install scripts; review the non-blocking physical-growth estimate, sparse logical limits, and reserve.
 2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, performs authoritative storage admission, builds and imports the template, and activates it only after exact readback. On macOS or Linux, review the narrowly scoped helper prompts described in [Private Filesystem and VM Helper Approval](#private-filesystem-and-vm-helper-approval) if the host presents them.
 3. Prewarm the selected template without GitHub registration:
 
    ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-native-controller.ps1 pool verify --config .local/docker-sandboxes.yml --project-root . --instances 1 --cleanup
+   .\start.ps1 pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
    ```
 
 4. Start the pool with `./start`. EPAR reuses the verified imported template without a registry check until the configured update schedule is due; local input changes and missing templates still rebuild immediately.
@@ -139,7 +139,7 @@ The opt-in `TestLiveRunnerTemplateIsolation` proof also exercises authenticated 
 Use the prewarm command above for an unregistered lifecycle check. To include GitHub registration, run:
 
 ```bash
-ephemeral-action-runner pool verify --config .local/docker-sandboxes.yml --instances 1 --register-only --cleanup
+./start pool verify --config .local/docker-sandboxes.yml --instances 1 --register-only --cleanup
 ```
 
 The shared pool treats provisioning, ready, draining, quarantined, and cleanup-pending instances as capacity-consuming states. Cleanup uses durable exact sandbox, GitHub runner, and staging-directory identities; it never uses an `sbx` reset or broad prefix deletion.
