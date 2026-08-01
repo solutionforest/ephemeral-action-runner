@@ -4,7 +4,7 @@ EPAR extensions preserve the existing user flow and controller design.
 
 ## Universal Start Contract
 
-The `start` wrapper family is EPAR's universal operator entry point for first-run configuration, normal controller operation, manual launch, and machine autorun. Use `./start` on macOS, Linux, WSL, and Git Bash, `start.ps1` from native PowerShell, and `start.cmd` from native Command Prompt or Windows startup automation. Operator documentation and startup automation must invoke one of these wrappers rather than a locally built controller binary.
+The `start` wrapper family is EPAR's universal operator entry point for first-run configuration, normal controller operation, manual launch, and machine autorun. Use `./start` on macOS, Linux, WSL, and Git Bash, and `.\start.ps1` on native Windows. Operator documentation and startup automation must invoke the applicable wrapper rather than a locally built controller binary.
 
 With no arguments, a wrapper invokes the controller's `start` command. When the first argument is a global flag, the wrapper inserts `start` before forwarding the complete argument array. When the first argument is an explicit command, the wrapper forwards that command and every argument exactly. Local-Go execution and the no-Go cached native-controller path must have the same command, argument, configuration, trust, reconciliation, and remediation behavior. Direct `go run` and `scripts/run-with-docker.*` invocations are development and diagnostic interfaces, not alternative operator entry points.
 

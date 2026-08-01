@@ -234,7 +234,7 @@ jobs:
         if: runner.os == 'Windows'
         run: scripts/test/windows-native-controller-contract.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
 
-      - name: Verify Windows start command forwarding
+      - name: Verify Windows start.ps1 command forwarding
         shell: pwsh
         if: runner.os == 'Windows'
         run: scripts/test/start-command-forwarding.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
@@ -300,6 +300,7 @@ jobs:
             'scripts/host-trust/wrapper-lib.ps1',
             'scripts/test/docker-sandboxes-plan-smoke.ps1',
             'scripts/test/host-trust-wrapper-smoke.ps1',
+            'scripts/test/start-command-forwarding.ps1',
             'scripts/test/windows-native-controller-contract.ps1'
           )
           foreach ($file in $files) {

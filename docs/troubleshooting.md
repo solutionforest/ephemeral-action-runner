@@ -282,7 +282,7 @@ Use the normal host entry point so EPAR can inspect the real Windows certificate
 .\start.ps1 image build --replace
 ```
 
-On no-Go Windows, use `start.cmd image build --replace` or `.\start.ps1 image build --replace`; on macOS/Linux, use `./start image build --replace`. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. The legacy containerized controller still requires the separate native-host feed bridge. A bare Linux toolchain container is not a replacement for either path.
+On no-Go Windows, use `.\start.ps1 image build --replace`; on macOS/Linux, use `./start image build --replace`. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. The legacy containerized controller still requires the separate native-host feed bridge. A bare Linux toolchain container is not a replacement for either path.
 
 ## Windows Docker Desktop WSL2 disk is smaller than expected
 

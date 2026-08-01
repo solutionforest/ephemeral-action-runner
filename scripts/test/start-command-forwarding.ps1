@@ -51,13 +51,21 @@ if ($Forwarded.Count -eq 1 -and $Forwarded[0] -eq 'version') {
     if ($LASTEXITCODE -ne 0) { throw "start.ps1 explicit-command forwarding exited $LASTEXITCODE" }
     Assert-ForwardedArguments @('run', './cmd/ephemeral-action-runner', 'storage', 'status', '--config', '.local\config with spaces.yml')
 
-    $startCommand = Join-Path $ProjectRoot 'start.cmd'
-    $commandLine = '""{0}" status --config "{1}""' -f $startCommand, '.local\config with spaces.yml'
-    & $env:ComSpec /d /s /c $commandLine
-    if ($LASTEXITCODE -ne 0) { throw "start.cmd forwarding exited $LASTEXITCODE" }
-    Assert-ForwardedArguments @('run', './cmd/ephemeral-action-runner', 'status', '--config', '.local\config with spaces.yml')
+    $removedAdapter = Join-Path $ProjectRoot ('start' + '.cmd')
+    if (Test-Path -LiteralPath $removedAdapter) {
+        throw "The removed CMD wrapper still exists at $removedAdapter"
+    }
 
-    Write-Output 'Windows start.ps1 and start.cmd command-forwarding smoke passed'
+    $staleReferences = @(& git -C $ProjectRoot grep -n -i 'start[.]cmd' -- .)
+    $grepExitCode = $LASTEXITCODE
+    if ($grepExitCode -eq 0) {
+        throw "Tracked files still reference the removed CMD wrapper:`n$($staleReferences -join "`n")"
+    }
+    if ($grepExitCode -ne 1) {
+        throw "git grep for removed CMD wrapper references exited $grepExitCode"
+    }
+
+    Write-Output 'Windows start.ps1 command-forwarding smoke passed'
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

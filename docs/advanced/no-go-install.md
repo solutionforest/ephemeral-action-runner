@@ -4,7 +4,7 @@ The standard path is to download GitHub's automatic **Source code (zip)** or **S
 
 ## Run With Docker
 
-Run `./start` at the source folder root on macOS, Linux, WSL, or Git Bash, or `./start.ps1` / `start.cmd` in native Windows PowerShell or cmd. The wrapper uses local Go when it is installed and runnable; otherwise a containerized Go toolchain cross-compiles a CGO-disabled host-native binary at `.local/bin/ephemeral-action-runner` (or `.exe` on Windows). Its adjacent `ephemeral-action-runner.manifest` records the deterministic source, platform, and toolchain fingerprint:
+Run `./start` at the source folder root on macOS, Linux, WSL, or Git Bash, or `.\start.ps1` in native Windows PowerShell. The wrapper uses local Go when it is installed and runnable; otherwise a containerized Go toolchain cross-compiles a CGO-disabled host-native binary at `.local/bin/ephemeral-action-runner` (or `.exe` on Windows). Its adjacent `ephemeral-action-runner.manifest` records the deterministic source, platform, and toolchain fingerprint:
 
 ```bash
 ./start --config .local/config.yml --instances 2
@@ -28,7 +28,7 @@ On Windows the helper reads local-machine and current-user root stores and exclu
 
 Do not replace the official wrapper with a bare `docker run` for Docker Sandboxes. EPAR rejects the legacy controller-in-Docker path for that provider.
 
-For wrapper-development diagnostics, you can run the Docker helper directly. Normal manual and automatic operation should continue to use `./start`, `start.ps1`, or `start.cmd`:
+For wrapper-development diagnostics, you can run the Docker helper directly. Normal manual and automatic operation should continue to use `./start` or `.\start.ps1`:
 
 ```bash
 scripts/run-with-docker.sh version
@@ -50,7 +50,7 @@ The compiler container mounts the source read-only and writes only the temporary
 ### Windows: WSL versus native PowerShell
 
 - From WSL2 or Git Bash, use `./start`. It behaves like the Linux case and needs Docker to be available and working in that environment.
-- From native PowerShell or cmd, use `./start.ps1` or `start.cmd`, which use `scripts/run-with-docker.ps1` instead of the Bash script.
+- From native Windows PowerShell, use `.\start.ps1`, which uses `scripts/run-with-docker.ps1` instead of the Bash script.
 
 `start.ps1` and `scripts/run-with-docker.ps1` are less exercised than the Bash/macOS path. If you hit an issue, check whether the host runtime can bind-mount the drive that holds the source folder.
 
