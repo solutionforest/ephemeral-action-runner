@@ -155,19 +155,24 @@ $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcherPath).Hash
 Assert-Equal 'hook launcher source' $launcherHash $lock.hookLauncher.sha256
 $hashManifestPath = Join-Path $templateDirectory 'helpers.sha256'
 $manifestEntries = Get-Content -LiteralPath $hashManifestPath
-$guestFiles = @(Get-ChildItem -LiteralPath (Join-Path $templateDirectory 'guest') -Filter '*.sh' -File | Sort-Object Name)
-Assert-Equal 'helper manifest entry count' $manifestEntries.Count $guestFiles.Count
+$guestDirectory = Join-Path $templateDirectory 'guest'
+$guestAssetFiles = @(Get-ChildItem -LiteralPath $guestDirectory -File | Sort-Object Name)
+$guestScripts = @($guestAssetFiles | Where-Object Extension -EQ '.sh')
+Assert-Equal 'helper manifest entry count' $manifestEntries.Count $guestAssetFiles.Count
+$manifestFileNames = @()
 foreach ($line in $manifestEntries) {
-    if ($line -notmatch '^([0-9a-f]{64})  \./([a-z0-9.-]+\.sh)$') {
+    if ($line -notmatch '^([0-9a-f]{64})  \./((?:[a-z0-9.-]+\.sh)|docker-daemon\.json)$') {
         throw "Invalid helper hash entry: $line"
     }
-    $helperPath = Join-Path (Join-Path $templateDirectory 'guest') $Matches[2]
+    $manifestFileNames += $Matches[2]
+    $helperPath = Join-Path $guestDirectory $Matches[2]
     if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
         throw "Helper hash references missing file: $helperPath"
     }
     $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $helperPath).Hash.ToLowerInvariant()
     Assert-Equal "helper $($Matches[2])" $actualHash $Matches[1]
 }
+Assert-Equal 'unique helper manifest entry count' @($manifestFileNames | Sort-Object -Unique).Count $guestAssetFiles.Count
 
 Write-Host '[3/6] Checking Dockerfile and entrypoint invariants.'
 $dockerfilePath = Join-Path $templateDirectory 'Dockerfile'
@@ -194,12 +199,12 @@ foreach ($required in @(
 if ($dockerfile -match '(?im)apt-get\s+update|(?im)\blatest\b|(?im)COPY\s+.*var/lib/docker|(?im)--privileged|(?im)--secret') {
     throw 'Dockerfile contains an unpinned, privileged, secret, or /var/lib/docker preload pattern'
 }
-foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!hook-launcher/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
+foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!guest/docker-daemon.json', '!hook-launcher/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
     if (-not ($dockerignore -split "`r?`n").Contains($requiredContextEntry)) {
         throw ".dockerignore is missing deterministic context entry: $requiredContextEntry"
     }
 }
-$guestText = ($guestFiles | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
+$guestText = ($guestScripts | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
 if ($guestText -match '(?im)apt-get\s+update|(?im)(^|[;&|]\s*)dockerd(?:\s|$)|(?im)-----BEGIN .*PRIVATE KEY-----|(?im)AKIA[0-9A-Z]{16}') {
     throw 'Guest helpers contain a boot-time package update, dockerd start, or credential pattern'
 }
@@ -258,7 +263,7 @@ else {
 if ($null -eq $bashPath) {
     throw 'bash is required to syntax-check guest helpers'
 }
-foreach ($guestFile in $guestFiles) {
+foreach ($guestFile in $guestScripts) {
     & $bashPath -n $guestFile.FullName
     if ($LASTEXITCODE -ne 0) {
         throw "bash -n failed for $($guestFile.FullName)"

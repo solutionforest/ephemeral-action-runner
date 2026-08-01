@@ -295,9 +295,9 @@ func setPoolControllerLockStateHome(t *testing.T) string {
 	return root
 }
 
-func testPoolControllerManager(t *testing.T, projectRoot, configName, providerType, prefix string) Manager {
+func testPoolControllerManager(t *testing.T, projectRoot, configName, providerType, prefix string) *Manager {
 	t.Helper()
-	manager := Manager{
+	manager := &Manager{
 		ProjectRoot: projectRoot,
 		ConfigPath:  configName,
 		Config: config.Config{
