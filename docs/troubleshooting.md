@@ -167,7 +167,19 @@ First verify only metadata, never credential contents: the listener should run a
 
 Inspect the host Docker Sandboxes daemon log for a message that the proxy is overriding a client-supplied registry credential with a host credential. When that message is present, the workflow credential was written correctly but cannot control the pull: Docker Sandboxes intentionally substitutes the host-side credential. An explicit guest config path cannot bypass that policy.
 
-Use Docker Container for workflows that require independent, per-job Docker Hub credentials. On a trusted single-tenant Docker Sandboxes host, an operator can instead choose one least-privilege Docker Hub identity with access to every required image and authenticate Docker Sandboxes with `sbx login`; this changes shared host runtime behavior, so coordinate it with every controller that uses the same `sbx` daemon. EPAR rejects global `sbx` secrets and never copies GitHub Actions secrets back to the host. See [Docker Hub Credentials and the Host Proxy](providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).
+Run `sbx login` on the host to display the current Docker Sandboxes username when it is already signed in. Do not assume that a successful host Docker CLI pull means `sbx` uses the same account: Docker's ordinary credential store and the Docker Sandboxes login session can contain different identities. Likewise, `sbx diagnose --output json` can prove that authentication is valid but cannot prove private-repository scope.
+
+On a trusted single-tenant host, stop every controller and sandbox that shares the runtime, authenticate `sbx` as one least-privilege account that can read every required image, restart the daemon, and create a fresh runner. Pass the token only through standard input from a protected local source:
+
+```sh
+printf '%s' "$DOCKERHUB_TOKEN" | sbx login --username "$DOCKERHUB_USERNAME" --password-stdin
+sbx daemon stop
+env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
+```
+
+First run a fresh Sandbox job that performs only `docker manifest inspect <private-reference>` without a guest login. If it succeeds, the host proxy identity has repository scope; run the original workflow next. A manual guest `docker login`, putting login and pull in one shell step, or changing `DOCKER_CONFIG` cannot bypass the proxy override.
+
+Use Docker Container for workflows that require independent, per-job Docker Hub credentials. EPAR rejects global `sbx` secrets and never copies GitHub Actions secrets back to the host. See [Docker Hub Credentials and the Host Proxy](providers/docker-sandboxes.md#docker-hub-credentials-and-the-host-proxy).
 
 ## An idle runner reports GitHub or Sandbox health warnings
 
