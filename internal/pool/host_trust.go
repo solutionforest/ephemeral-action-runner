@@ -1,8 +1,11 @@
 package pool
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -20,22 +24,24 @@ const (
 	hostTrustGuestDir      = "/usr/local/share/ca-certificates/epar-host"
 	hostTrustMarkerGuest   = "/opt/epar/host-trust-generation.json"
 	hostTrustLeaseGuest    = "/run/epar/host-trust-lease.json"
-	hostTrustLeaseLifetime = 20 * time.Second
+	hostTrustLeaseLifetime = 90 * time.Second
+	hostTrustHandoffLease  = 2 * time.Minute
 	hostTrustMaximumAge    = 30 * time.Second
 	hostTrustNativePoll    = 15 * time.Second
 )
 
-var hostTrustRefreshInterval = 5 * time.Second
+// HostTrustMarkerGuest is the stable guest path for verified host-trust metadata.
+const HostTrustMarkerGuest = hostTrustMarkerGuest
+
+// HostTrustLeaseLifetime is the default shared guest lease duration.
+const HostTrustLeaseLifetime = hostTrustLeaseLifetime
+
+var hostTrustRefreshInterval = 30 * time.Second
+var hostTrustWriteTimeout = 10 * time.Second
 var hostTrustControllerInContainer = linuxControllerInContainer
 var hostTrustControllerOS = runtime.GOOS
 
-type hostTrustImageMetadata struct {
-	Mode             string   `json:"mode"`
-	HostOS           string   `json:"hostOS"`
-	Scopes           []string `json:"scopes"`
-	Generation       string   `json:"generation"`
-	CertificateCount int      `json:"certificateCount"`
-}
+type hostTrustImageMetadata = artifactimage.HostTrustMetadata
 
 type hostTrustMarker struct {
 	SchemaVersion    int      `json:"schemaVersion"`
@@ -54,6 +60,12 @@ type hostTrustLease struct {
 	Scopes        []string `json:"scopes"`
 	ExpiresAt     string   `json:"expiresAt"`
 }
+
+// HostTrustMarker and HostTrustLease are shared payloads for specialized
+// providers that install the same verified host-trust contract by another
+// transport.
+type HostTrustMarker = hostTrustMarker
+type HostTrustLease = hostTrustLease
 
 func (m *Manager) hostTrustEnabled() bool {
 	return hosttrust.Enabled(m.Config.Image.HostTrustMode)
@@ -125,6 +137,52 @@ func (m *Manager) resolveHostTrust(ctx context.Context) (hosttrust.Snapshot, err
 	return validateHostTrustSnapshot(snapshot, time.Now().UTC())
 }
 
+func (m *Manager) resolveBuildTrust(ctx context.Context) (hosttrust.Snapshot, error) {
+	if m.buildTrustResolver != nil {
+		snapshot, err := m.buildTrustResolver(ctx)
+		if err != nil {
+			return hosttrust.Snapshot{}, err
+		}
+		return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+	}
+	if m.hostTrustResolver != nil {
+		snapshot, err := m.hostTrustResolver(ctx)
+		if err != nil {
+			return hosttrust.Snapshot{}, err
+		}
+		return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+	}
+	scopes := buildTrustScopes(m.Config.Image.HostTrustMode, m.Config.Image.HostTrustScopes)
+	feedPath := strings.TrimSpace(os.Getenv("EPAR_BUILD_TRUST_FEED"))
+	controllerHostOS := strings.TrimSpace(os.Getenv("EPAR_CONTROLLER_HOST_OS"))
+	if feedPath == "" && hostTrustControllerOS == "linux" && hostTrustControllerInContainer() {
+		return hosttrust.Snapshot{}, fmt.Errorf("operational BuildKit trust requires EPAR_BUILD_TRUST_FEED when the EPAR controller runs in a container; use an official no-Go wrapper")
+	}
+	snapshot, err := hosttrust.Resolve(ctx, hosttrust.Options{
+		Mode:             hosttrust.ModeOverlay,
+		Scopes:           scopes,
+		FeedPath:         feedPath,
+		ControllerHostOS: controllerHostOS,
+	})
+	if err != nil {
+		return hosttrust.Snapshot{}, fmt.Errorf("resolve operational BuildKit trust: %w", err)
+	}
+	return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+}
+
+func buildTrustScopes(runnerMode string, runnerScopes []string) []string {
+	scopes := []string{hosttrust.ScopeSystem}
+	if hosttrust.Enabled(runnerMode) {
+		for _, scope := range runnerScopes {
+			if strings.EqualFold(strings.TrimSpace(scope), hosttrust.ScopeUser) {
+				scopes = append(scopes, hosttrust.ScopeUser)
+				break
+			}
+		}
+	}
+	return scopes
+}
+
 func linuxControllerInContainer() bool {
 	return linuxContainerEvidence(
 		func(path string) bool { _, err := os.Stat(path); return err == nil },
@@ -182,6 +240,11 @@ func validateHostTrustSnapshot(snapshot hosttrust.Snapshot, now time.Time) (host
 		return hosttrust.Snapshot{}, fmt.Errorf("host trust snapshot collection time is in the future")
 	}
 	return snapshot, nil
+}
+
+// ValidateHostTrustSnapshot verifies the shared host-trust freshness contract.
+func ValidateHostTrustSnapshot(snapshot hosttrust.Snapshot, now time.Time) (hosttrust.Snapshot, error) {
+	return validateHostTrustSnapshot(snapshot, now)
 }
 
 func hostTrustMetadata(snapshot hosttrust.Snapshot) *hostTrustImageMetadata {
@@ -243,8 +306,15 @@ func validateHostTrustMarkerAgainstSnapshot(marker hostTrustMarker, snapshot hos
 }
 
 func hostTrustLeaseJSON(snapshot hosttrust.Snapshot, now time.Time) ([]byte, error) {
+	return hostTrustLeaseJSONWithLifetime(snapshot, now, hostTrustLeaseLifetime)
+}
+
+func hostTrustLeaseJSONWithLifetime(snapshot hosttrust.Snapshot, now time.Time, lifetime time.Duration) ([]byte, error) {
 	if _, err := validateHostTrustSnapshot(snapshot, now); err != nil {
 		return nil, err
+	}
+	if lifetime <= 0 {
+		return nil, fmt.Errorf("host trust lease lifetime must be positive")
 	}
 	return json.MarshalIndent(hostTrustLease{
 		SchemaVersion: 1,
@@ -252,7 +322,7 @@ func hostTrustLeaseJSON(snapshot hosttrust.Snapshot, now time.Time) ([]byte, err
 		HostOS:        snapshot.HostOS,
 		Mode:          hosttrust.ModeOverlay,
 		Scopes:        append([]string(nil), snapshot.Scopes...),
-		ExpiresAt:     now.Add(hostTrustLeaseLifetime).UTC().Format(time.RFC3339Nano),
+		ExpiresAt:     now.Add(lifetime).UTC().Format(time.RFC3339Nano),
 	}, "", "  ")
 }
 
@@ -264,6 +334,53 @@ func copyHostTrustCertificatesToDir(destination string, snapshot hosttrust.Snaps
 		if err := os.WriteFile(filepath.Join(destination, certificate.Name), certificate.PEM, 0644); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func hostTrustCertificateArchive(snapshot hosttrust.Snapshot) (string, error) {
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	for _, certificate := range snapshot.Certificates {
+		header := &tar.Header{
+			Name: certificate.Name,
+			Mode: 0644,
+			Size: int64(len(certificate.PEM)),
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			return "", err
+		}
+		if _, err := writer.Write(certificate.PEM); err != nil {
+			return "", err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
+}
+
+func (m *Manager) installHostTrustRuntime(ctx context.Context, instanceName string, snapshot hosttrust.Snapshot) error {
+	if !m.hostTrustEnabled() {
+		return nil
+	}
+	if _, err := validateHostTrustSnapshot(snapshot, time.Now().UTC()); err != nil {
+		return err
+	}
+	archive, err := hostTrustCertificateArchive(snapshot)
+	if err != nil {
+		return fmt.Errorf("archive host trust certificates: %w", err)
+	}
+	script := fmt.Sprintf("sudo install -d -m 0755 %s && sudo find %s -maxdepth 1 -type f -name 'epar-*.crt' -delete && sudo tar -x -f - --no-same-owner --no-same-permissions -C %s && sudo update-ca-certificates", shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir))
+	if _, err := m.execGuest(ctx, instanceName, provider.ShellCommand(script), provider.ExecOptions{Stdin: archive}); err != nil {
+		return fmt.Errorf("install host trust certificates in runtime: %w", err)
+	}
+	content, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		return err
+	}
+	if err := m.copyTextGuest(ctx, instanceName, hostTrustMarkerGuest, "0644", string(content)+"\n", true); err != nil {
+		return fmt.Errorf("install host trust generation marker: %w", err)
 	}
 	return nil
 }
@@ -287,23 +404,38 @@ func (m *Manager) writeHostTrustBuildInputs(buildContext string, snapshot hosttr
 }
 
 func (m *Manager) issueHostTrustLease(ctx context.Context, instanceName string, snapshot hosttrust.Snapshot) error {
+	return m.issueHostTrustLeaseWithLifetime(ctx, instanceName, snapshot, hostTrustLeaseLifetime)
+}
+
+func (m *Manager) issueHostTrustLeaseWithLifetime(ctx context.Context, instanceName string, snapshot hosttrust.Snapshot, lifetime time.Duration) error {
 	if !m.hostTrustEnabled() {
 		return nil
 	}
-	now := time.Now().UTC()
-	content, err := hostTrustLeaseJSON(snapshot, now)
+	content, err := hostTrustLeaseJSONWithLifetime(snapshot, time.Now().UTC(), lifetime)
 	if err != nil {
 		return err
 	}
-	if _, err := m.execGuest(ctx, instanceName, provider.ShellCommand("if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar; else install -d -m 0755 /run/epar; fi"), provider.ExecOptions{}); err != nil {
+	writeCtx, cancel := context.WithTimeout(ctx, hostTrustWriteTimeout)
+	defer cancel()
+	staging := hostTrustLeaseGuest + ".tmp"
+	script := fmt.Sprintf("cat > /tmp/epar-host-trust-lease && if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar && sudo install -m 0644 /tmp/epar-host-trust-lease %s && sudo mv -f %s %s; else install -d -m 0755 /run/epar && install -m 0644 /tmp/epar-host-trust-lease %s && mv -f %s %s; fi && rm -f /tmp/epar-host-trust-lease", shellQuote(staging), shellQuote(staging), shellQuote(hostTrustLeaseGuest), shellQuote(staging), shellQuote(staging), shellQuote(hostTrustLeaseGuest))
+	if _, err := m.execGuest(writeCtx, instanceName, provider.ShellCommand(script), provider.ExecOptions{Stdin: string(content) + "\n"}); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("host trust lease write exceeded %s: %w", hostTrustWriteTimeout, err)
+		}
 		return err
 	}
-	return provider.CopyTextAtomic(ctx, m.Provider, instanceName, hostTrustLeaseGuest, "0644", string(content)+"\n")
+	return nil
 }
 
-func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot) int {
+func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot, busyHandoff map[string]bool) int {
 	if m.GitHub == nil {
 		return 0
+	}
+	for name := range busyHandoff {
+		if _, found := active[name]; !found {
+			delete(busyHandoff, name)
+		}
 	}
 	retired := 0
 	for name, instance := range active {
@@ -317,19 +449,40 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 		}
 		runner, found, err := m.GitHub.RunnerByName(ctx, name)
 		if err != nil {
-			m.warnf("[%s] host trust reconciliation warning; lease not refreshed: %v\n", name, err)
+			if isTransientGitHubLivenessError(err) {
+				m.warnf("[%s] GitHub API is temporarily unavailable during host trust refresh; the existing lease will expire closed and EPAR will retry: %v\n", name, err)
+			} else {
+				m.warnf("[%s] host trust reconciliation warning; lease not refreshed: %v\n", name, err)
+			}
 			continue
 		}
 		if instance.HostTrustGeneration == current.Generation {
-			if !found || runner.Busy {
+			if !found {
+				delete(busyHandoff, name)
 				continue
 			}
+			if runner.Busy {
+				if busyHandoff[name] {
+					continue
+				}
+				// GitHub can mark a runner busy before the job-start hook executes.
+				// Issue one bounded handoff lease for that transition, but never
+				// renew it while the job remains busy.
+				if err := m.issueHostTrustLeaseWithLifetime(ctx, name, current, hostTrustHandoffLease); err != nil {
+					m.warnf("[%s] host trust job handoff lease warning: %v\n", name, err)
+					continue
+				}
+				busyHandoff[name] = true
+				continue
+			}
+			delete(busyHandoff, name)
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
 				m.warnf("[%s] host trust lease refresh warning: %v\n", name, err)
 			}
 			continue
 		}
 		if found && runner.Busy {
+			delete(busyHandoff, name)
 			m.infof("[%s] draining busy runner on old host trust generation %s\n", name, instance.HostTrustGeneration)
 			instance.Phase = LifecycleDraining
 			active[name] = instance
@@ -341,6 +494,7 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			continue
 		}
 		delete(active, name)
+		delete(busyHandoff, name)
 		retired++
 	}
 	return retired

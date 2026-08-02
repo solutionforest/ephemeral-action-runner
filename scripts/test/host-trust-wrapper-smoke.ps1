@@ -70,6 +70,8 @@ image:
 
     $bridge = Start-EparHostTrustBridge -ProjectRoot $ProjectRoot -Command pool -Arguments @('pool', 'up', '--config', $config)
     if (-not $bridge.WatchProcess -or $bridge.WatchProcess.HasExited) { throw 'Windows host-trust watcher did not start' }
+    $publishedFeed = Join-Path $bridge.RunnerFeedDir 'current.json'
+    $firstPublishedAt = (Get-Content -LiteralPath $publishedFeed -Raw | ConvertFrom-Json).generatedAt
     $liveLock = $bridge.FeedDir + '.lock'
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     while (-not (Test-Path -LiteralPath $liveLock -PathType Container) -and [DateTime]::UtcNow -lt $deadline) {
@@ -79,6 +81,13 @@ image:
     $lockRejected = $false
     try { & $helper sync -ProjectRoot $ProjectRoot -Config $config *> $null } catch { $lockRejected = $true }
     if (-not $lockRejected) { throw 'second controller unexpectedly acquired the live Windows wrapper lock' }
+    $refreshDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    $refreshedPublishedAt = $firstPublishedAt
+    while ($refreshedPublishedAt -eq $firstPublishedAt -and [DateTime]::UtcNow -lt $refreshDeadline) {
+        Start-Sleep -Milliseconds 250
+        $refreshedPublishedAt = (Get-Content -LiteralPath $publishedFeed -Raw | ConvertFrom-Json).generatedAt
+    }
+    if ($refreshedPublishedAt -eq $firstPublishedAt) { throw 'Windows host-trust watcher did not refresh its published feed' }
     Stop-EparHostTrustBridge -Bridge $bridge
     $bridge = $null
     if (Test-Path -LiteralPath $liveLock) { throw 'Windows wrapper shutdown left its singleton lock behind' }
@@ -107,6 +116,16 @@ image:
     $quotedFeed = Get-Content -LiteralPath $quotedCurrent -Raw | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or @($quotedFeed.scopes).Count -ne 1 -or $quotedFeed.scopes[0] -ne 'system') {
         throw 'Windows wrapper quoted mode/block-scope parsing failed'
+    }
+
+    $disabledConfig = Join-Path $temporary 'disabled.yml'
+    [System.IO.File]::WriteAllText($disabledConfig, "image:`n  hostTrustMode: disabled`n  hostTrustScopes: [system, user]`n", [System.Text.UTF8Encoding]::new($false))
+    $disabledRunnerFeed = [string](& $helper sync -ProjectRoot $ProjectRoot -Config $disabledConfig -Purpose runner)
+    if ($LASTEXITCODE -ne 0 -or $disabledRunnerFeed) { throw 'disabled runner trust unexpectedly published a feed' }
+    $disabledBuildCurrent = [string](& $helper sync -ProjectRoot $ProjectRoot -Config $disabledConfig -Purpose build)
+    $disabledBuildFeed = Get-Content -LiteralPath $disabledBuildCurrent -Raw | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or @($disabledBuildFeed.scopes).Count -ne 1 -or $disabledBuildFeed.scopes[0] -ne 'system') {
+        throw 'disabled runner trust did not retain automatic system-only build trust'
     }
 
     Write-Output 'Windows host-trust wrapper lifecycle smoke passed'

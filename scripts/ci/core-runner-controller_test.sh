@@ -175,9 +175,9 @@ if [[ " $* " == *" pool up "* ]]; then
       printf 'Authorization: token %s\n' "${MOCK_GUEST_AUTH_TOKEN}"
     } >"${log_dir}/mock.guest.log"
     {
-      echo 'Docker-DinD safe diagnostic'
+      echo 'Docker Container safe diagnostic'
       printf 'EPAR_APP_PRIVATE_KEY=%s\n' "${MOCK_PRIVATE_KEY_ENV}"
-    } >"${log_dir}/mock.docker-dind.log"
+    } >"${log_dir}/mock.docker-container.log"
     echo 'pool safe diagnostic'
     printf 'RUNNER_TOKEN=%s\n' "${MOCK_POOL_TOKEN}"
     printf -- '--token %s\n' "${MOCK_CLI_TOKEN}"
@@ -333,10 +333,10 @@ fi
 grep -q 'EPAR pool supervisor exited unexpectedly with status 7' "${failure_output}"
 grep -q 'EPAR pool supervisor log (last 200 lines, sanitized)' "${failure_output}"
 grep -q 'EPAR runner log: mock.guest.log (last 200 lines, sanitized)' "${failure_output}"
-grep -q 'EPAR runner log: mock.docker-dind.log (last 200 lines, sanitized)' "${failure_output}"
+grep -q 'EPAR runner log: mock.docker-container.log (last 200 lines, sanitized)' "${failure_output}"
 grep -q '| pool safe diagnostic' "${failure_output}"
 grep -q '| guest safe diagnostic' "${failure_output}"
-grep -q '| Docker-DinD safe diagnostic' "${failure_output}"
+grep -q '| Docker Container safe diagnostic' "${failure_output}"
 grep -q '| RUNNER_TOKEN=\*\*\*' "${failure_output}"
 grep -q '| Authorization: Bearer \*\*\*' "${failure_output}"
 grep -q '| Authorization: Basic \*\*\*' "${failure_output}"

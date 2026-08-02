@@ -24,7 +24,7 @@ if [[ " $* " == *" go run ./cmd/ephemeral-action-runner init "* ]]; then
   mkdir -p "$FAKE_PROJECT/.local"
   cat >"$FAKE_PROJECT/.local/config.yml" <<'YAML'
 provider:
-  type: docker-dind
+  type: docker-container
 runner:
   ephemeral: true
 image:
@@ -63,6 +63,7 @@ if [[ "$host_os" == Linux ]]; then
 fi
 export FAKE_PROJECT="$project"
 export FAKE_DOCKER_LOG="$temporary/docker.log"
+export EPAR_LEGACY_CONTROLLER_IN_DOCKER=1
 
 (cd "$project" && scripts/run-with-docker.sh start)
 [[ "$(grep -c ' <run>' "$FAKE_DOCKER_LOG")" == 2 ]]

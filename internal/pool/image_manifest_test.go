@@ -41,7 +41,7 @@ func TestImageManifestHashChangesWithImageInputs(t *testing.T) {
 	}
 	hash := func() string {
 		t.Helper()
-		manifest, err := manager.desiredImageManifest(context.Background())
+		manifest, err := manager.desiredLocalImageManifest(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -87,14 +87,14 @@ func TestImageManifestHashChangesWithImageInputs(t *testing.T) {
 	}
 }
 
-func TestDockerDindImageStateUsesManifestLabel(t *testing.T) {
+func TestDockerContainerImageStateUsesManifestLabel(t *testing.T) {
 	oldOutput := runHostOutputCommand
 	t.Cleanup(func() {
 		runHostOutputCommand = oldOutput
 	})
 	manager := Manager{Config: config.Config{
 		Image:    config.ImageConfig{OutputImage: "epar-test"},
-		Provider: config.ProviderConfig{Type: "docker-dind"},
+		Provider: config.ProviderConfig{Type: "docker-container"},
 	}}
 
 	runHostOutputCommand = func(context.Context, string, ...string) (string, error) {

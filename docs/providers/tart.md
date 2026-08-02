@@ -1,51 +1,69 @@
 # Tart Provider (Experimental)
 
-The Tart provider is experimental. It targets Apple Silicon macOS hosts and currently supports Ubuntu ARM64 guests. Tart itself can run macOS ARM64 VMs, but EPAR's image build, runner service, validation, and cleanup scripts currently depend on Ubuntu, systemd, and Linux process interfaces, so macOS guests are not yet an EPAR provider mode.
+Tart runs each disposable EPAR runner in an Ubuntu ARM64 VM on Apple Silicon macOS. EPAR's Tart integration is experimental.
 
-> [!WARNING]
-> The default Tart source, `ghcr.io/cirruslabs/ubuntu:latest`, is a basic Ubuntu ARM64 OS image. It does not contain the broad dependency set normally present in GitHub's hosted images from [`actions/runner-images`](https://github.com/actions/runner-images), including many language SDKs, CLIs, browsers, and build tools. Tart uses Apple's Virtualization framework, so an Apple Silicon host runs an ARM64 VM. Rosetta translates supported x86_64 Linux user-space programs inside that ARM64 guest; it does not create an x64 VM, and not every amd64 image or workload is compatible.
+## When To Use It
 
-EPAR currently validates the Ubuntu path:
+Choose Tart only when you have Apple Silicon macOS and specifically want Linux ARM64 VMs. Use Docker Container or WSL/x64 Linux when native amd64 workflow compatibility is more important.
 
-- clone a reusable Tart image
-- start the VM headless
-- use the Tart guest agent for `exec` and IP discovery
-- validate the base GitHub Actions runner runtime
-- register an ephemeral GitHub runner from the host
-- delete the VM after the runner exits
+## Support Status
 
-Use `configs/tart.example.yml` for the basic runner-only Ubuntu image or `configs/tart.web-e2e.example.yml` for the existing opt-in web/E2E and Rosetta experiment. EPAR installs the GitHub Actions runner and its lifecycle scripts, but the default does not install Docker, .NET, PowerShell, Go, browsers, or the rest of GitHub's hosted-runner tool inventory.
+EPAR supports Ubuntu ARM64 guests, not macOS guests. The default source is a basic Ubuntu VM image, not a GitHub-hosted runner image; it does not include the broad language, browser, Docker, and CLI inventory associated with `actions/runner-images`.
 
-If a workflow needs a GitHub-runner-like environment, build and maintain your own bootable Tart source image. Adapt the Ubuntu build scripts and tool definitions from [`actions/runner-images`](https://github.com/actions/runner-images) to that image, validate the resulting ARM64 tools, push it as a Tart VM image, and set `image.sourceImage` to it. Alternatively, add narrowly scoped `image.customInstallScripts` for only the dependencies your workflows require. EPAR does not convert the Catthehacker Docker image or automatically reproduce the complete GitHub-hosted image for Tart.
+## Prerequisites
 
-When Docker/browser support is selected on ARM64, EPAR exposes a Chromium-compatible browser through `epar-browser`, `chromium`, and `chromium-browser`; it is not guaranteed to be Google Chrome.
+- Apple Silicon macOS and a working `tart` CLI.
+- A bootable Ubuntu ARM64 Tart source image.
+- Enough local VM storage for a reusable image and active disposable VMs.
 
-The default network mode is Tart NAT. `softnet` is accepted by the provider, but it can require host-side privileges.
+## Minimal Configuration
 
-If Docker is installed in a custom Tart guest, optional `docker.registryMirrors` settings are applied to the guest Docker daemon when each disposable VM starts. Use a mirror URL that is reachable from inside the Tart VM; `host.docker.internal` is Docker-container-specific and may not resolve in Tart guests. See [Docker Registry Mirrors](../advanced/docker-registry-mirrors.md).
-
-## Experimental Rosetta Support For Linux Amd64 Containers
-
-Tart on Apple Silicon runs ARM64 VMs, but Tart can expose Apple's Linux Rosetta runtime to the guest with `tart run --rosetta <tag>`. EPAR supports this as an opt-in Tart-only setting:
+Start with [`configs/tart.example.yml`](../../configs/tart.example.yml):
 
 ```yaml
+image:
+  sourceImage: ghcr.io/cirruslabs/ubuntu:latest
+  outputImage: epar-ubuntu-24-arm64
+  updateFrequency: weekly
+  updateTime: "07:00"
+
 provider:
   type: tart
-  rosettaTag: rosetta
+  sourceImage: epar-ubuntu-24-arm64
+  network: default
 ```
 
-When `provider.rosettaTag` is set, EPAR starts Tart instances with `--rosetta rosetta`, installs `/opt/epar/setup-rosetta.sh` during image build, enables `epar-rosetta.service`, and registers an x86_64 Linux `binfmt_misc` handler inside the guest. Images with the Rosetta feature marker validate:
+Use a distinct image and label when adding tools through `image.customInstallScripts`. If workflows need a GitHub-runner-like environment, build and maintain your own bootable Ubuntu Tart image; EPAR does not convert Catthehacker Docker images into Tart VMs.
+
+## Normal Workflow
+
+1. Create the configuration and run `./start` to build the reusable Tart image and start the pool.
+2. Target the ARM64 Tart label in workflows.
+3. Use `pool verify` before routing a new workload to the provider.
+
+Tart clones the reusable image, starts the VM headless, uses the guest agent for command execution and IP discovery, and removes the VM after the ephemeral runner exits.
+
+## Limitations
+
+- This provider is experimental. It uses a per-runner VM boundary, but workflows still control the guest and any secrets or services exposed to the job.
+- The default image is runner-only. Add only the dependencies your workflows need, or maintain a fuller source image yourself.
+- `provider.network: softnet` may require additional host privileges; NAT is the default.
+- Rosetta can translate some Linux amd64 user-space workloads in an ARM64 guest, but it does not turn the VM into an x64 VM or guarantee every amd64 workload.
+
+## Verification
 
 ```bash
-sudo -u runner -H docker run --rm --platform linux/amd64 alpine:3.20 sh -c 'uname -m'
+./start pool verify --instances 1 --cleanup
 ```
 
-The expected output is `x86_64`.
+For the optional Rosetta experiment, use `configs/tart.web-e2e.example.yml` or set a distinct `provider.rosettaTag`. Verify a real container execution before routing amd64 workflows:
 
-Host prerequisites:
+```bash
+docker run --rm --platform linux/amd64 alpine:3.20 uname -m
+```
 
-- Apple Silicon macOS
-- Tart version with `--rosetta` support
-- Apple's Rosetta package installed on the macOS host
+Run that command inside the Tart guest; expected output is `x86_64`.
 
-This is experimental support for Linux amd64 user-space containers. It is not nested virtualization and it does not make the Ubuntu VM an x64 VM. For native amd64 performance and compatibility, use a Windows WSL x64 provider or another x64 Linux host. For Tart Rosetta-capable runners, expose a distinct label such as `epar-tart-rosetta-amd64` so workflows can opt into the behavior explicitly.
+## Troubleshooting
+
+See [Troubleshooting](../troubleshooting.md) for platform and runtime failures. Keep Rosetta-capable runners behind a dedicated label so workflows opt in deliberately.

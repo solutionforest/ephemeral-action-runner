@@ -19,6 +19,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  go-quality:
+    name: Go race and vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Run vet
+        run: go vet ./...
+
   native:
     name: Native read-only (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -40,7 +61,12 @@ jobs:
 
       - name: Run Go tests
         shell: bash
-        run: go test ./...
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            export TMPDIR="$(cd "${RUNNER_TEMP}" && pwd -P)"
+          fi
+          go test ./...
 
       - name: Smoke-test native host root collection without trust-store mutations
         shell: bash
@@ -203,10 +229,23 @@ jobs:
         if: runner.os == 'Windows'
         run: scripts/test/host-trust-wrapper-smoke.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
 
-      - name: Exercise no-Go first-run start lifecycle
+      - name: Verify no-Go native-controller contract
         shell: pwsh
         if: runner.os == 'Windows'
-        run: scripts/test/no-go-first-run-smoke.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+        run: scripts/test/windows-native-controller-contract.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+
+      - name: Verify Windows start.ps1 command forwarding
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: scripts/test/start-command-forwarding.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+
+      - name: Verify Docker Sandboxes plan-only contracts
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          scripts/test/docker-sandboxes-plan-smoke.ps1
+          scripts/docker-sandboxes/validate-assets.ps1 -Platform linux/amd64
+          scripts/docker-sandboxes/validate-assets.ps1 -Platform linux/arm64
 
       - name: Exercise official wrapper feed lifecycle and singleton lock
         shell: bash
@@ -217,6 +256,16 @@ jobs:
         shell: bash
         if: runner.os != 'Windows'
         run: bash scripts/test/no-go-first-run-smoke.sh
+
+      - name: Verify start command forwarding
+        shell: bash
+        if: runner.os != 'Windows'
+        run: bash scripts/test/start-command-forwarding.sh
+
+      - name: Verify native-controller cache retention
+        shell: bash
+        if: runner.os != 'Windows'
+        run: bash scripts/test/native-controller-cache-retention.sh
 
       - name: Parse Bash host-trust scripts
         if: runner.os != 'Windows'
@@ -229,7 +278,9 @@ jobs:
             scripts/host-trust/host-trust-feed.sh \
             scripts/host-trust/wrapper-lib.sh \
             scripts/test/host-trust-wrapper-smoke.sh \
+            scripts/test/native-controller-cache-retention.sh \
             scripts/test/no-go-first-run-smoke.sh \
+            scripts/test/start-command-forwarding.sh \
             scripts/guest/ubuntu/apply-trusted-ca-runtime.sh \
             scripts/guest/ubuntu/check-host-trust-generation.sh
 
@@ -241,10 +292,16 @@ jobs:
           $files = @(
             'start.ps1',
             'scripts/run-with-docker.ps1',
+            'scripts/build-native-controller.ps1',
+            'scripts/docker-sandboxes/build-template.ps1',
+            'scripts/docker-sandboxes/load-template.ps1',
+            'scripts/docker-sandboxes/validate-assets.ps1',
             'scripts/host-trust/host-trust-feed.ps1',
             'scripts/host-trust/wrapper-lib.ps1',
+            'scripts/test/docker-sandboxes-plan-smoke.ps1',
             'scripts/test/host-trust-wrapper-smoke.ps1',
-            'scripts/test/no-go-first-run-smoke.ps1'
+            'scripts/test/start-command-forwarding.ps1',
+            'scripts/test/windows-native-controller-contract.ps1'
           )
           foreach ($file in $files) {
             $tokens = $null

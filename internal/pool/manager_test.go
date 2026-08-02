@@ -19,6 +19,7 @@ import (
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -42,6 +43,106 @@ func TestRunnerAliveKeepsBusyGitHubRunnerWithoutServiceCheck(t *testing.T) {
 	}
 }
 
+func TestImageMaintenanceDrainRequiresConsecutiveIdleObservations(t *testing.T) {
+	host := &fakeProvider{}
+	github := &fakeGitHub{
+		runner: gh.Runner{ID: 42, Name: "epar-test-1", Status: "online"},
+		found:  true,
+	}
+	manager := Manager{Provider: host, GitHub: github}
+	active := map[string]ProvisionedInstance{
+		"epar-test-1": {Name: "epar-test-1", RunnerID: 42},
+	}
+	confirmedIdle := make(map[string]int)
+
+	remaining, err := manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 || atomic.LoadInt32(&github.deleteCalls) != 0 || atomic.LoadInt32(&host.deleteCalls) != 0 {
+		t.Fatalf("first idle observation retired runner: remaining=%d remoteDeletes=%d localDeletes=%d", remaining, github.deleteCalls, host.deleteCalls)
+	}
+
+	github.runner.Busy = true
+	remaining, err = manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 || confirmedIdle["epar-test-1"] != 0 {
+		t.Fatalf("busy observation did not reset idle confirmation: remaining=%d checks=%d", remaining, confirmedIdle["epar-test-1"])
+	}
+
+	github.runner.Busy = false
+	if remaining, err = manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle); err != nil || remaining != 1 {
+		t.Fatalf("idle confirmation after busy = remaining %d, error %v", remaining, err)
+	}
+	if remaining, err = manager.drainPoolForImageUpdate(context.Background(), active, confirmedIdle); err != nil || remaining != 0 {
+		t.Fatalf("second consecutive idle confirmation = remaining %d, error %v", remaining, err)
+	}
+	if atomic.LoadInt32(&github.deleteCalls) != 1 || atomic.LoadInt32(&host.deleteCalls) != 1 {
+		t.Fatalf("confirmed idle retirement calls = remote %d local %d, want 1 each", github.deleteCalls, host.deleteCalls)
+	}
+}
+
+func TestRunnerGroupPreflightEnforcesAndWarns(t *testing.T) {
+	violation := gh.RunnerGroupPolicyResult{Violations: []string{"runner group allows public repositories"}}
+	for _, test := range []struct {
+		name        string
+		enforcement string
+		result      gh.RunnerGroupPolicyResult
+		apiErr      error
+		wantErr     bool
+	}{
+		{name: "enforce violation", enforcement: config.RunnerGroupEnforcementEnforce, result: violation, wantErr: true},
+		{name: "warn violation", enforcement: config.RunnerGroupEnforcementWarn, result: violation},
+		{name: "enforce API failure", enforcement: config.RunnerGroupEnforcementEnforce, apiErr: errors.New("forbidden"), wantErr: true},
+		{name: "warn API failure", enforcement: config.RunnerGroupEnforcementWarn, apiErr: errors.New("forbidden")},
+		{name: "enforce allowed", enforcement: config.RunnerGroupEnforcementEnforce, result: gh.RunnerGroupPolicyResult{Resolved: true, Group: gh.RunnerGroup{Name: "restricted"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Runner.Group = "restricted"
+			cfg.Security.RunnerGroup.Enforcement = test.enforcement
+			github := &fakeGitHub{policyResult: test.result, policyErr: test.apiErr}
+			manager := Manager{Config: cfg, GitHub: github}
+			err := manager.PreflightRunnerGroup(context.Background())
+			if (err != nil) != test.wantErr {
+				t.Fatalf("PreflightRunnerGroup() error = %v, wantErr=%t", err, test.wantErr)
+			}
+			if got := atomic.LoadInt32(&github.policyCalls); got != 1 {
+				t.Fatalf("policy calls = %d, want 1", got)
+			}
+			if got := atomic.LoadInt32(&github.registrationCalls); got != 0 {
+				t.Fatalf("registration-token calls = %d, want 0", got)
+			}
+			if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+				t.Fatalf("runner delete calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestRegistrationPreflightRejectsBeforeTokenRequest(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{policyResult: gh.RunnerGroupPolicyResult{Violations: []string{"unsafe group"}}}
+	manager := newRegisteredTestManager(t, provider, github)
+	manager.Config.Security = config.Default().Security
+	manager.Config.Security.RunnerGroup.Enforcement = config.RunnerGroupEnforcementEnforce
+	_, err := manager.provisionOne(context.Background(), "epar-test-policy", true, false)
+	if err == nil || !strings.Contains(err.Error(), "unsafe group") {
+		t.Fatalf("provisionOne() error = %v, want policy rejection", err)
+	}
+	if got := atomic.LoadInt32(&github.policyCalls); got != 1 {
+		t.Fatalf("policy calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&github.registrationCalls); got != 0 {
+		t.Fatalf("registration-token calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("remote runner delete calls = %d, want 0", got)
+	}
+}
+
 func TestRetiredInstanceTranscriptsBecomeRetentionEligibleWhileLiveInstanceStaysProtected(t *testing.T) {
 	root := t.TempDir()
 	runtime, err := logging.NewRuntime(logging.Options{Directory: root, TranscriptSinks: logging.SinkFile})
@@ -52,14 +153,14 @@ func TestRetiredInstanceTranscriptsBecomeRetentionEligibleWhileLiveInstanceStays
 	manager := Manager{
 		Config: config.Config{
 			Logging:  config.LoggingConfig{Directory: root},
-			Provider: config.ProviderConfig{Type: "docker-dind"},
+			Provider: config.ProviderConfig{Type: "docker-container"},
 		},
 		ProjectRoot: root,
 		Logging:     runtime,
 	}
 	retired := ProvisionedInstance{
 		Name:         "retired-runner",
-		LogPath:      filepath.Join(root, "instances", "retired-runner.docker-dind.log"),
+		LogPath:      filepath.Join(root, "instances", "retired-runner.docker-container.log"),
 		GuestLogPath: filepath.Join(root, "instances", "retired-runner.guest.log"),
 	}
 	livePath := filepath.Join(root, "instances", "live-runner.guest.log")
@@ -115,13 +216,13 @@ func TestRetirementSuccessIsNotReversedByTranscriptCloseFailure(t *testing.T) {
 	manager := Manager{
 		Config: config.Config{
 			Logging:  config.LoggingConfig{Directory: root},
-			Provider: config.ProviderConfig{Type: "docker-dind"},
+			Provider: config.ProviderConfig{Type: "docker-container"},
 		},
 		Provider:    provider,
 		ProjectRoot: root,
 		Logging:     runtime,
 	}
-	vm := ProvisionedInstance{Name: "retired-runner", LogPath: filepath.Join(root, "instances", "retired-runner.docker-dind.log")}
+	vm := ProvisionedInstance{Name: "retired-runner", LogPath: filepath.Join(root, "instances", "retired-runner.docker-container.log")}
 	transcript, err := manager.transcript(vm.LogPath, vm.Name, "provider")
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +259,12 @@ func TestRetirementSuccessIsNotReversedByTranscriptCloseFailure(t *testing.T) {
 }
 
 func TestRunnerAliveRetiresIdleRunnerWhenServiceIsInactive(t *testing.T) {
-	provider := &fakeProvider{execErr: errors.New("inactive")}
+	provider := &fakeProvider{execFunc: func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), runnerProcessRunningSentinel) {
+			return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+		}
+		return provider.ExecResult{}, nil
+	}}
 	github := &fakeGitHub{
 		runner: gh.Runner{Name: "epar-test-1", Status: "online", Busy: false},
 		found:  true,
@@ -172,11 +278,65 @@ func TestRunnerAliveRetiresIdleRunnerWhenServiceIsInactive(t *testing.T) {
 	if alive {
 		t.Fatal("runnerAlive() alive = true, want false")
 	}
-	if reason != "actions runner process is no longer active" {
+	if reason != runnerProcessInactiveReason {
 		t.Fatalf("reason = %q", reason)
 	}
 	if got := atomic.LoadInt32(&provider.execCalls); got != 1 {
 		t.Fatalf("service check ran %d time(s), want 1", got)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.execOptions) != 1 || !provider.execOptions[0].SuppressTranscript {
+		t.Fatal("machine-readable health probe was not excluded from the guest transcript")
+	}
+}
+
+func TestRunnerAlivePreservesRunnerWhenProcessProbeIsUnavailable(t *testing.T) {
+	provider := &fakeProvider{execErr: context.DeadlineExceeded}
+	github := &fakeGitHub{
+		runner: gh.Runner{Name: "epar-test-1", Status: "online", Busy: false},
+		found:  true,
+	}
+	manager := Manager{Provider: provider, GitHub: github}
+
+	alive, reason, err := manager.runnerAlive(context.Background(), ProvisionedInstance{Name: "epar-test-1"})
+	if err == nil {
+		t.Fatal("runnerAlive() error = nil, want unavailable process-probe error")
+	}
+	if !alive {
+		t.Fatalf("runnerAlive() alive = false, reason = %q; an unavailable probe must preserve the runner", reason)
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", got)
+	}
+}
+
+func TestRunnerProcessProbeRejectsUnsupportedOutput(t *testing.T) {
+	provider := &fakeProvider{execFunc: func(context.Context, string, []string, provider.ExecOptions) (provider.ExecResult, error) {
+		return provider.ExecResult{Stdout: "unexpected\n"}, nil
+	}}
+	manager := Manager{Provider: provider}
+	if _, err := manager.probeRunnerProcess(context.Background(), "epar-test-1"); err == nil || !strings.Contains(err.Error(), "unsupported response") {
+		t.Fatalf("probeRunnerProcess() error = %v, want unsupported-response error", err)
+	}
+}
+
+func TestRunnerLivenessRequiresConsecutiveConfirmedInactiveProbes(t *testing.T) {
+	counts := make(map[string]int)
+	if count, retire := recordRunnerLiveness(counts, "runner-1", false, runnerProcessInactiveReason, nil); count != 1 || retire {
+		t.Fatalf("first confirmed inactive probe = count %d retire %t, want 1 false", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-1", true, "", context.DeadlineExceeded); count != 0 || retire {
+		t.Fatalf("unavailable probe = count %d retire %t, want 0 false", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-1", false, runnerProcessInactiveReason, nil); count != 1 || retire {
+		t.Fatalf("first probe after uncertainty = count %d retire %t, want 1 false", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-1", false, runnerProcessInactiveReason, nil); count != 2 || !retire {
+		t.Fatalf("second consecutive confirmed inactive probe = count %d retire %t, want 2 true", count, retire)
+	}
+	if count, retire := recordRunnerLiveness(counts, "runner-2", false, "GitHub runner record is gone", nil); count != 0 || !retire {
+		t.Fatalf("authoritative remote absence = count %d retire %t, want 0 true", count, retire)
 	}
 }
 
@@ -283,6 +443,7 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+			Security: config.Default().Security,
 		},
 		Provider:    provider,
 		GitHub:      github,
@@ -324,7 +485,7 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
@@ -336,7 +497,6 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 		GitHub:      github,
 		ProjectRoot: t.TempDir(),
 	}
-	var resolveCalls int32
 	snapshot := func(generation string) hosttrust.Snapshot {
 		return hosttrust.Snapshot{
 			Generation: generation, HostOS: "linux", Scopes: []string{"system"},
@@ -345,7 +505,7 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 		}
 	}
 	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
-		if atomic.AddInt32(&resolveCalls, 1) <= 2 {
+		if atomic.LoadInt32(&github.waitOnlineCalls)+atomic.LoadInt32(&github.waitOnlineIdleCalls) == 0 {
 			return snapshot("g1"), nil
 		}
 		return snapshot("g2"), nil
@@ -393,7 +553,7 @@ func TestVerifyUsesIdleReadiness(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
@@ -453,7 +613,7 @@ func TestProvisionOneRetriesTransientRuntimeValidationFailure(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
@@ -481,7 +641,7 @@ func TestVerifyCleanupUsesFreshContextAfterCancellation(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
@@ -512,7 +672,7 @@ func TestRunPoolCleanupUsesFreshContextAfterCancellation(t *testing.T) {
 	}
 	manager := Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
@@ -547,7 +707,7 @@ func TestProvisionOnePassesRunnerRegistrationControlsWithoutPrivateKey(t *testin
 			GitHub: config.GitHubConfig{PrivateKeyPath: "/secret/app.pem"},
 			Provider: config.ProviderConfig{
 				SourceImage: "image",
-				Type:        "docker-dind",
+				Type:        "docker-container",
 			},
 			Pool: config.PoolConfig{
 				Instances:  1,
@@ -713,6 +873,91 @@ func TestProvisionOneCapturesReadinessTimeoutAndPreservesCause(t *testing.T) {
 	}
 }
 
+func TestRunPoolCancellationAfterListenerStartCleansExactRunner(t *testing.T) {
+	state, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var deleted atomic.Bool
+	var lookupCalls atomic.Int32
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), "run-runner.sh") {
+			cancel()
+		}
+		return provider.ExecResult{}, nil
+	}
+	github := &fakeGitHub{
+		runnerByNameFunc: func(_ context.Context, name string) (gh.Runner, bool, error) {
+			if lookupCalls.Add(1) == 1 || deleted.Load() {
+				return gh.Runner{}, false, nil
+			}
+			return gh.Runner{Name: name, ID: 718}, true, nil
+		},
+		deleteFunc: func(context.Context, int64) error {
+			deleted.Store(true)
+			return nil
+		},
+		waitFunc: func(ctx context.Context, _ string, _ time.Duration) (gh.Runner, error) {
+			<-ctx.Done()
+			return gh.Runner{}, ctx.Err()
+		},
+	}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.LifecycleState = state
+
+	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, ReplaceCompleted: true, PoolLockHeld: true, HostTrustLockHeld: true}); err != nil {
+		t.Fatalf("RunPool() cancellation error = %v, want exact cleanup", err)
+	}
+	records, err := state.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("lifecycle records = %#v, want one tombstoned candidate", records)
+	}
+	record := records[0]
+	if record.Phase != poolstate.PhaseTombstoned || record.GitHub.RunnerID != 718 {
+		t.Fatalf("lifecycle after cancellation = phase %q runner id %d, want tombstoned with id 718", record.Phase, record.GitHub.RunnerID)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("remote delete calls = %d, want 1", got)
+	}
+	github.mu.Lock()
+	defer github.mu.Unlock()
+	if len(github.deletedIDs) != 1 || github.deletedIDs[0] != 718 {
+		t.Fatalf("deleted remote IDs = %v, want [718]", github.deletedIDs)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("local delete calls = %d, want 1", got)
+	}
+}
+
+func TestCommonLifecycleOwnsGuestTranscriptPath(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-1", State: "running"}}}
+	manager := newRegisteredTestManager(t, fake, nil)
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+
+	if _, err := manager.execGuest(context.Background(), "epar-test-1", []string{"true"}, provider.ExecOptions{Env: map[string]string{"EPAR_TEST": "value"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.logPathFor("true"); got != "" {
+		t.Fatalf("provider received common host transcript path %q", got)
+	}
+	fake.mu.Lock()
+	command := fake.commands[len(fake.commands)-1]
+	options := fake.execOptions[len(fake.execOptions)-1]
+	fake.mu.Unlock()
+	if len(options.Env) != 0 {
+		t.Fatalf("provider received ambient host environment: %#v", options.Env)
+	}
+	if !strings.Contains(command, "env EPAR_TEST=value true") {
+		t.Fatalf("provider command = %q, want explicit guest environment", command)
+	}
+}
+
 func TestProvisionOneReadinessSucceedsWhileRunnerProcessStaysHealthy(t *testing.T) {
 	oldInterval := runnerReadinessHealthCheckInterval
 	runnerReadinessHealthCheckInterval = time.Millisecond
@@ -797,6 +1042,59 @@ func TestProvisioningFailureRollbackBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProvisioningRecordsPartialCreateIdentityBeforeExactRollback(t *testing.T) {
+	const name = "epar-test-partial-create"
+	partial := provider.Instance{
+		Name:           name,
+		ProviderID:     "fake:partial-create-id",
+		Source:         "image",
+		State:          "running",
+		ReceiptVersion: "v1",
+		Receipt:        json.RawMessage(`{"providerId":"fake:partial-create-id","source":"image"}`),
+	}
+	fake := &fakeProvider{}
+	baseLifecycle := provider.AdaptLegacy(fake)
+	lifecycle := &partialCreateLifecycle{
+		Lifecycle: baseLifecycle,
+		create: func() (provider.Instance, error) {
+			fake.mu.Lock()
+			fake.instances = append(fake.instances, partial)
+			fake.mu.Unlock()
+			return partial, errors.New("post-create verification failed")
+		},
+	}
+	manager := newRegisteredTestManager(t, fake, nil)
+	manager.Lifecycle = lifecycle
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.LifecycleState = store
+
+	if _, err := manager.provisionOne(context.Background(), name, false, false); err == nil || !strings.Contains(err.Error(), "post-create verification failed") {
+		t.Fatalf("provisionOne() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("exact provider delete calls = %d, want 1", got)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.ProviderID != partial.ProviderID || record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("lifecycle record = %#v, want exact provider identity tombstoned", record)
+	}
+}
+
+type partialCreateLifecycle struct {
+	provider.Lifecycle
+	create func() (provider.Instance, error)
+}
+
+func (l *partialCreateLifecycle) Create(context.Context, provider.CreateRequest) (provider.Instance, error) {
+	return l.create()
 }
 
 func TestConfigureFailureDeletesExactLocalAndRemoteCandidate(t *testing.T) {
@@ -1184,7 +1482,7 @@ func newRegisteredTestManager(t *testing.T, provider provider.Provider, github G
 	t.Helper()
 	return Manager{
 		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-dind"},
+			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 			Logging:  config.LoggingConfig{Directory: t.TempDir()},
 			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
@@ -1226,7 +1524,7 @@ type fakeProvider struct {
 func (p *fakeProvider) Clone(_ context.Context, source, name string) error {
 	atomic.AddInt32(&p.cloneCalls, 1)
 	p.mu.Lock()
-	p.instances = append(p.instances, provider.Instance{Name: name, Source: source, State: "running"})
+	p.instances = append(p.instances, provider.Instance{Name: name, ProviderID: "fake:" + name, Source: source, State: "running"})
 	if len(p.instances) > int(atomic.LoadInt32(&p.maxInventory)) {
 		atomic.StoreInt32(&p.maxInventory, int32(len(p.instances)))
 	}
@@ -1259,6 +1557,9 @@ func (p *fakeProvider) Exec(ctx context.Context, name string, command []string, 
 	}
 	if int(call) <= len(p.execErrs) {
 		return provider.ExecResult{}, p.execErrs[call-1]
+	}
+	if p.execErr == nil && strings.Contains(commandText, runnerProcessRunningSentinel) {
+		return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
 	}
 	return provider.ExecResult{}, p.execErr
 }
@@ -1326,17 +1627,25 @@ func (p *fakeProvider) List(ctx context.Context) ([]provider.Instance, error) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]provider.Instance(nil), p.instances...), p.listErr
+	result := append([]provider.Instance(nil), p.instances...)
+	for i := range result {
+		if result[i].ProviderID == "" {
+			result[i].ProviderID = "fake:" + result[i].Name
+		}
+	}
+	return result, p.listErr
 }
 
 type fakeGitHub struct {
 	runner              gh.Runner
+	runnerByNameFunc    func(context.Context, string) (gh.Runner, bool, error)
 	waitRunner          gh.Runner
 	waitErr             error
 	waitFunc            func(context.Context, string, time.Duration) (gh.Runner, error)
 	found               bool
 	runnerErr           error
 	deleteErr           error
+	deleteFunc          func(context.Context, int64) error
 	waitOnlineCalls     int32
 	waitOnlineIdleCalls int32
 	listRunners         []gh.Runner
@@ -1344,6 +1653,10 @@ type fakeGitHub struct {
 	listFunc            func(context.Context) ([]gh.Runner, error)
 	registrationErr     error
 	registrationToken   string
+	policyResult        gh.RunnerGroupPolicyResult
+	policyErr           error
+	policyCalls         int32
+	registrationCalls   int32
 	deleteCalls         int32
 	deletedIDs          []int64
 	mu                  sync.Mutex
@@ -1355,7 +1668,13 @@ func (g *fakeGitHub) OrganizationURL() string {
 	return "https://github.test/example"
 }
 
+func (g *fakeGitHub) EvaluateRunnerGroupPolicy(context.Context, string, config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error) {
+	atomic.AddInt32(&g.policyCalls, 1)
+	return g.policyResult, g.policyErr
+}
+
 func (g *fakeGitHub) RegistrationToken(context.Context) (gh.RegistrationToken, error) {
+	atomic.AddInt32(&g.registrationCalls, 1)
 	token := g.registrationToken
 	if token == "" {
 		token = "token"
@@ -1371,8 +1690,11 @@ func (g *fakeGitHub) ListRunners(ctx context.Context) ([]gh.Runner, error) {
 	return append([]gh.Runner(nil), g.listRunners...), g.listErr
 }
 
-func (g *fakeGitHub) RunnerByName(context.Context, string) (gh.Runner, bool, error) {
+func (g *fakeGitHub) RunnerByName(ctx context.Context, name string) (gh.Runner, bool, error) {
 	atomic.AddInt32(&g.runnerByNameCalls, 1)
+	if g.runnerByNameFunc != nil {
+		return g.runnerByNameFunc(ctx, name)
+	}
 	return g.runner, g.found, g.runnerErr
 }
 
@@ -1399,11 +1721,14 @@ func (g *fakeGitHub) waitReady(ctx context.Context, name string, timeout time.Du
 	return g.runner, nil
 }
 
-func (g *fakeGitHub) DeleteRunnerIfExists(_ context.Context, id int64) error {
+func (g *fakeGitHub) DeleteRunnerIfExists(ctx context.Context, id int64) error {
 	atomic.AddInt32(&g.deleteCalls, 1)
 	g.mu.Lock()
 	g.deletedIDs = append(g.deletedIDs, id)
 	g.mu.Unlock()
+	if g.deleteFunc != nil {
+		return g.deleteFunc(ctx, id)
+	}
 	return g.deleteErr
 }
 

@@ -4,7 +4,10 @@
 # set EPAR_HOST_TRUST_HELPER to the real-host helper script before sourcing.
 
 EPAR_HOST_TRUST_FEED_DIR=""
+EPAR_BUILD_TRUST_FEED_DIR=""
+EPAR_RUNNER_TRUST_FEED_DIR=""
 EPAR_HOST_TRUST_WATCH_PID=""
+EPAR_TRUST_WATCH_PIDS=()
 EPAR_HOST_TRUST_POST_INIT_CONFIG=""
 
 epar_host_trust_config_path() {
@@ -72,9 +75,12 @@ epar_host_trust_prepare() {
   local project_root="$1" command="$2"
   shift 2
   EPAR_HOST_TRUST_FEED_DIR=""
+  EPAR_BUILD_TRUST_FEED_DIR=""
+  EPAR_RUNNER_TRUST_FEED_DIR=""
   EPAR_HOST_TRUST_WATCH_PID=""
+  EPAR_TRUST_WATCH_PIDS=()
   EPAR_HOST_TRUST_POST_INIT_CONFIG=""
-  local config_path feed_path watcher_log subcommand=""
+  local config_path feed_path feed_dir watcher_log subcommand="" purpose watcher_pid
   if (($# >= 2)); then subcommand="$2"; fi
   config_path="$(epar_host_trust_config_path "$project_root" "$@")"
   case "$command" in
@@ -85,25 +91,28 @@ epar_host_trust_prepare() {
       return 0
       ;;
     start) ;;
-    image) [[ "$subcommand" == build ]] || return 0 ;;
+    image) [[ "$subcommand" == build || "$subcommand" == update ]] || return 0 ;;
     pool) [[ "$subcommand" == up || "$subcommand" == verify ]] || return 0 ;;
     *) return 0 ;;
   esac
-  feed_path="$("$EPAR_HOST_TRUST_HELPER" sync --project-root "$project_root" --config "$config_path")" || return $?
-  [[ -n "$feed_path" ]] || return 0
-  EPAR_HOST_TRUST_FEED_DIR="$(dirname "$feed_path")"
-  watcher_log="${EPAR_HOST_TRUST_FEED_DIR}/watcher.log"
-  "$EPAR_HOST_TRUST_HELPER" watch --project-root "$project_root" --config "$config_path" --interval 10 >>"$watcher_log" 2>&1 &
-  EPAR_HOST_TRUST_WATCH_PID="$!"
-  # Fail closed when the singleton watcher rejects the lock or exits before
-  # the controller receives its first feed generation.
-  sleep 0.1
-  if ! kill -0 "$EPAR_HOST_TRUST_WATCH_PID" 2>/dev/null; then
-    wait "$EPAR_HOST_TRUST_WATCH_PID" || true
-    EPAR_HOST_TRUST_WATCH_PID=""
-    echo "host trust watcher failed to start; see $watcher_log" >&2
-    return 1
-  fi
+  for purpose in build runner; do
+    feed_path="$("$EPAR_HOST_TRUST_HELPER" sync --project-root "$project_root" --config "$config_path" --purpose "$purpose")" || return $?
+    [[ -n "$feed_path" ]] || continue
+    feed_dir="$(dirname "$feed_path")"
+    if [[ "$purpose" == build ]]; then EPAR_BUILD_TRUST_FEED_DIR="$feed_dir"; else EPAR_RUNNER_TRUST_FEED_DIR="$feed_dir"; fi
+    watcher_log="${feed_dir}/watcher.log"
+    "$EPAR_HOST_TRUST_HELPER" watch --project-root "$project_root" --config "$config_path" --purpose "$purpose" --interval 10 >>"$watcher_log" 2>&1 &
+    watcher_pid="$!"
+    EPAR_TRUST_WATCH_PIDS+=("$watcher_pid")
+    sleep 0.1
+    if ! kill -0 "$watcher_pid" 2>/dev/null; then
+      wait "$watcher_pid" || true
+      echo "$purpose trust watcher failed to start; see $watcher_log" >&2
+      return 1
+    fi
+  done
+  EPAR_HOST_TRUST_FEED_DIR="$EPAR_RUNNER_TRUST_FEED_DIR"
+  if ((${#EPAR_TRUST_WATCH_PIDS[@]} > 0)); then EPAR_HOST_TRUST_WATCH_PID="${EPAR_TRUST_WATCH_PIDS[0]}"; fi
 }
 
 epar_host_trust_post_init() {
@@ -125,9 +134,12 @@ epar_host_trust_post_init() {
 }
 
 epar_host_trust_cleanup() {
-  if [[ -n "${EPAR_HOST_TRUST_WATCH_PID:-}" ]]; then
-    kill "$EPAR_HOST_TRUST_WATCH_PID" 2>/dev/null || true
-    wait "$EPAR_HOST_TRUST_WATCH_PID" 2>/dev/null || true
-    EPAR_HOST_TRUST_WATCH_PID=""
-  fi
+  local watcher_pid
+  for watcher_pid in "${EPAR_TRUST_WATCH_PIDS[@]:-}"; do
+    [[ -n "$watcher_pid" ]] || continue
+    kill "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+  done
+  EPAR_TRUST_WATCH_PIDS=()
+  EPAR_HOST_TRUST_WATCH_PID=""
 }

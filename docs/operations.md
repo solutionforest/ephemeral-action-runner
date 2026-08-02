@@ -1,76 +1,77 @@
 # Operations
 
-## Logs
+EPAR is a foreground supervisor. Keep it running while the pool should accept jobs; it creates, monitors, retires, and replaces disposable runners within the configured capacity.
 
-Host-side logs go under `work/logs` by default. Run `ephemeral-action-runner logs path` to print the resolved directory. When `managerSinks` includes `file`, manager events use `work/logs/epar.log`; the default manager sink is console-only. Instance transcripts use `work/logs/instances/`, build/source transcripts use `work/logs/builds/`, startup timing JSONL uses `work/logs/benchmarks/`, and timestamped error reports use `work/logs/errors/`. See [Logging](logging.md) for sink, rotation, retention, and shipping configuration. Runner logs inside the Ubuntu guest are under:
-
-- `/var/log/actions-runner/run.log`
-- `/opt/actions-runner/_diag`
-
-Guest provisioning command output is streamed to `work/logs/instances/<instance-name>.guest.log`. If runner launch or GitHub online readiness fails, EPAR first appends bounded diagnostics to that host guest log:
-runner PID/process state, tails from `run.log` and the latest `Runner_*.log`,
-and the Docker-DinD daemon log when present. Diagnostic collection is
-best-effort and does not replace the original readiness error.
-
-On systemd instances, the runner process is launched with `systemd-run` as `actions-runner.service` so provider `exec` calls return immediately after the service starts. On non-systemd instances such as Docker-DinD containers, EPAR starts `run.sh` in the background, writes `/var/run/actions-runner.pid`, and appends output to `/var/log/actions-runner/run.log`.
-
-Docker-DinD containers also write inner Docker daemon logs to `/var/log/epar-dockerd.log` inside the runner container. Host-side Docker commands only show the outer runner container; job-created Compose resources live in the inner daemon.
-
-When `docker.registryMirrors` is configured, EPAR writes `/etc/docker/daemon.json` inside each instance before runtime validation. For Docker-DinD, inspect both `/etc/docker/daemon.json` and `/var/log/epar-dockerd.log` inside the outer runner container.
-
-## Supervisor Exit
-
-`pool up` cleans up prefixed instances and GitHub runner records when it exits. Use `--keep-on-exit` only when intentionally debugging a live instance after the supervisor stops. While the supervisor is not running, EPAR cannot retire or replace completed runners.
-
-## Capacity, Reconciliation, and Outage Recovery
-
-`pool.instances` is a strict cap on prefix-owned local resources. EPAR counts provisioning, ready, draining, quarantined, and cleanup-pending instances, so a GitHub outage or a failed cleanup cannot create a replacement storm. Host-trust rotation has no temporary surge allowance; old busy-generation instances retain their slots until they finish or can be safely retired.
-
-Only one controller may mutate a given canonical config, provider, and `pool.namePrefix` at a time. If another EPAR controller holds that lock, stop or reconfigure the other controller instead of forcing concurrent starts; use a distinct unique prefix for intentionally independent pools.
-
-At startup and before allocating a replacement, EPAR reconciles the provider inventory with exact-name GitHub runner records. Healthy pairs are adopted, stopped or proven unregistered local resources are removed, and exact stale GitHub records are deleted when GitHub is reachable. When GitHub is unavailable, an ambiguous local instance is quarantined and continues to consume capacity instead of being deleted or replaced. If old resources already exceed the configured cap, the supervisor creates nothing until safe cleanup or normal draining restores capacity.
-
-For transient network failures and GitHub `429` or `5xx` responses during supervised replacement, EPAR pauses allocation and retries with exponential backoff. The default nominal delays are 15, 30, 60, 120, 240, 480, 960, and 1800 seconds, each with ±20% jitter; a longer `Retry-After` response wins. Monitoring and housekeeping continue during that pause, and a successful adoption or fully online replacement resets the delay. Startup remains fail-fast after compensating rollback, and invalid configuration or GitHub authentication failures do not retry indefinitely.
-
-## Cleanup Safety
-
-Cleanup only touches local instances and GitHub runner records matching `pool.namePrefix`:
-
-```yaml
-pool:
-  namePrefix: epar-tart
+```mermaid
+flowchart LR
+  Start["Start or resume pool"] --> Ready["Maintain ready runners"]
+  Ready --> Job["One runner accepts one job"]
+  Job --> Retire["Retire completed runner"]
+  Retire --> Ready
+  Retire -->|"Cleanup or ownership is uncertain"| Quarantine["Quarantine; capacity remains occupied"]
+  Quarantine --> Reconcile["Reconcile exact local and GitHub state"]
+  Reconcile --> Ready
+  Ready --> Stop["Ctrl-C or pool down"]
+  Stop --> Cleanup["Reconcile and clean owned resources"]
 ```
 
-Generated names look like:
+## Start and stop deliberately
 
-```text
-epar-tart-20260703-010500-001
+Use `./start` for normal operation because it verifies the configured image or sandbox template before starting the pool. Press `Ctrl-C` once to request a clean stop, then wait for cleanup to finish before closing the terminal. `--keep-on-exit` is a debugging option that deliberately leaves owned runner resources running after the supervisor exits.
+
+The supervisor reports when GitHub assigns a job and when the ephemeral runner finishes or is released. GitHub Actions remains the source of truth for whether the job succeeded or failed.
+
+`pool up` is the lower-level command for a prepared image or template. While no supervisor is running, EPAR cannot retire completed ephemeral runners or create replacements.
+
+## Capacity and replacement
+
+`pool.instances` is a strict cap on local physical instances, not just ready GitHub runners. Provisioning, ready, draining, quarantined, and cleanup-pending instances all consume a slot. A busy runner retained during a trust-generation change also keeps its slot until it finishes or can be safely removed.
+
+Only one controller may manage a canonical configuration path on a host, even if that file is edited to select a different provider or prefix while the first controller is running. A second host-wide lock also reserves the normalized `pool.namePrefix`, so separate configs and projects can run concurrently only when every independent pool has a distinct prefix. Lock failures report the current owner metadata without exposing configuration contents.
+
+Before upgrading an existing checkout to a release that introduces or changes controller locking or lifecycle-state identity, stop the older controller for that same project/config and wait for its normal shutdown to finish. A pre-change process cannot participate in a lock protocol it does not implement, so starting the new binary concurrently could migrate state beneath it. This restriction is per managed config and prefix; an unrelated controller in another checkout with a distinct prefix does not need to be stopped.
+
+At startup and before a replacement, EPAR compares provider inventory with exact GitHub runner records. Healthy pairs are adopted. Proven stopped or unregistered resources are removed. An ambiguous resource is quarantined and consumes capacity instead of being deleted or replaced.
+
+For transient GitHub or network failures during replacement, including `429` and `5xx` responses, EPAR pauses allocation and retries with configured exponential backoff while monitoring and cleanup continue. Authentication failures and invalid configuration remain fail-fast. See [Configuration](configuration.md) to adjust the retry settings.
+
+## Inspect status and logs
+
+```bash
+./start status
+./start logs path
+./start logs list
 ```
 
-Do not set `namePrefix` to a broad value such as `ubuntu` or `runner`. Keep it within 40 characters so EPAR can append its generated runner-name suffix.
-Also do not reuse the same `namePrefix` on different machines or for separate EPAR supervisors in the same GitHub organization. GitHub cleanup is prefix-based, so a shared prefix lets one machine delete another machine's runner records.
+Add `--no-github` to `status` when you need a local-only view. By default, host logs live under `work/logs`; manager events are console-first and instance/build transcripts are file artifacts. A failed launch or readiness check appends bounded guest diagnostics to the relevant instance log. See [Logging](logging.md) for locations, formats, retention, and shipping.
 
-For Docker-DinD, cleanup removes the outer runner container with `docker rm -f -v`. That also removes the private inner Docker daemon's containers, networks, volumes, and image cache for that EPAR instance.
+When multiple configs run concurrently, give each one a distinct `logging.directory` as well as a distinct prefix and workflow-routing label. Config-specific lifecycle state and build workspaces remain isolated, while the host resource catalog retains exact shared-artifact references.
 
-## Troubleshooting
+## Clean up safely
 
-This section is a compact checklist. For symptom-first diagnostics with host/provider-specific commands, see [Troubleshooting](troubleshooting.md).
+```bash
+./start cleanup
+./start pool down
+```
 
-- If a Docker/browser or web/E2E image build fails before package installation, run `image update-upstream`.
-- If an image build fails with `E: You don't have enough free space in /var/cache/apt/archives/.`, check the Docker daemon or VM storage with `docker system df` and `docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /`. On Windows Docker Desktop with WSL2, the container-visible disk can be much smaller than Windows Explorer free space; see [Windows Docker Desktop WSL2 Disk Is Smaller Than Expected](troubleshooting.md#windows-docker-desktop-wsl2-disk-is-smaller-than-expected).
-- If Docker validation fails for a Docker-enabled image, inspect `work/logs/builds/<image>.guest.log`.
-- If browser validation fails on ARM64, confirm `epar-browser` exists inside the guest and inspect `/opt/epar/browser`.
-- If a Docker Compose job uses an amd64-only runtime image on an ARM64 Tart runner and fails with `exec format error` or repeated container exits such as status `139`, use a runner label that supports that image instead of changing application runtime settings only for runner compatibility. Suitable targets include Docker-DinD with verified `linux/amd64` emulation, WSL x64, an x64 Linux host, or a Tart image with Rosetta enabled and validated.
-- If a workflow uses fixed Compose project names, fixed container names, or fixed ports, Docker-DinD is often a better fit than a shared host Docker socket because each runner gets a private inner Docker daemon. Verify by starting two unregistered instances, running the same compose stack in both, and confirming host Docker only shows the outer EPAR runner containers.
-- If repeated jobs still pull slowly after configuring a registry mirror, verify the mirror is reachable from inside the runner instance and that it supports the requested registry, image platform, and authentication model. Docker daemon mirrors primarily target Docker Hub; other registry caches may require workflow image references to use the cache registry URL.
-- If a mirrored workflow only improves modestly, check where the time is going. Registry mirrors mainly reduce image pull time; container startup, Compose health checks, database initialization, volume sync, browser tests, private image authentication, and CPU-bound or emulated workloads can still dominate the total job time.
-- If GitHub registration fails, confirm the app has permission to manage organization self-hosted runners and that the private key path is readable by the host user.
-- If GitHub returns transient `500`, `502`, `503`, or `429` errors while the supervisor is replacing a runner, leave the supervisor running so it can retain the strict cap, reconcile exact runner names after recovery, and retry on its configured backoff. Do not manually start a second supervisor with the same `pool.namePrefix`.
-- If registration fails before the runner listener starts, EPAR rolls back the local candidate immediately and later reconciles a possible exact-name GitHub record. If the listener already started but GitHub readiness is uncertain, EPAR quarantines that candidate; inspect the instance transcript and wait for GitHub recovery before manually deleting it.
-- If stale runners remain, run `ephemeral-action-runner cleanup`.
-- If using Tart `softnet`, verify the host has the privileges Tart requires.
-- If default WSL image build fails before import, confirm Docker Desktop, Docker Engine, or another Docker daemon is reachable so EPAR can export `ghcr.io/catthehacker/ubuntu:full-latest` into a rootfs tar. For lean WSL configs, confirm the clean Ubuntu rootfs was exported from an Ubuntu 24.04 WSL distro.
-- If WSL image build fails before systemd is ready, confirm WSL2 is enabled and inspect `work/logs/builds/<image>.guest.log`.
-- If Docker-DinD startup fails, confirm the host Docker runtime supports privileged containers and inspect `/var/log/epar-dockerd.log` inside the runner container.
-- If Docker-DinD `docker run` fails with nested overlay mount errors, keep the default `EPAR_DOCKERD_STORAGE_DRIVER=vfs`. Only switch to `overlay2` or `auto` in a derived image after proving that storage driver works on the exact host runtime.
-- If the default WSL or Docker-DinD build cannot validate Docker, confirm the source image still provides `docker`, `dockerd`, Compose, Buildx, and `iptables`. If you intentionally use a clean Ubuntu source image instead of Catthehacker's runner image, run `image update-upstream` first and use a config that installs Docker from EPAR's pinned `actions/runner-images` Docker install harness.
+`pool down` is an alias for `cleanup`. Cleanup is intentionally bounded: Docker Sandboxes uses the durable ledger of exact owned identities, while legacy providers use the configured `pool.namePrefix` boundary. Unknown, shared, or identity-drifted resources are report-only rather than broad deletion targets. Do not reuse a prefix across machines or independent supervisors in the same GitHub organization.
+
+Before an exact cleanup honors a recorded job lease, EPAR rechecks the recorded runner name and immutable GitHub runner ID. A runner that is still busy remains protected; an exact runner that is idle or absent has its completed-job lease reconciled so cleanup can continue without waiting for lease expiry. API failures and identity drift preserve the lease and stop cleanup.
+
+Use `cleanup --no-github` only when you intentionally want to leave GitHub runner records untouched. After a failed Docker Sandboxes diagnostic check, review the retained evidence before using `--acknowledge-failed-diagnostics` to allow its exact cleanup.
+
+## Maintain storage and retention
+
+```bash
+./start storage status
+./start storage prune
+./start storage prune --execute
+./start storage prune --legacy
+./start logs prune --dry-run
+```
+
+Normal `./start` reconciles interrupted exact-owned work and retires unreferenced superseded artifacts. `storage prune` is a preview until `--execute` is supplied. `storage prune --legacy` reports prefix-era resources and requires its displayed plan hash for execution. Log pruning is separate. EPAR does not run broad Docker prune, Docker Sandboxes reset, WSL reset, Docker Desktop reset, or VHDX compaction. Read [Storage](storage.md) before reclaiming capacity.
+
+## Get help from the right page
+
+Use [Troubleshooting](troubleshooting.md) for symptom-led diagnosis and host/provider commands. Use [Support](../SUPPORT.md) when you need help and [Security](security.md) for trust-boundary guidance or private vulnerability reporting.

@@ -204,13 +204,15 @@ EPAR_HOST_TRUST_HELPER="$helper"
 missing_config="$temporary/missing-project/.local/config.yml"
 missing_output="$("$helper" sync --project-root "$project_root" --config "$missing_config")"
 [[ -z "$missing_output" ]] || { echo "missing config unexpectedly produced a host-trust feed" >&2; exit 1; }
+missing_build_output="$("$helper" sync --project-root "$project_root" --config "$missing_config" --purpose build)"
+[[ -s "$missing_build_output" ]] || { echo "missing config did not produce automatic system build trust" >&2; exit 1; }
 
 native_project="$temporary/native-go-project"
 fake_go="$temporary/fake-go"
 fake_go_log="$temporary/fake-go.log"
 mkdir -p "$native_project/scripts/host-trust"
 cp "$project_root/start" "$native_project/start"
-cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$native_project/scripts/host-trust/"
+cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$project_root/scripts/host-trust/macos-trust-settings.js" "$native_project/scripts/host-trust/"
 cat >"$fake_go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -219,10 +221,12 @@ if [[ "${1:-}" == version ]]; then
   exit 0
 fi
 printf '%s\n' "$*" >>"$FAKE_GO_LOG"
+printf 'trust build=<%s> runner=<%s> os=<%s> deferred=<%s>\n' "${EPAR_BUILD_TRUST_FEED:-}" "${EPAR_HOST_TRUST_FEED:-}" "${EPAR_CONTROLLER_HOST_OS:-}" "${EPAR_HOST_TRUST_INIT_DEFERRED:-}" >>"$FAKE_GO_LOG"
 SH
 chmod +x "$fake_go"
-(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" ./start)
+(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" EPAR_BUILD_TRUST_FEED=stale-build EPAR_HOST_TRUST_FEED=stale-runner EPAR_CONTROLLER_HOST_OS=darwin EPAR_HOST_TRUST_INIT_DEFERRED=1 ./start)
 grep -Fxq 'run ./cmd/ephemeral-action-runner start' "$fake_go_log"
+grep -Fxq 'trust build=<> runner=<> os=<> deferred=<>' "$fake_go_log"
 
 nested_root="$temporary/nested-project"
 mkdir -p "$nested_root/.local"

@@ -1,0 +1,113 @@
+{
+  "schemaVersion": 2,
+  "defaultPlatform": "linux/amd64",
+  "supportedPlatforms": ["linux/amd64", "linux/arm64"],
+  "dockerfileFrontend": {
+    "inspectionReference": "docker.io/docker/dockerfile@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+    "reference": "docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+    "indexDigest": "sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+  },
+  "sbomGenerator": {
+    "inspectionReference": "docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68",
+    "indexDigest": "sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
+  },
+  "goBuilder": {
+    "version": "1.25.12",
+    "inspectionReference": "docker.io/library/golang@sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980",
+    "indexDigest": "sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980"
+  },
+  "hookLauncher": {
+    "sha256": "7fe07f10f484fa6888481a4165e81570187c0aeff422738d3ea5add6b95dd9b7"
+  },
+  "tini": {
+    "version": "0.19.0"
+  },
+  "platforms": {
+    "linux/amd64": {
+      "architecture": "amd64",
+      "dockerfileFrontendManifestDigest": "sha256:b5f3b260a9678e1d83d2fce86eeddf79420b79147eaba2a25986f47133d73720",
+      "goBuilderManifestDigest": "sha256:12e171e33ce7ade87ac8ab2bbe65cea9371527285bdab43ca02780a9e6ac60e5",
+      "goBuilderReference": "docker.io/library/golang@sha256:12e171e33ce7ade87ac8ab2bbe65cea9371527285bdab43ca02780a9e6ac60e5",
+      "sbomGeneratorManifestDigest": "sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7",
+      "sbomGeneratorReference": "docker.io/docker/buildkit-syft-scanner@sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7",
+      "tini": {
+        "url": "https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64",
+        "sha256": "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c"
+      }
+    },
+    "linux/arm64": {
+      "architecture": "arm64",
+      "dockerfileFrontendManifestDigest": "sha256:c8678869a83fab70232869ba24acc1c0be661f4d65135c0eeacb6a8e78420fdd",
+      "goBuilderManifestDigest": "sha256:afe53a4752b49f57ddebc97501a99394e2f7715236b4241efa830d54efb44434",
+      "goBuilderReference": "docker.io/library/golang@sha256:afe53a4752b49f57ddebc97501a99394e2f7715236b4241efa830d54efb44434",
+      "sbomGeneratorManifestDigest": "sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d",
+      "sbomGeneratorReference": "docker.io/docker/buildkit-syft-scanner@sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d",
+      "tini": {
+        "url": "https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm64",
+        "sha256": "07952557df20bfd2a95f9bef198b445e006171969499a1d361bd9e6f8e5e0e81"
+      }
+    }
+  },
+  "supersededRecords": {
+    "linux/amd64": {
+      "act-22.04": {
+        "authoritative": false,
+        "reason": "Predates the current runner-template helper and architecture changes",
+        "manifestDigest": "sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8ef546ecb44ca256655",
+        "templateTag": "epar-docker-sandboxes-catthehacker-act-22.04:20260723-r3-amd64"
+      },
+      "full": {
+        "authoritative": false,
+        "reason": "Predates the current runner-template helper and architecture changes",
+        "manifestDigest": "sha256:58314fa8cbf0f0e5384a37b3444811033320038816ef7c16f30b3e841ed65e51",
+        "templateTag": "epar-docker-sandboxes-catthehacker-full:20260723-r1-amd64"
+      }
+    }
+  },
+  "profiles": {
+    "act-22.04": {
+      "sourceRepository": "ghcr.io/catthehacker/ubuntu",
+      "observedTagReference": "ghcr.io/catthehacker/ubuntu:act-22.04",
+      "inspectionReference": "ghcr.io/catthehacker/ubuntu@sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",
+      "immutableReference": "ghcr.io/catthehacker/ubuntu@sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",
+      "indexDigest": "sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac",
+      "sourceRevision": "e2f8efe464c82732f78e967ee709c00b6af53643",
+      "platforms": {
+        "linux/amd64": {
+          "validationStatus": "planned",
+          "manifestDigest": "sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8ef546ecb44ca256655",
+          "templateTag": "epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64",
+          "compatibilityFile": "act-22.04.amd64.compatibility.json"
+        },
+        "linux/arm64": {
+          "validationStatus": "unvalidated",
+          "manifestDigest": "sha256:72b9ec71ee5972e02df5053f0000d34dbd2a3d0165b912bf25bbeabd72fba160",
+          "templateTag": "epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-arm64",
+          "compatibilityFile": "act-22.04.arm64.compatibility.json"
+        }
+      }
+    },
+    "full": {
+      "sourceRepository": "ghcr.io/catthehacker/ubuntu",
+      "observedTagReference": "ghcr.io/catthehacker/ubuntu:full-latest",
+      "inspectionReference": "ghcr.io/catthehacker/ubuntu@sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+      "immutableReference": "ghcr.io/catthehacker/ubuntu@sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+      "indexDigest": "sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+      "sourceRevision": "96c58e2540a8c11351aed1269df0553663a1b8d7",
+      "platforms": {
+        "linux/amd64": {
+          "validationStatus": "planned",
+          "manifestDigest": "sha256:58314fa8cbf0f0e5384a37b3444811033320038816ef7c16f30b3e841ed65e51",
+          "templateTag": "epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64",
+          "compatibilityFile": "full.amd64.compatibility.json"
+        },
+        "linux/arm64": {
+          "validationStatus": "unvalidated",
+          "manifestDigest": "sha256:245c8981fbf4ac268db015463c6c446b9411481f7e0001537128dc384d46dd0c",
+          "templateTag": "epar-docker-sandboxes-catthehacker-full:20260723-r2-arm64",
+          "compatibilityFile": "full.arm64.compatibility.json"
+        }
+      }
+    }
+  }
+}

@@ -2,169 +2,80 @@
 
 ![Ephemeral Action Runner banner](docs/assets/brand/epar-banner.jpg)
 
-Ephemeral Action Runner (EPAR) keeps a warm pool of disposable GitHub Actions self-hosted runners on your own machine.
-
-Each runner is made for one job. EPAR starts it, registers it with GitHub, lets one workflow job run, deletes it, and creates a fresh replacement.
+Ephemeral Action Runner (EPAR) keeps a warm pool of disposable GitHub Actions self-hosted runners on a machine you control. A runner accepts one job, is removed, and is replaced with a clean runner so ordinary job files, containers, and caches do not become the next job's starting state.
 
 ```mermaid
-flowchart TB
-  EPAR["EPAR"] --> Create["Create runner"]
-  Create --> Ready["Runner ready"]
-  Ready --> Job["Run one GitHub Actions job"]
-  Job --> Delete["Delete runner"]
-  Delete --> Create
+flowchart LR
+  Start["EPAR starts a runner"] --> Ready["Runner is ready"]
+  Ready --> Job["One GitHub Actions job"]
+  Job --> Remove["Runner is removed"]
+  Remove --> Start
 ```
 
-## Use Case
+## Why EPAR
 
-Private repositories often have limited [GitHub-hosted Actions minutes](https://docs.github.com/en/billing/concepts/product-billing/github-actions#free-use-of-github-actions). If you already have a spare Windows, macOS, Linux, or Docker-capable machine, you can use it for feature-branch CI instead of spending those hosted-runner minutes.
-
-A normal long-lived self-hosted runner can leave dependencies, files, containers, caches, or other job state behind on that machine. EPAR lowers that risk by running each job in a disposable container, WSL distro, or VM, then deleting it and creating a clean replacement.
-
-## Why Use EPAR
-
-- **Warm pool:** keep ready self-hosted runners online after setup.
-- **Disposable jobs:** each runner is cleaned up after one job.
-- **Great default image:** Docker-DinD and WSL use Catthehacker's full Ubuntu runner image by default.
-- **Docker-friendly isolation:** Docker-DinD gives each runner its own private Docker daemon.
-- **Simple host use:** run Linux GitHub Actions jobs from a Windows, macOS, Linux, or Docker-capable host.
+- Keep private-repository CI ready without maintaining a long-lived runner workspace.
+- Protect the host with [Docker Sandboxes](docs/providers/docker-sandboxes.md): each runner gets a dedicated microVM and private Docker daemon, then is removed after one job.
+- Run Docker-friendly Linux jobs from a Windows, macOS, Linux, or other Docker-capable host.
 
 ## Quick Start
 
-The easiest path is the default **Docker-DinD** mode. It works well for most Linux GitHub Actions jobs, especially Docker and Docker Compose jobs.
+The normal path is a source archive plus Docker. EPAR's first run opens a guided setup wizard; it checks what the host supports and writes your ignored local configuration.
 
-### 1. Install Docker
+### 1. Install the host tools
 
-The default quick start needs a Docker-compatible daemon:
+- Install and start Docker.
+- For stronger isolation, also install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) to enable the Docker Sandboxes provider.
 
-- Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/), or another Docker daemon reachable from PowerShell
-- macOS: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/)
-- Linux: [Docker Engine](https://docs.docker.com/engine/)
+On macOS or Linux, the first Docker Sandboxes runner may trigger operating-system or security-tool prompts for runtime helpers such as `mkfs.ext4`, `mkfs.erofs`, and `containerd-shim-nerdbox-v1`; macOS may say the helper “is an app downloaded from the Internet.” These are used to create the runner's private Docker filesystem, unpack its read-only template filesystem, and launch the sandbox VM. Confirm that each executable belongs to the installed Docker Sandboxes runtime and that any displayed file target is sandbox-owned before approving it. Denying a required helper prevents that sandbox from starting, and EPAR fails closed without registering it; preserve and clean any diagnostic runtime state through EPAR's exact cleanup path. See the [Docker Sandboxes provider guide](docs/providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) and [troubleshooting](docs/troubleshooting.md#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt).
 
-### 2. Download EPAR Source
+Docker Sandboxes has a host credential-injecting forward proxy. EPAR's Docker Sandboxes template keeps the private Docker daemon and Actions listener on Docker Sandboxes' policy-enforced transparent egress path by default, so a workflow's own `docker login` remains authoritative instead of being replaced by the host `sbx login` identity. Rebuild older templates after upgrading EPAR. See [Docker Hub Credentials and Transparent Egress](docs/providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
-Open the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), select the release you want, and download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)**. EPAR releases use these source archives only.
+### 2. Download EPAR
 
-Extract the source archive and open a terminal in the extracted folder. The folder is usually named `ephemeral-action-runner-<tag>`.
+From the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), download GitHub's **Source code (zip)** or **Source code (tar.gz)** for the release you want. Extract it and open a terminal in the extracted folder.
 
-```bash
-cd path/to/ephemeral-action-runner-<tag>
-```
+### 3. Create a GitHub App
 
-### 3. Create A GitHub App
+EPAR uses a GitHub App to obtain short-lived runner registration tokens. Follow [GitHub App Setup](docs/github-app.md), then have the App ID, organization name, and private-key file path ready.
 
-EPAR uses a GitHub App to create short-lived runner registration tokens.
-
-Follow [GitHub App Setup](docs/github-app.md), then keep these three values ready:
-
-- GitHub App ID
-- GitHub organization name
-- private key file path
-
-### 4. Run EPAR
-
-Run EPAR with the default flow:
+### 4. Start EPAR
 
 ```bash
 ./start
 ```
 
-On Windows, `./start` also works in modern PowerShell. If your shell does not run it, use `.\start.ps1` or `start.cmd`.
+In native Windows PowerShell, use `.\start.ps1`. The wrapper uses local Go when it works; otherwise it builds a native controller with Docker. If no configuration exists, the interactive wizard asks for the GitHub App, a runner group, and an available provider. The first start can take longer while EPAR prepares the configured runner image or creates the first runner.
 
-That's it.
+Keep the process open while runners should accept work. Press `Ctrl-C` once to stop, then wait for cleanup to finish before closing the terminal. For detailed commands, config selection, no-Go startup, verification, and cleanup, read [Usage](docs/usage.md).
 
-#### What Happens
+## Choose a provider
 
-EPAR initializes `.local/config.yml` for you if it does not exist. Docker-DinD is the default. The wizard asks whether new Docker-DinD runners should inherit the host's trusted TLS roots and defaults to yes. On native Windows, it also offers WSL2 when `wsl.exe --status` confirms default version 2. On macOS, it offers experimental Tart mode when `tart --version` succeeds. Press Enter to keep Docker-DinD. Existing configs do not enable host trust inheritance automatically. You can customize the config afterward; see [Configuration](docs/configuration.md).
+Choose a provider based on your host OS, available prerequisites, and isolation needs. **Docker Sandboxes** is recommended when its capability checks pass as it provides the highest isolation level. EPAR never silently falls back to another provider.
 
-Then EPAR checks the configured runner image, builds or replaces it when needed, and starts the configured number of runners. The default config uses `pool.instances: 1`.
+| Provider | Host OS | Prerequisites | Isolation and compatibility |
+| --- | --- | --- | --- |
+| [Docker Sandboxes](docs/providers/docker-sandboxes.md) | Linux, macOS, Windows | Docker, the `sbx` CLI, and healthy `sbx diagnose --output json` results | Highest isolation level — each runner uses a dedicated microVM with a private Docker daemon. Recommended when capability checks pass. |
+| [Docker Container](docs/providers/docker-container.md) | Linux, macOS, Windows | Docker | Standard isolation level — each disposable runner container has a private Docker daemon. |
+| [WSL](docs/providers/wsl.md) | Windows | WSL2 and Docker | Standard isolation level — each runner uses a disposable WSL2 Linux environment. |
+| [Tart](docs/providers/tart.md) | Apple Silicon macOS | Tart | Experimental — ARM64 Linux VM with limited compatibility for CI jobs that require non-ARM64 Docker images. |
 
-The first run can take a while because EPAR may need to build the runner image before it starts the pool. Later runs reuse the aligned image unless the config, EPAR scripts, or source image changed.
+## Route a workflow to EPAR
 
-Keep EPAR running while you want runners online. Stop with `Ctrl-C`; EPAR cleans up matching local instances and GitHub runner records by default.
-
-#### Optional: Config Or Runner Count
-
-To choose a config or runner count:
-
-```bash
-./start --config .local/custom-config.yml --instances 2
-```
-
-If `--instances` is omitted, EPAR uses `pool.instances` from the config.
-
-#### GitHub Actions Labels
-
-GitHub Actions picks a runner by matching the job's `runs-on` list with the labels registered on each runner. Every self-hosted runner gets the `self-hosted` label, so the simplest workflow can use:
+Every EPAR runner has GitHub's `self-hosted` label. Add one of the provider labels when a repository has several types of runner:
 
 ```yaml
-runs-on: [self-hosted]
+runs-on: [self-hosted, linux, epar-docker-sandboxes]
 ```
 
-If you have multiple self-hosted runners and want this job to run on a specific kind of EPAR runner, add one of its extra labels to the list, e.g.:
+Use labels that describe the environment your job actually needs. In particular, an ARM64 Tart runner is not a replacement for GitHub-hosted `ubuntu-latest` or an x64-only workload.
 
-```yaml
-runs-on: [self-hosted, epar-docker-dind-catthehacker-ubuntu]
-```
+## Security depends on the provider
 
-EPAR also adds an `epar-host-<machine>` label by default, so you can see which host registered each runner. You only need to include that label in `runs-on` when you intentionally want a job to target one machine.
+Docker Sandboxes places each runner inside a dedicated microVM sandbox and provides EPAR's strongest host-isolation boundary. Docker Container and WSL remain trusted-workflow providers; Tart is VM-isolated but experimental. With every provider, restrict access with [runner groups](docs/runner-groups.md) and expose only the secrets and services each workflow needs. Read [Security](docs/security.md) before choosing a provider.
 
-## Other Modes
+## Find the right guide
 
-Docker-DinD is the default first choice. Other providers are available when they fit your host better:
-
-| Provider | Use when |
-| --- | --- |
-| Docker-DinD | You have a Docker-compatible daemon on Windows, macOS, or Linux, and want a private Docker daemon per runner. |
-| WSL2 | You are on Windows and want runners as disposable WSL distros. |
-| Tart (experimental) | You are on Apple Silicon macOS and want to experiment with native ARM64 Linux VMs. The default Tart image is a basic Ubuntu OS image and does not include the normal GitHub-hosted runner dependency set. |
-
-WSL2 also defaults to Catthehacker's full Ubuntu runner image, but it converts that Docker image into a WSL rootfs during `image build`.
-
-Tart is not a ready-made substitute for GitHub's hosted Ubuntu runners. If you need that environment, build and maintain your own bootable Tart runner image by adapting the scripts from [actions/runner-images](https://github.com/actions/runner-images), then configure EPAR to use it. EPAR does not automate that conversion.
-
-See [Usage](docs/usage.md) for WSL, Tart, source builds, custom configs, and advanced options.
-
-## FAQ
-
-### Can EPAR run multiple runners at once?
-
-Yes. Set `pool.instances` in `.local/config.yml`, or pass `--instances N` for one run.
-
-### Can one machine run runners for multiple GitHub organizations?
-
-Yes. Use one config per organization, then start EPAR once per config. Each config should use its own GitHub App values and a distinct `pool.namePrefix`.
-
-### Does each job get a clean runner?
-
-Yes. EPAR registers disposable ephemeral runners. After a job finishes, EPAR deletes that runner and creates a replacement.
-
-### Can jobs use Docker, Docker Compose, and Buildx?
-
-Yes, with the default Docker-DinD mode. Each runner gets its own private Docker daemon, so job-created containers, networks, and volumes stay inside that disposable runner.
-
-## Safety
-
-EPAR is for trusted jobs. It improves cleanup and reduces stale runner state, but it does not make your machine safe for arbitrary untrusted code.
-
-GitHub also warns against using self-hosted runners with public repositories that can run untrusted pull request workflows. Read GitHub's self-hosted runner guidance before exposing a runner to untrusted users.
-
-## More Docs
-
-- [Usage](docs/usage.md): setup, image builds, verification, and pool commands.
-- [Configuration](docs/configuration.md): config file sections and common edits.
-- [GitHub App Setup](docs/github-app.md): required GitHub App permissions and fields.
-- [Docker-DinD Provider](docs/providers/docker-dind.md): default Docker runner mode.
-- [WSL Provider](docs/providers/wsl.md): Windows WSL2 runners.
-- [Tart Provider (experimental)](docs/providers/tart.md): Apple Silicon ARM64 Linux VM runners and Rosetta compatibility limits.
-- [Image Build](docs/image-build.md): image internals and customization.
-- [Operations](docs/operations.md): logs, cleanup, and troubleshooting.
-- [Troubleshooting](docs/troubleshooting.md): symptom-first diagnostics by host and provider.
-- [Support](SUPPORT.md): where to start, what diagnostic information to collect, and where to ask for help.
-- [Windows Startup](docs/advanced/windows-startup.md): start EPAR after Windows login.
-- [macOS Startup](docs/advanced/macos-startup.md): start EPAR after macOS login.
-- [Running EPAR Without Installing Go](docs/advanced/no-go-install.md): run from source with no local Go install.
-- [Security](docs/security.md): trust boundaries, secret handling, and private vulnerability reporting.
-- [Contributing](CONTRIBUTING.md): how to propose and validate changes.
-- [Code of Conduct](CODE_OF_CONDUCT.md): community expectations and reporting concerns.
-- [Level 1 Core Runner Verification](docs/core-runner-verification.md): trusted live CI setup, canary behavior, and cleanup.
+- **Start and configure:** [Documentation hub](docs/README.md), [Usage](docs/usage.md), [Configuration](docs/configuration.md), and [GitHub App setup](docs/github-app.md).
+- **Run and maintain:** [Operations](docs/operations.md), [Troubleshooting](docs/troubleshooting.md), [Logging](docs/logging.md), and [Storage](docs/storage.md).
+- **Get help or contribute:** [Support](SUPPORT.md), [Contributing](CONTRIBUTING.md), and [Security reporting](docs/security.md).

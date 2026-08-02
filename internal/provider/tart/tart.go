@@ -3,9 +3,13 @@ package tart
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
@@ -15,6 +19,7 @@ type Provider struct {
 	Binary     string
 	DryRun     bool
 	runCommand runCommandFunc
+	identities func() (map[string]string, error)
 }
 
 type runCommandFunc func(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (provider.ExecResult, error)
@@ -64,12 +69,16 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 
 func (p *Provider) Exec(ctx context.Context, name string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
 	full := []string{"exec"}
-	if opts.Stdin != "" {
+	if opts.Stdin != "" || opts.StdinReader != nil {
 		full = append(full, "-i")
 	}
 	full = append(full, name)
 	full = append(full, provider.EnvCommand(opts.Env, command)...)
-	return p.runWithSensitiveLog(ctx, strings.NewReader(opts.Stdin), opts.Stdout, opts.Stderr, opts.SensitiveValues, full...)
+	stdin := opts.StdinReader
+	if stdin == nil && opts.Stdin != "" {
+		stdin = strings.NewReader(opts.Stdin)
+	}
+	return p.runWithSensitiveLog(ctx, stdin, opts.Stdout, opts.Stderr, opts.SensitiveValues, full...)
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
@@ -110,7 +119,59 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 			State:  fields[len(fields)-1],
 		})
 	}
+	if p.identities == nil && (runtime.GOOS != "darwin" || p.runCommand != nil) {
+		return out, nil
+	}
+	resolve := p.identities
+	if resolve == nil {
+		resolve = readLocalVMIdentities
+	}
+	identities, err := resolve()
+	if err != nil {
+		return nil, fmt.Errorf("read immutable Tart VM identities: %w", err)
+	}
+	for index := range out {
+		if identity := identities[out[index].Name]; identity != "" {
+			out[index].ProviderID = "tart-mac:" + strings.ToLower(identity)
+		}
+	}
 	return out, nil
+}
+
+func readLocalVMIdentities() (map[string]string, error) {
+	home := strings.TrimSpace(os.Getenv("TART_HOME"))
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		home = filepath.Join(userHome, ".tart")
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "vms"))
+	if os.IsNotExist(err) {
+		return map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.ContainsAny(entry.Name(), `/\`) {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(home, "vms", entry.Name(), "config.json"))
+		if readErr != nil {
+			continue
+		}
+		var config struct {
+			MACAddress string `json:"macAddress"`
+		}
+		if json.Unmarshal(data, &config) != nil || strings.TrimSpace(config.MACAddress) == "" {
+			continue
+		}
+		result[entry.Name()] = strings.TrimSpace(config.MACAddress)
+	}
+	return result, nil
 }
 
 func (p *Provider) run(ctx context.Context, stdin io.Reader, args ...string) (provider.ExecResult, error) {
@@ -136,6 +197,9 @@ func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, stdoutSin
 		return provider.ExecResult{}, nil
 	}
 	cmd := exec.CommandContext(ctx, p.Binary, args...)
+	if len(args) > 0 && args[0] == "clone" {
+		cmd.Env = tartCloneEnvironment(os.Environ())
+	}
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
@@ -148,6 +212,16 @@ func (p *Provider) runWithLogRaw(ctx context.Context, stdin io.Reader, stdoutSin
 		return result, fmt.Errorf("%s %s failed: %w: %s", p.Binary, strings.Join(args, " "), err, strings.TrimSpace(result.Stderr))
 	}
 	return result, nil
+}
+
+func tartCloneEnvironment(base []string) []string {
+	result := make([]string, 0, len(base)+1)
+	for _, value := range base {
+		if !strings.HasPrefix(value, "TART_NO_AUTO_PRUNE=") {
+			result = append(result, value)
+		}
+	}
+	return append(result, "TART_NO_AUTO_PRUNE=1")
 }
 
 func captureWriter(capture io.Writer, sink io.Writer) io.Writer {

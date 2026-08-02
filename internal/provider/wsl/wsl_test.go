@@ -125,6 +125,13 @@ func TestParseListParsesVerboseOutput(t *testing.T) {
 
 func TestNoInstalledDistrosReturnsEmptyList(t *testing.T) {
 	p := New("wsl.exe", t.TempDir(), t.TempDir(), true)
+	p.runCommand = func(_ context.Context, _ io.Reader, _ string, _, _ io.Writer, args ...string) (provider.ExecResult, error) {
+		if !reflect.DeepEqual(args, []string{"--list", "--verbose"}) {
+			t.Fatalf("args = %#v", args)
+		}
+		message := "Windows Subsystem for Linux has no installed distributions."
+		return provider.ExecResult{Stderr: message}, errors.New(message)
+	}
 	out, err := p.List(context.Background())
 	if err != nil {
 		t.Fatalf("dry-run list failed: %v", err)
@@ -210,5 +217,23 @@ func TestDeleteReturnsUnregisterFailureWhenDistroStillExists(t *testing.T) {
 
 	if err := p.Delete(context.Background(), "epar-wsl-1"); err == nil {
 		t.Fatal("Delete() error = nil, want unregister error")
+	}
+}
+
+func TestParseRegistryIdentities(t *testing.T) {
+	identities, err := parseRegistryIdentities(`
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lxss\{2A6C842D-6F31-45D8-86A2-66A35D210B42}
+    DistributionName    REG_SZ    epar-wsl-runner
+    BasePath    REG_SZ    C:\repos\ephemeral-action-runner\work\wsl\epar-wsl-runner
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := identities["epar-wsl-runner"]
+	if identity.ID != "2A6C842D-6F31-45D8-86A2-66A35D210B42" {
+		t.Fatalf("identity = %#v", identity)
+	}
+	if !sameWindowsPath(identity.BasePath, `c:\repos\ephemeral-action-runner\work\wsl\epar-wsl-runner`) {
+		t.Fatalf("base path did not compare case-insensitively: %#v", identity)
 	}
 }

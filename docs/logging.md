@@ -1,10 +1,10 @@
 # Logging
 
-EPAR uses `work/logs` under the project root by default. Set `logging.directory` to an absolute path to store logs elsewhere, or to another relative path to resolve it from the project root.
+EPAR writes logs under `work/logs` by default. Use `./start logs path` to print the resolved directory.
 
 ```text
 work/logs/
-├── epar.log                 # when managerSinks includes file
+├── epar.log
 ├── epar-last-error.log
 ├── errors/
 ├── instances/
@@ -12,71 +12,60 @@ work/logs/
 └── benchmarks/
 ```
 
-Manager events and command transcripts have independent sinks. `console` and `file` may be selected separately or together. Console manager events route debug and info to stdout and warnings and errors to stderr. File manager events go to `epar.log`. File transcripts remain raw command output; console transcripts frame every completed stdout or stderr line with timestamp, instance, component, and stream context. JSON console mode emits one JSON object per line.
+## What Goes Where
 
-The local default keeps manager events on the console and command transcripts in files:
+Manager events describe EPAR decisions and progress. Command transcripts contain raw instance, provider, and image-build output.
+
+The local default sends manager events to the console and transcripts to files:
 
 ```yaml
 logging:
-  directory: work/logs
   managerSinks: [console]
   managerConsoleFormat: text
-  managerConsoleTextFormat: "{time} [{level}] {message}"
-  managerFileFormat: json
   transcriptSinks: [file]
-  transcriptConsoleFormat: text
-  maxFileSizeMiB: 100
-  maxBackups: 3
-  compressBackups: true
-  retentionEnabled: true
-  retentionMaxTotalMiB: 1024
-  managerMaxAgeDays: 14
-  instanceMaxAgeDays: 14
-  buildMaxAgeDays: 14
-  errorMaxAgeDays: 30
-  benchmarkMaxAgeDays: 90
-  retentionIntervalMinutes: 60
 ```
 
-The default manager console line is compact and human-readable:
+Manager file events use `epar.log`. Instance transcripts use `instances/`, build and source transcripts use `builds/`, startup timing records use `benchmarks/`, and timestamped error reports use `errors/`. `epar-last-error.log` always points to the latest error report and is never removed by retention.
 
-```text
-2026-07-16T00:14:58.108+08:00 [INFO] cloning instance
-```
+Runner logs inside an Ubuntu guest are normally:
 
-When `managerConsoleFormat` is `text`, `managerConsoleTextFormat` accepts `{time}`, `{level}`, `{message}`, and `{attributes}`. `{message}` is required. The default deliberately omits structured attributes for concise local output. To include them, use `"{time} [{level}] {message}{attributes}"`; `{attributes}` expands to structured fields with its own leading space when fields exist.
+- `/var/log/actions-runner/run.log`
+- `/opt/actions-runner/_diag`
+- `/var/log/epar-dockerd.log` when the runner has a private Docker daemon
 
-When `transcriptConsoleFormat` is `text`, the optional `transcriptConsoleTextFormat` accepts `{time}`, `{instance}`, `{component}`, `{stream}`, `{message}`, `{session}`, `{category}`, `{provider}`, and `{attributes}`. Its default is `"{time} {stream} {instance} {component} {message}{attributes}"`.
+When runner launch or GitHub readiness fails, EPAR appends bounded process and runner diagnostics to the matching host-side instance transcript.
 
-Custom text formats are rejected when the corresponding console format is `json`. JSON records keep their fixed structured schema so downstream parsers and log shippers can rely on it.
+## Console And File Formats
 
-For Kubernetes, use console sinks so the container runtime can collect stdout and stderr:
+Console and file sinks can use `text` or `json`. For Kubernetes or another runtime that already collects standard output, send both event types to the console:
 
 ```yaml
 logging:
-  directory: work/logs
   managerSinks: [console]
   managerConsoleFormat: json
-  managerFileFormat: json
   transcriptSinks: [console]
   transcriptConsoleFormat: json
-  maxFileSizeMiB: 100
-  maxBackups: 3
-  compressBackups: true
-  retentionEnabled: true
-  retentionMaxTotalMiB: 1024
-  managerMaxAgeDays: 14
-  instanceMaxAgeDays: 14
-  buildMaxAgeDays: 14
-  errorMaxAgeDays: 30
-  benchmarkMaxAgeDays: 90
-  retentionIntervalMinutes: 60
 ```
 
-Benchmark JSONL and error reports remain file artifacts in every sink mode. EPAR rotates active manager and transcript files at the configured size, retains the configured number of gzip-compressed backups, and applies category age limits before the aggregate size budget. It protects active files across EPAR processes, does not follow links or reparse points, ignores unknown files, and never removes `epar-last-error.log`.
+Text templates can change the human-readable console layout. Manager templates support `{time}`, `{level}`, `{message}`, and `{attributes}`. Transcript templates also support instance, component, stream, session, category, and provider fields. A template must contain `{message}` and is invalid when the corresponding console format is JSON.
 
-Wrapper control files and command result files are state rather than logs. New wrappers place them under `work/state`, outside retention scope.
+See [Configuration](configuration.md#logging) for every logging property, default, and validation rule.
 
-Use `ephemeral-action-runner logs path` to find the resolved root, `ephemeral-action-runner logs list` to inspect recognized artifacts, and `ephemeral-action-runner logs prune --dry-run` to preview retention. Remove `--dry-run` to prune immediately.
+## Rotation And Retention
 
-EPAR intentionally does not embed OTLP or vendor-specific clients. To ship file artifacts, use an external agent such as the OpenTelemetry Collector `filelog` receiver. See [`examples/observability`](../examples/observability/README.md).
+EPAR rotates active manager and transcript files at `logging.maxFileSizeMiB`, retains the configured number of compressed backups, applies category age limits, then enforces the total retained-size budget. It protects active files across EPAR processes, does not follow links or reparse points, and ignores unknown files.
+
+Inspect or preview recognized log maintenance with:
+
+```bash
+./start logs list
+./start logs prune --dry-run
+```
+
+Remove `--dry-run` only after reviewing the exact retention plan.
+
+Wrapper control files and command results are state, not logs. Current wrappers place them under `work/state`, outside log retention.
+
+## Shipping Logs
+
+EPAR does not embed vendor-specific or OTLP clients. Use an external collector when logs must leave the host. The [`examples/observability`](../examples/observability/README.md) directory includes local file, Kubernetes console, and OpenTelemetry Collector examples.

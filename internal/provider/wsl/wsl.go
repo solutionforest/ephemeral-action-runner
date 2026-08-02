@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -21,6 +22,12 @@ type Provider struct {
 	ProjectRoot string
 	DryRun      bool
 	runCommand  runCommandFunc
+	identities  func(context.Context) (map[string]wslIdentity, error)
+}
+
+type wslIdentity struct {
+	ID       string
+	BasePath string
 }
 
 type runCommandFunc func(ctx context.Context, stdin io.Reader, logPath string, stdout, stderr io.Writer, args ...string) (provider.ExecResult, error)
@@ -94,7 +101,9 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 
 func (p *Provider) Exec(ctx context.Context, name string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
 	var stdin io.Reader
-	if opts.Stdin != "" {
+	if opts.StdinReader != nil {
+		stdin = opts.StdinReader
+	} else if opts.Stdin != "" {
 		stdin = strings.NewReader(opts.Stdin)
 	}
 	return p.runWithSensitiveLog(ctx, stdin, opts.LogPath, opts.Stdout, opts.Stderr, opts.SensitiveValues, p.execArgs(name, command, opts.Env)...)
@@ -185,7 +194,115 @@ func (p *Provider) List(ctx context.Context) ([]provider.Instance, error) {
 		}
 		return nil, err
 	}
-	return parseList(result.Stdout), nil
+	instances := parseList(result.Stdout)
+	if p.identities == nil && (runtime.GOOS != "windows" || p.runCommand != nil) {
+		return instances, nil
+	}
+	resolve := p.identities
+	if resolve == nil {
+		resolve = p.readRegistryIdentities
+	}
+	identities, err := resolve(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read immutable WSL distribution identities: %w", err)
+	}
+	for index := range instances {
+		identity, found := identities[strings.ToLower(instances[index].Name)]
+		if !found || identity.ID == "" {
+			continue
+		}
+		expected, pathErr := p.instanceDir(instances[index].Name)
+		if pathErr != nil || !sameWindowsPath(identity.BasePath, expected) {
+			continue
+		}
+		instances[index].ProviderID = "wsl:" + strings.ToLower(identity.ID)
+	}
+	return instances, nil
+}
+
+func (p *Provider) readRegistryIdentities(ctx context.Context) (map[string]wslIdentity, error) {
+	command := exec.CommandContext(ctx, "reg.exe", "query", `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`, "/s")
+	output, err := command.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseRegistryIdentities(cleanWSLOutput(output))
+}
+
+func parseRegistryIdentities(output string) (map[string]wslIdentity, error) {
+	result := make(map[string]wslIdentity)
+	var currentID, distributionName, basePath string
+	flush := func() {
+		if currentID != "" && distributionName != "" && basePath != "" {
+			result[strings.ToLower(distributionName)] = wslIdentity{ID: currentID, BasePath: expandWindowsEnvironment(basePath)}
+		}
+		currentID, distributionName, basePath = "", "", ""
+	}
+	for _, raw := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(strings.ToUpper(line), `HKEY_CURRENT_USER\`) {
+			flush()
+			if start := strings.LastIndex(line, `\{`); start >= 0 && strings.HasSuffix(line, "}") {
+				currentID = strings.Trim(line[start+1:], "{}")
+			}
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		value := strings.Join(fields[2:], " ")
+		switch strings.ToLower(fields[0]) {
+		case "distributionname":
+			distributionName = value
+		case "basepath":
+			basePath = value
+		}
+	}
+	flush()
+	if len(result) == 0 {
+		return nil, fmt.Errorf("WSL registry inventory contained no complete distribution identities")
+	}
+	return result, nil
+}
+
+func sameWindowsPath(left, right string) bool {
+	normalize := func(value string) string {
+		value = strings.TrimPrefix(strings.TrimSpace(value), `\\?\`)
+		value = filepath.Clean(expandWindowsEnvironment(value))
+		return strings.TrimRight(strings.ToLower(value), `\/`)
+	}
+	return normalize(left) == normalize(right)
+}
+
+func expandWindowsEnvironment(value string) string {
+	value = os.ExpandEnv(value)
+	for {
+		start := strings.IndexByte(value, '%')
+		if start < 0 {
+			return value
+		}
+		end := strings.IndexByte(value[start+1:], '%')
+		if end < 0 {
+			return value
+		}
+		end += start + 1
+		key := value[start+1 : end]
+		replacement := os.Getenv(key)
+		if replacement == "" {
+			for _, entry := range os.Environ() {
+				parts := strings.SplitN(entry, "=", 2)
+				if len(parts) == 2 && strings.EqualFold(parts[0], key) {
+					replacement = parts[1]
+					break
+				}
+			}
+		}
+		if replacement == "" {
+			return value
+		}
+		value = value[:start] + replacement + value[end+1:]
+	}
 }
 
 func (p *Provider) Export(ctx context.Context, name, outputPath string) error {
@@ -231,6 +348,7 @@ func (p *Provider) startKeepAlive(name string, stdoutSink, stderrSink io.Writer)
 		return nil, nil
 	}
 	cmd := exec.Command(p.Binary, args...)
+	isolateKeepaliveProcess(cmd)
 	cmd.Stdout = writerOrDiscard(stdoutSink)
 	cmd.Stderr = writerOrDiscard(stderrSink)
 	if err := cmd.Start(); err != nil {

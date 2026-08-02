@@ -2,6 +2,7 @@ package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -39,7 +40,7 @@ type startupTiming struct {
 	logger        *slog.Logger
 }
 
-// StartStartupTiming records the initial Docker-DinD or WSL start path.
+// StartStartupTiming records the initial Docker Container or WSL start path.
 func (m *Manager) StartStartupTiming() (string, error) {
 	provider := m.Config.Provider.Type
 	if !supportsStartupTiming(provider) {
@@ -151,12 +152,26 @@ func (t *startupTiming) finish(err error) {
 	} else {
 		t.stages = append(t.stages, startupTimingStage{name: "total_startup", elapsed: elapsed})
 		t.eventLocked("total_startup", "completed", elapsed, nil)
-		for _, stage := range t.stages {
-			t.logger.Info("startup timing", "provider", t.provider, "operation", "startup", "stage", stage.name, "duration", stage.elapsed.Round(time.Millisecond), "logPath", t.path)
-		}
+		t.logger.Info(startupTimingSummary(t.provider, t.stages, t.path), "provider", t.provider, "operation", "startup", "stages", slog.GroupValue(startupTimingStageAttributes(t.stages)...), "logPath", t.path)
 	}
 	t.closed = true
 	_ = t.file.Close()
+}
+
+func startupTimingSummary(provider string, stages []startupTimingStage, path string) string {
+	parts := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		parts = append(parts, fmt.Sprintf("%s=%s", stage.name, stage.elapsed.Round(time.Millisecond)))
+	}
+	return fmt.Sprintf("%s startup timing: %s; log: %s", startupTimingLabel(provider), strings.Join(parts, ", "), path)
+}
+
+func startupTimingStageAttributes(stages []startupTimingStage) []slog.Attr {
+	attributes := make([]slog.Attr, 0, len(stages))
+	for _, stage := range stages {
+		attributes = append(attributes, slog.Duration(stage.name, stage.elapsed.Round(time.Millisecond)))
+	}
+	return attributes
 }
 
 func (t *startupTiming) eventLocked(stage, outcome string, elapsed time.Duration, err error) {
@@ -174,13 +189,13 @@ func (t *startupTiming) eventLocked(stage, outcome string, elapsed time.Duration
 }
 
 func supportsStartupTiming(provider string) bool {
-	return provider == "docker-dind" || provider == "wsl"
+	return provider == "docker-container" || provider == "wsl"
 }
 
 func startupTimingLabel(provider string) string {
 	switch provider {
-	case "docker-dind":
-		return "DinD"
+	case "docker-container":
+		return "Docker Container"
 	case "wsl":
 		return "WSL"
 	default:

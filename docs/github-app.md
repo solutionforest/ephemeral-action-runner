@@ -30,10 +30,11 @@ github:
 
 `github.organization` must be the organization where the app is installed. `privateKeyPath` is resolved relative to the project root unless it is absolute.
 
-Image-only commands do not use GitHub credentials. Runner registration, GitHub-backed status, and GitHub cleanup do.
+Image-only commands do not use GitHub credentials. The initializer reads runner groups and selected repositories. Runner registration, GitHub-backed status, and GitHub cleanup also use the App. The existing **Self-hosted runners** read and write permission covers these operations.
 
 References:
 
 - [Registering a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
 - [Managing private keys for GitHub Apps](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps)
 - [Organization self-hosted runner registration token API](https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#create-a-registration-token-for-an-organization)
+- [Organization runner-group API](https://docs.github.com/en/rest/actions/self-hosted-runner-groups)

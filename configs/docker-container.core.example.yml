@@ -1,0 +1,87 @@
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest@sha256:2362bb12b0c61438d334b9ed3686809981796a864ab89d93b5ee657652774eb7
+  sourcePlatform: linux/amd64
+  outputImage: epar-ci-core
+  upstreamDir: third_party/runner-images
+  upstreamLock: third_party/runner-images.lock
+  runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
+  # Existing configs stay disabled. Set overlay to add the host's trusted root
+  # anchors to Ubuntu runners. Windows/macOS: [system, user]; Linux: [system].
+  hostTrustMode: disabled
+  hostTrustScopes: [system]
+  customInstallScripts:
+
+pool:
+  instances: 1
+  namePrefix: epar-ci-core
+  replacementRetryInitialSeconds: 15
+  replacementRetryMaxSeconds: 1800
+  replacementRetryMultiplier: 2
+  replacementRetryJitterPercent: 20
+
+storage:
+  minimumFree: 1GiB
+  gracePeriod: 168h
+  keepPrevious: 0
+  automaticHousekeeping: conservative
+  buildCacheLimit: 20GiB
+  goCacheLimit: 10GiB
+
+logging:
+  directory: work/logs
+  managerSinks: [console]
+  managerConsoleFormat: text
+  managerConsoleTextFormat: "{time} [{level}] {message}"
+  managerFileFormat: json
+  transcriptSinks: [file]
+  transcriptConsoleFormat: text
+  maxFileSizeMiB: 100
+  maxBackups: 3
+  compressBackups: true
+  retentionEnabled: true
+  retentionMaxTotalMiB: 1024
+  managerMaxAgeDays: 14
+  instanceMaxAgeDays: 14
+  buildMaxAgeDays: 14
+  errorMaxAgeDays: 30
+  benchmarkMaxAgeDays: 90
+  retentionIntervalMinutes: 60
+
+runner:
+  group: epar-ci-canary
+  labels: [epar-core-CHANGE-ME]
+  includeHostLabel: false
+  noDefaultLabels: true
+  ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    requirePublicRepositoriesDisabled: false
+
+provider:
+  type: docker-container
+  sourceImage: epar-ci-core
+  network: default
+  platform: linux/amd64
+
+docker:
+  registryMirrors:
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900

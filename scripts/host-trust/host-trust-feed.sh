@@ -7,7 +7,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: host-trust-feed.sh sync|watch --project-root <path> --config <path> [--interval <seconds>]
+Usage: host-trust-feed.sh sync|watch --project-root <path> --config <path> [--purpose runner|build] [--interval <seconds>]
 
 The config must opt in with:
   image:
@@ -20,6 +20,7 @@ shift || true
 project_root=""
 config_path=""
 interval=10
+purpose="runner"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 while (($#)); do
@@ -27,12 +28,17 @@ while (($#)); do
     --project-root) project_root="${2:?missing value for --project-root}"; shift 2 ;;
     --config) config_path="${2:?missing value for --config}"; shift 2 ;;
     --interval) interval="${2:?missing value for --interval}"; shift 2 ;;
+    --purpose) purpose="${2:?missing value for --purpose}"; shift 2 ;;
     *) usage; exit 2 ;;
   esac
 done
 
 if [[ "$command_name" != "sync" && "$command_name" != "watch" ]] || [[ -z "$project_root" || -z "$config_path" ]]; then
   usage
+  exit 2
+fi
+if [[ "$purpose" != "runner" && "$purpose" != "build" ]]; then
+  echo "trust feed purpose must be runner or build" >&2
   exit 2
 fi
 if [[ ! "$interval" =~ ^[1-9][0-9]*$ ]]; then
@@ -45,13 +51,15 @@ if [[ "$config_path" != /* ]]; then
   config_path="$project_root/$config_path"
 fi
 if [[ ! -f "$config_path" ]]; then
-  # The first `start` can create config interactively. Treat missing config as
-  # disabled: native controller code will re-evaluate after init.
-  exit 0
-fi
-config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
-if command -v realpath >/dev/null 2>&1; then
-  config_path="$(realpath "$config_path")"
+  # A first `start` still needs operational system trust to compile the native
+  # controller before the wizard can create a config. Runner inheritance
+  # remains disabled until an existing config explicitly enables it.
+  if [[ "$purpose" != "build" ]]; then exit 0; fi
+else
+  config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
+  if command -v realpath >/dev/null 2>&1; then
+    config_path="$(realpath "$config_path")"
+  fi
 fi
 
 sha256_text() {
@@ -63,6 +71,7 @@ sha256_text() {
 }
 
 config_values() {
+  [[ -f "$config_path" ]] || return 0
   # Supported deliberately-small YAML subset: EPAR's own parser is flat in
   # each section and supports inline or block lists. Emit mode followed by
   # one scope per line.
@@ -98,7 +107,13 @@ while IFS= read -r value; do
     scope=*) scopes+=("$(printf '%s' "${value#scope=}" | tr '[:upper:]' '[:lower:]')") ;;
   esac
 done < <(config_values)
-if [[ "$mode" != "overlay" ]]; then
+if [[ "$purpose" == "build" ]]; then
+  build_scopes=(system)
+  if [[ "$mode" == "overlay" ]] && printf '%s\n' "${scopes[@]}" | grep -Fxq user; then
+    build_scopes+=(user)
+  fi
+  scopes=("${build_scopes[@]}")
+elif [[ "$mode" != "overlay" ]]; then
   exit 0
 fi
 
@@ -123,7 +138,7 @@ for scope in "${scopes[@]}"; do
   fi
 done
 
-config_id="$(printf '%s' "$config_path" | sha256_text | cut -c1-32)"
+config_id="$(printf '%s\0%s' "$purpose" "$config_path" | sha256_text | cut -c1-32)"
 feed_root="$cache_root/$config_id"
 lock_dir="$feed_root.lock"
 

@@ -14,6 +14,7 @@ func TestVersionStringDefaults(t *testing.T) {
 		"ephemeral-action-runner dev",
 		"commit: unknown",
 		"buildDate: unknown",
+		"sourceRevision: unknown",
 		"go: " + runtime.Version(),
 		"platform: " + runtime.GOOS + "/" + runtime.GOARCH,
 	} {
@@ -24,20 +25,22 @@ func TestVersionStringDefaults(t *testing.T) {
 }
 
 func TestVersionStringInjectedMetadata(t *testing.T) {
-	oldVersion, oldCommit, oldBuildDate := version, commit, buildDate
+	oldVersion, oldCommit, oldBuildDate, oldSourceRevision := version, commit, buildDate, sourceRevision
 	t.Cleanup(func() {
-		version, commit, buildDate = oldVersion, oldCommit, oldBuildDate
+		version, commit, buildDate, sourceRevision = oldVersion, oldCommit, oldBuildDate, oldSourceRevision
 	})
 
 	version = "v1.2.3-beta.1"
 	commit = "abc1234"
 	buildDate = "2026-07-07T00:00:00Z"
+	sourceRevision = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 	got := versionString()
 	for _, want := range []string{
 		"ephemeral-action-runner v1.2.3-beta.1",
 		"commit: abc1234",
 		"buildDate: 2026-07-07T00:00:00Z",
+		"sourceRevision: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("versionString() missing %q in:\n%s", want, got)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -102,4 +103,39 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return buf.String()
+}
+
+func TestReadLocalVMIdentitiesUsesStableMACAddress(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TART_HOME", home)
+	vmDirectory := filepath.Join(home, "vms", "epar-tart-runner")
+	if err := os.MkdirAll(vmDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vmDirectory, "config.json"), []byte(`{"macAddress":"02:00:00:12:34:56"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identities, err := readLocalVMIdentities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := identities["epar-tart-runner"]; got != "02:00:00:12:34:56" {
+		t.Fatalf("identity = %q", got)
+	}
+}
+
+func TestCloneEnvironmentDisablesTartAutomaticPruning(t *testing.T) {
+	environment := tartCloneEnvironment([]string{"PATH=/bin", "TART_NO_AUTO_PRUNE="})
+	if got := environment[len(environment)-1]; got != "TART_NO_AUTO_PRUNE=1" {
+		t.Fatalf("clone environment final override = %q", got)
+	}
+	count := 0
+	for _, value := range environment {
+		if strings.HasPrefix(value, "TART_NO_AUTO_PRUNE=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("clone environment contains %d TART_NO_AUTO_PRUNE entries: %#v", count, environment)
+	}
 }

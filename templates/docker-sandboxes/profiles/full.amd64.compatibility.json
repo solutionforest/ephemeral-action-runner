@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 2,
+  "templateSchemaVersion": 1,
+  "profile": "full",
+  "validationStatus": "planned",
+  "platform": "linux/amd64",
+  "source": {
+    "reference": "ghcr.io/catthehacker/ubuntu@sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+    "indexDigest": "sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+    "manifestDigest": "sha256:58314fa8cbf0f0e5384a37b3444811033320038816ef7c16f30b3e841ed65e51"
+  },
+  "runner": {
+    "execution": "direct-actions-listener",
+    "version": "2.332.0",
+    "user": "agent",
+    "uid": 1000,
+    "gid": 1000,
+    "home": "/home/agent",
+    "directory": "/opt/actions-runner"
+  },
+  "docker": {
+    "daemonOwner": "docker-sandboxes-runtime",
+    "expectedDaemonCount": 1,
+    "imagePreloadsVarLibDocker": false,
+    "buildRequiresPrivilegedBuildkit": false
+  }
+}

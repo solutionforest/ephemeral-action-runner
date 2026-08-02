@@ -7,6 +7,8 @@ param(
     [string] $ProjectRoot,
     [Parameter(Mandatory = $true)]
     [string] $Config,
+    [ValidateSet('runner', 'build')]
+    [string] $Purpose = 'runner',
     [ValidateRange(1, 3600)]
     [int] $Interval = 10
 )
@@ -14,8 +16,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Get-OverlayConfiguration {
-    param([string] $Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    param([string] $Path, [string] $FeedPurpose)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        if ($FeedPurpose -eq 'build') { return [pscustomobject]@{ Scopes = [string[]]@('system') } }
+        return $null
+    }
     $inImage = $false
     $listMode = $false
     $mode = ''
@@ -51,6 +56,12 @@ function Get-OverlayConfiguration {
             continue
         }
         $listMode = $false
+    }
+    if ($FeedPurpose -eq 'build') {
+        $buildScopes = [System.Collections.Generic.List[string]]::new()
+        [void]$buildScopes.Add('system')
+        if ($mode -eq 'overlay' -and $scopes -contains 'user') { [void]$buildScopes.Add('user') }
+        return [pscustomobject]@{ Scopes = $buildScopes }
     }
     if ($mode -ne 'overlay') { return $null }
     if ($scopes.Count -eq 0) { [void]$scopes.Add('system') }
@@ -219,11 +230,11 @@ if (Test-Path -LiteralPath $Config -PathType Leaf) {
     }
 }
 $Config = $Config.ToLowerInvariant()
-$settings = Get-OverlayConfiguration $Config
+$settings = Get-OverlayConfiguration $Config $Purpose
 if ($null -eq $settings) { exit 0 }
 
 $cacheBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'ephemeral-action-runner\host-trust' } else { Join-Path $env:TEMP 'ephemeral-action-runner\host-trust' }
-$configId = Get-ConfigId $Config
+$configId = Get-ConfigId ($Purpose + [char]0 + $Config)
 $feedRoot = Join-Path $cacheBase $configId
 $lockDir = $feedRoot + '.lock'
 function Acquire-EparSharedLock {

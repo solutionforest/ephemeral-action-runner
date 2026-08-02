@@ -1,57 +1,44 @@
 # Troubleshooting
 
-This page is organized by symptom, host OS, and EPAR provider. Start with the sections that match the machine and provider you are using.
+Start with the symptom that most closely matches the failure. Regardless of provider, keep TLS verification enabled, preserve the first relevant log, and do not use broad Docker/WSL resets or prune commands as a first response.
 
-## Quick Diagnostics
+## Contents
 
-Start with the commands that match your host and provider.
+- [Quick diagnostics](#quick-diagnostics)
+- [Windows no-Go startup prints an HTTP/2 named-pipe diagnostic](#windows-no-go-startup-prints-an-http2-named-pipe-diagnostic)
+- [A Docker workload fails with an architecture error](#a-docker-workload-fails-with-an-architecture-error)
+- [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
+- [Docker Sandboxes rejects template, policy, or capacity](#docker-sandboxes-rejects-template-policy-or-capacity)
+- [Docker Sandboxes creation fails after a runtime-helper prompt](#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt)
+- [Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present](#docker-sandboxes-rejects-a-staging-workspace-because-ssh-agent-forwarding-is-present)
+- [Docker Hub login succeeds but a private pull is denied in Docker Sandboxes](#docker-hub-login-succeeds-but-a-private-pull-is-denied-in-docker-sandboxes)
+- [An idle runner reports GitHub or Sandbox health warnings](#an-idle-runner-reports-github-or-sandbox-health-warnings)
+- [GitHub Actions runner release resolution reports HTTP 403 or 429](#github-actions-runner-release-resolution-reports-http-403-or-429)
+- [A scheduled image check or update fails](#a-scheduled-image-check-or-update-fails)
+- [A runner is held for diagnostics or an acknowledgement](#a-runner-is-held-for-diagnostics-or-an-acknowledgement)
+- [Docker image build runs out of space](#docker-image-build-runs-out-of-space)
+- [Storage keeps growing after updates](#storage-keeps-growing-after-updates)
+- [Docker image build fails with TLS certificate errors](#docker-image-build-fails-with-tls-certificate-errors)
+- [Windows Docker Desktop WSL2 disk is smaller than expected](#windows-docker-desktop-wsl2-disk-is-smaller-than-expected)
+- [Docker Container startup fails](#docker-container-startup-fails)
+- [WSL provider image build fails early](#wsl-provider-image-build-fails-early)
+- [GitHub runner registration fails](#github-runner-registration-fails)
 
-### All Hosts
+## Quick diagnostics
 
-EPAR logs are written under `work/logs` by default. The latest top-level error report is usually:
+EPAR writes logs under `work/logs` by default. Start with `work/logs/epar-last-error.log`, then inspect the matching build log in `work/logs/builds/` or instance transcript in `work/logs/instances/`. Manager events are console-only by default; raw transcripts are file-only unless `logging.transcriptSinks` includes `console`.
 
-```text
-work/logs/epar-last-error.log
-```
-
-Image build logs use provider-specific names, for example:
-
-```text
-work/logs/builds/epar-docker-dind-catthehacker-ubuntu.docker-build.log
-work/logs/builds/epar-wsl-catthehacker-ubuntu.wsl-build.log
-```
-
-Check the EPAR version and selected config:
+Long Buildx operations show a bounded console summary with downloaded bytes, completed layers, the active BuildKit step, elapsed time, and growing direct-archive bytes when an export is in progress. The complete raw progress remains in the printed build-log path.
 
 ```bash
 ./start --help
-go run ./cmd/ephemeral-action-runner version
-```
-
-If you are running without local Go, use `./start --help`; the wrapper will run EPAR through the containerized Go toolchain.
-
-### Docker-Backed Workflows
-
-Use these on any host when the provider is Docker-DinD, when WSL image preparation starts from a Docker image, or when the no-Go wrapper is in use:
-
-```bash
+./start version
 docker version
 docker info
 docker system df
-docker image ls
 ```
 
-To see the free space available to containers on the active Docker daemon:
-
-```bash
-docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
-```
-
-For a custom source image, replace `ghcr.io/catthehacker/ubuntu:full-latest` with the value from `image.sourceImage`.
-
-### Windows Hosts
-
-For Windows hosts that use WSL2, Docker Desktop's WSL2 backend, or the WSL provider:
+Without local Go, use `./start --help`; the wrapper selects the containerized toolchain. For Windows WSL2, a WSL-backed Docker daemon, or the WSL provider, also run:
 
 ```powershell
 wsl --version
@@ -60,320 +47,289 @@ docker context ls
 docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
-`ghcr.io/catthehacker/ubuntu:full-latest` is the default source image for EPAR's default config. If your config uses a custom source image, replace it with your configured `image.sourceImage`.
+Container-visible free space is the relevant value for Docker builds. Windows Explorer or Finder free space does not necessarily equal the free space in a Linux VM backing the daemon.
 
-Docker Desktop's WSL2 backend stores Docker data in a WSL-backed virtual disk. Windows Explorer free space and container-visible free space are related, but they are not the same number.
+## Windows no-Go startup prints an HTTP/2 named-pipe diagnostic
 
-### Linux Docker Engine Hosts
+### Symptom
 
-On native Linux, Docker data usually lives under Docker's root directory. Check it directly:
-
-```bash
-docker info --format '{{.DockerRootDir}}'
-df -h "$(docker info --format '{{.DockerRootDir}}')"
-```
-
-### macOS Docker Hosts
-
-Docker Desktop and OrbStack keep Linux container data inside their own VM/storage area. Use Docker's own view first:
-
-```bash
-docker system df
-docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
-```
-
-If the container-visible disk is full, adjust or clean the Docker/OrbStack storage from that product's settings. Finder free space by itself may not reflect the Linux VM storage available to containers.
-
-## Docker Container Fails Because Its Architecture Does Not Match The Runner
-
-### Symptoms
-
-A Docker or Docker Compose service may fail immediately with one of these messages:
+The Windows no-Go bootstrap prints a line like:
 
 ```text
-exec /bin/sh: exec format error
-exec user process caused: exec format error
-cannot execute binary file: Exec format error
+http2: server: error reading preface from client //./pipe/dockerDesktopLinuxEngine: file has already been closed
 ```
 
-Docker may also warn that the requested image platform does not match the detected host platform. That warning alone is not a failure: the container can still run when a compatible emulation handler is already registered.
+### Diagnosis and remediation
 
-These related messages point to different problems:
+Docker Desktop can emit this named-pipe transport diagnostic when a client connection closes. If the bootstrap `docker build` succeeds and the wizard or command continues, it is not an EPAR runner-group or GitHub API failure. The wrapper suppresses only this exact successful-build diagnostic and keeps full Docker stderr when the build fails.
 
-- `no matching manifest for linux/arm64/v8` or `no matching manifest for linux/amd64` means the image does not publish the requested platform. QEMU cannot supply a missing image manifest; choose an available platform or publish a multi-platform image.
-- `qemu-x86_64: Could not open '/lib64/ld-linux-x86-64.so.2'` means translation started but the expected foreign-architecture loader or userspace is unavailable or incompatible. Registration alone may not make that image work.
-- Exit code `139` indicates a segmentation fault. Emulation can expose workload-specific incompatibilities, but this code by itself does not prove an architecture mismatch.
+If startup stops, verify the selected engine and context:
 
-### Confirm The Host And Image Platforms
+```powershell
+docker version
+docker info
+docker context show
+```
 
-Check the runner architecture and the Docker daemon that will execute the container:
+Resolve a failed command or unhealthy engine; do not treat every named-pipe line as harmless when Docker returned a nonzero exit code.
+
+## A Docker workload fails with an architecture error
+
+### Symptom
+
+Docker or Compose exits with `exec format error`, `cannot execute binary file`, a platform-mismatch warning, `no matching manifest`, a QEMU loader error, or exit code `139`.
+
+### Diagnosis and remediation
+
+Inspect the runner, daemon, image manifest, and Compose platform setting:
 
 ```bash
 uname -m
 docker info --format '{{.OSType}}/{{.Architecture}}'
-```
-
-Inspect the locally selected image platform:
-
-```bash
 docker image inspect --format '{{.Os}}/{{.Architecture}}' IMAGE
-```
-
-Inspect all platforms published by a registry image:
-
-```bash
 docker buildx imagetools inspect IMAGE
-```
-
-For Docker Compose, also inspect the resolved configuration and look for a service-level `platform:` value:
-
-```bash
 docker compose config
 ```
 
-An x64 Linux Docker daemon normally runs `linux/amd64` images natively, and an ARM64 daemon normally runs `linux/arm64` images natively. Pulling or loading a foreign image does not prove that the daemon can execute it.
+`no matching manifest` means the image does not publish the requested platform; emulation cannot create a missing manifest. A platform warning alone does not prove failure, and exit code `139` alone does not prove an architecture mismatch. Use the exact image and workload evidence. For the architecture model, QEMU setup, provider scope, and verification commands, see [Cross-architecture containers](advanced/cross-architecture-containers.md).
 
-### Match GitHub-Hosted Linux Behavior With Explicit QEMU Setup
-
-GitHub's Ubuntu runner image installs Docker, but its published installation script and software inventory do not promise pre-registered foreign-architecture emulators. When a trusted Linux job must run foreign-architecture containers, configure the requirement explicitly before the first such container starts:
-
-```yaml
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set up ARM64 container emulation
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-        with:
-          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-          platforms: arm64
-
-      - name: Verify the foreign container
-        run: docker run --rm --platform linux/arm64 alpine:3.22 uname -m
-```
-
-The expected output is `aarch64`. Add only the platforms the workflow needs; emulated compilation and compute-heavy workloads can be substantially slower than native execution. Keep architecture-sensitive jobs on native runners when performance or full compatibility matters.
-
-`docker/setup-qemu-action` registers user-mode QEMU interpreters through Linux `binfmt_misc`. It helps Linux containers launch foreign-architecture user-space executables; it does not change the runner's CPU architecture, create a foreign-architecture VM, or make arbitrary host executables and libraries compatible. The action uses a privileged helper container, so use it only in trusted workflows and pin reviewed action and helper-image revisions according to your dependency policy.
-
-Provider notes:
-
-- Docker-DinD: run the setup action inside the EPAR job before Docker Compose or other foreign-image commands. It configures the disposable runner's Docker execution environment; no EPAR configuration switch is required.
-- WSL: run the setup action inside the WSL runner when its Linux Docker daemon must execute a foreign image. An x64 WSL runner does not gain ARM64 container support merely by pulling or loading an ARM64 image.
-- Tart: Tart runs an ARM64 VM on Apple Silicon. Its optional Rosetta path is experimental and is not equivalent to QEMU/binfmt compatibility. Prefer Docker-DinD or a native matching architecture when a workload is not compatible.
-- GitHub-hosted Windows and macOS: GitHub documents Docker container actions and service containers as Linux-runner features. A Windows or macOS hardware label alone is therefore not a substitute for a Linux Docker daemon with emulation configured.
-
-Official references:
-
-- [Docker Setup QEMU action](https://github.com/docker/setup-qemu-action)
-- [Docker multi-platform build strategies](https://docs.docker.com/build/building/multi-platform/)
-- [GitHub-hosted runner labels and limitations](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
-- [GitHub self-hosted runner container requirements](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#requirements-for-self-hosted-runner-machines)
-- [GitHub Ubuntu runner Docker installation](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/install-docker.sh)
-
-## Docker Image Build Runs Out Of Space
+## Docker Sandboxes is unavailable or its preflight fails
 
 ### Symptom
 
-During `start` or `image build`, the log contains:
+The wizard marks Docker Sandboxes unavailable, or `sbx diagnose --output json` reports failures.
 
-```text
-E: You don't have enough free space in /var/cache/apt/archives/.
+### Diagnosis and remediation
+
+Check the diagnostic result before editing configuration:
+
+```bash
+sbx diagnose --output json
 ```
 
-or another package install fails with `No space left on device`.
+EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose Refresh in the provider menu to recheck availability; do not manually force a provider selection or substitute Docker Container for a configured Docker Sandboxes pool.
 
-### What It Means
+## Docker Sandboxes rejects template, policy, or capacity
 
-This error is raised inside the temporary container or guest that is building the runner image. It usually means the Docker daemon or VM backing that build is out of writable layer space. It does not necessarily mean the host OS drive has no free space.
+### Symptom
 
-Check the active Docker daemon:
+Startup reports a template identity/digest mismatch, policy-generation drift, an admission failure, or insufficient capacity.
+
+### Diagnosis and remediation
+
+Docker Sandboxes resolves the configured source selector, records the exact OCI identities in a local artifact receipt, and verifies the host-global policy fingerprint. If the desired source, platform, scripts, template inputs, runner inputs, or trust inputs change, rerun `./start`; EPAR builds and imports a replacement and activates it only after exact readback succeeds.
+
+An imported Docker Sandboxes template does not require a matching Docker image. EPAR builds directly to a verified archive, imports that archive, and then removes the transient workspace. If startup reports a missing Docker staging image, the controller is stale; rebuild the native controller and rerun `./start`. If direct archive verification or `sbx template load` fails, use the printed Buildx transcript and archive error; EPAR does not fall back to the memory-heavy Docker load/save path.
+
+Capacity admission accounts for estimated incremental physical growth on each measurable backing filesystem plus the fixed `storage.minimumFree` reserve. Docker Sandboxes root and inner-Docker sizes are independent sparse logical maxima and are not added as immediate host usage. Inspect the reported physical surface, run the matching `storage status` and prune-preview commands, or deliberately retry only that invocation with `--allow-insufficient-storage`. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
+
+## Docker Sandboxes creation fails after a runtime-helper prompt
+
+### Symptom
+
+On macOS or Linux, host security asks whether to allow a Docker Sandboxes helper such as `mkfs.ext4`, `mkfs.erofs`, or `containerd-shim-nerdbox-v1`; macOS may say that the helper “is an app downloaded from the Internet.” After a required prompt is denied or blocked, EPAR reports `create docker sandbox failed`, and `sbx` may report `500 Internal Server Error: failed to run sandbox container`. The runner is neither registered nor marked ready.
+
+### Diagnosis and remediation
+
+Docker Sandboxes uses `mkfs.ext4` to create an ext4 filesystem inside each sandbox's private Docker disk-image file, `mkfs.erofs` to construct the read-only template snapshot, and `containerd-shim-nerdbox-v1` to launch and manage the sandbox VM. Expected file targets are regular sandbox-owned files beneath the Docker Sandboxes runtime data directory—for example, current macOS releases may use `~/.sbx/run/d/containerd/.../images/<runner>-docker.img` and `~/.sbx/run/d/containerd/.../snapshots/<id>/layer.erofs`. With the current Homebrew `sbx` package, the runtime and shim are beneath `/opt/homebrew/Caskroom/sbx/<version>/`. A formatter must not target a physical device such as `/dev/disk*`, an EPAR checkout, a home-directory document, or another unrelated path.
+
+If each executable belongs to the Docker Sandboxes installation you intentionally installed and any displayed target is the expected sandbox-owned file, allow the operation through the host's security or application-control prompt, then rerun the same EPAR start or verification command if creation already failed. Do not invoke a formatter or shim yourself, disable host security broadly, or approve a command with an unfamiliar target. The configured private Docker disk is sparse, so its logical maximum does not mean the formatter immediately consumes that amount of physical storage.
+
+If no prompt appeared, or approval still produces the 500 error, preserve the failed runner evidence and inspect the Docker Sandboxes daemon/client logs and `sbx diagnose --output json`; the same top-level error can also represent a runtime, capacity, or host-policy failure. See [Private Filesystem and VM Helper Approval](providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) for the provider contract.
+
+## Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present
+
+### Symptom
+
+Sandbox creation reaches `verify dedicated docker sandbox staging workspace` and fails with a message that host SSH-agent forwarding is not permitted. Diagnostics may show `SSH_AUTH_SOCK=/run/ssh-agent.sock` or `SSH_AUTH_SOCK_GATEWAY=...` inside the guest even though the imported template does not define them.
+
+### Diagnosis and remediation
+
+Docker Sandboxes may forward the host SSH agent when its shared daemon inherits the host's agent environment. EPAR rejects the resulting sandbox because the forwarded socket or gateway could let a workflow use host SSH credentials. This is not evidence that the staging mount is missing or read-only, and deleting only `/run/ssh-agent.sock` is insufficient when the forwarding gateway remains configured.
+
+Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then restart it with all forwarding variables removed and retry EPAR:
+
+```sh
+sbx daemon stop
+env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
+```
+
+EPAR strips these variables from Docker Sandboxes commands it launches, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
+
+## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
+
+### Symptom
+
+A workflow's Docker login step reports `Login Succeeded`, but a later pull of a private Docker Hub image fails with `insufficient_scope: authorization failed`, `pull access denied`, or an equivalent authorization response. The same workflow and credentials may succeed with Docker Container or a GitHub-hosted runner. Using `docker --config /home/agent/.docker pull ...` produces the same denial.
+
+### Diagnosis and remediation
+
+First verify only metadata, never credential contents: the listener should run as `agent` with `HOME=/home/agent` and `DOCKER_CONFIG=/home/agent/.docker`, and a post-login config should be owned by `agent` with restrictive permissions. If Docker reaches the registry and returns an authorization response, do not investigate CA copying unless an `x509` or TLS error is also present.
+
+Inspect the host Docker Sandboxes daemon log for a message that the proxy is overriding a client-supplied registry credential with a host credential. When that message is present, the workflow credential was written correctly but dockerd used the credential-injecting forward path. An explicit guest config path cannot bypass that path.
+
+On a current EPAR template, `docker info --format '{{.NoProxy}}'` must print `*`, `/etc/docker/daemon.json` must be a root-owned regular file, and `sbx policy log <sandbox-name>` must report `transparent` for `registry-1.docker.io`, `auth.docker.io`, and the blob host used by the pull. Docker Sandboxes documents transparent traffic as policy-enforced without credential injection. If dockerd reports another no-proxy value or the policy log reports `forward`, stop the workspace controller, let its exact cleanup finish, rerun `./start` to build and import the changed template, and test on a newly created runner. Do not reuse the old sandbox.
+
+Do not set `DOCKER_SANDBOXES_NO_PROXY` expecting it to disable credential injection. That host variable only excludes destinations from an optional upstream proxy used after traffic reaches the mandatory Sandbox proxy. Replacing `docker/login-action` with `docker login`, combining login and pull in one shell step, or changing `DOCKER_CONFIG` also leaves an old daemon's forward route unchanged.
+
+Keep the host `sbx login` identity intentionally different from the workflow identity when proving this fix. A successful private pull together with transparent policy-log entries proves that the guest credential is authoritative. Changing the host login to match the workflow can diagnose the old interception behavior, but it is a shared-identity workaround rather than the fix.
+
+EPAR rejects global `sbx` secrets and removes inherited proxy variables from runner registration and the Actions listener. A root-capable workflow can still deliberately reconnect a client to Docker Sandboxes' forward proxy, and v0.37.1 has no documented per-sandbox switch that disables the interceptor. Use a least-privilege host `sbx` account and choose Docker Container if that residual capability is outside the trust boundary. See [Docker Hub Credentials and Transparent Egress](providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
+
+## An idle runner reports GitHub or Sandbox health warnings
+
+A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR keeps the exact runner, lets a trust lease expire closed when it cannot refresh it, and retries. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
+
+`networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
+
+## GitHub Actions runner release resolution reports HTTP 403 or 429
+
+The public `actions/runner` Releases API has a separate unauthenticated rate limit. An EPAR GitHub App installation token is not used for that public repository because it may not have permission to read it. On a 403, 429, timeout, or transient server response, EPAR prints the HTTP status and any safe rate-limit, retry, and request-ID headers, then uses the reviewed exact release in `third_party/actions-runner-release.lock.json`. This is an explicit metadata-only fallback: the selected version must match `image.runnerVersion` when that value is pinned, the expected asset name and canonical GitHub URL are checked, and the downloaded package must still match the lock's SHA-256 before it is installed.
+
+If EPAR says the checked-in fallback is unusable, restore that file from the EPAR release or update to a release with a refreshed lock; do not replace the digest with an unverified value. Authentication, malformed successful API responses, selector mismatches, missing assets, and other non-transient API failures remain errors rather than using the fallback.
+
+## A scheduled image check or update fails
+
+Run `./start status` to see the last successful remote check, next check or retry, pending immutable identity, deferred reason, and last error. A failed scheduled check or build keeps the previous exactly verified generation available and retries with bounded backoff; a missing artifact or changed local configuration still fails closed. Use `./start image update` to retry an immediate remote check, or correct local input errors and rerun `./start`.
+
+## A runner is held for diagnostics or an acknowledgement
+
+### Symptom
+
+An instance is retained, quarantined, or shown as requiring an acknowledgement after a provisioning, policy, or runtime failure.
+
+### Diagnosis and remediation
+
+Preserve the instance and inspect `work/logs/instances/<instance>.guest.log`, the matching runner diagnostics, and controller output before acknowledging or removing it. EPAR deliberately keeps uncertain ownership, failed cleanup, and unverified remote state inside the strict `pool.instances` cap instead of creating a replacement storm.
+
+If an incident requires stopping new work immediately, stop the controller with `Ctrl-C` or the service manager that launched it. This prevents replacement; it does not erase retained evidence. Use the configured EPAR cleanup command only after identifying the exact affected pool. Do not use a broad `docker system prune`, WSL unregister, or reset as an incident-disable switch.
+
+Set `EPAR_DISABLE_DOCKER_SANDBOXES=1` before starting EPAR when Docker Sandboxes admission must remain disabled during an incident or compatibility investigation. This fails the provider closed without changing configuration or deleting evidence.
+
+After reviewing retained Docker Sandboxes diagnostics, acknowledge that review only for the exact configured pool:
+
+```bash
+./start cleanup --acknowledge-failed-diagnostics
+```
+
+## Docker image build runs out of space
+
+### Symptom
+
+`start` or `image build` reports `No space left on device` or `E: You don't have enough free space in /var/cache/apt/archives/.`.
+
+### Diagnosis and remediation
+
+The temporary guest or Docker writable layer is full; this does not necessarily mean the host OS drive is full. Inspect the active Docker daemon:
 
 ```bash
 docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
-docker system df
-```
-
-If `/` inside the container is nearly full, clean up Docker data or increase the Docker VM/data-disk limit before retrying.
-
-### Cleanup Direction
-
-Review Docker's usage first:
-
-```bash
 docker system df
 docker system df -v
 ```
 
-Docker prune commands remove resources that Docker considers unused. Depending on the command, that can include stopped containers, unused images, build cache, unused networks, or unused volumes. Review the Docker command help and the data on the machine before pruning, especially if you expect to restart stopped containers or keep data in Docker volumes.
+Increase the relevant Docker/VM data-disk allocation or deliberately remove unneeded data after reviewing it. Docker prune commands can remove stopped containers, unused images, build cache, networks, and volumes; they are not a safe generic fix.
 
-## Docker Image Build Fails With SSL Certificate Errors
-
-### Symptom
-
-During `start`, `image build`, or a CI job, HTTPS access fails with certificate errors such as:
-
-```text
-curl: (60) SSL certificate problem: unable to get local issuer certificate
-```
-
-```text
-Certificate verification failed: The certificate is NOT trusted.
-The certificate issuer is unknown. Could not handshake: Error in the certificate verification.
-```
-
-### What It Means
-
-Antivirus, endpoint-security, firewall, or corporate-proxy software may be inspecting HTTPS and re-signing certificates with a root CA trusted by the host but not present in the Ubuntu runner image.
-
-### How to Fix
-
-Do not disable certificate verification. Use EPAR's host trust overlay so the disposable Docker-DinD runners automatically inherit the host's trusted root CAs while retaining Ubuntu's standard roots.
-
-New interactive Docker-DinD configurations enable the overlay by default. For an older Windows or macOS configuration, add:
-
-```yaml
-image:
-  hostTrustMode: overlay
-  hostTrustScopes: [system, user]
-```
-
-Linux supports only the system scope, so use `hostTrustScopes: [system]` instead. Rebuild the image after changing the configuration:
-
-```powershell
-go run ./cmd/ephemeral-action-runner image build --replace
-```
-
-Without Go installed, run `scripts\run-with-docker.ps1 image build --replace` on Windows or `scripts/run-with-docker.sh image build --replace` on macOS or Linux. Use the official wrapper because it collects trust from the real host rather than the temporary Linux toolchain container.
-
-EPAR uses the resulting consolidated Ubuntu trust bundle during both image construction and CI jobs. Node.js, Python Requests, and pip receive compatible runtime defaults without overwriting values already supplied by the source image or runner environment.
-
-Programs with private certificate stores can still require application-specific configuration. Java keystores remain a separate concern.
-
-### Advanced: Add a Certificate Explicitly
-
-Use `image.trustedCaCertificatePaths` when a required CA is not trusted by the selected host stores or when the configuration must pin a specific CA independently of host trust.
-
-Export the CA as PEM, Base-64 encoded X.509 `.CER`, or DER-encoded `.CER`, place it in the repository, and add it to the configuration:
-
-```yaml
-image:
-  hostTrustMode: overlay
-  hostTrustScopes: [system, user]
-  trustedCaCertificatePaths:
-    - .local/private-root.cer
-```
-
-Explicit certificates are validated and added to the same Ubuntu trust bundle; they are combined with, not substituted for, the host trust overlay.
-
-### Host Trust Overlay Is Missing, Stale, Or Mismatched
-
-This section applies when a Docker-DinD config contains:
-
-```yaml
-image:
-  hostTrustMode: overlay
-```
-
-EPAR fails closed when host collection returns no roots, the official no-Go bridge is missing, its feed is invalid or more than 30 seconds old, or a runner's 20-second lease does not match the image's trust generation. A pre-job mismatch can fail an already assigned GitHub job before repository steps run. Inspect the controller output, runner guest log, and the no-Go watcher's log in the host trust cache for the first collection, feed, or lease error.
-
-Check these boundaries:
-
-- Windows and macOS support `hostTrustScopes: [system, user]`; Linux supports `[system]` only.
-- Overlay mode requires `provider.type: docker-dind` and `runner.ephemeral: true`.
-- Use the official `./start`, `start.ps1`, or release launcher for the no-Go path. A bare Linux toolchain container cannot inspect Windows Certificate Stores or macOS Keychain and must not substitute its own CA bundle.
-- On an uncommon Linux distribution, set `EPAR_HOST_TRUST_BUNDLE` to the distribution-generated PEM CA bundle before launching EPAR.
-- Confirm host and guest clocks are correct; feed and lease expiry checks use timestamps and reject stale data.
-
-Do not disable the pre-job gate or TLS verification. Restore host collection, then let EPAR build and register the current immutable trust generation.
-
-Host Docker daemon trust is separate from runner trust. If `docker pull` of the source image fails, configure the authorized CA for Docker Desktop, OrbStack, or the host Docker Engine first; the Ubuntu overlay does not exist until after that pull succeeds.
-
-## Windows Docker Desktop WSL2 Disk Is Smaller Than Expected
+## Storage keeps growing after updates
 
 ### Symptom
 
-On a Windows machine where WSL2 storage was set up before 2021, the Docker container filesystem may report about 251 GB total:
+Old EPAR images, Docker Sandboxes templates, staging archives, or no-Go controller files remain after an update or an interrupted start.
 
-```powershell
-docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
-```
+### Diagnosis and remediation
 
-Example:
+Run `./start` once more. Startup reconciles incomplete exact-owned work and retires an unreferenced superseded generation after its replacement passes readback. It does not delete shared images, prefix-only historical resources, active containers, active sandboxes, or resources referenced by another configuration.
 
-```text
-Filesystem      Size  Used Avail Use% Mounted on
-overlay         251G  211G   28G  89% /
-```
-
-On a Windows machine where WSL2 storage was set up after the 2022 WSL default-size change, the same command may report about 1007 GB total:
-
-```text
-Filesystem      Size  Used Avail Use% Mounted on
-overlay        1007G  127G  830G  14% /
-```
-
-### Why It Happens
-
-This is a Windows Docker Desktop / WSL2 storage detail, not an EPAR image-size issue. The command reports the size of Docker Desktop's Linux container storage, not the size of `ghcr.io/catthehacker/ubuntu:full-latest`.
-
-For Windows machines where WSL2 storage was set up before 2021, the default WSL2 virtual disk maximum may be about 256 GB. For WSL2 setups created after the WSL 0.58.0 change, released in 2022, Microsoft's documentation says the default maximum for each WSL2 VHD is 1 TB. This can explain why one Windows machine reports about 251 GB while another reports about 1007 GB for the container-visible filesystem.
-
-Windows Explorer free space by itself is not enough to confirm Docker has build space. The container-visible filesystem must have enough free space for the image pull, build layers, package manager cache, and final runner image.
-
-For more background, see:
-
-- <https://github.com/microsoft/WSL/issues/4373>
-- <https://learn.microsoft.com/windows/wsl/disk-space>
-- <https://docs.docker.com/desktop/features/wsl/>
-
-## Docker-DinD Build Fails With `unknown flag: --progress`
-
-### Symptom
-
-The Docker-DinD image build fails with:
-
-```text
-unknown flag: --progress
-```
-
-### What It Means
-
-This happens when the Docker client used for the build routes `docker build` through the legacy builder, or when the client does not have Buildx-style build support. It is most visible when EPAR is run through a containerized Go toolchain whose bundled Docker client differs from the host `docker.exe`.
-
-Current EPAR builds use legacy-builder-compatible Docker build arguments. If you still see this error, confirm you are running a revision that includes that fix and check which Docker client is actually executing the command:
+Inspect the exact classification before removing anything manually:
 
 ```bash
-docker version
-docker build --help
-docker buildx version
+./start storage status
+./start storage prune
+./start storage prune --legacy
 ```
 
-## Docker-DinD Startup Fails
+Use normal `storage prune --execute` only for exact catalog-owned resources. Legacy prefix-era entries require the plan hash printed by `storage prune --legacy`; they are not removed automatically. Do not use broad Docker prune/reset commands or VHDX compaction as a substitute for this review.
 
-### Privileged Containers
+## Docker image build fails with TLS certificate errors
 
-Docker-DinD requires the host Docker runtime to allow privileged Linux containers. Confirm the Docker host supports:
+### Symptom
+
+HTTPS access fails with `curl: (60)`, `certificate verification failed`, or an unknown issuer during an EPAR build or job.
+
+### Diagnosis and remediation
+
+Do not disable certificate verification. First identify which trust boundary failed.
+
+For a no-Go native-controller build, `./start` automatically reads host system roots, excludes explicitly distrusted certificates, validates the short-lived feed in an offline container, and mounts only the resulting CA bundle into the Go compiler container. Runner CA inheritance remains independent. If the build still reports an unknown issuer, inspect `work/logs/epar-native-controller-build.log`: the wrapper prints the requested host, presented certificate subject and issuer, SHA-256 fingerprint, validity, and verification result, and on Windows it lists matching roots from `LocalMachine\Root` and `CurrentUser\Root`. A remaining failure means the expected issuer was absent, distrusted, malformed, expired, or not the certificate actually presented; EPAR never disables TLS verification or retries insecurely.
+
+For an EPAR Buildx failure, leave `image.hostTrustMode` unchanged. EPAR automatically supplies host system roots to its config-owned builder and prints the full build transcript path before `docker buildx build`. The console and error report include a bounded redacted tail. Inspect the underlying `x509` line together with the registry host, builder identity, and active trust generation:
+
+```powershell
+docker buildx ls
+Get-ChildItem .local/storage/buildx -Recurse -Filter metadata.json | Get-Content
+Get-ChildItem .local/storage/buildkit -Recurse -Filter buildkitd.toml | Get-Content
+```
+
+The owned metadata records the exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in the host daemon because builder trust cannot repair host-daemon trust.
+
+Configure runner overlay only when jobs inside an ephemeral runner must inherit host roots:
+
+```yaml
+image:
+  hostTrustMode: overlay
+  hostTrustScopes: [system, user]
+```
+
+Use `[system]` on Linux. Overlay mode collects the current host roots, validates them before registration, and combines them with Ubuntu roots and any `image.trustedCaCertificatePaths`; it is root-anchor inheritance rather than exact Windows/macOS TLS-policy emulation. It requires `runner.ephemeral: true`. Omitted or disabled mode remains valid for Docker Sandboxes and does not install the job-start trust hook.
+
+Use the normal host entry point so EPAR can inspect the real Windows certificate stores or macOS Keychain:
+
+```powershell
+.\start.ps1
+.\start.ps1 image build --replace
+```
+
+On no-Go Windows, use `.\start.ps1 image build --replace`; on macOS/Linux, use `./start image build --replace`. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. The legacy containerized controller still requires the separate native-host feed bridge. A bare Linux toolchain container is not a replacement for either path.
+
+## Windows Docker Desktop WSL2 disk is smaller than expected
+
+### Symptom
+
+`docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /` shows much less capacity than Windows Explorer.
+
+### Diagnosis and remediation
+
+Docker Desktop stores Linux container data in a WSL-backed virtual disk. Older WSL2 installations can have a smaller default VHD maximum than newer ones, but the reported container filesystem is the evidence that matters for image pulls and builds. Inspect Docker usage first, then change Docker Desktop/WSL storage using the product's supported settings. See [Microsoft WSL disk-space guidance](https://learn.microsoft.com/windows/wsl/disk-space) and [Docker Desktop WSL guidance](https://docs.docker.com/desktop/features/wsl/).
+
+## Docker Container startup fails
+
+### Privileged containers
+
+Docker Container requires a host Docker runtime that permits privileged Linux containers:
 
 ```bash
 docker run --rm --privileged alpine:3.20 true
 ```
 
-### Nested Docker Storage Driver
+### Nested Docker storage driver
 
-If Docker-DinD starts but nested Docker operations fail with overlay mount errors, keep the default inner daemon storage driver:
+If nested Docker operations fail with overlay-mount errors, retain the default inner storage driver:
 
 ```text
 EPAR_DOCKERD_STORAGE_DRIVER=vfs
 ```
 
-Use `overlay2` or `auto` in a derived image only after proving that storage driver works on the exact host runtime.
+Use `overlay2` or `auto` only in a derived image after proving it works on the exact host runtime.
 
-## WSL Provider Image Build Fails Early
+## WSL provider image build fails early
 
-This section applies to Windows hosts using `provider.type: wsl`.
+### Symptom
 
-If the default WSL image build fails before importing or starting the temporary distro, confirm Docker is reachable because the default WSL full image converts a Docker image into a rootfs tar:
+The WSL image build fails before import, during import with `0xffffffff`, or before systemd is ready.
+
+### Diagnosis and remediation
+
+The default WSL build obtains a Docker source image before importing it into WSL. Verify Docker and WSL first:
 
 ```powershell
 docker version
@@ -381,58 +337,19 @@ docker pull ghcr.io/catthehacker/ubuntu:full-latest
 wsl -l -v
 ```
 
-### WSL Import Exits With `0xffffffff`
+For `Wsl/Service/CreateInstance/E_UNEXPECTED`, `Catastrophic failure`, or import exit `0xffffffff`, stop EPAR, save work in other distros, then run `wsl --shutdown`. This stops every running WSL distro, including any Docker backend using WSL. Restart the affected Docker host runtime, verify a normal distro command returns `0`, then rerun `./start`; a matching cached source rootfs is reused. If it persists, update WSL, shut it down again, reboot, and consult [Microsoft's WSL troubleshooting guidance](https://learn.microsoft.com/windows/wsl/troubleshooting#error-code-0x8000ffff-unexpected-failure).
 
-If the Docker export completes but the first temporary-distro import fails like this:
+If a guest exists but systemd does not become ready, inspect `work/logs/builds/<image>.wsl-build.log` and `work/logs/builds/<temporary-distro>.guest.log`. Do not unregister a distro until you have identified the exact EPAR-owned target and accepted that unregistration is irreversible.
 
-```text
-wsl.exe --import ... --version 2 failed: exit status 0xffffffff:
-```
+## GitHub runner registration fails
 
-WSL may be in an unstable service or VM session. The error can also appear as
-`Wsl/Service/CreateInstance/E_UNEXPECTED` or `Catastrophic failure` when
-starting an existing distro. When the import itself fails, the advertised WSL
-build and guest logs may be empty or absent because no guest was created yet.
+### Symptom
 
-Reset the WSL session before deleting or rebuilding a completed source rootfs:
+EPAR cannot request a registration token, add a runner to a group, or observe the runner online.
 
-1. Stop EPAR and quit Docker Desktop cleanly from its tray menu.
-2. Run:
+### Diagnosis and remediation
 
-   ```powershell
-   wsl --shutdown
-   ```
-
-3. Start Docker Desktop again and wait until it is ready.
-4. Verify WSL and Docker. Replace `Ubuntu-24.04` if your installed distro has a
-   different name:
-
-   ```powershell
-   wsl -d Ubuntu-24.04 --user root --exec /bin/true
-   $LASTEXITCODE
-   docker version
-   ```
-
-5. When the WSL command returns `0` and Docker is ready, rerun `./start` or
-   `.\start`. EPAR reuses a matching cached
-   `work/images/*.source.rootfs.tar`, avoiding another large Docker export.
-
-`wsl --shutdown` stops every running WSL distro, including Docker Desktop's WSL
-backend. Save work in other distros first. If the failure persists after the
-reset, run `wsl --update`, shut WSL down again, reboot Windows, and retry once.
-For persistent `0x8000FFFF` or `E_UNEXPECTED` failures, follow
-[Microsoft's WSL troubleshooting guidance](https://learn.microsoft.com/windows/wsl/troubleshooting#error-code-0x8000ffff-unexpected-failure).
-
-If the WSL image build fails after import but before systemd is ready, inspect:
-
-```text
-work/logs/builds/<image>.wsl-build.log
-work/logs/builds/<temporary-distro>.guest.log
-```
-
-## GitHub Runner Registration Fails
-
-Confirm the GitHub App has organization self-hosted runner read/write permission and that the private key path in the config is readable from the EPAR process:
+Verify GitHub App organization self-hosted-runner read/write permission and a readable private key:
 
 ```yaml
 github:
@@ -441,10 +358,12 @@ github:
   privateKeyPath: .local/github-app.pem
 ```
 
-If stale runner records remain after an interrupted run:
+Then inspect runner-group policy and the first registration error. A strict policy can intentionally block a group that is default, overly broad, or public-repository enabled. See [Runner Group Security](runner-groups.md).
+
+For a confirmed stale EPAR resource, run the configured cleanup command:
 
 ```bash
-go run ./cmd/ephemeral-action-runner cleanup
+./start cleanup
 ```
 
-Cleanup only targets runner names matching `pool.namePrefix`, so keep that prefix unique per machine/config within the GitHub organization.
+Cleanup is bounded by the configured pool and durable exact lifecycle identities; it does not authorize a broad prefix deletion, wildcard, Docker prune, or removal of unknown/shared resources. Keep `pool.namePrefix` unique per controller and organization.
