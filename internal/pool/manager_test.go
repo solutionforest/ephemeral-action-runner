@@ -819,6 +819,7 @@ func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
 			case 2:
 				close(ready)
 			}
+			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
 		}
 		return provider.ExecResult{}, nil
 	}
