@@ -84,7 +84,7 @@ dockerSandboxes:
 
 ## Normal Workflow
 
-1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the proven Catthehacker `full-latest` or `act-latest` profile and optional custom install scripts; review the non-blocking physical-growth estimate, sparse logical limits, and reserve. Specialized and custom tags remain available to Docker Container and WSL, but Docker Sandboxes rejects them because they do not guarantee the private Docker daemon and runtime closure required by its template contract.
+1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the proven Catthehacker `full-latest` or `act-latest` profile, then review the non-blocking physical-growth estimate, sparse logical limits, and reserve. The generated config uses no custom install scripts; add them afterward when needed. Specialized and custom tags remain available to Docker Container and WSL, but Docker Sandboxes rejects them because they do not guarantee the private Docker daemon and runtime closure required by its template contract.
 2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, performs authoritative storage admission, builds and imports the template, and activates it only after exact readback. On macOS or Linux, review the narrowly scoped helper prompts described in [Private Filesystem and VM Helper Approval](#private-filesystem-and-vm-helper-approval) if the host presents them.
 3. Prewarm the selected template without GitHub registration:
 

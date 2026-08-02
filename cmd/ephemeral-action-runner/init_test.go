@@ -166,6 +166,11 @@ func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 	if !strings.Contains(string(configText), "storage:\n  minimumFree: 1GiB\n  gracePeriod: 168h\n  keepPrevious: 0\n  automaticHousekeeping: conservative\n  buildCacheLimit: 20GiB\n  goCacheLimit: 10GiB\n") {
 		t.Fatalf("generated config did not include bounded storage settings:\n%s", configText)
 	}
+	for _, want := range []string{"updateFrequency: weekly", "updateTime: \"07:00\"", "hostTrustMode: overlay", "hostTrustScopes:", "customInstallScripts:"} {
+		if !strings.Contains(string(configText), want) {
+			t.Fatalf("generated config omitted default advanced setting %q:\n%s", want, configText)
+		}
+	}
 	if got := strings.Join(cfg.Runner.Labels, ","); !strings.Contains(got, "epar-docker-container-catthehacker-ubuntu") {
 		t.Fatalf("runner labels = %q", got)
 	}
@@ -175,10 +180,22 @@ func TestInitCreatesDefaultDockerContainerConfig(t *testing.T) {
 	if !strings.Contains(out.String(), "Pool name prefix (press Enter to use build-box-01-a4f9c2; /back to return):") {
 		t.Fatalf("init output did not explain default prefix acceptance:\n%s", out.String())
 	}
-	hostTrustExplanation := "Runners need this host's trusted TLS roots to access services that this machine trusts."
-	hostTrustPrompt := "Inherit this host's trusted TLS roots into disposable runners?"
-	if explanationIndex, promptIndex := strings.Index(out.String(), hostTrustExplanation), strings.Index(out.String(), hostTrustPrompt); explanationIndex < 0 || promptIndex < 0 || explanationIndex > promptIndex {
-		t.Fatalf("init output did not explain host trust before prompting:\n%s", out.String())
+	if got, want := cfg.Image.UpdateFrequency, config.ImageUpdateFrequencyWeekly; got != want {
+		t.Fatalf("image.updateFrequency = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.UpdateTime, config.DefaultImageUpdateTime; got != want {
+		t.Fatalf("image.updateTime = %q, want %q", got, want)
+	}
+	if len(cfg.Image.CustomInstallScripts) != 0 {
+		t.Fatalf("image.customInstallScripts = %#v, want default empty list", cfg.Image.CustomInstallScripts)
+	}
+	for _, hidden := range []string{"Run custom install scripts", "Custom install scripts:", "Inherit this host's trusted TLS roots", "Host trusted TLS roots:", "Automatic image and Actions runner updates:", "Update frequency", "Local update time", "Updates:", "Change host trust", "Change update frequency", "Change runner image or install scripts"} {
+		if strings.Contains(out.String(), hidden) {
+			t.Fatalf("init output retained removed wizard text %q:\n%s", hidden, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "4. Change runner image") {
+		t.Fatalf("review did not retain the simplified runner-image edit action:\n%s", out.String())
 	}
 	for _, want := range []string{"1. Docker Container", "private daemon (default)", "2. Docker Sandboxes — recommended when ready"} {
 		if !strings.Contains(out.String(), want) {
@@ -204,9 +221,9 @@ func TestInitWizardCanBackAcrossSectionsAndPreservesCompletedAnswers(t *testing.
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"", "2", "n", "custom-prefix", "y", "2", "06:30",
-		"0", "0", "/back", "/back", "0", "0",
-		"1", "", "1", "", "", "", "", "",
+		"", "2", "custom-prefix",
+		"0", "/back", "0", "0", "1",
+		"", "1", "", "",
 	}, "\n") + "\n"
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
@@ -216,8 +233,8 @@ func TestInitWizardCanBackAcrossSectionsAndPreservesCompletedAnswers(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Image.SourceImage != "ghcr.io/catthehacker/ubuntu:act-latest" || cfg.Pool.NamePrefix != "custom-prefix" || cfg.Image.UpdateFrequency != config.ImageUpdateFrequencyDaily || cfg.Image.UpdateTime != "06:30" {
-		t.Fatalf("answers were not preserved after repeated Back: image=%q prefix=%q updates=%s@%s", cfg.Image.SourceImage, cfg.Pool.NamePrefix, cfg.Image.UpdateFrequency, cfg.Image.UpdateTime)
+	if cfg.Image.SourceImage != "ghcr.io/catthehacker/ubuntu:act-latest" || cfg.Pool.NamePrefix != "custom-prefix" || cfg.Image.UpdateFrequency != config.ImageUpdateFrequencyWeekly || cfg.Image.UpdateTime != config.DefaultImageUpdateTime {
+		t.Fatalf("answers and generated defaults were not preserved after repeated Back: image=%q prefix=%q updates=%s@%s", cfg.Image.SourceImage, cfg.Pool.NamePrefix, cfg.Image.UpdateFrequency, cfg.Image.UpdateTime)
 	}
 	for _, want := range []string{"0. Back", "/back to return", "Current runner artifact setup:", "Configuration review:"} {
 		if !strings.Contains(out.String(), want) {
@@ -234,7 +251,7 @@ func TestInitWizardQuitAtReviewWritesNoConfig(t *testing.T) {
 	stubNoWSL2(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
-	input := strings.Join([]string{"123456", "solutionforest", ".local/github-app.pem", "1", "", "", "", "", "", "", "", "q"}, "\n") + "\n"
+	input := strings.Join([]string{"123456", "solutionforest", ".local/github-app.pem", "1", "", "", "", "q"}, "\n") + "\n"
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
 		t.Fatal(err)
@@ -254,7 +271,7 @@ func TestInitWizardReviewCanEditPoolDirectly(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"", "", "", "", "", "", "",
+		"", "", "",
 		"5", "edited-prefix", "",
 	}, "\n") + "\n"
 	var out bytes.Buffer
@@ -280,9 +297,9 @@ func TestInitWizardBackAfterDirectEditUsesNaturalHistory(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"", "", "", "", "", "", "",
+		"", "", "",
 		"5", "edited-prefix",
-		"0", "0", "/back", "", "", "", "", "q",
+		"0", "/back", "0", "0", "q",
 	}, "\n") + "\n"
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
@@ -299,10 +316,12 @@ func TestInitWizardBackAfterDirectEditUsesNaturalHistory(t *testing.T) {
 	}
 	secondReview := firstReview + 1 + secondRelative
 	afterSecondReview := transcript[secondReview:]
-	updates := strings.Index(afterSecondReview, "Automatic image and Actions runner updates:")
 	pool := strings.Index(afterSecondReview, "Pool name prefix must be unique")
-	if updates < 0 || pool < 0 || updates > pool {
-		t.Fatalf("Back after direct edit did not resume the natural history at updates:\n%s", afterSecondReview)
+	if pool < 0 {
+		t.Fatalf("Back after direct edit did not resume the natural history at the pool section:\n%s", afterSecondReview)
+	}
+	if strings.Contains(afterSecondReview, "Automatic image and Actions runner updates:") {
+		t.Fatalf("Back after direct edit retained the removed update section:\n%s", afterSecondReview)
 	}
 }
 
@@ -314,7 +333,7 @@ func TestInitWizardProviderEditInvalidatesProviderSpecificDraft(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"", "2", "n", "custom-prefix", "y", "", "",
+		"", "2", "custom-prefix",
 		"3", "4", "",
 	}, "\n") + "\n"
 	var out bytes.Buffer
@@ -422,7 +441,7 @@ func TestInitAllowsDefaultGroupWithReminderAndWritesMatchingPolicy(t *testing.T)
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n\nn\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -468,7 +487,7 @@ func TestInitCanBackFromBroadGroupAndChooseRestrictedGroup(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\n2\n2\n1\n\nn\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\n2\n2\n1\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -507,7 +526,7 @@ func TestInitRejectsPublicGroupAndAllowsAnotherSelection(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\nb\n2\n1\n1\n\nn\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\nb\n2\n1\n1\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -596,7 +615,7 @@ func TestInitRefreshesRunnerGroupsOnlyWhenRequested(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\nr\n1\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\nr\n1\n\n\n\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -625,7 +644,7 @@ func TestInitAllowsInheritedGroupWithAdvisory(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -702,18 +721,19 @@ func TestDetectedInitHostTrustOSUsesWrapperHost(t *testing.T) {
 	}
 }
 
-func TestInitCanDisableHostTrustOverlay(t *testing.T) {
+func TestInitDefaultsHostTrustOverlayWithoutPrompt(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
+	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{
 		ProjectRoot:        dir,
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\nn\n\n\n\n"),
-		Out:                &bytes.Buffer{},
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n"),
+		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -721,8 +741,16 @@ func TestInitCanDisableHostTrustOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Image.HostTrustMode != config.HostTrustModeDisabled {
-		t.Fatalf("image.hostTrustMode = %q, want disabled", cfg.Image.HostTrustMode)
+	if cfg.Image.HostTrustMode != config.HostTrustModeOverlay {
+		t.Fatalf("image.hostTrustMode = %q, want overlay", cfg.Image.HostTrustMode)
+	}
+	if got, want := cfg.Image.HostTrustScopes, hostTrustScopesForOS(runtime.GOOS); !slices.Equal(got, want) {
+		t.Fatalf("image.hostTrustScopes = %#v, want %#v", got, want)
+	}
+	for _, hidden := range []string{"Runners need this host's trusted TLS roots", "Inherit this host's trusted TLS roots", "Host trusted TLS roots:"} {
+		if strings.Contains(out.String(), hidden) {
+			t.Fatalf("wizard retained host-trust prompt or review text %q:\n%s", hidden, out.String())
+		}
 	}
 }
 
@@ -730,7 +758,9 @@ func TestInitDoesNotWriteEnabledConfigWhenHostTrustPreflightFails(t *testing.T) 
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
 	oldResolve := initResolveHostTrust
-	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+	var resolvedOptions hosttrust.Options
+	initResolveHostTrust = func(_ context.Context, options hosttrust.Options) (hosttrust.Snapshot, error) {
+		resolvedOptions = options
 		return hosttrust.Snapshot{}, errors.New("collector unavailable")
 	}
 	t.Cleanup(func() { initResolveHostTrust = oldResolve })
@@ -740,11 +770,17 @@ func TestInitDoesNotWriteEnabledConfigWhenHostTrustPreflightFails(t *testing.T) 
 		ProjectRoot:     dir,
 		ConfigPath:      path,
 		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n\n"),
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n"),
 		Out:             &bytes.Buffer{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "collector unavailable") {
 		t.Fatalf("init error = %v, want collector failure", err)
+	}
+	if resolvedOptions.Mode != config.HostTrustModeOverlay {
+		t.Fatalf("host-trust preflight mode = %q, want overlay", resolvedOptions.Mode)
+	}
+	if got, want := resolvedOptions.Scopes, hostTrustScopesForOS(runtime.GOOS); !slices.Equal(got, want) {
+		t.Fatalf("host-trust preflight scopes = %#v, want %#v", got, want)
 	}
 	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("config exists after failed preflight: %v", statErr)
@@ -762,7 +798,7 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\ncustom-prefix\n\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\ncustom-prefix\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -788,7 +824,7 @@ func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n-bad\nfixed-prefix\n\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n-bad\nfixed-prefix\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -946,7 +982,7 @@ func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1033,7 +1069,7 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n2\nn\nnot-a-size\n30GiB\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n2\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1111,7 +1147,7 @@ func TestInitDockerSandboxesWritesConfigBeforeOrdinaryProvisioning(t *testing.T)
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n"),
 		Out:                io.Discard,
 	})
 	if err != nil {
@@ -1176,97 +1212,38 @@ func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.
 	}
 }
 
-func TestImageUpdatePolicyWizardDefaultsAndOrdering(t *testing.T) {
-	var out bytes.Buffer
-	policy, err := promptImageUpdatePolicy(&out, bufio.NewReader(strings.NewReader("\n\n")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if policy.Frequency != config.ImageUpdateFrequencyWeekly || policy.Time != config.DefaultImageUpdateTime {
-		t.Fatalf("default policy = %+v", policy)
-	}
-	text := out.String()
-	choices := []string{"1. Weekly (default)", "2. Daily", "3. Every two weeks", "4. Monthly", "5. Manual"}
-	last := -1
-	for _, choice := range choices {
-		index := strings.Index(text, choice)
-		if index <= last {
-			t.Fatalf("wizard choices are missing or out of order: %q\n%s", choice, text)
-		}
-		last = index
-	}
-	if strings.Contains(strings.ToLower(text), "monthly") && strings.Contains(strings.ToLower(text), "warning") {
-		t.Fatalf("monthly choice should not carry a warning:\n%s", text)
-	}
-}
-
-func TestImageUpdatePolicyWizardManualSkipsTimePrompt(t *testing.T) {
-	var out bytes.Buffer
-	policy, err := promptImageUpdatePolicy(&out, bufio.NewReader(strings.NewReader("5\n")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if policy.Frequency != config.ImageUpdateFrequencyManual {
-		t.Fatalf("manual policy = %+v", policy)
-	}
-	if strings.Contains(out.String(), "Local update time") {
-		t.Fatalf("manual policy unexpectedly prompted for a time:\n%s", out.String())
-	}
-	if !strings.Contains(out.String(), "5. Manual — check only on demand\n     Command: ./start image update") {
-		t.Fatalf("manual policy omitted its neutral trigger explanation:\n%s", out.String())
-	}
-}
-
-func TestImageUpdatePolicyWizardRepromptsInvalidChoiceAndTime(t *testing.T) {
-	var out bytes.Buffer
-	policy, err := promptImageUpdatePolicy(&out, bufio.NewReader(strings.NewReader("invalid\n2\n7am\n06:30\n")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if policy.Frequency != config.ImageUpdateFrequencyDaily || policy.Time != "06:30" {
-		t.Fatalf("reprompted policy = %+v", policy)
-	}
-	if !strings.Contains(out.String(), "Choose 1") || !strings.Contains(out.String(), "24-hour HH:MM") {
-		t.Fatalf("wizard did not explain invalid input:\n%s", out.String())
-	}
-}
-
-func TestDockerContainerWizardCollectsCustomTagAndInstallScript(t *testing.T) {
+func TestDockerContainerWizardCollectsCustomTagWithoutInstallScriptPrompt(t *testing.T) {
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.DarwinARM64, initDockerSandboxesDiscovery{
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 	}, nil)
 	projectRoot := t.TempDir()
-	scriptPath := filepath.Join(projectRoot, "scripts", "install-extra.sh")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\nset -euo pipefail\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerImageProfile(context.Background(), projectRoot, "docker-container", sandboxpromotion.DarwinARM64, &out, bufio.NewReader(strings.NewReader("5\ngo-24.04\ny\nscripts/install-extra.sh\nn\n\n\n")))
+	profile, accepted, err := promptDockerImageProfile(context.Background(), projectRoot, "docker-container", sandboxpromotion.DarwinARM64, &out, bufio.NewReader(strings.NewReader("5\ngo-24.04\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !accepted || profile == nil || profile.SourceImage != "ghcr.io/catthehacker/ubuntu:go-24.04" || profile.HostPlatform != sandboxpromotion.DarwinARM64 {
 		t.Fatalf("wizard profile = %+v, accepted=%t", profile, accepted)
 	}
-	if len(profile.CustomScripts) != 1 || profile.CustomScripts[0] != "scripts/install-extra.sh" {
-		t.Fatalf("custom scripts = %#v", profile.CustomScripts)
+	if len(profile.CustomScripts) != 0 {
+		t.Fatalf("custom scripts = %#v, want wizard default", profile.CustomScripts)
 	}
-	for _, want := range []string{"Scripts run as root", "Do not put secrets", "Platform: linux/arm64", "Custom install scripts: scripts/install-extra.sh"} {
+	for _, want := range []string{"Platform: linux/arm64", "Runner artifact estimate:"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("wizard output omitted %q:\n%s", want, out.String())
 		}
 	}
+	if strings.Contains(out.String(), "custom install") || strings.Contains(out.String(), "Custom install") {
+		t.Fatalf("wizard output retained custom-install interaction or review text:\n%s", out.String())
+	}
 }
 
-func TestDockerSandboxesWizardAllowsEmptyCustomInstallScriptChoice(t *testing.T) {
+func TestDockerSandboxesWizardUsesNoCustomInstallScriptsByDefault(t *testing.T) {
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 	}, nil)
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("1\ny\n\n\n")))
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("1\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1276,13 +1253,8 @@ func TestDockerSandboxesWizardAllowsEmptyCustomInstallScriptChoice(t *testing.T)
 	if len(profile.CustomScripts) != 0 {
 		t.Fatalf("custom scripts = %#v, want none", profile.CustomScripts)
 	}
-	for _, want := range []string{"Custom install script path (press Enter for none; /back to return):", "Custom install scripts: none"} {
-		if !strings.Contains(out.String(), want) {
-			t.Fatalf("wizard output omitted %q:\n%s", want, out.String())
-		}
-	}
-	if strings.Contains(out.String(), "Custom install script path is required") {
-		t.Fatalf("empty custom install script path was treated as required:\n%s", out.String())
+	if strings.Contains(out.String(), "custom install") || strings.Contains(out.String(), "Custom install") {
+		t.Fatalf("wizard output retained custom-install interaction or review text:\n%s", out.String())
 	}
 }
 
@@ -1298,7 +1270,7 @@ func TestDockerContainerWizardRepromptsAfterUnresolvableTag(t *testing.T) {
 		return resolver(ctx, input, platform)
 	}
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerImageProfile(context.Background(), t.TempDir(), "docker-container", sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("5\nmissing\n4\nn\n\n\n")))
+	profile, accepted, err := promptDockerImageProfile(context.Background(), t.TempDir(), "docker-container", sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("5\nmissing\n4\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1607,7 +1579,7 @@ func TestInitCapabilityReadyDockerSandboxesIsDefaultWithoutPreviewAcknowledgemen
 				ConfigPath:         path,
 				SkipDockerCheck:    true,
 				SkipHostTrustCheck: true,
-				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n\n\nn\n"),
+				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n"),
 				Out:                &out,
 			}); err != nil {
 				t.Fatal(err)
@@ -1756,7 +1728,7 @@ func TestInitDockerSandboxesUsesGuidedRootDiskDefault(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\nn\n\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1856,7 +1828,7 @@ func TestInitDockerSandboxesDiscoveryRetryKeepsProviderSelectionAndWritesVerifie
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\nn\n\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1895,7 +1867,7 @@ func TestInitDockerSandboxesDiscoveryRetryDeclinedExitsWithoutRepeatingProviderO
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n"),
 		Out:                &out,
 	})
 	if err == nil || !strings.Contains(err.Error(), "resolve runner source image") {
@@ -1965,7 +1937,7 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\nn\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -2097,7 +2069,7 @@ func TestInitPromotionGateFailuresRequireExplicitProviderAndExplainAction(t *tes
 				ConfigPath:         path,
 				SkipDockerCheck:    true,
 				SkipHostTrustCheck: true,
-				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ndocker-sandboxes\n1\n\nn\n"),
+				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ndocker-sandboxes\n1\n\n\n\n"),
 				Out:                &out,
 			}); err != nil {
 				t.Fatal(err)
@@ -2133,7 +2105,7 @@ func TestInitFailedPromotionAllowsExplicitWSLSelection(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)

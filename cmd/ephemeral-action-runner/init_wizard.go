@@ -24,8 +24,6 @@ const (
 	initWizardProvider
 	initWizardProviderSetup
 	initWizardPool
-	initWizardHostTrust
-	initWizardUpdates
 	initWizardReview
 )
 
@@ -67,7 +65,6 @@ func (history *initWizardHistory) reset(step initWizardStep) {
 type initArtifactEstimate struct {
 	Source                    string
 	Platform                  string
-	CustomScripts             []string
 	DownloadBytes             uint64
 	ExpandedBytes             uint64
 	IncrementalPeakBytes      uint64
@@ -88,9 +85,6 @@ type initWizardDraft struct {
 	HostTrustMode   string
 	HostTrustScopes []string
 	UpdatePolicy    initImageUpdatePolicy
-	PoolChosen      bool
-	HostTrustChosen bool
-	UpdatesChosen   bool
 }
 
 type initWizardOutcome struct {
@@ -132,17 +126,13 @@ func runInitConfigurationWizard(opts initOptions, reader *bufio.Reader, githubCo
 				return initWizardOutcome{}, err
 			}
 			action = result.Action
-			if action == initWizardNext && result.Value != draft.ProviderType {
-				oldUsesHostTrust := initProviderUsesHostTrust(draft.ProviderType)
-				draft.ProviderType = result.Value
-				draft.Profile = nil
-				draft.Estimate = nil
-				newUsesHostTrust := initProviderUsesHostTrust(draft.ProviderType)
-				if !newUsesHostTrust || !oldUsesHostTrust {
-					draft.HostTrustMode = config.HostTrustModeDisabled
-					draft.HostTrustScopes = []string{config.HostTrustScopeSystem}
-					draft.HostTrustChosen = false
+			if action == initWizardNext {
+				if result.Value != draft.ProviderType {
+					draft.ProviderType = result.Value
+					draft.Profile = nil
+					draft.Estimate = nil
 				}
+				applyInitWizardProviderDefaults(&draft)
 			}
 		case initWizardProviderSetup:
 			result, estimate, err := promptProviderSetupWizard(opts.Context, opts.ProjectRoot, draft.ProviderType, draft.Profile, draft.Estimate, opts.Out, reader)
@@ -165,36 +155,6 @@ func runInitConfigurationWizard(opts initOptions, reader *bufio.Reader, githubCo
 			action = result.Action
 			if action == initWizardNext {
 				draft.PoolNamePrefix = result.Value
-				draft.PoolChosen = true
-			}
-		case initWizardHostTrust:
-			defaultEnabled := true
-			if draft.HostTrustChosen {
-				defaultEnabled = draft.HostTrustMode == config.HostTrustModeOverlay
-			}
-			result, err := promptHostTrustWizard(opts, reader, defaultEnabled)
-			if err != nil {
-				return initWizardOutcome{}, err
-			}
-			action = result.Action
-			if action == initWizardNext {
-				draft.HostTrustMode = config.HostTrustModeDisabled
-				draft.HostTrustScopes = []string{config.HostTrustScopeSystem}
-				if result.Value {
-					draft.HostTrustMode = config.HostTrustModeOverlay
-					draft.HostTrustScopes = hostTrustScopesForOS(initHostTrustOS)
-				}
-				draft.HostTrustChosen = true
-			}
-		case initWizardUpdates:
-			result, err := promptImageUpdatePolicyWizard(opts.Out, reader, draft.UpdatePolicy)
-			if err != nil {
-				return initWizardOutcome{}, err
-			}
-			action = result.Action
-			if action == initWizardNext {
-				draft.UpdatePolicy = result.Value
-				draft.UpdatesChosen = true
 			}
 		case initWizardReview:
 			result, err := promptInitReview(opts.Out, reader, draft)
@@ -203,6 +163,9 @@ func runInitConfigurationWizard(opts initOptions, reader *bufio.Reader, githubCo
 			}
 			switch result.Action {
 			case initWizardNext:
+				if err := preflightInitWizardHostTrust(opts, draft); err != nil {
+					return initWizardOutcome{}, err
+				}
 				return initWizardOutcome{Draft: draft, Create: true}, nil
 			case initWizardQuit:
 				return initWizardOutcome{Draft: draft}, nil
@@ -271,14 +234,8 @@ func nextInitWizardStep(current initWizardStep, draft initWizardDraft, editing b
 			if initProviderNeedsSetup(draft.ProviderType) {
 				return initWizardProviderSetup
 			}
-			if initProviderUsesHostTrust(draft.ProviderType) && !draft.HostTrustChosen {
-				return initWizardHostTrust
-			}
 			return initWizardReview
 		case initWizardProviderSetup:
-			if initProviderUsesHostTrust(draft.ProviderType) && !draft.HostTrustChosen {
-				return initWizardHostTrust
-			}
 			return initWizardReview
 		default:
 			return initWizardReview
@@ -295,14 +252,18 @@ func nextInitWizardStep(current initWizardStep, draft initWizardDraft, editing b
 	case initWizardProviderSetup:
 		return initWizardPool
 	case initWizardPool:
-		if initProviderUsesHostTrust(draft.ProviderType) {
-			return initWizardHostTrust
-		}
-		return initWizardUpdates
-	case initWizardHostTrust:
-		return initWizardUpdates
+		return initWizardReview
 	default:
 		return initWizardReview
+	}
+}
+
+func applyInitWizardProviderDefaults(draft *initWizardDraft) {
+	draft.HostTrustMode = config.HostTrustModeDisabled
+	draft.HostTrustScopes = []string{config.HostTrustScopeSystem}
+	if initProviderUsesHostTrust(draft.ProviderType) {
+		draft.HostTrustMode = config.HostTrustModeOverlay
+		draft.HostTrustScopes = hostTrustScopesForOS(initHostTrustOS)
 	}
 }
 
@@ -333,19 +294,6 @@ func promptWizardDefault(out io.Writer, reader *bufio.Reader, label, defaultValu
 	return initWizardResult[string]{Action: initWizardNext, Value: value}, hitEOF, nil
 }
 
-func promptWizardOptional(out io.Writer, reader *bufio.Reader, label string) (initWizardResult[string], error) {
-	fmt.Fprintf(out, "%s (press Enter for none; /back to return): ", label)
-	value, err := reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return initWizardResult[string]{}, err
-	}
-	value = strings.TrimSpace(value)
-	if strings.EqualFold(value, "/back") {
-		return initWizardResult[string]{Action: initWizardBack}, nil
-	}
-	return initWizardResult[string]{Action: initWizardNext, Value: value}, nil
-}
-
 func promptWizardRequired(out io.Writer, reader *bufio.Reader, label string) (initWizardResult[string], error) {
 	for {
 		fmt.Fprintf(out, "%s (/back to return): ", label)
@@ -367,30 +315,6 @@ func promptWizardRequired(out io.Writer, reader *bufio.Reader, label string) (in
 	}
 }
 
-func promptWizardYesNo(out io.Writer, reader *bufio.Reader, label string, defaultYes bool) (initWizardResult[bool], error) {
-	defaultValue := "Y"
-	if !defaultYes {
-		defaultValue = "N"
-	}
-	for {
-		result, hitEOF, err := promptWizardDefault(out, reader, label+" [Y/n]", defaultValue)
-		if err != nil || result.Action == initWizardBack {
-			return initWizardResult[bool]{Action: result.Action}, err
-		}
-		switch strings.ToLower(result.Value) {
-		case "y", "yes":
-			return initWizardResult[bool]{Action: initWizardNext, Value: true}, nil
-		case "n", "no":
-			return initWizardResult[bool]{Action: initWizardNext, Value: false}, nil
-		default:
-			fmt.Fprintln(out, "Please answer yes or no, or enter /back to return.")
-			if hitEOF {
-				return initWizardResult[bool]{}, fmt.Errorf("invalid yes/no response %q", result.Value)
-			}
-		}
-	}
-}
-
 func promptPoolNamePrefixWizard(out io.Writer, reader *bufio.Reader, defaultValue string) (initWizardResult[string], error) {
 	for {
 		result, hitEOF, err := promptWizardDefault(out, reader, "Pool name prefix", defaultValue)
@@ -408,22 +332,20 @@ func promptPoolNamePrefixWizard(out io.Writer, reader *bufio.Reader, defaultValu
 	}
 }
 
-func promptHostTrustWizard(opts initOptions, reader *bufio.Reader, defaultEnabled bool) (initWizardResult[bool], error) {
-	fmt.Fprintln(opts.Out, "Runners need this host's trusted TLS roots to access services that this machine trusts.")
-	result, err := promptWizardYesNo(opts.Out, reader, "Inherit this host's trusted TLS roots into disposable runners?", defaultEnabled)
-	if err != nil || result.Action != initWizardNext || !result.Value {
-		return result, err
+func preflightInitWizardHostTrust(opts initOptions, draft initWizardDraft) error {
+	if !initProviderUsesHostTrust(draft.ProviderType) {
+		return nil
 	}
 	deferred := os.Getenv("EPAR_HOST_TRUST_INIT_DEFERRED") == "1"
 	if !opts.SkipHostTrustCheck && !deferred {
-		preflightCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_, collectErr := initResolveHostTrust(preflightCtx, hosttrust.Options{Mode: config.HostTrustModeOverlay, Scopes: hostTrustScopesForOS(initHostTrustOS), ControllerHostOS: initHostTrustOS})
+		preflightCtx, cancel := context.WithTimeout(opts.Context, 30*time.Second)
+		_, collectErr := initResolveHostTrust(preflightCtx, hosttrust.Options{Mode: draft.HostTrustMode, Scopes: draft.HostTrustScopes, ControllerHostOS: initHostTrustOS})
 		cancel()
 		if collectErr != nil {
-			return initWizardResult[bool]{}, fmt.Errorf("collect host trusted TLS roots before writing config: %w", collectErr)
+			return fmt.Errorf("collect host trusted TLS roots before writing config: %w", collectErr)
 		}
 	}
-	return result, nil
+	return nil
 }
 
 func renderInitArtifactEstimate(out io.Writer, estimate *initArtifactEstimate) {
@@ -434,11 +356,6 @@ func renderInitArtifactEstimate(out io.Writer, estimate *initArtifactEstimate) {
 	fmt.Fprintln(out, "Runner artifact estimate:")
 	fmt.Fprintf(out, "  Source: %s\n", estimate.Source)
 	fmt.Fprintf(out, "  Platform: %s\n", estimate.Platform)
-	if len(estimate.CustomScripts) == 0 {
-		fmt.Fprintln(out, "  Custom install scripts: none")
-	} else {
-		fmt.Fprintf(out, "  Custom install scripts: %s\n", strings.Join(estimate.CustomScripts, ", "))
-	}
 	fmt.Fprintf(out, "  Estimated download: %s compressed layers\n", formatInitUintByteCount(estimate.DownloadBytes))
 	fmt.Fprintf(out, "  Estimated expanded source: %s\n", formatInitUintByteCount(estimate.ExpandedBytes))
 	fmt.Fprintf(out, "  Estimated incremental physical peak: %s\n", formatInitUintByteCount(estimate.IncrementalPeakBytes))
@@ -463,11 +380,6 @@ func promptProviderSetupWizard(ctx context.Context, projectRoot, providerType st
 			fmt.Fprintln(out, "")
 			fmt.Fprintln(out, "Current runner artifact setup:")
 			fmt.Fprintf(out, "  Image: %s\n", existing.SourceImage)
-			if len(existing.CustomScripts) == 0 {
-				fmt.Fprintln(out, "  Custom install scripts: none")
-			} else {
-				fmt.Fprintf(out, "  Custom install scripts: %s\n", strings.Join(existing.CustomScripts, ", "))
-			}
 			fmt.Fprintln(out, "  1. Continue with this setup (default)")
 			fmt.Fprintln(out, "  2. Change runner artifact setup")
 			fmt.Fprintln(out, "  0. Back")
@@ -513,79 +425,6 @@ func promptInitProviderWizard(ctx context.Context, projectRoot string, out io.Wr
 	}
 }
 
-func promptImageUpdatePolicyWizard(out io.Writer, reader *bufio.Reader, current initImageUpdatePolicy) (initWizardResult[initImageUpdatePolicy], error) {
-	defaultChoice := "1"
-	switch current.Frequency {
-	case config.ImageUpdateFrequencyDaily:
-		defaultChoice = "2"
-	case config.ImageUpdateFrequencyBiweekly:
-		defaultChoice = "3"
-	case config.ImageUpdateFrequencyMonthly:
-		defaultChoice = "4"
-	case config.ImageUpdateFrequencyManual:
-		defaultChoice = "5"
-	}
-	for {
-		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Automatic image and Actions runner updates:")
-		fmt.Fprintln(out, "  1. Weekly")
-		fmt.Fprintln(out, "  2. Daily")
-		fmt.Fprintln(out, "  3. Every two weeks")
-		fmt.Fprintln(out, "  4. Monthly")
-		fmt.Fprintln(out, "  5. Manual — check only on demand")
-		fmt.Fprintln(out, "     Command: ./start image update")
-		fmt.Fprintln(out, "  0. Back")
-		result, hitEOF, err := promptWizardDefault(out, reader, "Update frequency", defaultChoice)
-		if err != nil {
-			return initWizardResult[initImageUpdatePolicy]{}, err
-		}
-		if result.Action == initWizardBack || result.Value == "0" {
-			return initWizardResult[initImageUpdatePolicy]{Action: initWizardBack}, nil
-		}
-		frequency := ""
-		switch strings.ToLower(result.Value) {
-		case "1", "weekly":
-			frequency = config.ImageUpdateFrequencyWeekly
-		case "2", "daily":
-			frequency = config.ImageUpdateFrequencyDaily
-		case "3", "biweekly", "every two weeks":
-			frequency = config.ImageUpdateFrequencyBiweekly
-		case "4", "monthly":
-			frequency = config.ImageUpdateFrequencyMonthly
-		case "5", "manual":
-			return initWizardResult[initImageUpdatePolicy]{Action: initWizardNext, Value: initImageUpdatePolicy{Frequency: config.ImageUpdateFrequencyManual, Time: config.DefaultImageUpdateTime}}, nil
-		default:
-			fmt.Fprintln(out, "  Choose 1–5, 0 to go back, or enter daily, weekly, biweekly, monthly, or manual.")
-			if hitEOF {
-				return initWizardResult[initImageUpdatePolicy]{}, fmt.Errorf("invalid image update frequency %q", result.Value)
-			}
-			continue
-		}
-		updateTimeDefault := current.Time
-		if updateTimeDefault == "" {
-			updateTimeDefault = config.DefaultImageUpdateTime
-		}
-		for {
-			timeResult, _, promptErr := promptWizardDefault(out, reader, "Local update time (24-hour HH:MM)", updateTimeDefault)
-			if promptErr != nil {
-				return initWizardResult[initImageUpdatePolicy]{}, promptErr
-			}
-			if timeResult.Action == initWizardBack {
-				return initWizardResult[initImageUpdatePolicy]{Action: initWizardBack}, nil
-			}
-			policy := initImageUpdatePolicy{Frequency: frequency, Time: timeResult.Value}
-			image := config.Default().Image
-			image.UpdateFrequency = policy.Frequency
-			image.UpdateTime = policy.Time
-			if validationErr := config.ValidateImageUpdatePolicy(image); validationErr != nil {
-				fmt.Fprintf(out, "  %v\n", validationErr)
-				continue
-			}
-			return initWizardResult[initImageUpdatePolicy]{Action: initWizardNext, Value: policy}, nil
-		}
-	}
-}
-
 type initReviewOption struct {
 	Label string
 	Step  initWizardStep
@@ -608,11 +447,6 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 			return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q review requires an image profile", draft.ProviderType)
 		}
 		fmt.Fprintf(out, "  Runner image: %s\n", draft.Profile.SourceImage)
-		if len(draft.Profile.CustomScripts) == 0 {
-			fmt.Fprintln(out, "  Custom install scripts: none")
-		} else {
-			fmt.Fprintf(out, "  Custom install scripts: %s\n", strings.Join(draft.Profile.CustomScripts, ", "))
-		}
 	case provider.WizardReviewNativeImage:
 		fmt.Fprintf(out, "  Runner image: %s\n", descriptor.WizardReviewSource)
 		fmt.Fprintf(out, "  Reusable artifact: %s\n", descriptor.WizardReviewOutput)
@@ -620,20 +454,6 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 		return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q has unknown wizard review contribution %q", draft.ProviderType, descriptor.WizardReview)
 	}
 	fmt.Fprintf(out, "  Pool name prefix: %s\n", draft.PoolNamePrefix)
-	if initProviderUsesHostTrust(draft.ProviderType) {
-		if draft.HostTrustMode == config.HostTrustModeOverlay {
-			fmt.Fprintln(out, "  Host trusted TLS roots: inherited")
-		} else {
-			fmt.Fprintln(out, "  Host trusted TLS roots: not inherited")
-		}
-	} else {
-		fmt.Fprintln(out, "  Host trusted TLS roots: not applicable")
-	}
-	fmt.Fprintf(out, "  Updates: %s", draft.UpdatePolicy.Frequency)
-	if draft.UpdatePolicy.Frequency != config.ImageUpdateFrequencyManual {
-		fmt.Fprintf(out, " at %s local time", draft.UpdatePolicy.Time)
-	}
-	fmt.Fprintln(out)
 	renderInitArtifactEstimate(out, draft.Estimate)
 
 	options := []initReviewOption{
@@ -642,13 +462,9 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 		{Label: "Change provider", Step: initWizardProvider},
 	}
 	if initProviderNeedsSetup(draft.ProviderType) {
-		options = append(options, initReviewOption{Label: "Change runner image or install scripts", Step: initWizardProviderSetup})
+		options = append(options, initReviewOption{Label: "Change runner image", Step: initWizardProviderSetup})
 	}
 	options = append(options, initReviewOption{Label: "Change pool name prefix", Step: initWizardPool})
-	if initProviderUsesHostTrust(draft.ProviderType) {
-		options = append(options, initReviewOption{Label: "Change host trust", Step: initWizardHostTrust})
-	}
-	options = append(options, initReviewOption{Label: "Change update frequency", Step: initWizardUpdates})
 
 	fmt.Fprintln(out, "")
 	for index, option := range options {

@@ -906,56 +906,6 @@ func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostP
 	return promptDockerImageProfile(ctx, projectRoot, "docker-sandboxes", hostPlatform, out, reader)
 }
 
-func promptImageUpdatePolicy(out io.Writer, reader *bufio.Reader) (initImageUpdatePolicy, error) {
-	var frequency string
-	for frequency == "" {
-		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Automatic image and Actions runner updates:")
-		fmt.Fprintln(out, "  1. Weekly (default)")
-		fmt.Fprintln(out, "  2. Daily")
-		fmt.Fprintln(out, "  3. Every two weeks")
-		fmt.Fprintln(out, "  4. Monthly")
-		fmt.Fprintln(out, "  5. Manual — check only on demand")
-		fmt.Fprintln(out, "     Command: ./start image update")
-		choice, hitEOF, err := promptDefault(out, reader, "Update frequency", "1")
-		if err != nil {
-			return initImageUpdatePolicy{}, err
-		}
-		switch strings.ToLower(strings.TrimSpace(choice)) {
-		case "1", "weekly":
-			frequency = config.ImageUpdateFrequencyWeekly
-		case "2", "daily":
-			frequency = config.ImageUpdateFrequencyDaily
-		case "3", "biweekly", "every two weeks":
-			frequency = config.ImageUpdateFrequencyBiweekly
-		case "4", "monthly":
-			frequency = config.ImageUpdateFrequencyMonthly
-		case "5", "manual":
-			return initImageUpdatePolicy{Frequency: config.ImageUpdateFrequencyManual, Time: config.DefaultImageUpdateTime}, nil
-		default:
-			fmt.Fprintln(out, "  Choose 1–5 or enter daily, weekly, biweekly, monthly, or manual.")
-			if hitEOF {
-				return initImageUpdatePolicy{}, fmt.Errorf("invalid image update frequency %q", choice)
-			}
-		}
-	}
-	for {
-		updateTime, _, promptErr := promptDefault(out, reader, "Local update time (24-hour HH:MM)", config.DefaultImageUpdateTime)
-		if promptErr != nil {
-			return initImageUpdatePolicy{}, promptErr
-		}
-		policy := initImageUpdatePolicy{Frequency: frequency, Time: updateTime}
-		image := config.Default().Image
-		image.UpdateFrequency = policy.Frequency
-		image.UpdateTime = policy.Time
-		if validationErr := config.ValidateImageUpdatePolicy(image); validationErr != nil {
-			fmt.Fprintf(out, "  %v\n", validationErr)
-			continue
-		}
-		return policy, nil
-	}
-}
-
 func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (initWizardResult[*initDockerSandboxesProfile], *initArtifactEstimate, error) {
 	guestPlatform, err := initDockerGuestPlatform(providerType, hostPlatform)
 	if err != nil {
@@ -1044,47 +994,6 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		}
 	}
 
-	var customScripts []string
-	addScriptsResult, err := promptWizardYesNo(out, reader, "Run custom install scripts while building the runner artifact?", false)
-	if err != nil {
-		return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
-	}
-	if addScriptsResult.Action == initWizardBack {
-		return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
-	}
-	if addScriptsResult.Value {
-		fmt.Fprintln(out, "  Scripts run as root during the image build. Do not put secrets in scripts or build inputs.")
-		for {
-			scriptResult, promptErr := promptWizardOptional(out, reader, "Custom install script path")
-			if promptErr != nil {
-				return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
-			}
-			if scriptResult.Action == initWizardBack {
-				return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
-			}
-			script := scriptResult.Value
-			if script == "" {
-				break
-			}
-			normalized, validationErr := validateInitCustomInstallScript(projectRoot, script)
-			if validationErr != nil {
-				fmt.Fprintf(out, "  Invalid custom install script: %v\n", validationErr)
-				continue
-			}
-			customScripts = append(customScripts, normalized)
-			anotherResult, promptErr := promptWizardYesNo(out, reader, "Add another custom install script?", false)
-			if promptErr != nil {
-				return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
-			}
-			if anotherResult.Action == initWizardBack {
-				return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
-			}
-			if !anotherResult.Value {
-				break
-			}
-		}
-	}
-
 	policyFingerprint := ""
 	if providerType == "docker-sandboxes" {
 		policyFingerprint, err = initDockerSandboxesPolicyFingerprint(ctx)
@@ -1109,7 +1018,6 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 	estimate := &initArtifactEstimate{
 		Source:                 source.Reference,
 		Platform:               source.Platform,
-		CustomScripts:          append([]string(nil), customScripts...),
 		DownloadBytes:          source.CompressedLayerBytes,
 		ExpandedBytes:          sourceEstimate.ExpandedBytes,
 		IncrementalPeakBytes:   artifactPlan.EstimatedIncrementalPeak,
@@ -1124,7 +1032,6 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		HostPlatform:      hostPlatform,
 		GuestPlatform:     guestPlatform,
 		SourceImage:       source.Reference,
-		CustomScripts:     customScripts,
 		PolicyFingerprint: policyFingerprint,
 		RootDisk:          config.DockerSandboxesAutomaticRootDisk,
 		DockerDisk:        dockerDisk,
@@ -1159,26 +1066,6 @@ func initDockerGuestPlatform(providerType string, hostPlatform sandboxpromotion.
 	default:
 		return "", fmt.Errorf("unsupported Docker image architecture %q", architecture)
 	}
-}
-
-func validateInitCustomInstallScript(projectRoot, configured string) (string, error) {
-	value := strings.TrimSpace(configured)
-	if value == "" || filepath.IsAbs(value) || filepath.VolumeName(value) != "" {
-		return "", fmt.Errorf("path must be project-relative")
-	}
-	path := config.ProjectPath(projectRoot, value)
-	relative, err := filepath.Rel(projectRoot, path)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path must remain under the project root")
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("path must name a regular file")
-	}
-	return filepath.ToSlash(filepath.Clean(relative)), nil
 }
 
 func checkInitDockerSandboxesCapacity(rootDisk, dockerDisk, minHostFreeSpace uint64) (initDockerSandboxesCapacityResult, error) {

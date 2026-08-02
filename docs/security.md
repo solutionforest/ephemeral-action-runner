@@ -44,7 +44,7 @@ WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provid
 
 Certificates configured through `image.trustedCaCertificatePaths` are embedded in the reusable image and become public trust anchors for every process in its runner instances. CA certificates are not treated as secrets. Add only CA roots or intermediates that your organization has explicitly authorized, and rebuild the image when they are rotated or revoked.
 
-`image.hostTrustMode: overlay` is a broader policy choice: after the operator enables it, EPAR follows every root anchor in the configured host scopes, including later additions, removals, and rotations. Windows and macOS user scope can include roots installed by software running as that account. Enable it only when the host trust administrators are also authorized to control runner trust.
+`image.hostTrustMode: overlay` is a broader policy choice: the first-run wizard enables it for providers that support host-trust inheritance, and EPAR then follows every root anchor in the configured host scopes, including later additions, removals, and rotations. Windows and macOS user scope can include roots installed by software running as that account. Use it only when the host trust administrators are also authorized to control runner trust; edit the generated configuration if this trust model is unsuitable.
 
 Host trust inheritance is additive to Ubuntu's default roots and explicit CA paths. It does not emulate every Windows or macOS certificate-policy constraint, and removing a host root cannot revoke an identical Ubuntu-bundled or explicitly configured anchor. EPAR applies host changes through immutable runner generations: running jobs keep their starting trust, while stale idle runners are replaced.
 
