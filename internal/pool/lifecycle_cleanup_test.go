@@ -97,6 +97,206 @@ func TestLifecycleCleanupRefusesActiveLeaseBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestLifecycleCleanupReconcilesJobLeaseAfterExactRemoteAbsence(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	github := &fakeGitHub{}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = github
+
+	if err := manager.cleanupOwnedLifecycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("phase = %s, want %s", record.Phase, poolstate.PhaseTombstoned)
+	}
+	if lease, active := activeLifecycleLease(record.Leases, time.Now()); active {
+		t.Fatalf("job lease remained active after exact remote absence: %+v", lease)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0 for an already-absent runner", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("provider delete calls = %d, want 1", got)
+	}
+}
+
+func TestLifecycleCleanupReconcilesJobLeaseAfterExactRunnerBecomesIdle(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	var deleted atomic.Bool
+	github := &fakeGitHub{
+		runnerByNameFunc: func(context.Context, string) (gh.Runner, bool, error) {
+			if deleted.Load() {
+				return gh.Runner{}, false, nil
+			}
+			return gh.Runner{Name: name, ID: 42, Status: "online", Busy: false}, true, nil
+		},
+		deleteFunc: func(context.Context, int64) error {
+			deleted.Store(true)
+			return nil
+		},
+	}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = github
+
+	if err := manager.cleanupOwnedLifecycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("phase = %s, want %s", record.Phase, poolstate.PhaseTombstoned)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub delete calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("provider delete calls = %d, want 1", got)
+	}
+}
+
+func TestLifecycleCleanupPreservesJobLeaseWhileExactRunnerIsBusy(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	github := &fakeGitHub{runner: gh.Runner{Name: name, ID: 42, Status: "online", Busy: true}, found: true}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = github
+
+	err := manager.cleanupOwnedLifecycle(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "active job lease") {
+		t.Fatalf("cleanup error = %v, want active lease protection", err)
+	}
+	record, readErr := store.Read(context.Background(), name)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if record.Phase != poolstate.PhaseBusy {
+		t.Fatalf("phase = %s, want %s", record.Phase, poolstate.PhaseBusy)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", got)
+	}
+}
+
+func TestLifecycleCleanupRenewsExpiredJobLeaseWhileExactRunnerIsBusy(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	observedAt := time.Now()
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: observedAt.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	github := &fakeGitHub{runner: gh.Runner{Name: name, ID: 42, Status: "online", Busy: true}, found: true}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = github
+	manager.now = func() time.Time { return observedAt.Add(2 * time.Minute) }
+
+	err := manager.cleanupOwnedLifecycle(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "active job lease") {
+		t.Fatalf("cleanup error = %v, want renewed active lease protection", err)
+	}
+	record, readErr := store.Read(context.Background(), name)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	lease, active := activeLifecycleLease(record.Leases, time.Now())
+	if !active || lease.Purpose != "job" || lease.Holder != "github-42" {
+		t.Fatalf("job lease = %+v active=%t, want renewed exact busy-runner lease", lease, active)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", got)
+	}
+}
+
+func TestLifecycleCleanupPreservesJobLeaseWhenGitHubStateIsUnavailable(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	github := &fakeGitHub{runnerErr: context.DeadlineExceeded}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = github
+
+	err := manager.cleanupOwnedLifecycle(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "verify job completion against exact GitHub runner") {
+		t.Fatalf("cleanup error = %v, want exact GitHub verification failure", err)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", got)
+	}
+}
+
+func TestLifecycleCleanupPreservesJobLeaseOnGitHubIdentityDrift(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionJobStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(context.Background(), name, poolstate.Lease{Purpose: "job", Holder: "github-42", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	github := &fakeGitHub{runner: gh.Runner{Name: name, ID: 99, Status: "online"}, found: true}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake)
+	manager.GitHub = github
+
+	err := manager.cleanupOwnedLifecycle(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "does not match recorded id=42") {
+		t.Fatalf("cleanup error = %v, want exact GitHub identity mismatch", err)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", got)
+	}
+}
+
 func TestLifecycleCleanupTombstonesIdentitylessQuarantineAfterExactAbsence(t *testing.T) {
 	store, err := poolstate.Open(t.TempDir())
 	if err != nil {
@@ -413,7 +613,8 @@ func TestReconciliationPreservesStoppedBusyRunnerProtectedByJobLease(t *testing.
 		t.Fatal(err)
 	}
 	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "stopped"}}}
-	github := &fakeGitHub{listRunners: []gh.Runner{{Name: name, ID: 42, Status: "offline", Busy: true}}}
+	busyRunner := gh.Runner{Name: name, ID: 42, Status: "offline", Busy: true}
+	github := &fakeGitHub{runner: busyRunner, found: true, listRunners: []gh.Runner{busyRunner}}
 	manager.Provider = fake
 	manager.Lifecycle = provider.AdaptLegacy(fake)
 	manager.GitHub = github

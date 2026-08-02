@@ -56,6 +56,8 @@ When multiple configs run concurrently, give each one a distinct `logging.direct
 
 `pool down` is an alias for `cleanup`. Cleanup is intentionally bounded: Docker Sandboxes uses the durable ledger of exact owned identities, while legacy providers use the configured `pool.namePrefix` boundary. Unknown, shared, or identity-drifted resources are report-only rather than broad deletion targets. Do not reuse a prefix across machines or independent supervisors in the same GitHub organization.
 
+Before an exact cleanup honors a recorded job lease, EPAR rechecks the recorded runner name and immutable GitHub runner ID. A runner that is still busy remains protected; an exact runner that is idle or absent has its completed-job lease reconciled so cleanup can continue without waiting for lease expiry. API failures and identity drift preserve the lease and stop cleanup.
+
 Use `cleanup --no-github` only when you intentionally want to leave GitHub runner records untouched. After a failed Docker Sandboxes diagnostic check, review the retained evidence before using `--acknowledge-failed-diagnostics` to allow its exact cleanup.
 
 ## Maintain storage and retention

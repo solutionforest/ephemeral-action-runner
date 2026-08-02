@@ -88,6 +88,20 @@ func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, i
 		if err != nil {
 			return err
 		}
+		if !remoteKnownAbsent {
+			absent, err := m.reconcileJobLeaseForCleanup(ctx, record)
+			if err != nil {
+				return err
+			}
+			remoteKnownAbsent = absent
+			if absent {
+				continue
+			}
+			record, err = m.LifecycleState.Read(ctx, initial.Name)
+			if err != nil {
+				return err
+			}
+		}
 		if lease, protected := activeLifecycleLease(record.Leases, m.currentTime()); protected {
 			return fmt.Errorf("active %s lease held by %s protects the instance until %s; refusing cleanup", lease.Purpose, lease.Holder, lease.ExpiresAt.Format(time.RFC3339))
 		}
@@ -191,6 +205,40 @@ func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, i
 			return fmt.Errorf("unsupported cleanup phase %s", record.Phase)
 		}
 	}
+}
+
+func (m *Manager) reconcileJobLeaseForCleanup(ctx context.Context, record poolstate.Record) (bool, error) {
+	shouldReconcile := record.Phase == poolstate.PhaseBusy
+	expectedHolder := fmt.Sprintf("github-%d", record.GitHub.RunnerID)
+	for _, lease := range record.Leases {
+		if lease.Purpose == "job" && lease.Holder == expectedHolder {
+			shouldReconcile = true
+			break
+		}
+	}
+	if !shouldReconcile {
+		return false, nil
+	}
+	if m.GitHub == nil || record.GitHub.ExactName == "" || record.GitHub.RunnerID == 0 {
+		return false, fmt.Errorf("cannot verify job completion for %s without its exact GitHub runner identity", record.Name)
+	}
+	runner, found, err := m.GitHub.RunnerByName(ctx, record.GitHub.ExactName)
+	if err != nil {
+		return false, fmt.Errorf("verify job completion against exact GitHub runner %s id=%d: %w", record.GitHub.ExactName, record.GitHub.RunnerID, err)
+	}
+	if !found {
+		if err := m.recordLifecycleRemoteAbsence(ctx, record.Name); err != nil {
+			return false, fmt.Errorf("record exact GitHub runner absence before cleanup: %w", err)
+		}
+		return true, nil
+	}
+	if runner.ID != record.GitHub.RunnerID {
+		return false, fmt.Errorf("same-name GitHub runner id=%d does not match recorded id=%d; preserving active job lease", runner.ID, record.GitHub.RunnerID)
+	}
+	if err := m.recordLifecycleJobObservation(ctx, runner); err != nil {
+		return false, fmt.Errorf("record exact GitHub runner state before cleanup: %w", err)
+	}
+	return false, nil
 }
 
 func activeLifecycleLease(leases []poolstate.Lease, now time.Time) (poolstate.Lease, bool) {
