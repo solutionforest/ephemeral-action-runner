@@ -31,6 +31,16 @@ const (
 
 var dockerTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 
+var dockerSandboxesCompactEvidenceFiles = map[string]string{
+	"attestationMetadata": "attestation-metadata.json",
+	"buildMetadata":       "build-metadata.json",
+	"compatibility":       "compatibility.json",
+	"provenance":          "provenance.json",
+	"sbomDescriptor":      "sbom-descriptor.json",
+	"softwareInventory":   "software-inventory.txt",
+	"templateMetadata":    "template-metadata.json",
+}
+
 type ResolvedDockerSource struct {
 	Reference            string `json:"reference"`
 	ImmutableReference   string `json:"immutableReference"`
@@ -539,12 +549,27 @@ func (m *Coordinator) ensureDockerSandboxesTemplateResolved(ctx context.Context,
 		if receiptErr != nil && !errors.Is(receiptErr, os.ErrNotExist) {
 			m.warnf("ignoring stale unpublished Docker Sandboxes receipt and rebuilding: %v\n", receiptErr)
 		}
+		adopted := false
+		if err := m.withSandboxBackendLock(ctx, func() error {
+			var adoptErr error
+			adopted, adoptErr = m.adoptReusableDockerSandboxesTemplateLocked(ctx, manifest, source, manifestHash, rootDisk, runtime)
+			return adoptErr
+		}); err != nil {
+			return err
+		}
+		if adopted {
+			m.infof("adopted shared verified Docker Sandboxes runner template for manifest %s\n", manifestHash)
+			if err := m.cleanupSupersededCatalog(ctx); err != nil {
+				return err
+			}
+			return nil
+		}
 	}
 	if m.DryRun {
 		m.infof("[dry-run] would build and import Docker Sandboxes runner template from %s for %s\n", source.Reference, source.Platform)
 		return nil
 	}
-	return m.buildDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, runtime)
+	return m.buildDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, !force, runtime)
 }
 
 func (m *Coordinator) ensureDockerSandboxesTemplateWithPolicy(ctx context.Context, forceRemote bool) error {
@@ -715,7 +740,7 @@ func (m *Coordinator) effectiveDockerSandboxesRootDisk(source ResolvedDockerSour
 	return fmt.Sprintf("%dGiB", required/storage.GiB), nil
 }
 
-func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, runtime provider.TemplateArtifactRuntime) error {
+func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, runtime provider.TemplateArtifactRuntime) error {
 	if err := m.preflightStorage("template-build", estimatedDockerSandboxesExpansion(source)); err != nil {
 		return err
 	}
@@ -1036,7 +1061,33 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if err != nil {
 		return err
 	}
-	if err := m.withSandboxBackendLock(ctx, func() error {
+	adoptedReusable, activatedAt, err := m.importOrAdoptDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, allowReusable, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+	if err != nil {
+		return err
+	}
+	if adoptedReusable {
+		m.infof("adopted shared verified Docker Sandboxes runner template for manifest %s after concurrent build work\n", manifestHash)
+		return m.finishDockerSandboxesTemplateActivation(ctx, archivePath, manifestHash, m.now().UTC())
+	}
+	if err := m.finishDockerSandboxesTemplateActivation(ctx, archivePath, manifestHash, activatedAt); err != nil {
+		return err
+	}
+	m.infof("activated Docker Sandboxes runner template %s@%s\n", artifact.Reference, artifact.Digest)
+	return nil
+}
+
+func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) (bool, time.Time, error) {
+	adoptedReusable := false
+	activatedAt := time.Time{}
+	err := m.withSandboxBackendLock(ctx, func() error {
+		if allowReusable {
+			var adoptErr error
+			adoptedReusable, adoptErr = m.adoptReusableDockerSandboxesTemplateLocked(ctx, manifest, source, manifestHash, rootDisk, runtime)
+			if adoptErr != nil || adoptedReusable {
+				return adoptErr
+			}
+		}
+		imported := false
 		if err := runtime.VerifyImportedTemplate(ctx, artifact); err != nil {
 			if !errors.Is(err, provider.ErrTemplateNotFound) {
 				return err
@@ -1047,17 +1098,184 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			}); err != nil {
 				return err
 			}
+			imported = true
 		}
-		if err := m.runProgressOperation("Docker Sandboxes imported-template verification", nil, func() error {
-			return runtime.VerifyImportedTemplate(ctx, artifact)
-		}); err != nil {
-			return fmt.Errorf("verify imported Docker Sandboxes runner template: %w", err)
+		if imported {
+			if err := m.runProgressOperation("Docker Sandboxes imported-template verification", nil, func() error {
+				return runtime.VerifyImportedTemplate(ctx, artifact)
+			}); err != nil {
+				return fmt.Errorf("verify imported Docker Sandboxes runner template: %w", err)
+			}
 		}
-		return nil
-	}); err != nil {
+		var publishErr error
+		activatedAt, publishErr = m.publishDockerSandboxesTemplateLocked(manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+		return publishErr
+	})
+	return adoptedReusable, activatedAt, err
+}
+
+func (m *Coordinator) adoptReusableDockerSandboxesTemplateLocked(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, runtime provider.TemplateArtifactRuntime) (bool, error) {
+	receipt, sourceReceiptPath, found, err := m.reusableDockerSandboxesReceipt(manifest, source, manifestHash, rootDisk)
+	if err != nil || !found {
+		return false, err
+	}
+	if err := runtime.VerifyImportedTemplate(ctx, receipt.Artifact); err != nil {
+		if errors.Is(err, provider.ErrTemplateNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("verify reusable Docker Sandboxes template from %s: %w", sourceReceiptPath, err)
+	}
+	destinationReceiptPath, err := m.dockerSandboxesReceiptPath()
+	if err != nil {
+		return false, err
+	}
+	if err := cloneDockerSandboxesReceiptEvidence(sourceReceiptPath, destinationReceiptPath, receipt); err != nil {
+		return false, fmt.Errorf("adopt reusable Docker Sandboxes evidence: %w", err)
+	}
+	if err := runtime.ActivateTemplate(receipt.Artifact); err != nil {
+		return false, err
+	}
+	if err := writeJSONFile(destinationReceiptPath, receipt); err != nil {
+		return false, err
+	}
+	if err := m.recordCurrentSandboxArtifactLocked(receipt.Artifact, manifestHash, receipt.ActivatedAt); err != nil {
+		return false, fmt.Errorf("record adopted Docker Sandboxes template ownership: %w", err)
+	}
+	return true, nil
+}
+
+func (m *Coordinator) reusableDockerSandboxesReceipt(manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string) (dockerSandboxesReceipt, string, bool, error) {
+	backendID, err := sandboxBackendID()
+	if err != nil {
+		return dockerSandboxesReceipt{}, "", false, err
+	}
+	store, err := m.hostCatalog()
+	if err != nil {
+		return dockerSandboxesReceipt{}, "", false, err
+	}
+	catalogValue, err := store.Load(m.now())
+	if err != nil {
+		return dockerSandboxesReceipt{}, "", false, err
+	}
+	projectRoot, err := storagecatalog.CanonicalPath(m.ProjectRoot)
+	if err != nil {
+		return dockerSandboxesReceipt{}, "", false, err
+	}
+	currentConfigID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return dockerSandboxesReceipt{}, "", false, err
+	}
+	configs := make(map[string]storagecatalog.Config, len(catalogValue.Configs))
+	for _, record := range catalogValue.Configs {
+		configs[record.ID] = record
+	}
+	var selected dockerSandboxesReceipt
+	selectedPath := ""
+	for _, resource := range catalogValue.Resources {
+		if resource.BackendID != backendID || resource.Kind != catalogSandboxTemplateKind || resource.Provider != "docker-sandboxes" || resource.Role != "runtime-template" || resource.Custody != storagecatalog.CustodyGenerated || resource.State != storagecatalog.StateCurrent || resource.ManifestHash != manifestHash || !validSHA256(resource.Fingerprint) || len(resource.Identity) != 12 {
+			continue
+		}
+		for _, reference := range resource.References {
+			if reference.ConfigID == currentConfigID || reference.Role != "provider-artifact" || (reference.ManifestHash != "" && reference.ManifestHash != manifestHash) {
+				continue
+			}
+			configRecord, ok := configs[reference.ConfigID]
+			if !ok || configRecord.ProjectRoot != projectRoot {
+				continue
+			}
+			receiptPath := filepath.Join(configRecord.ProjectRoot, ".local", "state", "image", reference.ConfigID, "docker-sandboxes", "active.json")
+			receipt, readErr := readDockerSandboxesReceiptPath(receiptPath)
+			if readErr != nil {
+				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("read cataloged Docker Sandboxes receipt %s: %w", receiptPath, readErr)
+			}
+			recomputedHash, hashErr := ManifestHash(receipt.Manifest)
+			if hashErr != nil {
+				return dockerSandboxesReceipt{}, "", false, hashErr
+			}
+			if receipt.ManifestHash != manifestHash || recomputedHash != manifestHash || receipt.ManifestHash != resource.ManifestHash || receipt.Source != source || receipt.Artifact.Reference != resource.Locator || receipt.Artifact.CacheID != resource.Identity || receipt.Artifact.Digest != resource.Fingerprint || receipt.Artifact.Platform != source.Platform || receipt.Artifact.RootDisk != rootDisk {
+				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("cataloged Docker Sandboxes artifact for manifest %s disagrees with its active receipt", manifestHash)
+			}
+			requestedHash, hashErr := ManifestHash(manifest)
+			if hashErr != nil {
+				return dockerSandboxesReceipt{}, "", false, hashErr
+			}
+			if requestedHash != recomputedHash {
+				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("cataloged Docker Sandboxes receipt does not match the requested manifest")
+			}
+			if selectedPath != "" && (selected.Artifact != receipt.Artifact || selected.ArchiveSHA256 != receipt.ArchiveSHA256 || selected.MetadataSHA256 != receipt.MetadataSHA256) {
+				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("multiple conflicting current Docker Sandboxes artifacts claim manifest %s", manifestHash)
+			}
+			selected = receipt
+			selectedPath = receiptPath
+		}
+	}
+	if selectedPath == "" {
+		return dockerSandboxesReceipt{}, "", false, nil
+	}
+	if err := validateDockerSandboxesReceiptEvidence(selectedPath, selected); err != nil {
+		return dockerSandboxesReceipt{}, "", false, err
+	}
+	return selected, selectedPath, true, nil
+}
+
+func validateDockerSandboxesReceiptEvidence(receiptPath string, receipt dockerSandboxesReceipt) error {
+	receiptDirectory := filepath.Dir(receiptPath)
+	if len(receipt.Evidence) != len(dockerSandboxesCompactEvidenceFiles) {
+		return fmt.Errorf("Docker Sandboxes receipt evidence is incomplete")
+	}
+	for name, filename := range dockerSandboxesCompactEvidenceFiles {
+		evidence, found := receipt.Evidence[name]
+		if !found {
+			return fmt.Errorf("Docker Sandboxes receipt evidence %q is missing", name)
+		}
+		clean := filepath.Clean(filepath.FromSlash(evidence.Path))
+		expectedPath := filepath.ToSlash(filepath.Join("evidence", receipt.ManifestHash, filename))
+		if evidence.Path != expectedPath || filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.ToSlash(clean) != evidence.Path || !validSHA256(evidence.SHA256) {
+			return fmt.Errorf("Docker Sandboxes receipt evidence %q has an invalid path or digest", name)
+		}
+		if name == "sbomDescriptor" && !validSHA256(evidence.SourceDigest) {
+			return fmt.Errorf("Docker Sandboxes receipt evidence %q has an invalid source digest", name)
+		}
+		path := filepath.Join(receiptDirectory, clean)
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("Docker Sandboxes receipt evidence %q is missing or not a regular file", name)
+		}
+		digest, _, err := hashFile(path)
+		if err != nil {
+			return err
+		}
+		if digest != evidence.SHA256 {
+			return fmt.Errorf("Docker Sandboxes receipt evidence %q digest does not match its receipt", name)
+		}
+	}
+	return nil
+}
+
+func cloneDockerSandboxesReceiptEvidence(sourceReceiptPath, destinationReceiptPath string, receipt dockerSandboxesReceipt) error {
+	if filepath.Clean(sourceReceiptPath) == filepath.Clean(destinationReceiptPath) {
+		return validateDockerSandboxesReceiptEvidence(sourceReceiptPath, receipt)
+	}
+	if err := validateDockerSandboxesReceiptEvidence(sourceReceiptPath, receipt); err != nil {
 		return err
 	}
-	return m.activateDockerSandboxesTemplate(ctx, manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+	sourceDirectory := filepath.Dir(sourceReceiptPath)
+	destinationDirectory := filepath.Dir(destinationReceiptPath)
+	for name, evidence := range receipt.Evidence {
+		relative := filepath.FromSlash(evidence.Path)
+		destination := filepath.Join(destinationDirectory, relative)
+		if err := copyFile(filepath.Join(sourceDirectory, relative), destination, 0o600); err != nil {
+			return fmt.Errorf("copy %s: %w", name, err)
+		}
+		digest, _, err := hashFile(destination)
+		if err != nil {
+			return err
+		}
+		if digest != evidence.SHA256 {
+			return fmt.Errorf("copied Docker Sandboxes receipt evidence %q changed during publication", name)
+		}
+	}
+	return nil
 }
 
 func (m *Coordinator) dockerSandboxesArtifactRoot(manifestHash string) (string, error) {
@@ -1273,6 +1491,7 @@ func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifes
 	if artifact.RootDisk != rootDisk {
 		return false, nil
 	}
+	activatedAt := time.Time{}
 	if err := m.withSandboxBackendLock(ctx, func() error {
 		if err := runtime.VerifyImportedTemplate(ctx, artifact); err != nil {
 			if !errors.Is(err, provider.ErrTemplateNotFound) {
@@ -1289,16 +1508,18 @@ func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifes
 		}); err != nil {
 			return fmt.Errorf("verify resumed Docker Sandboxes runner template: %w", err)
 		}
-		return nil
+		if metadata.ManifestHash != manifestHash {
+			return fmt.Errorf("verified Docker Sandboxes build evidence changed during resume")
+		}
+		activatedAt, err = m.publishDockerSandboxesTemplateLocked(manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+		return err
 	}); err != nil {
 		return false, err
 	}
-	if metadata.ManifestHash != manifestHash {
-		return false, fmt.Errorf("verified Docker Sandboxes build evidence changed during resume")
-	}
-	if err := m.activateDockerSandboxesTemplate(ctx, manifest, source, manifestHash, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime); err != nil {
+	if err := m.finishDockerSandboxesTemplateActivation(ctx, archivePath, manifestHash, activatedAt); err != nil {
 		return false, err
 	}
+	m.infof("activated Docker Sandboxes runner template %s@%s\n", artifact.Reference, artifact.Digest)
 	m.infof("resumed Docker Sandboxes runner template from verified interrupted build evidence\n")
 	return true, nil
 }
@@ -1388,21 +1609,22 @@ func verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePat
 	}, metadataSHA, archiveSHA, true, nil
 }
 
-func (m *Coordinator) activateDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash string, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) error {
+func (m *Coordinator) publishDockerSandboxesTemplateLocked(manifest Manifest, source ResolvedDockerSource, manifestHash string, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) (time.Time, error) {
 	if err := runtime.ActivateTemplate(artifact); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	archiveInfo, err := os.Lstat(archivePath)
 	if err != nil {
-		return fmt.Errorf("inspect verified Docker Sandboxes archive before activation: %w", err)
+		return time.Time{}, fmt.Errorf("inspect verified Docker Sandboxes archive before activation: %w", err)
 	}
 	if !archiveInfo.Mode().IsRegular() {
-		return errors.New("verified Docker Sandboxes archive is not a regular file")
+		return time.Time{}, errors.New("verified Docker Sandboxes archive is not a regular file")
 	}
 	evidence, err := m.persistDockerSandboxesCompactEvidence(manifestHash, filepath.Dir(metadataPath))
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
+	activatedAt := m.now().UTC()
 	receipt := dockerSandboxesReceipt{
 		SchemaVersion:  dockerSandboxesReceiptSchema,
 		ManifestHash:   manifestHash,
@@ -1413,25 +1635,28 @@ func (m *Coordinator) activateDockerSandboxesTemplate(ctx context.Context, manif
 		ArchiveSHA256:  archiveSHA,
 		ArchiveBytes:   uint64(archiveInfo.Size()),
 		Evidence:       evidence,
-		ActivatedAt:    time.Now().UTC(),
+		ActivatedAt:    activatedAt,
 	}
 	receiptPath, err := m.dockerSandboxesReceiptPath()
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if err := writeJSONFile(receiptPath, receipt); err != nil {
-		return err
+		return time.Time{}, err
 	}
-	if err := m.recordCurrentSandboxArtifact(ctx, artifact, manifestHash, receipt.ActivatedAt); err != nil {
-		return fmt.Errorf("record current Docker Sandboxes template ownership: %w", err)
+	if err := m.recordCurrentSandboxArtifactLocked(artifact, manifestHash, activatedAt); err != nil {
+		return time.Time{}, fmt.Errorf("record current Docker Sandboxes template ownership: %w", err)
 	}
-	if err := m.recordSandboxWorkspace(ctx, filepath.Dir(archivePath), manifestHash, storagecatalog.StateSuperseded, receipt.ActivatedAt); err != nil {
+	return activatedAt, nil
+}
+
+func (m *Coordinator) finishDockerSandboxesTemplateActivation(ctx context.Context, archivePath, manifestHash string, activatedAt time.Time) error {
+	if err := m.recordSandboxWorkspace(ctx, filepath.Dir(archivePath), manifestHash, storagecatalog.StateSuperseded, activatedAt); err != nil {
 		return fmt.Errorf("record Docker Sandboxes staging ownership: %w", err)
 	}
 	if err := m.cleanupSupersededCatalog(ctx); err != nil {
 		return err
 	}
-	m.infof("activated Docker Sandboxes runner template %s@%s\n", artifact.Reference, artifact.Digest)
 	return nil
 }
 
@@ -1445,14 +1670,10 @@ func (m *Coordinator) persistDockerSandboxesCompactEvidence(manifestHash, artifa
 		return nil, err
 	}
 	result := make(map[string]artifactEvidence)
-	for name, filename := range map[string]string{
-		"buildMetadata":       "build-metadata.json",
-		"attestationMetadata": "attestation-metadata.json",
-		"provenance":          "provenance.json",
-		"softwareInventory":   "software-inventory.txt",
-		"compatibility":       "compatibility.json",
-		"templateMetadata":    "template-metadata.json",
-	} {
+	for name, filename := range dockerSandboxesCompactEvidenceFiles {
+		if name == "sbomDescriptor" {
+			continue
+		}
 		source := filepath.Join(artifactRoot, filename)
 		destination := filepath.Join(evidenceRoot, filename)
 		if err := copyFile(source, destination, 0o600); err != nil {

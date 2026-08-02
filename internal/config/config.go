@@ -1116,7 +1116,7 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("image.sourceType must be docker-image with provider.type=docker-sandboxes")
 		}
 		if cfg.Image.SourceType != "" && !validDockerSandboxesSourceImage(cfg.Image.SourceImage) {
-			return fmt.Errorf("image.sourceImage with provider.type=docker-sandboxes must be an exact ghcr.io/catthehacker/ubuntu:<tag> reference")
+			return fmt.Errorf("image.sourceImage with provider.type=docker-sandboxes must be ghcr.io/catthehacker/ubuntu:full-latest or ghcr.io/catthehacker/ubuntu:act-latest; specialized and custom tags do not satisfy the private dockerd template contract")
 		}
 		if cfg.Image.SourcePlatform != "" && cfg.Image.SourcePlatform != cfg.Provider.Platform {
 			return fmt.Errorf("image.sourcePlatform must match provider.platform with provider.type=docker-sandboxes")
@@ -1341,22 +1341,12 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 }
 
 func validDockerSandboxesSourceImage(value string) bool {
-	const prefix = "ghcr.io/catthehacker/ubuntu:"
-	if !strings.HasPrefix(value, prefix) {
+	switch value {
+	case "ghcr.io/catthehacker/ubuntu:full-latest", "ghcr.io/catthehacker/ubuntu:act-latest":
+		return true
+	default:
 		return false
 	}
-	tag := strings.TrimPrefix(value, prefix)
-	if tag == "" || len(tag) > 128 || strings.ContainsAny(tag, "/@\t\r\n ") {
-		return false
-	}
-	for _, character := range tag {
-		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '_' || character == '.' || character == '-' {
-			continue
-		}
-		return false
-	}
-	first := tag[0]
-	return (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9') || first == '_'
 }
 
 func validateDockerSandboxesStagingRoot(value string) error {

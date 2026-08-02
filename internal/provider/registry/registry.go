@@ -34,7 +34,7 @@ type entry struct {
 
 var entries = []entry{
 	{
-		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
+		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
 			environment := map[string]string{
@@ -60,7 +60,7 @@ var entries = []entry{
 			StorageSupported:       true,
 			ImageMode:              provider.ImageModeTemplate,
 			GuidedArtifacts:        true,
-			WizardImageProfiles:    catthehackerProfiles(),
+			WizardImageProfiles:    dockerSandboxesProfiles(),
 			WizardPrerequisite:     provider.WizardPrerequisiteDockerSandboxes,
 			WizardOnboarding:       provider.WizardOnboardingCatthehackerDocker,
 			WizardHostTrust:        provider.WizardHostTrustOverlay,
@@ -72,7 +72,7 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
+		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			installRoot := config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)
 			return adaptLegacy(wsl.New("", installRoot, projectRoot, dryRun), providerStorage(cfg, projectRoot), dryRun)
@@ -92,6 +92,13 @@ func catthehackerProfiles() []provider.WizardImageProfile {
 		{Name: "act", Tag: "act-latest"},
 		{Name: "dotnet", Tag: "dotnet-latest"},
 		{Name: "js", Tag: "js-latest"},
+	}
+}
+
+func dockerSandboxesProfiles() []provider.WizardImageProfile {
+	return []provider.WizardImageProfile{
+		{Name: "full", Tag: "full-latest"},
+		{Name: "act", Tag: "act-latest"},
 	}
 }
 

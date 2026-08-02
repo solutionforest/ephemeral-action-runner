@@ -22,11 +22,13 @@ Use `./start` for first-run provisioning or the shared image command afterward:
 
 EPAR resolves the configured Catthehacker tag for the native platform, checks capacity, and has BuildKit stream one verified Docker-compatible archive directly to disk. EPAR verifies the archive tag, platform, labels, configuration, layers, and digests without loading it into Docker, imports it with `sbx template load`, and reads back the exact Sandbox-cache identity. Build metadata, provenance, an SPDX SBOM descriptor, compatibility evidence, and a software inventory are retained compactly; the active receipt is updated atomically only after every step succeeds.
 
+When another configuration in the same project selects the exact same immutable manifest, EPAR verifies the cataloged Sandbox-cache identity and every retained evidence digest, copies that evidence into the new configuration's state, and adds the new ownership reference without rebuilding. A missing template, incomplete evidence, manifest disagreement, or conflicting identity is never adopted. EPAR repeats this check under the shared backend lock before import so concurrent configurations cannot collide on a non-reproducible archive identity.
+
 The compatibility scripts under `scripts/docker-sandboxes` delegate to this command. They no longer maintain a separate build or load implementation.
 
 ## Configure And Prewarm
 
-Run `./start` with no configuration. The wizard offers `full-latest`, `act-latest`, `dotnet-latest`, `js-latest`, or another `catthehacker/ubuntu` tag; verifies the tag and native platform; validates optional custom install scripts; displays source, platform, size estimates, and reserve in the final review; then saves the desired configuration after one confirmation. Normal startup performs the build and import, and a provisioning failure leaves the configuration available for a retry.
+Run `./start` with no configuration. The Docker Sandboxes wizard offers `full-latest` and `act-latest`, the profiles proven to contain the private Docker daemon and runtime closure required by the template contract. Specialized Catthehacker tags such as `js-latest`, `dotnet-latest`, and `gh-latest` remain valid upstream images for providers that supply their own daemon environment, but Docker Sandboxes rejects them before an expensive build. The wizard verifies the selected tag and native platform, validates optional custom install scripts, displays source, platform, size estimates, and reserve in the final review, then saves the desired configuration after one confirmation. Normal startup performs the build and import, and a provisioning failure leaves the configuration available for a retry.
 
 After configuration, prewarm the selected template outside the job path:
 

@@ -3,7 +3,9 @@ package image
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +17,11 @@ import (
 
 const defaultActionsRunnerReleaseAPI = "https://api.github.com/repos/actions/runner/releases"
 
+// actionsRunnerFallbackReleasePath contains a reviewed, exact Actions runner
+// release identity. It is used only when GitHub's public Releases API is
+// temporarily unavailable. The package download remains SHA-256 verified.
+const actionsRunnerFallbackReleasePath = "third_party/actions-runner-release.lock.json"
+
 type actionsRunnerRelease struct {
 	TagName string               `json:"tag_name"`
 	Assets  []actionsRunnerAsset `json:"assets"`
@@ -24,6 +31,20 @@ type actionsRunnerAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Digest             string `json:"digest"`
+}
+
+type actionsRunnerReleaseFailure struct {
+	err              error
+	fallbackEligible bool
+	diagnostic       string
+}
+
+func (e *actionsRunnerReleaseFailure) Error() string {
+	return e.err.Error()
+}
+
+func (e *actionsRunnerReleaseFailure) Unwrap() error {
+	return e.err
 }
 
 func normalizedRunnerSelector(value string) string {
@@ -49,12 +70,6 @@ func (m *Coordinator) resolveActionsRunner(ctx context.Context, manifest Manifes
 	default:
 		return manifest, fmt.Errorf("GitHub Actions runner packages are not configured for %s", platform)
 	}
-	endpoint := actionsRunnerReleaseAPI()
-	if selector == "latest" {
-		endpoint += "/latest"
-	} else {
-		endpoint += "/tags/v" + selector
-	}
 	buildTrust, err := m.resolveBuildTrust(ctx)
 	if err != nil {
 		return manifest, err
@@ -63,6 +78,31 @@ func (m *Coordinator) resolveActionsRunner(ctx context.Context, manifest Manifes
 	if err != nil {
 		return manifest, err
 	}
+	resolved, err := resolveActionsRunnerFromAPI(ctx, manifest, selector, architecture, client, actionsRunnerReleaseEndpoint(selector))
+	if err == nil {
+		return resolved, nil
+	}
+	var failure *actionsRunnerReleaseFailure
+	if !errors.As(err, &failure) || !failure.fallbackEligible {
+		return manifest, err
+	}
+	fallback, fallbackErr := resolveActionsRunnerFallback(m.ProjectRoot, manifest, selector, architecture)
+	if fallbackErr != nil {
+		return manifest, fmt.Errorf("%w; checked-in Actions runner fallback is unusable: %v", err, fallbackErr)
+	}
+	m.warnf("GitHub Actions runner release resolution failed (%s); using checked-in, SHA-256-locked runner release %s for selector %q\n", failure.diagnostic, fallback.RunnerVersion, selector)
+	return fallback, nil
+}
+
+func actionsRunnerReleaseEndpoint(selector string) string {
+	endpoint := actionsRunnerReleaseAPI()
+	if selector == "latest" {
+		return endpoint + "/latest"
+	}
+	return endpoint + "/tags/v" + selector
+}
+
+func resolveActionsRunnerFromAPI(ctx context.Context, manifest Manifest, selector, architecture string, client *http.Client, endpoint string) (Manifest, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return manifest, err
@@ -72,17 +112,79 @@ func (m *Coordinator) resolveActionsRunner(ctx context.Context, manifest Manifes
 	request.Header.Set("User-Agent", "ephemeral-action-runner")
 	response, err := client.Do(request)
 	if err != nil {
-		return manifest, fmt.Errorf("resolve GitHub Actions runner %s: %w", selector, err)
+		return manifest, actionsRunnerReleaseRequestError(selector, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return manifest, fmt.Errorf("resolve GitHub Actions runner %s: GitHub returned HTTP %d", selector, response.StatusCode)
+		return manifest, actionsRunnerReleaseHTTPError(selector, response)
 	}
 	var release actionsRunnerRelease
 	if err := json.NewDecoder(response.Body).Decode(&release); err != nil {
 		return manifest, fmt.Errorf("parse GitHub Actions runner release: %w", err)
 	}
 	return applyActionsRunnerRelease(manifest, selector, architecture, release)
+}
+
+func actionsRunnerReleaseRequestError(selector string, err error) error {
+	failure := &actionsRunnerReleaseFailure{err: fmt.Errorf("resolve GitHub Actions runner %s: %w", selector, err), diagnostic: "request failed"}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
+		failure.fallbackEligible = true
+		failure.diagnostic = "transient request failure"
+	}
+	return failure
+}
+
+func actionsRunnerReleaseHTTPError(selector string, response *http.Response) error {
+	fallbackEligible := response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusRequestTimeout || response.StatusCode >= http.StatusInternalServerError
+	return &actionsRunnerReleaseFailure{
+		err:              fmt.Errorf("resolve GitHub Actions runner %s: GitHub returned HTTP %d", selector, response.StatusCode),
+		fallbackEligible: fallbackEligible,
+		diagnostic:       actionsRunnerReleaseHTTPDiagnostic(response),
+	}
+}
+
+func actionsRunnerReleaseHTTPDiagnostic(response *http.Response) string {
+	parts := []string{fmt.Sprintf("HTTP %d", response.StatusCode)}
+	for _, header := range []string{"X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After", "X-GitHub-Request-Id"} {
+		if value := safeHTTPDiagnosticValue(response.Header.Get(header)); value != "" {
+			parts = append(parts, strings.ToLower(header)+"="+value)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func safeHTTPDiagnosticValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 128 {
+		return ""
+	}
+	for _, runeValue := range value {
+		if runeValue < 0x20 || runeValue == 0x7f {
+			return ""
+		}
+	}
+	return value
+}
+
+func resolveActionsRunnerFallback(projectRoot string, manifest Manifest, selector, architecture string) (Manifest, error) {
+	content, err := os.ReadFile(filepath.Join(projectRoot, actionsRunnerFallbackReleasePath))
+	if err != nil {
+		return manifest, fmt.Errorf("read %s: %w", actionsRunnerFallbackReleasePath, err)
+	}
+	var release actionsRunnerRelease
+	if err := json.Unmarshal(content, &release); err != nil {
+		return manifest, fmt.Errorf("parse %s: %w", actionsRunnerFallbackReleasePath, err)
+	}
+	resolved, err := applyActionsRunnerRelease(manifest, selector, architecture, release)
+	if err != nil {
+		return manifest, fmt.Errorf("validate %s: %w", actionsRunnerFallbackReleasePath, err)
+	}
+	expectedURL := fmt.Sprintf("https://github.com/actions/runner/releases/download/v%s/%s", resolved.RunnerVersion, resolved.RunnerAssetName)
+	if resolved.RunnerAssetURL != expectedURL {
+		return manifest, fmt.Errorf("validate %s: runner asset URL is not the canonical GitHub release URL", actionsRunnerFallbackReleasePath)
+	}
+	return resolved, nil
 }
 
 func applyActionsRunnerRelease(manifest Manifest, selector, architecture string, release actionsRunnerRelease) (Manifest, error) {

@@ -968,6 +968,10 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 	fmt.Fprintln(out, "")
 	fmt.Fprintf(out, "%s image setup:\n", descriptor.DisplayName)
 	fmt.Fprintln(out, "  Choose the Catthehacker Ubuntu image for this runner. EPAR will provision or update the reusable runner artifact during startup.")
+	if !descriptor.WizardCustomImageTags {
+		fmt.Fprintln(out, "  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.")
+	}
+	fmt.Fprintln(out, "  Image catalog: https://github.com/catthehacker/docker_images#images-available")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Runner base image:")
 	for index, profile := range descriptor.WizardImageProfiles {
@@ -977,9 +981,11 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		}
 		fmt.Fprintf(out, "  %d. %s — %s%s\n", index+1, profile.Name, profile.Tag, defaultLabel)
 	}
-	customChoice := strconv.Itoa(len(descriptor.WizardImageProfiles) + 1)
-	fmt.Fprintf(out, "  %s. Another catthehacker/ubuntu tag, such as go-24.04\n", customChoice)
-	fmt.Fprintln(out, "  Image catalog: https://github.com/catthehacker/docker_images#images-available")
+	customChoice := ""
+	if descriptor.WizardCustomImageTags {
+		customChoice = strconv.Itoa(len(descriptor.WizardImageProfiles) + 1)
+		fmt.Fprintf(out, "  %s. Another catthehacker/ubuntu tag, such as go-24.04\n", customChoice)
+	}
 	fmt.Fprintln(out, "  0. Back")
 
 	var source imageartifact.ResolvedDockerSource
@@ -1003,7 +1009,7 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 				break
 			}
 		}
-		if normalizedChoice == customChoice {
+		if customChoice != "" && normalizedChoice == customChoice {
 			var requiredResult initWizardResult[string]
 			requiredResult, promptErr = promptWizardRequired(out, reader, "catthehacker/ubuntu tag")
 			if promptErr != nil {
@@ -1015,7 +1021,11 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 			input = requiredResult.Value
 		}
 		if input == "" {
-			fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, %s for another catthehacker/ubuntu tag, or 0 to go back.\n", len(descriptor.WizardImageProfiles), customChoice)
+			if customChoice != "" {
+				fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, %s for another catthehacker/ubuntu tag, or 0 to go back.\n", len(descriptor.WizardImageProfiles), customChoice)
+			} else {
+				fmt.Fprintf(out, "  Choose a supported image from 1 to %d or 0 to go back.\n", len(descriptor.WizardImageProfiles))
+			}
 			if hitEOF {
 				return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("invalid runner base image %q", choice)
 			}

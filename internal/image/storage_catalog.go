@@ -528,13 +528,30 @@ func (m *Coordinator) recordCurrentSandboxArtifact(ctx context.Context, artifact
 	if err != nil {
 		return err
 	}
+	store, err := m.hostCatalog()
+	if err != nil {
+		return err
+	}
+	backendLock, err := store.AcquireBackendLock(ctx, backendID)
+	if err != nil {
+		return err
+	}
+	defer backendLock.Close()
+	return m.recordCurrentSandboxArtifactLocked(artifact, manifestHash, now)
+}
+
+func (m *Coordinator) recordCurrentSandboxArtifactLocked(artifact provider.TemplateArtifact, manifestHash string, now time.Time) error {
+	backendID, err := sandboxBackendID()
+	if err != nil {
+		return err
+	}
 	resource := storagecatalog.Resource{
 		BackendID: backendID, Kind: catalogSandboxTemplateKind, Provider: "docker-sandboxes", Role: "runtime-template",
 		Locator: artifact.Reference, Identity: artifact.CacheID, Fingerprint: artifact.Digest,
 		Custody: storagecatalog.CustodyGenerated, ManifestHash: manifestHash, State: storagecatalog.StateCurrent,
 		CreatedAt: now, LastSeenAt: now,
 	}
-	if err := m.registerCurrentCatalogResource(ctx, resource, manifestHash, now); err != nil {
+	if err := m.registerCurrentCatalogResourceLocked(resource, manifestHash, now); err != nil {
 		return err
 	}
 	return m.releaseCatalogRole("build-source", now)
@@ -754,6 +771,14 @@ func (m *Coordinator) registerCurrentCatalogResource(ctx context.Context, resour
 		return err
 	}
 	defer backendLock.Close()
+	return m.registerCurrentCatalogResourceLocked(resource, manifestHash, now)
+}
+
+func (m *Coordinator) registerCurrentCatalogResourceLocked(resource storagecatalog.Resource, manifestHash string, now time.Time) error {
+	store, err := m.hostCatalog()
+	if err != nil {
+		return err
+	}
 	_, err = store.WithLock(now, func(value *storagecatalog.Catalog) error {
 		configRecord, err := storagecatalog.RegisterConfig(value, m.ProjectRoot, m.effectiveConfigPath(), now)
 		if err != nil {

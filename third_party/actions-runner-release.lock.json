@@ -1,0 +1,15 @@
+{
+  "tag_name": "v2.336.0",
+  "assets": [
+    {
+      "name": "actions-runner-linux-arm64-2.336.0.tar.gz",
+      "browser_download_url": "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz",
+      "digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
+    },
+    {
+      "name": "actions-runner-linux-x64-2.336.0.tar.gz",
+      "browser_download_url": "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz",
+      "digest": "sha256:04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"
+    }
+  ]
+}

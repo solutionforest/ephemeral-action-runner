@@ -20,6 +20,7 @@ type Descriptor struct {
 	ImageMode              string
 	GuidedArtifacts        bool
 	WizardImageProfiles    []WizardImageProfile
+	WizardCustomImageTags  bool
 	WizardPrerequisite     WizardPrerequisiteKind
 	WizardOnboarding       WizardOnboardingKind
 	WizardHostTrust        WizardHostTrustKind

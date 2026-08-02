@@ -1399,6 +1399,13 @@ func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T)
 			mutate: func(cfg *Config) { cfg.Provider.SourceImage = "runner-image" },
 		},
 		{
+			name: "specialized source image lacks the private daemon contract",
+			mutate: func(cfg *Config) {
+				cfg.Image.SourceType = ImageSourceDockerImage
+				cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:js-latest"
+			},
+		},
+		{
 			name:   "platform is not a supported sandbox guest",
 			mutate: func(cfg *Config) { cfg.Provider.Platform = "linux/s390x" },
 		},

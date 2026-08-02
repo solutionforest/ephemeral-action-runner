@@ -162,7 +162,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 
 | Property | Type and default | Required or applies when | Effect and caution |
 | --- | --- | --- | --- |
-| `image.sourceImage` | `ghcr.io/catthehacker/ubuntu:full-latest` | Required with Docker Sandboxes. | Desired Catthehacker source selector; EPAR builds and imports the runnable template automatically. |
+| `image.sourceImage` | `ghcr.io/catthehacker/ubuntu:full-latest` | Required with Docker Sandboxes; must be the exact `full-latest` or `act-latest` profile. | Desired Catthehacker source selector; EPAR builds and imports the runnable template automatically. Specialized and custom tags remain available to Docker Container and WSL. |
 | `policyGeneration` | lowercase `sha256:<64-hex>`; no default | Required with Docker Sandboxes. | Recorded fingerprint of the host-global Balanced policy. |
 | `networkBaseline` | `open` or `balanced`; `open` | Docker Sandboxes. | `open` adds a sandbox-scoped public-egress rule while denying host aliases; it does not change the host-global policy. |
 | `additionalAllow` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped allow resources. With `open`, it cannot re-allow EPAR's host-alias deny guardrails. |
@@ -186,7 +186,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 
 - `provider.sourceImage` is required for Tart, WSL, and Docker Container, and forbidden for Docker Sandboxes.
 - `provider.rosettaTag` is accepted only for Tart. `provider.platform` is accepted only for Docker Container or Docker Sandboxes. Docker Sandboxes accepts only `linux/amd64` and `linux/arm64`.
-- Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, a valid desired Catthehacker image, policy generation, resource values, and a lowercase-compatible pool prefix.
+- Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, the exact Catthehacker `full-latest` or `act-latest` profile, policy generation, resource values, and a lowercase-compatible pool prefix.
 - `image.sourcePlatform` requires `image.sourceType: docker-image`; all byte-size fields require a positive `B`, `KiB`, `MiB`, `GiB`, or `TiB` value.
 - Host-trust overlay requires a non-empty, duplicate-free scope list and `runner.ephemeral: true`; `user` is not supported on Linux.
 - `pool.namePrefix` is a host-wide controller and ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses its durable ledger of exact owned identities. EPAR rejects concurrent reuse across configs, projects, and providers; do not assume broad prefix cleanup is safe.

@@ -13,6 +13,7 @@ Start with the symptom that most closely matches the failure. Regardless of prov
 - [Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present](#docker-sandboxes-rejects-a-staging-workspace-because-ssh-agent-forwarding-is-present)
 - [Docker Hub login succeeds but a private pull is denied in Docker Sandboxes](#docker-hub-login-succeeds-but-a-private-pull-is-denied-in-docker-sandboxes)
 - [An idle runner reports GitHub or Sandbox health warnings](#an-idle-runner-reports-github-or-sandbox-health-warnings)
+- [GitHub Actions runner release resolution reports HTTP 403 or 429](#github-actions-runner-release-resolution-reports-http-403-or-429)
 - [A scheduled image check or update fails](#a-scheduled-image-check-or-update-fails)
 - [A runner is held for diagnostics or an acknowledgement](#a-runner-is-held-for-diagnostics-or-an-acknowledgement)
 - [Docker image build runs out of space](#docker-image-build-runs-out-of-space)
@@ -180,6 +181,12 @@ EPAR rejects global `sbx` secrets and removes inherited proxy variables from run
 A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR keeps the exact runner, lets a trust lease expire closed when it cannot refresh it, and retries. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
 
 `networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
+
+## GitHub Actions runner release resolution reports HTTP 403 or 429
+
+The public `actions/runner` Releases API has a separate unauthenticated rate limit. An EPAR GitHub App installation token is not used for that public repository because it may not have permission to read it. On a 403, 429, timeout, or transient server response, EPAR prints the HTTP status and any safe rate-limit, retry, and request-ID headers, then uses the reviewed exact release in `third_party/actions-runner-release.lock.json`. This is an explicit metadata-only fallback: the selected version must match `image.runnerVersion` when that value is pinned, the expected asset name and canonical GitHub URL are checked, and the downloaded package must still match the lock's SHA-256 before it is installed.
+
+If EPAR says the checked-in fallback is unusable, restore that file from the EPAR release or update to a release with a refreshed lock; do not replace the digest with an unverified value. Authentication, malformed successful API responses, selector mismatches, missing assets, and other non-transient API failures remain errors rather than using the fallback.
 
 ## A scheduled image check or update fails
 

@@ -1078,6 +1078,14 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 			t.Fatalf("init output omitted %q:\n%s", want, out.String())
 		}
 	}
+	setupHints := "  Choose the Catthehacker Ubuntu image for this runner. EPAR will provision or update the reusable runner artifact during startup.\n  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.\n  Image catalog: https://github.com/catthehacker/docker_images#images-available\n\nRunner base image:"
+	if !strings.Contains(out.String(), setupHints) {
+		t.Fatalf("Docker Sandboxes setup hints were not grouped before the option list:\n%s", out.String())
+	}
+	cleanOptions := "Runner base image:\n  1. full — full-latest (default)\n  2. act — act-latest\n  0. Back"
+	if !strings.Contains(out.String(), cleanOptions) {
+		t.Fatalf("Docker Sandboxes option list contains non-option text:\n%s", out.String())
+	}
 	for _, removed := range []string{"informational; configuration creation is not blocked", "Estimate confidence:", "Expected duration:"} {
 		if strings.Contains(out.String(), removed) {
 			t.Fatalf("init output retained removed estimate text %q:\n%s", removed, out.String())
@@ -1122,8 +1130,6 @@ func TestDockerSandboxesWizardResolvesEveryBuiltInImageChoice(t *testing.T) {
 		{choice: "", want: "ghcr.io/catthehacker/ubuntu:full-latest"},
 		{choice: "1", want: "ghcr.io/catthehacker/ubuntu:full-latest"},
 		{choice: "2", want: "ghcr.io/catthehacker/ubuntu:act-latest"},
-		{choice: "3", want: "ghcr.io/catthehacker/ubuntu:dotnet-latest"},
-		{choice: "4", want: "ghcr.io/catthehacker/ubuntu:js-latest"},
 	} {
 		t.Run(test.want, func(t *testing.T) {
 			stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
@@ -1155,7 +1161,13 @@ func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.
 			if !accepted || profile == nil || profile.Provider != providerType || profile.SourceImage != "ghcr.io/catthehacker/ubuntu:full-latest" {
 				t.Fatalf("shared wizard profile = %+v, accepted=%t", profile, accepted)
 			}
-			for _, want := range []string{"1. full — full-latest (default)", "2. act — act-latest", "3. dotnet — dotnet-latest", "4. js — js-latest", "Runner artifact estimate:"} {
+			wants := []string{"1. full — full-latest (default)", "2. act — act-latest", "Runner artifact estimate:"}
+			if providerType != "docker-sandboxes" {
+				wants = append(wants, "3. dotnet — dotnet-latest", "4. js — js-latest", "5. Another catthehacker/ubuntu tag")
+			} else {
+				wants = append(wants, "specialized and custom tags are not admitted")
+			}
+			for _, want := range wants {
 				if !strings.Contains(out.String(), want) {
 					t.Fatalf("%s wizard output omitted %q:\n%s", providerType, want, out.String())
 				}
@@ -1219,7 +1231,7 @@ func TestImageUpdatePolicyWizardRepromptsInvalidChoiceAndTime(t *testing.T) {
 	}
 }
 
-func TestDockerSandboxesWizardCollectsCustomTagAndInstallScript(t *testing.T) {
+func TestDockerContainerWizardCollectsCustomTagAndInstallScript(t *testing.T) {
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.DarwinARM64, initDockerSandboxesDiscovery{
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 	}, nil)
@@ -1232,7 +1244,7 @@ func TestDockerSandboxesWizardCollectsCustomTagAndInstallScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), projectRoot, sandboxpromotion.DarwinARM64, &out, bufio.NewReader(strings.NewReader("5\ngo-24.04\ny\nscripts/install-extra.sh\nn\n\n\n")))
+	profile, accepted, err := promptDockerImageProfile(context.Background(), projectRoot, "docker-container", sandboxpromotion.DarwinARM64, &out, bufio.NewReader(strings.NewReader("5\ngo-24.04\ny\nscripts/install-extra.sh\nn\n\n\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1274,7 +1286,7 @@ func TestDockerSandboxesWizardAllowsEmptyCustomInstallScriptChoice(t *testing.T)
 	}
 }
 
-func TestDockerSandboxesWizardRepromptsAfterUnresolvableTag(t *testing.T) {
+func TestDockerContainerWizardRepromptsAfterUnresolvableTag(t *testing.T) {
 	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 	}, nil)
@@ -1286,7 +1298,7 @@ func TestDockerSandboxesWizardRepromptsAfterUnresolvableTag(t *testing.T) {
 		return resolver(ctx, input, platform)
 	}
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("5\nmissing\n4\nn\n\n\n")))
+	profile, accepted, err := promptDockerImageProfile(context.Background(), t.TempDir(), "docker-container", sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("5\nmissing\n4\nn\n\n\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
