@@ -285,11 +285,11 @@ Use `[system]` on Linux. Overlay mode collects the current host roots, validates
 Use the normal host entry point so EPAR can inspect the real Windows certificate stores or macOS Keychain:
 
 ```powershell
-.\start.ps1
-.\start.ps1 image build --replace
+./start
+./start image build --replace
 ```
 
-On no-Go Windows, use `.\start.ps1 image build --replace`; on macOS/Linux, use `./start image build --replace`. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. The legacy containerized controller still requires the separate native-host feed bridge. A bare Linux toolchain container is not a replacement for either path.
+Use `./start image build --replace` on every supported shell, including native Windows PowerShell. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. A bare Linux toolchain container is not a replacement for the project-local native-controller path.
 
 ## Windows Docker Desktop WSL2 disk is smaller than expected
 

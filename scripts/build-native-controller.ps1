@@ -1,10 +1,15 @@
 [CmdletBinding()]
 param(
+    [ValidateSet('local-go', 'docker')]
+    [string] $Backend = 'docker',
+    [string] $GoBin = 'go',
+    [switch] $UseOld,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $EparArgs
 )
 
 $ErrorActionPreference = 'Stop'
+$NativeBuilderPath = $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 . (Join-Path $RepoRoot 'scripts\host-trust\wrapper-lib.ps1')
 $GoImage = if ($env:GO_DOCKER_IMAGE) { $env:GO_DOCKER_IMAGE } else { 'golang:latest' }
@@ -38,12 +43,6 @@ if ($env:EPAR_BOOTSTRAP_MIN_FREE_BYTES) {
     }
     $BootstrapMinimumFreeBytes = $parsedBootstrapMinimum
 }
-
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Error 'docker command not found. Install Docker and make sure it is available on PATH.'
-    exit 1
-}
-
 try {
     $repoVolumeRoot = [System.IO.Path]::GetPathRoot($repoRootPath)
     $repoDrive = [System.IO.DriveInfo]::new($repoVolumeRoot)
@@ -171,7 +170,7 @@ function Get-EparNativeSourceHash {
         Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'cmd'), (Join-Path $RepoRoot 'internal') -Filter '*.go' -File -Recurse
         Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'scripts\docker') -File -Recurse
         Get-Item -LiteralPath (Join-Path $RepoRoot 'go.mod'), (Join-Path $RepoRoot 'go.sum')
-        Get-Item -LiteralPath $MyInvocation.ScriptName
+        Get-Item -LiteralPath $NativeBuilderPath
     ) | Sort-Object FullName
     $material = [System.Text.StringBuilder]::new()
     [void] $material.AppendLine('windows/amd64')
@@ -686,188 +685,337 @@ function Initialize-EparBootstrapBuildTrust {
     return [pscustomobject]@{ BundlePath = $bundlePath; Summary = $summary; ConfigPath = $configPath }
 }
 
-$previousDevImageID = Get-EparDockerImageID -Reference $DevImage
-$goToolchain = Resolve-EparGoToolchainImage -PreviousDevImageID $previousDevImageID
-$buildExit = Invoke-EparDockerBuild
-if ($buildExit -ne 0) { exit $buildExit }
-$DevImageID = Get-EparDockerImageID -Reference $DevImage
-if (-not $DevImageID) { Write-Error "could not resolve the immutable Docker toolchain image ID for $DevImage"; exit 1 }
-Write-EparBootstrapAcquisitionJournal -Phase 'toolchain-built' -PreviousGoImageID $goToolchain.PreviousImageID -ResolvedGoImageID $goToolchain.ResolvedImageID -ResolvedDevImageID $DevImageID -PreviousDevImageID $previousDevImageID
-if ($ManageGoCache) {
-    Initialize-EparGoCacheVolume -Name $GomodVolume -Role 'gomod'
-    Initialize-EparGoCacheVolume -Name $GocacheVolume -Role 'gobuild'
-    Invoke-EparGoCacheLimit
-}
+$ReceiptName = 'controller.receipt'
+$NativeExecutable = 'ephemeral-action-runner.exe'
+$TargetOS = 'windows'
+$TargetArch = 'amd64'
 
-$gitCommit = 'unknown'
-$sourceState = 'unknown'
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $gitCommitOutput = ((& git -C $RepoRoot rev-parse --verify HEAD 2>$null) -join '').Trim()
-    if ($LASTEXITCODE -eq 0 -and $gitCommitOutput -match '^[0-9a-f]{40}$') {
-        $gitCommit = $gitCommitOutput
-        $gitStatus = @(& git -C $RepoRoot status --porcelain=v1 --untracked-files=all 2>$null)
-        if ($LASTEXITCODE -eq 0) {
-            $sourceState = if ($gitStatus.Count -eq 0) { 'clean' } else { 'dirty' }
-        }
-    }
-}
-
-$fingerprint = Get-EparNativeSourceHash -DevImageID $DevImageID -GitCommit $gitCommit -SourceState $sourceState
-$controllerSourceRevision = if ($sourceState -eq 'clean') { "sha256:$fingerprint" } elseif ($sourceState -eq 'dirty') { "dirty:sha256:$fingerprint" } else { 'unknown' }
-$cacheRoot = Join-Path $RepoRoot '.local\bin'
-$binary = Join-Path $cacheRoot 'ephemeral-action-runner.exe'
-$manifestPath = Join-Path $cacheRoot 'ephemeral-action-runner.manifest'
-New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
-
-# Historical hash directories were created by older no-Go wrappers. Delete only
-# complete, exactly shaped, inactive revisions; unknown paths are intentionally
-# left for storage's legacy inventory.
-try {
-    Invoke-EparNativeControllerCacheRetention -CacheRoot $cacheRoot -CurrentCacheKey ([string]::new([char]'0', 64)) -KeepPrevious 0 -MaxBytes 1 -GracePeriod ([TimeSpan]::Zero) -RemoveCurrent
-} catch {
-    Write-Warning "Native-controller legacy revision cleanup skipped after an error: $($_.Exception.Message)"
-}
-
-$existingManifest = Read-EparStableNativeControllerManifest -Path $manifestPath
-$needsBuild = -not (Test-Path -LiteralPath $binary -PathType Leaf) -or $null -eq $existingManifest -or $existingManifest.fingerprint -cne $fingerprint -or $existingManifest.toolchainImageID -cne $DevImageID
-if ($needsBuild -and $null -ne $existingManifest -and (Test-Path -LiteralPath $binary -PathType Leaf) -and (Test-EparNativeControllerLeaseActive -Directory $cacheRoot)) {
-    # A mutable bootstrap dependency can produce a new dev-toolchain image
-    # while an already-built controller is serving another invocation. Reuse
-    # that stable binary only when the current source still fingerprints
-    # exactly against the toolchain recorded beside it. Real source changes
-    # continue to fail with the stop-running-process instruction below.
-    $activeControllerFingerprint = Get-EparNativeSourceHash -DevImageID $existingManifest.toolchainImageID -GitCommit $gitCommit -SourceState $sourceState
-    if ($existingManifest.fingerprint -ceq $activeControllerFingerprint) {
-        $needsBuild = $false
-    }
-}
-if ($needsBuild) {
-    $buildLock = Enter-EparStableNativeControllerBuildLock -Path (Join-Path $cacheRoot '.native-controller.lock')
+function Get-EparSHA256Text {
+    param([Parameter(Mandatory = $true)][string] $Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $existingManifest = Read-EparStableNativeControllerManifest -Path $manifestPath
-        $needsBuild = -not (Test-Path -LiteralPath $binary -PathType Leaf) -or $null -eq $existingManifest -or $existingManifest.fingerprint -cne $fingerprint -or $existingManifest.toolchainImageID -cne $DevImageID
-        if ($needsBuild) {
-            if (Test-EparNativeControllerLeaseActive -Directory $cacheRoot) {
-                throw 'EPAR source or its Go toolchain changed while a native EPAR controller is running. Stop the running EPAR process, then run ./start again; EPAR keeps one stable native controller binary and will not create another versioned copy.'
-            }
-            $buildLogDirectory = Join-Path $RepoRoot 'work\logs'
-            New-Item -ItemType Directory -Force -Path $buildLogDirectory | Out-Null
-            $buildLogPath = Join-Path $buildLogDirectory 'epar-native-controller-build.log'
-            $bootstrapBuildTrust = Initialize-EparBootstrapBuildTrust -ProjectRoot $RepoRoot -Arguments $EparArgs
-            [System.IO.File]::WriteAllLines($buildLogPath, @(
-                "EPAR native-controller build started at $([DateTime]::UtcNow.ToString('o'))",
-                "Toolchain image: $DevImage",
-                "Target: windows/amd64",
-                "Bootstrap build trust: $($bootstrapBuildTrust.Summary)",
-                ''
-            ), [System.Text.UTF8Encoding]::new($false))
-            Write-Output "Native controller build log: $buildLogPath"
-            $temporaryDirectory = Join-Path $cacheRoot ('.build-' + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
-            $buildLeasePath = Join-Path $temporaryDirectory ("lease-build-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N'))
-            $buildProcessStartUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
-            [System.IO.File]::WriteAllLines($buildLeasePath, @('schemaVersion=1', "host=$([Environment]::MachineName)", "pid=$PID", "processStartUtc=$buildProcessStartUtc", "startedAtUtc=$([DateTime]::UtcNow.ToString('o'))"), [System.Text.UTF8Encoding]::new($false))
-            try {
-                $previousErrorActionPreference = $ErrorActionPreference
-                try {
-                    $ErrorActionPreference = 'Continue'
-                    $buildOutput = @(& docker run --rm `
-                        -e CGO_ENABLED=0 `
-                        -e GOOS=windows `
-                        -e GOARCH=amd64 `
-                        -e GOTOOLCHAIN=local `
-                        -e SSL_CERT_FILE=/run/epar-bootstrap-ca.pem `
-                        -v "${RepoRoot}:/src:ro" `
-                        -v "${temporaryDirectory}:/out" `
-                        -v "${GomodVolume}:/go/pkg/mod" `
-                        -v "${GocacheVolume}:/root/.cache/go-build" `
-                        -v "$($bootstrapBuildTrust.BundlePath):/run/epar-bootstrap-ca.pem:ro" `
-                        -w /src `
-                        $DevImage `
-                        go build -trimpath -ldflags "-X main.sourceRevision=$controllerSourceRevision" -o /out/ephemeral-action-runner.exe ./cmd/ephemeral-action-runner 2>&1 | ForEach-Object { "$_" })
-                    $nativeBuildExitCode = $LASTEXITCODE
-                } finally {
-                    $ErrorActionPreference = $previousErrorActionPreference
-                }
-                $buildTranscript = if ($buildOutput.Count -ne 0) { ($buildOutput -join [Environment]::NewLine) + [Environment]::NewLine } else { '' }
-                if ($buildTranscript) {
-                    [System.IO.File]::AppendAllText($buildLogPath, $buildTranscript, [System.Text.UTF8Encoding]::new($false))
-                }
-                if ($nativeBuildExitCode -ne 0) {
-                    $tlsFailureHost = Get-EparTLSFailureHost -Transcript $buildTranscript
-                    if ($tlsFailureHost) {
-                        [Console]::Error.WriteLine("Native controller build failed while downloading dependencies from https://$tlsFailureHost.")
-                        [Console]::Error.WriteLine('  The build container rejected the presented TLS certificate as an unknown issuer.')
-                        [Console]::Error.WriteLine("  Full compiler output: $buildLogPath")
-                    } elseif ($buildTranscript) {
-                        [Console]::Error.Write($buildTranscript)
-                    }
-                    Invoke-EparTLSFailureDiagnostic -Transcript $buildTranscript -LogPath $buildLogPath
-                    exit $nativeBuildExitCode
-                }
-                if ($buildTranscript) { [Console]::Error.Write($buildTranscript) }
-                $temporaryBinary = Join-Path $temporaryDirectory 'ephemeral-action-runner.exe'
-                if (-not (Test-Path -LiteralPath $temporaryBinary -PathType Leaf)) { throw 'native EPAR build completed without producing the expected Windows binary' }
-                try {
-                    Move-Item -LiteralPath $temporaryBinary -Destination $binary -Force
-                } catch {
-                    throw "could not atomically replace $binary. Stop every EPAR process using the native controller and retry: $($_.Exception.Message)"
-                }
-                $manifestTemporaryPath = Join-Path $cacheRoot ('.native-controller-manifest-' + [guid]::NewGuid().ToString('N') + '.tmp')
-                [System.IO.File]::WriteAllLines($manifestTemporaryPath, @('schemaVersion=2', "fingerprint=$fingerprint", 'executable=ephemeral-action-runner.exe', "toolchainImageID=$DevImageID", "sourceRevision=$controllerSourceRevision", "completedAtUtc=$([DateTime]::UtcNow.ToString('o'))"), [System.Text.UTF8Encoding]::new($false))
-                Move-Item -LiteralPath $manifestTemporaryPath -Destination $manifestPath -Force
-            } finally {
-                if ($temporaryDirectory -and (Test-Path -LiteralPath $temporaryDirectory)) { Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-EparDigestForFiles {
+    param([Parameter(Mandatory = $true)][System.Collections.IEnumerable] $Files)
+    $material = [System.Text.StringBuilder]::new()
+    foreach ($file in @($Files | Sort-Object FullName -Unique)) {
+        if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "native-controller input must not be a reparse point: $($file.FullName)" }
+        $relative = $file.FullName.Substring($RepoRoot.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
+        [void] $material.AppendLine($relative)
+        [void] $material.AppendLine((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())
+    }
+    return Get-EparSHA256Text -Text $material.ToString()
+}
+
+function Get-EparNativeSourceDigest {
+    $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+    foreach ($root in @('cmd', 'internal')) {
+        $path = Join-Path $RepoRoot $root
+        if (Test-Path -LiteralPath $path -PathType Container) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $path -Filter '*.go' -File -Recurse | Where-Object { $_.Name -notlike '*_test.go' })) { $files.Add($file) }
+        }
+    }
+    foreach ($moduleFile in @('go.mod', 'go.sum')) {
+        $path = Join-Path $RepoRoot $moduleFile
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "required native-controller source input is missing: $moduleFile" }
+        $files.Add((Get-Item -LiteralPath $path))
+    }
+    # Include declared go:embed inputs without making Git metadata part of the identity.
+    foreach ($source in @($files | Where-Object { $_.Extension -eq '.go' })) {
+        foreach ($match in [regex]::Matches((Get-Content -Raw -LiteralPath $source.FullName), '(?m)^\s*//go:embed\s+(.+)$')) {
+            foreach ($pattern in ($match.Groups[1].Value -split '\s+')) {
+                if (-not $pattern -or $pattern.StartsWith('#')) { continue }
+                foreach ($embedded in @(Get-ChildItem -Path (Join-Path $source.DirectoryName $pattern) -File -ErrorAction Stop)) { $files.Add($embedded) }
             }
         }
-    } finally {
-        $buildLock.Dispose()
     }
-}
-if ($ManageGoCache) {
-    $configuredGoCacheLimit = ((& $binary storage effective-go-cache-limit --project-root $RepoRoot) -join '').Trim()
-    $parsedConfiguredGoCacheLimit = [uint64] 0
-    if ($LASTEXITCODE -ne 0 -or -not [uint64]::TryParse($configuredGoCacheLimit, [ref] $parsedConfiguredGoCacheLimit) -or $parsedConfiguredGoCacheLimit -eq 0) {
-        throw 'EPAR returned an invalid configured Go cache limit'
-    }
-    $GoCacheLimitBytes = $parsedConfiguredGoCacheLimit
-    Invoke-EparGoCacheLimit
+    return 'sha256:' + (Get-EparDigestForFiles -Files $files)
 }
 
-$leasePath = Join-Path $cacheRoot ("lease-native-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N'))
-$processStartUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
-[System.IO.File]::WriteAllLines($leasePath, @(
-    'schemaVersion=1',
-    "host=$([Environment]::MachineName)",
-    "pid=$PID",
-    "processStartUtc=$processStartUtc",
-    "startedAtUtc=$([DateTime]::UtcNow.ToString('o'))"
-), [System.Text.UTF8Encoding]::new($false))
+function Get-EparNativeBuildDigest {
+    param(
+        [Parameter(Mandatory = $true)][string] $SourceDigest,
+        [Parameter(Mandatory = $true)][ValidateSet('local-go', 'docker')][string] $Builder,
+        [Parameter(Mandatory = $true)][string] $Toolchain
+    )
+    $buildFiles = @(
+        Get-Item -LiteralPath $MyInvocation.ScriptName
+        Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'scripts\docker'), (Join-Path $RepoRoot 'scripts\bootstrap-trust') -File -Recurse
+    )
+    $material = [System.Text.StringBuilder]::new()
+    [void] $material.AppendLine('native-controller-build-recipe-v3')
+    [void] $material.AppendLine($SourceDigest)
+    [void] $material.AppendLine("target=$TargetOS/$TargetArch")
+    [void] $material.AppendLine("builder=$Builder")
+    [void] $material.AppendLine("toolchain=$Toolchain")
+    [void] $material.AppendLine('CGO_ENABLED=0')
+    [void] $material.AppendLine('go build -trimpath -ldflags sourceRevision/sourceDigest/buildDigest')
+    [void] $material.AppendLine('buildInputs=' + (Get-EparDigestForFiles -Files $buildFiles))
+    return 'sha256:' + (Get-EparSHA256Text -Text $material.ToString())
+}
 
-$previousNative = $env:EPAR_NATIVE_CONTROLLER
-$previousControllerOS = $env:EPAR_CONTROLLER_HOST_OS
-$previousHostName = $env:EPAR_HOST_NAME
-$previousHints = $env:DOCKER_CLI_HINTS
-$controllerCommand = if ($EparArgs -and $EparArgs.Count -gt 0) { [string]$EparArgs[0] } else { 'start' }
+function Get-EparSourceRevisionDiagnostic {
+    param([Parameter(Mandatory = $true)][string] $SourceDigest)
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $commitExitCode = -1
+        $statusExitCode = -1
+        $commit = ''
+        $status = @()
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $commit = ((& git -C $RepoRoot rev-parse --verify HEAD 2>$null) -join '').Trim()
+            $commitExitCode = $LASTEXITCODE
+            if ($commitExitCode -eq 0 -and $commit -match '^[0-9a-f]{40}$') {
+                $status = @(& git -C $RepoRoot status --porcelain=v1 --untracked-files=all 2>$null)
+                $statusExitCode = $LASTEXITCODE
+            }
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($commitExitCode -eq 0 -and $commit -match '^[0-9a-f]{40}$' -and $statusExitCode -eq 0) {
+            return "git:$commit`:$(if ($status.Count -eq 0) { 'clean' } else { 'dirty' })"
+        }
+    }
+    return $SourceDigest
+}
+
+function Get-EparLocalGoToolchain {
+    param([Parameter(Mandatory = $true)][string] $Candidate)
+    $command = Get-Command $Candidate -ErrorAction SilentlyContinue
+    if ($null -eq $command -or $command.CommandType -notin @('Application', 'ExternalScript')) { throw "Go not found or not runnable: $Candidate" }
+    $resolved = [System.IO.Path]::GetFullPath($command.Source)
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "Go executable is not a regular file: $resolved" }
+    $version = ((& $resolved version) -join ' ').Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $version) { throw "Go not found or not runnable: $Candidate" }
+    $hash = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
+    return [pscustomobject]@{ Path = $resolved; Identity = "sha256:$hash;$version" }
+}
+
+function Read-EparNativeControllerReceipt {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $fields = @{}
+    try {
+        foreach ($line in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+            $separator = $line.IndexOf('=')
+            if ($separator -le 0) { return $null }
+            $key = $line.Substring(0, $separator)
+            if ($fields.ContainsKey($key)) { return $null }
+            $fields[$key] = $line.Substring($separator + 1)
+        }
+    } catch { return $null }
+    $required = @('schemaVersion', 'artifactKind', 'distribution', 'targetOS', 'targetArch', 'executable', 'sourceDigest', 'buildDigest', 'binaryDigest', 'sourceRevision', 'builder', 'toolchain', 'completedAtUtc')
+    if ($fields.Count -ne $required.Count -or @($required | Where-Object { -not $fields.ContainsKey($_) }).Count -ne 0) { return $null }
+    if ($fields.schemaVersion -ne '3' -or $fields.artifactKind -ne 'native-controller' -or $fields.distribution -ne 'source' -or $fields.targetOS -ne $TargetOS -or $fields.targetArch -ne $TargetArch -or $fields.executable -ne $NativeExecutable) { return $null }
+    if ($fields.sourceDigest -notmatch '^sha256:[0-9a-f]{64}$' -or $fields.buildDigest -notmatch '^sha256:[0-9a-f]{64}$' -or $fields.binaryDigest -notmatch '^sha256:[0-9a-f]{64}$' -or [string]::IsNullOrWhiteSpace($fields.sourceRevision) -or $fields.builder -notin @('local-go', 'docker') -or [string]::IsNullOrWhiteSpace($fields.toolchain)) { return $null }
+    $completedAt = [DateTime]::MinValue
+    if (-not [DateTime]::TryParse($fields.completedAtUtc, [ref] $completedAt)) { return $null }
+    return $fields
+}
+
+function Test-EparNativeControllerSlot {
+    param(
+        [Parameter(Mandatory = $true)][string] $Directory,
+        [string] $ExpectedSourceDigest = '',
+        [string] $ExpectedBuildDigest = '',
+        [switch] $SkipBuildDigestCheck
+    )
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return [pscustomobject]@{ Exists = $false; Owned = $false; Valid = $false; Reason = 'slot is missing'; Receipt = $null } }
+    $resolvedRoot = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot '.local\bin')).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $resolved = [System.IO.Path]::GetFullPath($Directory)
+    if ([System.IO.Path]::GetDirectoryName($resolved) -ne $resolvedRoot) { return [pscustomobject]@{ Exists = $true; Owned = $false; Valid = $false; Reason = 'slot is outside the exact cache root'; Receipt = $null } }
+    $item = Get-Item -LiteralPath $resolved -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return [pscustomobject]@{ Exists = $true; Owned = $false; Valid = $false; Reason = 'slot is a reparse point'; Receipt = $null } }
+    $files = @(Get-ChildItem -LiteralPath $resolved -File -Force -ErrorAction Stop)
+    $directories = @(Get-ChildItem -LiteralPath $resolved -Directory -Force -ErrorAction Stop)
+    if ($directories.Count -ne 0 -or @($files | Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -ne 0) { return [pscustomobject]@{ Exists = $true; Owned = $false; Valid = $false; Reason = 'slot has nested directories or reparse points'; Receipt = $null } }
+    $allowed = @($NativeExecutable, $ReceiptName)
+    if (@($files | Where-Object { $_.Name -notin $allowed -and $_.Name -notmatch '^lease-native-[1-9][0-9]*-[0-9a-f]{32}\.txt$' }).Count -ne 0) { return [pscustomobject]@{ Exists = $true; Owned = $false; Valid = $false; Reason = 'slot has unknown files'; Receipt = $null } }
+    $receipt = Read-EparNativeControllerReceipt -Path (Join-Path $resolved $ReceiptName)
+    if ($null -eq $receipt) { return [pscustomobject]@{ Exists = $true; Owned = $false; Valid = $false; Reason = 'slot receipt is absent or invalid'; Receipt = $null } }
+    $binaryPath = Join-Path $resolved $NativeExecutable
+    if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $false; Reason = 'slot executable is missing'; Receipt = $receipt } }
+    $binaryDigest = 'sha256:' + (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($binaryDigest -cne $receipt.binaryDigest) { return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $false; Reason = 'slot executable digest does not match its receipt'; Receipt = $receipt } }
+    if (-not $SkipBuildDigestCheck -and (Get-EparNativeBuildDigest -SourceDigest $receipt.sourceDigest -Builder $receipt.builder -Toolchain $receipt.toolchain) -cne $receipt.buildDigest) { return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $false; Reason = 'slot build digest does not match its receipt'; Receipt = $receipt } }
+    if ($ExpectedSourceDigest -and $receipt.sourceDigest -cne $ExpectedSourceDigest) { return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $false; Reason = 'source digest differs from this checkout'; Receipt = $receipt } }
+    if ($ExpectedBuildDigest -and $receipt.buildDigest -cne $ExpectedBuildDigest) { return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $false; Reason = 'build identity differs from the selected compiler'; Receipt = $receipt } }
+    return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $true; Reason = ''; Receipt = $receipt }
+}
+
+function Write-EparNativeControllerReceipt {
+    param([Parameter(Mandatory = $true)][string] $Directory, [Parameter(Mandatory = $true)][string] $SourceDigest, [Parameter(Mandatory = $true)][string] $BuildDigest, [Parameter(Mandatory = $true)][string] $Builder, [Parameter(Mandatory = $true)][string] $Toolchain)
+    $binaryPath = Join-Path $Directory $NativeExecutable
+    $binaryDigest = 'sha256:' + (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sourceRevisionDiagnostic = Get-EparSourceRevisionDiagnostic -SourceDigest $SourceDigest
+    [System.IO.File]::WriteAllLines((Join-Path $Directory $ReceiptName), @('schemaVersion=3', 'artifactKind=native-controller', 'distribution=source', "targetOS=$TargetOS", "targetArch=$TargetArch", "executable=$NativeExecutable", "sourceDigest=$SourceDigest", "buildDigest=$BuildDigest", "binaryDigest=$binaryDigest", "sourceRevision=$sourceRevisionDiagnostic", "builder=$Builder", "toolchain=$Toolchain", "completedAtUtc=$([DateTime]::UtcNow.ToString('o'))"), [System.Text.UTF8Encoding]::new($false))
+}
+
+function Move-EparNativeControllerCandidateIntoCurrent {
+    param([Parameter(Mandatory = $true)][string] $CacheRoot, [Parameter(Mandatory = $true)][string] $CurrentSlot, [Parameter(Mandatory = $true)][string] $OldSlot, [Parameter(Mandatory = $true)][string] $Candidate)
+    foreach ($slot in @($CurrentSlot, $OldSlot)) {
+        $state = Test-EparNativeControllerSlot -Directory $slot
+        if ($state.Exists -and -not $state.Owned) { throw "refusing to replace native-controller slot $($slot): $($state.Reason)" }
+        if ($state.Exists -and (Test-EparNativeControllerLeaseActive -Directory $slot)) { throw "refusing to replace native-controller slot $slot while an EPAR controller lease is active" }
+    }
+    if (Test-Path -LiteralPath $OldSlot) { Remove-Item -LiteralPath $OldSlot -Recurse -Force -ErrorAction Stop }
+    $movedCurrent = $false
+    try {
+        if (Test-Path -LiteralPath $CurrentSlot) {
+            Move-Item -LiteralPath $CurrentSlot -Destination $OldSlot -ErrorAction Stop
+            $movedCurrent = $true
+        }
+        Move-Item -LiteralPath $Candidate -Destination $CurrentSlot -ErrorAction Stop
+    } catch {
+        if ($movedCurrent -and -not (Test-Path -LiteralPath $CurrentSlot) -and (Test-Path -LiteralPath $OldSlot)) {
+            Move-Item -LiteralPath $OldSlot -Destination $CurrentSlot -ErrorAction SilentlyContinue
+        }
+        throw "could not promote the validated native controller. The prior slot was restored when possible: $($_.Exception.Message)"
+    }
+}
+
+# v3: validate the local receipt before any Docker acquisition. This lets a
+# valid cached controller run offline and prevents %LOCALAPPDATA%\go-build use.
+$sourceDigest = Get-EparNativeSourceDigest
+$cacheRoot = Join-Path $RepoRoot '.local\bin'
+$currentSlot = Join-Path $cacheRoot "$TargetOS-$TargetArch"
+$oldSlot = Join-Path $cacheRoot "$TargetOS-$TargetArch-old"
+$buildLockPath = Join-Path $cacheRoot ".native-controller-$TargetOS-$TargetArch.lock"
+New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
+$selectedSlot = $currentSlot
+
+if ($UseOld) {
+    $oldState = Test-EparNativeControllerSlot -Directory $oldSlot -SkipBuildDigestCheck
+    if (-not $oldState.Valid) { throw "The previous native controller cannot be used: $($oldState.Reason)" }
+    Write-Warning "Using the previous native controller from $oldSlot. It is not checked against the current source checkout."
+    $selectedSlot = $oldSlot
+} else {
+    $toolchain = ''
+    if ($Backend -eq 'local-go') {
+        $localToolchain = Get-EparLocalGoToolchain -Candidate $GoBin
+        $toolchain = $localToolchain.Identity
+    } else {
+        $toolchain = Get-EparDockerImageID -Reference $DevImage
+    }
+    $expectedBuildDigest = if ($toolchain) { Get-EparNativeBuildDigest -SourceDigest $sourceDigest -Builder $Backend -Toolchain $toolchain } else { '' }
+    $currentState = Test-EparNativeControllerSlot -Directory $currentSlot -ExpectedSourceDigest $sourceDigest -ExpectedBuildDigest $expectedBuildDigest
+    if (-not $currentState.Valid) {
+        Write-Warning "Native controller rebuild required: $($currentState.Reason)"
+        $buildLock = Enter-EparStableNativeControllerBuildLock -Path $buildLockPath
+        try {
+            if ($Backend -eq 'docker') {
+                if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'docker command not found. Install Docker and make sure it is available on PATH.' }
+                $previousDevImageID = Get-EparDockerImageID -Reference $DevImage
+                $goToolchain = Resolve-EparGoToolchainImage -PreviousDevImageID $previousDevImageID
+                if ((Invoke-EparDockerBuild) -ne 0) { exit $LASTEXITCODE }
+                $toolchain = Get-EparDockerImageID -Reference $DevImage
+                if (-not $toolchain) { throw "could not resolve the immutable Docker toolchain image ID for $DevImage" }
+                Write-EparBootstrapAcquisitionJournal -Phase 'toolchain-built' -PreviousGoImageID $goToolchain.PreviousImageID -ResolvedGoImageID $goToolchain.ResolvedImageID -ResolvedDevImageID $toolchain -PreviousDevImageID $previousDevImageID
+                if ($ManageGoCache) { Initialize-EparGoCacheVolume -Name $GomodVolume -Role 'gomod'; Initialize-EparGoCacheVolume -Name $GocacheVolume -Role 'gobuild'; Invoke-EparGoCacheLimit }
+            } else {
+                $localToolchain = Get-EparLocalGoToolchain -Candidate $GoBin
+                $toolchain = $localToolchain.Identity
+            }
+            $expectedBuildDigest = Get-EparNativeBuildDigest -SourceDigest $sourceDigest -Builder $Backend -Toolchain $toolchain
+            $currentState = Test-EparNativeControllerSlot -Directory $currentSlot -ExpectedSourceDigest $sourceDigest -ExpectedBuildDigest $expectedBuildDigest
+            if (-not $currentState.Valid) {
+                $candidate = Join-Path $cacheRoot ('.build-' + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $candidate | Out-Null
+                $buildLogDirectory = Join-Path $RepoRoot 'work\logs'
+                New-Item -ItemType Directory -Force -Path $buildLogDirectory | Out-Null
+                $buildLogPath = Join-Path $buildLogDirectory 'epar-native-controller-build.log'
+                [System.IO.File]::WriteAllLines($buildLogPath, @("EPAR native-controller build started at $([DateTime]::UtcNow.ToString('o'))", "Builder: $Backend", "Toolchain: $toolchain", "Target: $TargetOS/$TargetArch", ''), [System.Text.UTF8Encoding]::new($false))
+                Write-Output "Native controller build log: $buildLogPath"
+                try {
+                    $candidateBinary = Join-Path $candidate $NativeExecutable
+                    $ldflags = "-X main.sourceRevision=$sourceDigest -X main.sourceDigest=$sourceDigest -X main.buildDigest=$expectedBuildDigest"
+                    if ($Backend -eq 'docker') {
+                        $trust = Initialize-EparBootstrapBuildTrust -ProjectRoot $RepoRoot -Arguments $EparArgs
+                        $output = @(& docker run --rm -e CGO_ENABLED=0 -e GOOS=windows -e GOARCH=amd64 -e GOTOOLCHAIN=local -e SSL_CERT_FILE=/run/epar-bootstrap-ca.pem -v "$($RepoRoot):/src:ro" -v "$($candidate):/out" -v "$($GomodVolume):/go/pkg/mod" -v "$($GocacheVolume):/root/.cache/go-build" -v "$($trust.BundlePath):/run/epar-bootstrap-ca.pem:ro" -w /src $DevImage go build -trimpath -ldflags $ldflags -o "/out/$NativeExecutable" ./cmd/ephemeral-action-runner 2>&1)
+                    } else {
+                        $oldCgo = $env:CGO_ENABLED; $oldOS = $env:GOOS; $oldArch = $env:GOARCH; $oldGoCache = $env:GOCACHE; $oldGoTmp = $env:GOTMPDIR
+                        try {
+                            $env:CGO_ENABLED = '0'; $env:GOOS = $TargetOS; $env:GOARCH = $TargetArch
+                            $projectGoCache = Join-Path $RepoRoot '.local\go-build-cache'
+                            $projectGoTmp = Join-Path $RepoRoot '.local\go-build-tmp'
+                            New-Item -ItemType Directory -Force -Path $projectGoCache, $projectGoTmp | Out-Null
+                            $env:GOCACHE = $projectGoCache; $env:GOTMPDIR = $projectGoTmp
+                            $output = @(& $localToolchain.Path build -trimpath -ldflags $ldflags -o $candidateBinary ./cmd/ephemeral-action-runner 2>&1)
+                        } finally {
+                            if ($null -eq $oldCgo) { Remove-Item Env:CGO_ENABLED -ErrorAction SilentlyContinue } else { $env:CGO_ENABLED = $oldCgo }
+                            if ($null -eq $oldOS) { Remove-Item Env:GOOS -ErrorAction SilentlyContinue } else { $env:GOOS = $oldOS }
+                            if ($null -eq $oldArch) { Remove-Item Env:GOARCH -ErrorAction SilentlyContinue } else { $env:GOARCH = $oldArch }
+                            if ($null -eq $oldGoCache) { Remove-Item Env:GOCACHE -ErrorAction SilentlyContinue } else { $env:GOCACHE = $oldGoCache }
+                            if ($null -eq $oldGoTmp) { Remove-Item Env:GOTMPDIR -ErrorAction SilentlyContinue } else { $env:GOTMPDIR = $oldGoTmp }
+                        }
+                    }
+                    $buildExitCode = $LASTEXITCODE
+                    $buildTranscript = $output -join [Environment]::NewLine
+                    if ($buildTranscript) { [System.IO.File]::AppendAllText($buildLogPath, $buildTranscript + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false)) }
+                    if ($buildExitCode -ne 0) {
+                        if ($Backend -eq 'docker') { Invoke-EparTLSFailureDiagnostic -Transcript $buildTranscript -LogPath $buildLogPath }
+                        throw ('native-controller build failed; see ' + $buildLogPath + [Environment]::NewLine + $buildTranscript)
+                    }
+                    if (-not (Test-Path -LiteralPath $candidateBinary -PathType Leaf)) { throw 'native EPAR build completed without producing the expected Windows binary' }
+                    Write-EparNativeControllerReceipt -Directory $candidate -SourceDigest $sourceDigest -BuildDigest $expectedBuildDigest -Builder $Backend -Toolchain $toolchain
+                    $candidateState = Test-EparNativeControllerSlot -Directory $candidate -ExpectedSourceDigest $sourceDigest -ExpectedBuildDigest $expectedBuildDigest
+                    if (-not $candidateState.Valid) { throw "native-controller candidate failed validation: $($candidateState.Reason)" }
+                    Move-EparNativeControllerCandidateIntoCurrent -CacheRoot $cacheRoot -CurrentSlot $currentSlot -OldSlot $oldSlot -Candidate $candidate
+                } finally {
+                    if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        } finally { $buildLock.Dispose() }
+    }
+}
+
+$binary = Join-Path $selectedSlot $NativeExecutable
+$leasePath = $null
+$launchLock = Enter-EparStableNativeControllerBuildLock -Path $buildLockPath
+try {
+    # Revalidate and publish the runtime lease while holding the same exclusive
+    # gate used by promotion. A replacer can observe either no launch or the
+    # completed lease, never the gap between validation and lease creation.
+    $selectedState = Test-EparNativeControllerSlot -Directory $selectedSlot -ExpectedSourceDigest $(if ($UseOld) { '' } else { $sourceDigest }) -ExpectedBuildDigest $(if ($UseOld) { '' } else { $expectedBuildDigest }) -SkipBuildDigestCheck:$UseOld
+    if (-not $selectedState.Valid) { throw "The selected native controller cannot be executed: $($selectedState.Reason)" }
+    $leasePath = Join-Path $selectedSlot ("lease-native-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N'))
+    $processStartUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    [System.IO.File]::WriteAllLines($leasePath, @('schemaVersion=1', "host=$([Environment]::MachineName)", "pid=$PID", "processStartUtc=$processStartUtc", "startedAtUtc=$([DateTime]::UtcNow.ToString('o'))"), [System.Text.UTF8Encoding]::new($false))
+} catch {
+    if ($leasePath) { Remove-Item -LiteralPath $leasePath -Force -ErrorAction SilentlyContinue }
+    throw
+} finally {
+    $launchLock.Dispose()
+}
+$previousNative = $env:EPAR_NATIVE_CONTROLLER; $previousControllerOS = $env:EPAR_CONTROLLER_HOST_OS; $previousSlot = $env:EPAR_CONTROLLER_SLOT
+$controllerCommand = if ($EparArgs.Count) { [string]$EparArgs[0] } else { 'start' }
 $bridge = if ($controllerCommand -eq 'init') { Start-EparHostTrustBridge -ProjectRoot $RepoRoot -Command $controllerCommand -Arguments $EparArgs } else { $null }
 try {
-    $env:EPAR_NATIVE_CONTROLLER = '1'
-    $env:EPAR_CONTROLLER_HOST_OS = 'windows'
-    if (-not $env:EPAR_HOST_NAME) {
-        $env:EPAR_HOST_NAME = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [System.Net.Dns]::GetHostName() }
+    $env:EPAR_NATIVE_CONTROLLER = '1'; $env:EPAR_CONTROLLER_HOST_OS = 'windows'; $env:EPAR_CONTROLLER_SLOT = if ($UseOld) { 'old' } else { 'current' }
+    if (-not $UseOld -and $Backend -eq 'docker' -and $ManageGoCache) {
+        $configuredGoCacheLimit = ((& $binary storage effective-go-cache-limit --project-root $RepoRoot) -join '').Trim()
+        $parsedConfiguredGoCacheLimit = [uint64] 0
+        if ($LASTEXITCODE -ne 0 -or -not [uint64]::TryParse($configuredGoCacheLimit, [ref] $parsedConfiguredGoCacheLimit) -or $parsedConfiguredGoCacheLimit -eq 0) {
+            throw 'EPAR returned an invalid configured Go cache limit'
+        }
+        $GoCacheLimitBytes = $parsedConfiguredGoCacheLimit
+        Invoke-EparGoCacheLimit
     }
-    if (-not $env:DOCKER_CLI_HINTS) { $env:DOCKER_CLI_HINTS = 'false' }
     & $binary @EparArgs
     $nativeExitCode = $LASTEXITCODE
-    if ($nativeExitCode -eq 0 -and $controllerCommand -eq 'init') {
-        Complete-EparHostTrustInit -ProjectRoot $RepoRoot -Bridge $bridge
-    }
+    if ($nativeExitCode -eq 0 -and $controllerCommand -eq 'init') { Complete-EparHostTrustInit -ProjectRoot $RepoRoot -Bridge $bridge }
     exit $nativeExitCode
 } finally {
     Stop-EparHostTrustBridge -Bridge $bridge
     Remove-Item -LiteralPath $leasePath -Force -ErrorAction SilentlyContinue
     if ($null -eq $previousNative) { Remove-Item Env:EPAR_NATIVE_CONTROLLER -ErrorAction SilentlyContinue } else { $env:EPAR_NATIVE_CONTROLLER = $previousNative }
     if ($null -eq $previousControllerOS) { Remove-Item Env:EPAR_CONTROLLER_HOST_OS -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_HOST_OS = $previousControllerOS }
-    if ($null -eq $previousHostName) { Remove-Item Env:EPAR_HOST_NAME -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_NAME = $previousHostName }
-    if ($null -eq $previousHints) { Remove-Item Env:DOCKER_CLI_HINTS -ErrorAction SilentlyContinue } else { $env:DOCKER_CLI_HINTS = $previousHints }
+    if ($null -eq $previousSlot) { Remove-Item Env:EPAR_CONTROLLER_SLOT -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_SLOT = $previousSlot }
 }

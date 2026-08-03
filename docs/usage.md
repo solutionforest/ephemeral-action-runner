@@ -19,23 +19,13 @@ EPAR works with any Docker installation that supports the selected provider.
 
 ## Start a pool
 
-On macOS, Linux, WSL, or Git Bash, run:
+On macOS, Linux, WSL, Git Bash, or native Windows PowerShell, run:
 
-```bash
+```text
 ./start
 ```
 
-On native Windows PowerShell, run:
-
-```powershell
-.\start.ps1
-```
-
-The wrapper uses local Go when available, otherwise it uses Docker to build and cache a native controller under `.local/bin`. See [Running EPAR Without Installing Go](advanced/no-go-install.md) for the fallback details. Direct `go run` commands are development and diagnostic equivalents rather than the normal operator interface:
-
-```bash
-go run ./cmd/ephemeral-action-runner start
-```
+PowerShell resolves `./start` to EPAR's internal Windows wrapper. Do not use bare `start` in PowerShell because that name is the `Start-Process` alias. The wrapper uses local Go when available, otherwise it uses Docker, to build a native controller under `.local/bin/<os>-<arch>/`; it then executes that project-local controller directly. See [Running EPAR Without Installing Go](advanced/no-go-install.md) for the fallback details.
 
 When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group. The runner-group list orders GitHub's Default group first, hides blocked groups and policy details initially, and lets you reveal either from the menu. The provider list shows every provider with its prerequisite status and refuses unavailable selections. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share the Catthehacker image-selection and estimate flow, but Docker Sandboxes limits source selection to the `full-latest` and `act-latest` profiles proven to include its required private Docker daemon and runtime closure. Docker Container and WSL continue to offer specialized and custom tags. The wizard writes empty custom-install scripts, weekly updates at 07:00 local time, and host-trust overlay for applicable providers; edit the generated config afterward to change those advanced settings. Later option lists use `0` to go back, text prompts use `/back`, and a final provider-neutral review shows the applicable artifact estimate before one creation decision. Running `./start init` exits after writing, while an embedded first run continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
 
@@ -55,17 +45,10 @@ Pass a config path and an instance count through the wrapper:
 ./start --config .local/ci.yml --instances 2
 ```
 
-Development/diagnostic equivalent:
-
-```bash
-go run ./cmd/ephemeral-action-runner start --config .local/ci.yml --instances 2
-```
-
-On Windows PowerShell, use backslash paths when that is clearer. The second command is the development/diagnostic equivalent:
+On Windows PowerShell, backslash paths may be clearer while the command remains the same:
 
 ```powershell
-.\start.ps1 --config .local\ci.yml --instances 2
-go run ./cmd/ephemeral-action-runner start --config .local\ci.yml --instances 2
+./start --config .local\ci.yml --instances 2
 ```
 
 If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.instances` from the selected config. EPAR resolves configuration from `--config`, `EPAR_CONFIG`, `.local/config.yml`, then `~/.config/ephemeral-action-runner/config.yml`. Tracked files in `configs/` are examples; keep App values and key paths in an ignored local file. See [Configuration](configuration.md) for every setting and [Runner Group Security](runner-groups.md) before broadening repository access.

@@ -89,7 +89,7 @@ dockerSandboxes:
 3. Prewarm the selected template without GitHub registration:
 
    ```powershell
-   .\start.ps1 pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
+   ./start pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
    ```
 
 4. Start the pool with `./start`. EPAR reuses the verified imported template without a registry check until the configured update schedule is due; local input changes and missing templates still rebuild immediately.

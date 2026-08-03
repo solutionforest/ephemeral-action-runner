@@ -85,6 +85,57 @@ func TestCollectNativeRecognizesStableControllerLayout(t *testing.T) {
 	}
 }
 
+func TestCollectNativeIgnoresExactPlatformBuildLock(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, ".native-controller-windows-amd64.lock"), nil)
+	artifacts, warnings := collectNative(nativeOptions{Root: root})
+	if len(artifacts) != 0 || len(warnings) != 0 {
+		t.Fatalf("collectNative() artifacts=%+v warnings=%v", artifacts, warnings)
+	}
+}
+
+func TestCollectNativeRecognizesV3PlatformSlots(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	completed := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	writeNativeSlot(t, root, "windows-amd64", completed, false)
+	writeNativeSlot(t, root, "windows-amd64-old", completed.Add(-time.Hour), true)
+
+	artifacts, warnings := collectNative(nativeOptions{Root: root})
+	if len(warnings) != 0 || len(artifacts) != 2 {
+		t.Fatalf("collectNative() artifacts=%+v warnings=%v", artifacts, warnings)
+	}
+	current := findArtifact(t, artifacts, "native-controller-slot:windows-amd64:sha256:"+repeatedHex("2"))
+	if !current.Current || !hasProtection(current, storage.ProtectionCurrent) || current.SupersededAt != nil {
+		t.Fatalf("current slot = %+v", current)
+	}
+	old := findArtifact(t, artifacts, "native-controller-slot:windows-amd64-old:sha256:"+repeatedHex("2"))
+	if old.Current || old.SupersededAt == nil || !hasProtection(old, storage.ProtectionLease) {
+		t.Fatalf("old slot = %+v", old)
+	}
+}
+
+func TestCollectNativeRejectsInvalidV3Receipt(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	slot := writeNativeSlot(t, root, "linux-amd64", time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC), false)
+	mustWriteFile(t, filepath.Join(slot, "controller.receipt"), []byte("schemaVersion=3\nartifactKind=native-controller\ndistribution=prebuilt\ntargetOS=linux\ntargetArch=amd64\nexecutable=ephemeral-action-runner\nsourceDigest=sha256:"+repeatedHex("1")+"\nbuildDigest=sha256:"+repeatedHex("2")+"\nbinaryDigest=sha256:"+repeatedHex("3")+"\nsourceRevision=unknown\nbuilder=local-go\ntoolchain=go1.26\ncompletedAtUtc=2026-08-04T12:00:00Z\n"))
+	artifacts, warnings := collectNative(nativeOptions{Root: root})
+	if len(artifacts) != 1 || len(warnings) != 1 || artifacts[0].Ownership.Kind != storage.OwnershipUnknown || !hasProtection(artifacts[0], storage.ProtectionUncertain) {
+		t.Fatalf("collectNative() artifacts=%+v warnings=%v", artifacts, warnings)
+	}
+}
+
+func TestParseControllerReceiptRejectsUnexpectedFields(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "controller.receipt")
+	mustWriteFile(t, path, []byte("schemaVersion=3\nartifactKind=native-controller\ndistribution=source\ntargetOS=linux\ntargetArch=amd64\nexecutable=ephemeral-action-runner\nsourceDigest=sha256:"+repeatedHex("1")+"\nbuildDigest=sha256:"+repeatedHex("2")+"\nbinaryDigest=sha256:"+repeatedHex("3")+"\nsourceRevision=unknown\nbuilder=local-go\ntoolchain=go1.26\ncompletedAtUtc=2026-08-04T12:00:00Z\nextra=value\n"))
+	if _, err := parseControllerReceipt(path); err == nil {
+		t.Fatal("parseControllerReceipt() accepted an unexpected field")
+	}
+}
+
 func TestCollectNativeRejectsSymlinkedRevision(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -161,4 +212,25 @@ func writeNativeRevision(t *testing.T, root, key string, completed time.Time, le
 		mustWriteFile(t, filepath.Join(directory, "lease.123.abcdef"), []byte("schemaVersion=1\n"))
 	}
 	return binary
+}
+
+func writeNativeSlot(t *testing.T, root, name string, completed time.Time, lease bool) string {
+	t.Helper()
+	target, _, recognized := nativeSlotTargetForName(name)
+	if !recognized {
+		t.Fatalf("unrecognized native slot %q", name)
+	}
+	directory := filepath.Join(root, name)
+	executableName := "ephemeral-action-runner"
+	if target.os == "windows" {
+		executableName += ".exe"
+	}
+	binary := []byte("binary:" + name)
+	mustWriteFile(t, filepath.Join(directory, executableName), binary)
+	receipt := fmt.Sprintf("schemaVersion=3\nartifactKind=native-controller\ndistribution=source\ntargetOS=%s\ntargetArch=%s\nexecutable=%s\nsourceDigest=sha256:%s\nbuildDigest=sha256:%s\nbinaryDigest=%s\nsourceRevision=unknown\nbuilder=local-go\ntoolchain=go1.26\ncompletedAtUtc=%s\n", target.os, target.arch, executableName, repeatedHex("1"), repeatedHex("2"), hashBytes(binary), completed.Format(time.RFC3339Nano))
+	mustWriteFile(t, filepath.Join(directory, "controller.receipt"), []byte(receipt))
+	if lease {
+		mustWriteFile(t, filepath.Join(directory, "lease-native-123"), []byte("lease"))
+	}
+	return directory
 }

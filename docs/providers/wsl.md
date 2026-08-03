@@ -54,7 +54,7 @@ EPAR imports each runner from `provider.sourceImage`, enables systemd in the reu
 ## Verification
 
 ```powershell
-.\start.ps1 pool verify --instances 1 --cleanup
+./start pool verify --instances 1 --cleanup
 ```
 
 For a lean rootfs source, export Ubuntu 24.04 once before building:

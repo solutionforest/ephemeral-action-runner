@@ -15,9 +15,19 @@ import (
 )
 
 var (
-	cacheKeyPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	leasePattern    = regexp.MustCompile(`^lease(?:[.-]).+$`)
+	cacheKeyPattern          = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	leasePattern             = regexp.MustCompile(`^lease(?:[.-]).+$`)
+	digestPattern            = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	platformBuildLockPattern = regexp.MustCompile(`^\.native-controller-(?:windows|linux|darwin)-(?:amd64|arm64)\.lock$`)
 )
+
+var nativeSlotTargets = map[string]nativeSlotTarget{
+	"windows-amd64": {os: "windows", arch: "amd64"},
+	"linux-amd64":   {os: "linux", arch: "amd64"},
+	"linux-arm64":   {os: "linux", arch: "arm64"},
+	"darwin-amd64":  {os: "darwin", arch: "amd64"},
+	"darwin-arm64":  {os: "darwin", arch: "arm64"},
+}
 
 type nativeOptions struct {
 	Root              string
@@ -30,6 +40,16 @@ type nativeRevision struct {
 	key       string
 	completed time.Time
 	binary    storage.Target
+}
+
+type nativeSlotTarget struct {
+	os   string
+	arch string
+}
+
+type nativeSlot struct {
+	artifact storage.Artifact
+	binary   storage.Target
 }
 
 func collectNative(options nativeOptions) ([]storage.Artifact, []string) {
@@ -62,6 +82,7 @@ func collectNative(options nativeOptions) ([]storage.Artifact, []string) {
 	}
 
 	var revisions []nativeRevision
+	var slots []nativeSlot
 	var artifacts []storage.Artifact
 	stable, stableNames, stableCurrentMatch, stableFound, stableErr := inspectStableNativeController(rootTarget.Locator, currentExecutable)
 	if stableFound && stableErr == nil {
@@ -74,11 +95,34 @@ func collectNative(options nativeOptions) ([]storage.Artifact, []string) {
 			continue
 		}
 		path := filepath.Join(rootTarget.Locator, entry.Name())
+		if entry.Name() == ".native-controller.lock" || platformBuildLockPattern.MatchString(entry.Name()) {
+			info, lockErr := entry.Info()
+			if lockErr == nil && !entry.IsDir() && info.Mode().IsRegular() && !isRedirect(info) && info.Size() == 0 {
+				continue
+			}
+		}
 		info, infoErr := entry.Info()
 		if infoErr != nil || isRedirect(info) {
 			artifact := unknownEntryArtifact("native-controller", path, "", entry.IsDir(), storage.ArtifactOther, infoErr)
 			artifacts = append(artifacts, artifact)
 			warnings = append(warnings, fmt.Sprintf("native-controller entry %q is unsafe or unreadable", entry.Name()))
+			continue
+		}
+		if target, old, recognized := nativeSlotTargetForName(entry.Name()); recognized {
+			if !entry.IsDir() {
+				artifact := unknownEntryArtifact("native-controller-slot", path, "", false, storage.ArtifactNativeControllerRevision, fmt.Errorf("platform slot is not a directory"))
+				artifacts = append(artifacts, artifact)
+				warnings = append(warnings, fmt.Sprintf("native-controller platform slot %q remains ownership-unknown: is not a directory", entry.Name()))
+				continue
+			}
+			slot, slotErr := inspectNativeSlot(path, entry.Name(), target, old)
+			if slotErr != nil {
+				artifact := unknownEntryArtifact("native-controller-slot", path, "", true, storage.ArtifactNativeControllerRevision, slotErr)
+				artifacts = append(artifacts, artifact)
+				warnings = append(warnings, fmt.Sprintf("native-controller platform slot %q remains ownership-unknown: %v", entry.Name(), slotErr))
+				continue
+			}
+			slots = append(slots, slot)
 			continue
 		}
 		if !entry.IsDir() || !cacheKeyPattern.MatchString(entry.Name()) {
@@ -125,13 +169,39 @@ func collectNative(options nativeOptions) ([]storage.Artifact, []string) {
 			supersededAt := current.completed
 			revisions[index].artifact.SupersededAt = &supersededAt
 		}
-	} else if (currentKey != "" || currentExecutable.Identity != "") && !stableCurrentMatch {
+	} else if (currentKey != "" || currentExecutable.Identity != "") && !stableCurrentMatch && !nativeSlotMatchesExecutable(slots, currentExecutable) {
 		warnings = append(warnings, "explicit current native-controller identity did not match a recognized revision")
 	}
 	for _, revision := range revisions {
 		artifacts = append(artifacts, revision.artifact)
 	}
+	for _, slot := range slots {
+		artifacts = append(artifacts, slot.artifact)
+	}
 	return artifacts, warnings
+}
+
+func nativeSlotTargetForName(name string) (nativeSlotTarget, bool, bool) {
+	if target, ok := nativeSlotTargets[name]; ok {
+		return target, false, true
+	}
+	if !strings.HasSuffix(name, "-old") {
+		return nativeSlotTarget{}, false, false
+	}
+	target, ok := nativeSlotTargets[strings.TrimSuffix(name, "-old")]
+	return target, ok, ok
+}
+
+func nativeSlotMatchesExecutable(slots []nativeSlot, current storage.Target) bool {
+	if current.Identity == "" {
+		return false
+	}
+	for _, slot := range slots {
+		if slot.binary.Identity == current.Identity && slot.binary.Fingerprint == current.Fingerprint {
+			return true
+		}
+	}
+	return false
 }
 
 func inspectStableNativeController(root string, currentExecutable storage.Target) (storage.Artifact, map[string]bool, bool, bool, error) {
@@ -239,6 +309,157 @@ func parseStableManifest(path string) (map[string]string, error) {
 	sourceMatches := fields["sourceRevision"] == "unknown" || sourceFingerprint == fields["fingerprint"]
 	if !sourceMatches || !strings.HasPrefix(fields["toolchainImageID"], "sha256:") || !cacheKeyPattern.MatchString(strings.TrimPrefix(fields["toolchainImageID"], "sha256:")) {
 		return nil, fmt.Errorf("manifest source or toolchain identity is invalid")
+	}
+	return fields, nil
+}
+
+// inspectNativeSlot verifies the self-contained schema-v3 platform slot. The
+// receipt is deliberately strict so cleanup never claims ownership of a
+// partially copied, redirected, or otherwise unexpected directory.
+func inspectNativeSlot(path, slotName string, targetSpec nativeSlotTarget, old bool) (nativeSlot, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	var receiptPath, executableName string
+	var leaseNames []string
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return nativeSlot{}, err
+		}
+		if entry.IsDir() || !info.Mode().IsRegular() || isRedirect(info) {
+			return nativeSlot{}, fmt.Errorf("contains a directory, special file, or redirect at %q", entry.Name())
+		}
+		switch {
+		case entry.Name() == "controller.receipt":
+			receiptPath = filepath.Join(path, entry.Name())
+		case entry.Name() == "ephemeral-action-runner" || entry.Name() == "ephemeral-action-runner.exe":
+			if executableName != "" {
+				return nativeSlot{}, fmt.Errorf("contains multiple controller executables")
+			}
+			executableName = entry.Name()
+		case leasePattern.MatchString(entry.Name()):
+			leaseNames = append(leaseNames, entry.Name())
+		default:
+			return nativeSlot{}, fmt.Errorf("contains unexpected file %q", entry.Name())
+		}
+	}
+	if receiptPath == "" || executableName == "" {
+		return nativeSlot{}, fmt.Errorf("requires one controller.receipt and one controller executable")
+	}
+	fields, err := parseControllerReceipt(receiptPath)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	if fields["targetOS"] != targetSpec.os || fields["targetArch"] != targetSpec.arch || fields["executable"] != executableName {
+		return nativeSlot{}, fmt.Errorf("receipt identity does not match platform slot %q", slotName)
+	}
+	expectedExecutable := "ephemeral-action-runner"
+	if targetSpec.os == "windows" {
+		expectedExecutable += ".exe"
+	}
+	if executableName != expectedExecutable {
+		return nativeSlot{}, fmt.Errorf("receipt executable is invalid for target %s/%s", targetSpec.os, targetSpec.arch)
+	}
+	binaryPath := filepath.Join(path, executableName)
+	binaryDigest, _, err := hashFile(binaryPath)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	if binaryDigest != fields["binaryDigest"] {
+		return nativeSlot{}, fmt.Errorf("receipt binaryDigest does not match controller executable")
+	}
+	completed, err := time.Parse(time.RFC3339Nano, fields["completedAtUtc"])
+	if err != nil {
+		return nativeSlot{}, fmt.Errorf("receipt completedAtUtc is invalid")
+	}
+	target, err := storage.SnapshotFilesystemTarget(path)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	binary, err := storage.SnapshotFilesystemTarget(binaryPath)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	receiptDigest, _, err := hashFile(receiptPath)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	size, err := directoryBytes(path)
+	if err != nil {
+		return nativeSlot{}, err
+	}
+	id := "native-controller-slot:" + slotName + ":" + fields["buildDigest"]
+	artifact := storage.Artifact{
+		ID:             id,
+		SurfaceID:      ProjectSurfaceID,
+		Kind:           storage.ArtifactNativeControllerRevision,
+		RetentionGroup: "native-controller",
+		Target:         target,
+		Ownership: storage.Ownership{
+			Kind:     storage.OwnershipExact,
+			OwnerID:  id,
+			Evidence: "controller.receipt@" + receiptDigest,
+		},
+		SizeBytes: size,
+		CreatedAt: completed.UTC(),
+	}
+	if old {
+		supersededAt := completed.UTC()
+		artifact.SupersededAt = &supersededAt
+	} else {
+		artifact.Current = true
+		artifact.Protections = append(artifact.Protections, storage.Protection{Kind: storage.ProtectionCurrent, Detail: "current native-controller platform slot"})
+	}
+	if len(leaseNames) > 0 {
+		artifact.Protections = append(artifact.Protections, storage.Protection{Kind: storage.ProtectionLease, Detail: "platform slot contains one or more unexpired-status-unknown leases"})
+	}
+	return nativeSlot{artifact: artifact, binary: binary}, nil
+}
+
+func parseControllerReceipt(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	fields := make(map[string]string, 13)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 16*1024)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), "=")
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("receipt contains an invalid field")
+		}
+		if _, exists := fields[key]; exists {
+			return nil, fmt.Errorf("receipt contains duplicate field %q", key)
+		}
+		fields[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	required := []string{"schemaVersion", "artifactKind", "distribution", "targetOS", "targetArch", "executable", "sourceDigest", "buildDigest", "binaryDigest", "sourceRevision", "builder", "toolchain", "completedAtUtc"}
+	if len(fields) != len(required) {
+		return nil, fmt.Errorf("receipt must contain exactly %d fields", len(required))
+	}
+	for _, key := range required {
+		if fields[key] == "" {
+			return nil, fmt.Errorf("receipt is missing %q", key)
+		}
+	}
+	if fields["schemaVersion"] != "3" || fields["artifactKind"] != "native-controller" || fields["distribution"] != "source" {
+		return nil, fmt.Errorf("receipt schema, artifact kind, or distribution is invalid")
+	}
+	if !digestPattern.MatchString(fields["sourceDigest"]) || !digestPattern.MatchString(fields["buildDigest"]) || !digestPattern.MatchString(fields["binaryDigest"]) {
+		return nil, fmt.Errorf("receipt digest is invalid")
+	}
+	if fields["builder"] != "local-go" && fields["builder"] != "docker" {
+		return nil, fmt.Errorf("receipt builder is invalid")
+	}
+	if fields["sourceRevision"] == "" || fields["toolchain"] == "" {
+		return nil, fmt.Errorf("receipt source revision or toolchain is empty")
 	}
 	return fields, nil
 }

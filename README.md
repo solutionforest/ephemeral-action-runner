@@ -45,7 +45,7 @@ EPAR uses a GitHub App to obtain short-lived runner registration tokens. Follow 
 ./start
 ```
 
-In native Windows PowerShell, use `.\start.ps1`. The wrapper uses local Go when it works; otherwise it builds a native controller with Docker. If no configuration exists, the interactive wizard asks for the GitHub App, a runner group, and an available provider. The first start can take longer while EPAR prepares the configured runner image or creates the first runner.
+Use `./start` in native Windows PowerShell too. PowerShell resolves it to EPAR's internal Windows wrapper; do not use bare `start`, which is PowerShell's `Start-Process` alias. The wrapper builds a project-local native controller with local Go when it works, otherwise with Docker, and then executes that controller directly. If no configuration exists, the interactive wizard asks for the GitHub App, a runner group, and an available provider. The first start can take longer while EPAR prepares the controller, the configured runner image, or the first runner.
 
 Keep the process open while runners should accept work. Press `Ctrl-C` once to stop, then wait for cleanup to finish before closing the terminal. For detailed commands, config selection, no-Go startup, verification, and cleanup, read [Usage](docs/usage.md).
 
