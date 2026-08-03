@@ -35,7 +35,7 @@ type wslExporter interface {
 }
 
 func (m *Coordinator) UpdateUpstream(ctx context.Context) error {
-	if err := m.preflightStorage("source-update", sourceUpdateExpansionBytes); err != nil {
+	if err := m.preflightStorage(sourceUpdateOperationPlan()); err != nil {
 		return err
 	}
 	dir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)
@@ -88,7 +88,8 @@ func (m *Coordinator) BuildImage(ctx context.Context, opts ImageBuildOptions) er
 	if err != nil {
 		return err
 	}
-	if err := m.preflightStorage("image-build", plan.EstimatedIncrementalPeak); err != nil {
+	plan.OperationPlan.ID = "image-build"
+	if err := m.preflightStorage(plan.OperationPlan); err != nil {
 		return err
 	}
 	upstreamDir := config.ProjectPath(m.ProjectRoot, m.Config.Image.UpstreamDir)

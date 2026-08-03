@@ -37,10 +37,14 @@ type SourceSizeEstimate struct {
 }
 
 type ArtifactStoragePlan struct {
-	Provider                  string             `json:"provider"`
-	CompressedDownloadBytes   uint64             `json:"compressedDownloadBytes"`
-	ExpandedSourceBytes       uint64             `json:"expandedSourceBytes"`
-	CustomizationBytes        uint64             `json:"customizationBytes"`
+	Provider                string                `json:"provider"`
+	CompressedDownloadBytes uint64                `json:"compressedDownloadBytes"`
+	ExpandedSourceBytes     uint64                `json:"expandedSourceBytes"`
+	CustomizationBytes      uint64                `json:"customizationBytes"`
+	OperationPlan           storage.OperationPlan `json:"operationPlan"`
+	// EstimatedIncrementalPeak is retained only for the onboarding wizard while
+	// it moves to capacity-domain-aware operation plans. Runtime preflight must
+	// use OperationPlan, whose role allocations preserve their phase overlap.
 	EstimatedIncrementalPeak  uint64             `json:"estimatedIncrementalPeak"`
 	Confidence                EstimateConfidence `json:"confidence"`
 	LogicalRootMaximumBytes   uint64             `json:"logicalRootMaximumBytes,omitempty"`
@@ -48,6 +52,8 @@ type ArtifactStoragePlan struct {
 	LogicalLimitsSparse       bool               `json:"logicalLimitsSparse,omitempty"`
 	Notes                     []string           `json:"notes,omitempty"`
 }
+
+const projectWorkspaceAllowanceBytes = 5 * storage.GiB
 
 func EstimateSourceSize(compressedBytes, exactExpandedBytes uint64) (SourceSizeEstimate, error) {
 	if compressedBytes == 0 && exactExpandedBytes == 0 {
@@ -92,67 +98,173 @@ func PlanArtifactStorage(providerType string, source SourceSizeEstimate, cached 
 		ExpandedSourceBytes:     source.ExpandedBytes,
 		CustomizationBytes:      CustomizationAllowanceBytes,
 		Confidence:              source.Confidence,
+		OperationPlan: storage.OperationPlan{
+			ID:       "artifact-build",
+			Provider: providerType,
+		},
 	}
 	if cached {
-		plan.EstimatedIncrementalPeak = 0
+		plan.OperationPlan.Phases = []storage.OperationPhase{{ID: "build-export"}}
 		plan.Notes = append(plan.Notes, "A verified current artifact can be reused.")
 		return plan, nil
 	}
-	add := func(value uint64) error {
-		if plan.EstimatedIncrementalPeak > math.MaxUint64-value {
-			return errors.New("artifact storage estimate overflows uint64")
-		}
-		plan.EstimatedIncrementalPeak += value
-		return nil
+	appendPhase := func(id string, allocations ...storage.Allocation) {
+		plan.OperationPlan.Phases = append(plan.OperationPlan.Phases, storage.OperationPhase{ID: id, Allocations: allocations})
 	}
 	switch providerType {
 	case "docker-container":
-		if err := add(source.CompressedBytes); err != nil {
+		engineBytes, err := sumStorageBytes(source.CompressedBytes, source.ExpandedBytes, CustomizationAllowanceBytes)
+		if err != nil {
 			return ArtifactStoragePlan{}, err
 		}
-		if err := add(source.ExpandedBytes); err != nil {
-			return ArtifactStoragePlan{}, err
-		}
-		if err := add(CustomizationAllowanceBytes); err != nil {
-			return ArtifactStoragePlan{}, err
-		}
-		plan.Notes = append(plan.Notes, "Physical estimate covers Docker Engine source/output growth and customization.")
+		appendPhase("build-export", storage.Allocation{ID: "docker-image-store-build", Role: storage.StorageRoleContainerdStore, Bytes: engineBytes})
+		plan.Notes = append(plan.Notes, "Docker Container source, output, and customization growth are allocated only to the active Docker image-store role.")
 	case "docker-sandboxes":
 		rootBytes, err := AutomaticDockerSandboxesRootBytes(source.ExpandedBytes)
 		if err != nil {
 			return ArtifactStoragePlan{}, err
 		}
-		for _, value := range []uint64{source.CompressedBytes, source.ExpandedBytes, source.ExpandedBytes, CustomizationAllowanceBytes} {
-			if err := add(value); err != nil {
-				return ArtifactStoragePlan{}, err
-			}
+		engineBytes, err := sumStorageBytes(source.CompressedBytes, source.ExpandedBytes, CustomizationAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
 		}
+		projectBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes, projectWorkspaceAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
+		}
+		cacheBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
+		}
+		appendPhase("build-export",
+			storage.Allocation{ID: "docker-image-store-build", Role: storage.StorageRoleContainerdStore, Bytes: engineBytes},
+			storage.Allocation{ID: "project-build-export", Role: storage.StorageRoleProject, Bytes: projectBytes},
+		)
+		appendPhase("import",
+			storage.Allocation{ID: "docker-image-store-import", Role: storage.StorageRoleContainerdStore, Bytes: engineBytes},
+			storage.Allocation{ID: "project-import", Role: storage.StorageRoleProject, Bytes: projectBytes},
+			storage.Allocation{ID: "sandbox-template-cache-import", Role: storage.StorageRoleSandboxTemplateCache, Bytes: cacheBytes},
+		)
 		plan.LogicalRootMaximumBytes = rootBytes
 		plan.LogicalDockerMaximumBytes = dockerDiskBytes
 		plan.LogicalLimitsSparse = true
-		plan.Notes = append(plan.Notes, "Physical estimate covers dedicated BuildKit state, one directly exported archive, Sandbox template-cache import, and customization; no Docker Engine output image is created.", "The root and inner-Docker sizes are independent sparse logical limits and are not added to immediate host growth.")
+		plan.Notes = append(plan.Notes, "Build/export and import preserve their actual overlap across the active Docker image store, project workspace, and Sandbox template-cache roles; no staging role is allocated.", "The root and inner-Docker sizes are independent sparse logical limits and are not added to immediate host growth.")
 	case "wsl":
-		for _, value := range []uint64{source.CompressedBytes, source.ExpandedBytes, source.ExpandedBytes, CustomizationAllowanceBytes} {
-			if err := add(value); err != nil {
-				return ArtifactStoragePlan{}, err
-			}
+		engineBytes, err := sumStorageBytes(source.CompressedBytes, source.ExpandedBytes, CustomizationAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
 		}
-		plan.Notes = append(plan.Notes, "Physical estimate covers Docker Engine build data, rootfs export, temporary build distribution, and customization.")
+		projectBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes, projectWorkspaceAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
+		}
+		distributionBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
+		}
+		appendPhase("build-export",
+			storage.Allocation{ID: "docker-image-store-build", Role: storage.StorageRoleContainerdStore, Bytes: engineBytes},
+			storage.Allocation{ID: "project-rootfs", Role: storage.StorageRoleProject, Bytes: projectBytes},
+			storage.Allocation{ID: "wsl-distribution-build", Role: storage.StorageRoleWSLDistribution, Bytes: distributionBytes},
+		)
+		plan.Notes = append(plan.Notes, "WSL Docker image-store, project rootfs, and temporary distribution allocations overlap during build/export.")
+	case "tart":
+		tartBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes)
+		if err != nil {
+			return ArtifactStoragePlan{}, err
+		}
+		appendPhase("build-clone", storage.Allocation{ID: "tart-store-build-clone", Role: storage.StorageRoleTartStore, Bytes: tartBytes})
+		plan.Notes = append(plan.Notes, "Tart image clone and customization growth are allocated to the Tart store role.")
 	default:
 		return ArtifactStoragePlan{}, fmt.Errorf("provider %q does not use the shared Docker-image storage plan", providerType)
 	}
+	peak, err := operationPlanAggregatePeak(plan.OperationPlan)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	plan.EstimatedIncrementalPeak = peak
 	return plan, nil
+}
+
+func sourceUpdateOperationPlan() storage.OperationPlan {
+	return storage.OperationPlan{
+		ID:       "source-update",
+		Provider: "shared",
+		Phases: []storage.OperationPhase{{
+			ID: "source-update",
+			Allocations: []storage.Allocation{{
+				ID: "project-source-update", Role: storage.StorageRoleProject, Bytes: sourceUpdateExpansionBytes,
+			}},
+		}},
+	}
+}
+
+func PlanDockerSandboxesImportStorage(source SourceSizeEstimate, archiveBytes uint64) (ArtifactStoragePlan, error) {
+	plannedCacheBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	archiveDerivedBytes, err := sumStorageBytes(archiveBytes, CustomizationAllowanceBytes)
+	if err != nil {
+		return ArtifactStoragePlan{}, errors.New("Docker Sandboxes verified archive import estimate overflows uint64")
+	}
+	cacheBytes := plannedCacheBytes
+	if archiveDerivedBytes > cacheBytes {
+		cacheBytes = archiveDerivedBytes
+	}
+	operationPlan := storage.OperationPlan{
+		ID:       "template-import",
+		Provider: "docker-sandboxes",
+		Phases: []storage.OperationPhase{{
+			ID: "import-only",
+			Allocations: []storage.Allocation{{
+				ID: "sandbox-template-cache-import-only", Role: storage.StorageRoleSandboxTemplateCache, Bytes: cacheBytes,
+			}},
+		}},
+	}
+	return ArtifactStoragePlan{
+		Provider:                 "docker-sandboxes",
+		CompressedDownloadBytes:  source.CompressedBytes,
+		ExpandedSourceBytes:      source.ExpandedBytes,
+		CustomizationBytes:       CustomizationAllowanceBytes,
+		OperationPlan:            operationPlan,
+		EstimatedIncrementalPeak: cacheBytes,
+		Confidence:               source.Confidence,
+		Notes:                    []string{"Import-only preflight reserves the larger of the planned Sandbox cache allocation and verified archive-derived cache estimate."},
+	}, nil
+}
+
+func sumStorageBytes(values ...uint64) (uint64, error) {
+	var total uint64
+	for _, value := range values {
+		if total > math.MaxUint64-value {
+			return 0, errors.New("artifact storage estimate overflows uint64")
+		}
+		total += value
+	}
+	return total, nil
+}
+
+func operationPlanAggregatePeak(operationPlan storage.OperationPlan) (uint64, error) {
+	var peak uint64
+	for _, phase := range operationPlan.Phases {
+		var phaseTotal uint64
+		for _, allocation := range phase.Allocations {
+			if phaseTotal > math.MaxUint64-allocation.Bytes {
+				return 0, errors.New("artifact storage estimate overflows uint64")
+			}
+			phaseTotal += allocation.Bytes
+		}
+		if phaseTotal > peak {
+			peak = phaseTotal
+		}
+	}
+	return peak, nil
 }
 
 func (m *Coordinator) configuredArtifactStoragePlan(ctx context.Context, cached bool) (ArtifactStoragePlan, error) {
 	if m.Config.Provider.Type == "tart" {
-		return ArtifactStoragePlan{
-			Provider:                 m.Config.Provider.Type,
-			CustomizationBytes:       CustomizationAllowanceBytes,
-			EstimatedIncrementalPeak: CustomizationAllowanceBytes,
-			Confidence:               EstimateDerived,
-			Notes:                    []string{"Tart does not use the shared Docker-image plan; only the customization allowance is admitted here."},
-		}, nil
+		return PlanArtifactStorage(m.Config.Provider.Type, SourceSizeEstimate{Confidence: EstimateDerived}, cached, 0)
 	}
 	if m.Config.Provider.Type == "wsl" && m.Config.Image.SourceType == config.ImageSourceRootFSTar {
 		sourcePath := config.ProjectPath(m.ProjectRoot, m.Config.Image.SourceImage)

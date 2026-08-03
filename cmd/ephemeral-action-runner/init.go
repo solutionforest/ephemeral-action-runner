@@ -1011,18 +1011,14 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 	if err != nil {
 		return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 	}
-	var availableText = "unknown"
-	if capacity, probeErr := storage.ProbeFilesystemCapacity(projectRoot, time.Now()); probeErr == nil && capacity.Known {
-		availableText = formatInitUintByteCount(capacity.AvailableBytes)
-	}
 	estimate := &initArtifactEstimate{
-		Source:                 source.Reference,
-		Platform:               source.Platform,
-		DownloadBytes:          source.CompressedLayerBytes,
-		ExpandedBytes:          sourceEstimate.ExpandedBytes,
-		IncrementalPeakBytes:   artifactPlan.EstimatedIncrementalPeak,
-		AvailablePhysicalSpace: availableText,
+		Source:        source.Reference,
+		Platform:      source.Platform,
+		DownloadBytes: source.CompressedLayerBytes,
+		ExpandedBytes: sourceEstimate.ExpandedBytes,
 	}
+	artifactPlan.OperationPlan.ID = "template-build"
+	populateInitArtifactCapacityEstimate(ctx, projectRoot, providerType, artifactPlan.OperationPlan, estimate)
 	if providerType == "docker-sandboxes" {
 		estimate.LogicalRootMaximumBytes = artifactPlan.LogicalRootMaximumBytes
 		estimate.LogicalDockerMaximumBytes = artifactPlan.LogicalDockerMaximumBytes
@@ -1037,6 +1033,93 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		DockerDisk:        dockerDisk,
 	}
 	return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardNext, Value: profile}, estimate, nil
+}
+
+func populateInitArtifactCapacityEstimate(ctx context.Context, projectRoot, providerType string, operationPlan storage.OperationPlan, estimate *initArtifactEstimate) {
+	if estimate == nil {
+		return
+	}
+	cfg := config.Default()
+	cfg.Provider.Type = providerType
+	operationPlan.Provider = providerType
+	operationPlan.MinimumFreeBytes = storage.DefaultMinimumFreeBytes
+	runtime, err := providerregistry.New(cfg, projectRoot, true)
+	if err != nil {
+		estimate.CapacityWarnings = append(estimate.CapacityWarnings, fmt.Sprintf("capacity-domain discovery is unavailable: %v", err))
+		return
+	}
+	snapshot, err := runtime.Storage.StorageSnapshot(ctx, provider.StorageRequest{OperationPlan: operationPlan, Now: time.Now()})
+	if err != nil {
+		estimate.CapacityWarnings = append(estimate.CapacityWarnings, fmt.Sprintf("capacity-domain discovery is unavailable: %v", err))
+		return
+	}
+	estimate.CapacityWarnings = append(estimate.CapacityWarnings, snapshot.Warnings...)
+	evaluation, err := storage.EvaluateOperationPlan(operationPlan, snapshot.Surfaces, snapshot.Domains)
+	if err != nil {
+		estimate.CapacityWarnings = append(estimate.CapacityWarnings, fmt.Sprintf("capacity-domain plan cannot be resolved: %v", err))
+		return
+	}
+	surfaceByID := make(map[string]storage.Surface, len(snapshot.Surfaces))
+	for _, surface := range snapshot.Surfaces {
+		surfaceByID[surface.ID] = surface
+	}
+	domainByID := make(map[string]storage.CapacityDomain, len(snapshot.Domains))
+	for _, domain := range snapshot.Domains {
+		domainByID[domain.ID] = domain
+	}
+	rolesByDomain := make(map[string]map[string]struct{})
+	locationsByDomain := make(map[string]map[string]struct{})
+	for _, allocation := range evaluation.Allocations {
+		if rolesByDomain[allocation.DomainID] == nil {
+			rolesByDomain[allocation.DomainID] = make(map[string]struct{})
+			locationsByDomain[allocation.DomainID] = make(map[string]struct{})
+		}
+		rolesByDomain[allocation.DomainID][string(allocation.Role)] = struct{}{}
+		if surface, ok := surfaceByID[allocation.SurfaceID]; ok {
+			location := surface.Path
+			if location == "" {
+				location = surface.Location
+			}
+			if location != "" {
+				locationsByDomain[allocation.DomainID][location] = struct{}{}
+			}
+		}
+	}
+	checkByDomain := make(map[string]storage.CapacityCheck, len(evaluation.CapacityChecks))
+	for _, check := range evaluation.CapacityChecks {
+		if check.DomainRequirement != nil {
+			checkByDomain[check.DomainRequirement.DomainID] = check
+		}
+	}
+	for _, requirement := range evaluation.Requirements {
+		domain := domainByID[requirement.DomainID]
+		roles := sortedInitEstimateValues(rolesByDomain[requirement.DomainID])
+		locations := sortedInitEstimateValues(locationsByDomain[requirement.DomainID])
+		location := strings.Join(locations, ", ")
+		if location == "" {
+			location = domain.Path
+		}
+		check := checkByDomain[requirement.DomainID]
+		estimate.CapacityDomains = append(estimate.CapacityDomains, initCapacityDomainEstimate{
+			Roles:          strings.Join(roles, ","),
+			Location:       location,
+			AvailableBytes: domain.Capacity.AvailableBytes,
+			AvailableKnown: domain.Capacity.Known,
+			PhasePeakBytes: requirement.PeakBytes,
+			ReserveBytes:   requirement.MinimumFreeBytes,
+			Confidence:     domain.Confidence,
+			Status:         string(check.Status),
+		})
+	}
+}
+
+func sortedInitEstimateValues(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func promptDockerImageProfile(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {

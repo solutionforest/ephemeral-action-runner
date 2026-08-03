@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const planSchemaVersion = 1
+const planSchemaVersion = 2
 
 var automaticKinds = map[ArtifactKind]bool{
 	ArtifactNativeControllerRevision: true,
@@ -32,14 +32,27 @@ func Preview(request PreviewRequest) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	surfaces := append([]Surface(nil), request.Surfaces...)
-	for index := range surfaces {
-		surfaces[index].Capacity.ObservedAt = surfaces[index].Capacity.ObservedAt.UTC()
-	}
-	sort.Slice(surfaces, func(i, j int) bool { return surfaces[i].ID < surfaces[j].ID })
-	checks, err := capacityPreflight(surfaces, request.Requirements)
+	surfaces, domains, err := normalizeCapacityTopology(request.Surfaces, request.CapacityDomains)
 	if err != nil {
 		return Plan{}, err
+	}
+	operationPlans, err := previewOperationPlans(request.OperationPlans, request.Requirements)
+	if err != nil {
+		return Plan{}, err
+	}
+	var checks []CapacityCheck
+	var resolvedAllocations []ResolvedAllocation
+	var domainRequirements []DomainRequirement
+	normalizedOperationPlans := make([]OperationPlan, 0, len(operationPlans))
+	for _, operationPlan := range operationPlans {
+		evaluation, evaluationErr := EvaluateOperationPlan(operationPlan, surfaces, domains)
+		if evaluationErr != nil {
+			return Plan{}, evaluationErr
+		}
+		normalizedOperationPlans = append(normalizedOperationPlans, evaluation.Plan)
+		resolvedAllocations = append(resolvedAllocations, evaluation.Allocations...)
+		domainRequirements = append(domainRequirements, evaluation.Requirements...)
+		checks = append(checks, evaluation.CapacityChecks...)
 	}
 	artifacts := append([]Artifact(nil), request.Artifacts...)
 	if err := normalizeAndValidateArtifacts(artifacts, surfaces); err != nil {
@@ -60,16 +73,24 @@ func Preview(request PreviewRequest) (Plan, error) {
 	applyCacheBudgets(policy, decisions, candidates)
 
 	plan := Plan{
-		SchemaVersion:  planSchemaVersion,
-		CreatedAt:      now,
-		Policy:         policy,
-		Surfaces:       surfaces,
-		CapacityChecks: checks,
-		Decisions:      decisions,
+		SchemaVersion:       planSchemaVersion,
+		CreatedAt:           now,
+		Policy:              policy,
+		Surfaces:            surfaces,
+		CapacityDomains:     domains,
+		OperationPlans:      normalizedOperationPlans,
+		ResolvedAllocations: resolvedAllocations,
+		DomainRequirements:  domainRequirements,
+		CapacityChecks:      checks,
+		Decisions:           decisions,
 	}
 	for _, check := range checks {
 		if check.Status != CapacityReady {
-			plan.Warnings = append(plan.Warnings, fmt.Sprintf("capacity %s: requirement=%s surface=%s reason=%s", check.Status, check.Requirement.ID, check.Requirement.SurfaceID, check.Reason))
+			if check.DomainRequirement != nil {
+				plan.Warnings = append(plan.Warnings, fmt.Sprintf("capacity %s: operation=%s domain=%s reason=%s", check.Status, check.DomainRequirement.OperationID, check.DomainRequirement.DomainID, check.Reason))
+			} else {
+				plan.Warnings = append(plan.Warnings, fmt.Sprintf("capacity %s: requirement=%s surface=%s reason=%s", check.Status, check.Requirement.ID, check.Requirement.SurfaceID, check.Reason))
+			}
 		}
 	}
 	for _, decision := range decisions {
@@ -83,6 +104,68 @@ func Preview(request PreviewRequest) (Plan, error) {
 		return Plan{}, err
 	}
 	return plan, nil
+}
+
+func previewOperationPlans(operationPlans []OperationPlan, requirements []Requirement) ([]OperationPlan, error) {
+	if len(operationPlans) > 0 && len(requirements) > 0 {
+		return nil, errors.New("storage preview cannot combine operation plans with legacy scalar requirements")
+	}
+	if len(operationPlans) > 0 {
+		plans := append([]OperationPlan(nil), operationPlans...)
+		seen := make(map[string]struct{}, len(plans))
+		for _, plan := range plans {
+			if strings.TrimSpace(plan.ID) == "" {
+				return nil, errors.New("storage operation plan ID is required")
+			}
+			if _, duplicate := seen[plan.ID]; duplicate {
+				return nil, fmt.Errorf("duplicate storage operation plan ID %q", plan.ID)
+			}
+			seen[plan.ID] = struct{}{}
+		}
+		sort.Slice(plans, func(i, j int) bool { return plans[i].ID < plans[j].ID })
+		return plans, nil
+	}
+	if len(requirements) == 0 {
+		return nil, nil
+	}
+	legacy := append([]Requirement(nil), requirements...)
+	sort.Slice(legacy, func(i, j int) bool { return legacy[i].ID < legacy[j].ID })
+	seen := make(map[string]struct{}, len(legacy))
+	minimumFree := uint64(0)
+	provider := ""
+	mixedProviders := false
+	allocations := make([]Allocation, 0, len(legacy))
+	for _, requirement := range legacy {
+		if strings.TrimSpace(requirement.ID) == "" {
+			return nil, errors.New("storage requirement ID is required")
+		}
+		if _, duplicate := seen[requirement.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate storage requirement ID %q", requirement.ID)
+		}
+		seen[requirement.ID] = struct{}{}
+		reserve := requirement.MinimumFreeBytes
+		if reserve == 0 {
+			reserve = DefaultMinimumFreeBytes
+		}
+		if reserve > minimumFree {
+			minimumFree = reserve
+		}
+		if provider == "" {
+			provider = requirement.Provider
+		} else if requirement.Provider != "" && requirement.Provider != provider {
+			mixedProviders = true
+		}
+		allocations = append(allocations, Allocation{ID: requirement.ID, SurfaceID: requirement.SurfaceID, Bytes: requirement.PeakBytes})
+	}
+	if mixedProviders {
+		provider = ""
+	}
+	return []OperationPlan{{
+		ID:               "legacy-requirements",
+		Provider:         provider,
+		MinimumFreeBytes: minimumFree,
+		Phases:           []OperationPhase{{ID: "legacy-peak", Allocations: allocations}},
+	}}, nil
 }
 
 func normalizePolicy(policy Policy) (Policy, error) {

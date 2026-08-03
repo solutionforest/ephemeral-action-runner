@@ -37,7 +37,7 @@ EPAR recommends this provider in the wizard by capability, not by an operating-s
 - Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Before the first-run provider assessment, the wizard runs `sbx daemon start --detach` when the `sbx` executable is installed, then runs diagnostics. Warnings and skipped checks do not make the provider unavailable.
 - A native `amd64` or `arm64` controller with matching `linux/amd64` or `linux/arm64` image support. EPAR does not use emulation to admit a mismatched template.
 - Enough capacity to resolve, build, export, import, and retain the selected runner template.
-- Enough physical backing storage for the estimated incremental template and sandbox bootstrap work while retaining `storage.minimumFree`. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
+- Enough physical backing storage in every resolved Engine, project, Sandbox cache, and Sandbox state capacity domain for the phase-overlapping template and sandbox bootstrap work while retaining `storage.minimumFree` once per domain. Use `./start storage status --operation template-build --provider docker-sandboxes --config <path> --project-root <path>` to inspect the same plan. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
 - A GitHub runner group that meets enforced policy. Docker Sandboxes requires `security.runnerGroup.enforcement: enforce` and `runner.ephemeral: true`.
 
 The wizard builds and imports the template. The recipes in `templates/docker-sandboxes` are build inputs, not prebuilt images.

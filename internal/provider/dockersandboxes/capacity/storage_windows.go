@@ -3,20 +3,30 @@
 package capacity
 
 import (
-	"errors"
-	"os"
-	"path/filepath"
+	"fmt"
+
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/storagepath"
 )
 
 // DockerSandboxesStorageRoot returns the documented Windows root that contains
 // Docker Sandboxes' persistent state, cache, configuration, and sandbox data.
 func DockerSandboxesStorageRoot() (string, error) {
-	localAppData := os.Getenv("LOCALAPPDATA")
-	if localAppData == "" {
-		return "", errors.New("LOCALAPPDATA is unavailable")
+	return dockerSandboxesStateRoot()
+}
+
+func dockerSandboxesStateRoot() (string, error) {
+	environment, err := storagepath.CurrentEnvironment()
+	if err != nil {
+		return "", err
 	}
-	if !filepath.IsAbs(localAppData) {
-		return "", errors.New("LOCALAPPDATA is not an absolute path")
+	roots, err := storagepath.DockerSandboxesRoots(environment)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(localAppData, "DockerSandboxes"), nil
+	for _, root := range roots {
+		if root.ID == "state" {
+			return root.Path, nil
+		}
+	}
+	return "", fmt.Errorf("Docker Sandboxes state root was not discovered")
 }

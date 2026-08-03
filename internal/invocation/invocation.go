@@ -18,6 +18,28 @@ func Command(args ...string) string {
 	return strings.Join(parts, " ")
 }
 
+// ScopedCommand returns a command line that preserves the exact configuration
+// and project root used by the current controller. Storage diagnostics and
+// remediation hints use this helper so a non-default --config invocation never
+// inspects or mutates the default configuration by accident.
+func ScopedCommand(configPath, projectRoot string, args ...string) string {
+	parts := append([]string(nil), args...)
+	if strings.TrimSpace(configPath) != "" {
+		parts = append(parts, "--config", quoteArgument(configPath))
+	}
+	if strings.TrimSpace(projectRoot) != "" {
+		parts = append(parts, "--project-root", quoteArgument(projectRoot))
+	}
+	return Command(parts...)
+}
+
+func quoteArgument(value string) string {
+	if value != "" && !strings.ContainsAny(value, " \t\r\n\"") {
+		return value
+	}
+	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
+}
+
 func executablePath() string {
 	path, err := os.Executable()
 	if err != nil {

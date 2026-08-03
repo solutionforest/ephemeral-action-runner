@@ -1537,10 +1537,13 @@ func TestDockerSandboxesProfileShowsEstimateWithoutCapacityAdmission(t *testing.
 	if profile == nil || !accepted {
 		t.Fatalf("informational estimate returned profile=%+v accepted=%t", profile, accepted)
 	}
-	for _, want := range []string{"Runner artifact estimate:", "Available physical space:", "Fixed free-space reserve: 1GiB", "sparse logical maximum"} {
+	for _, want := range []string{"Runner artifact estimate:", "Capacity domains (non-blocking estimate; startup admission remains authoritative):", "sparse logical maximum"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("informational estimate output omitted %q:\n%s", want, out.String())
 		}
+	}
+	if !strings.Contains(out.String(), "role=") && !strings.Contains(out.String(), "STORAGE DISCOVERY WARNING") {
+		t.Fatalf("informational estimate reported neither capacity domains nor a discovery warning:\n%s", out.String())
 	}
 }
 

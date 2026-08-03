@@ -13,18 +13,41 @@ import (
 	"time"
 )
 
-// ProbeFilesystemCapacity returns an OS capacity observation for an exact,
-// redirect-free existing filesystem path.
+// ProbeFilesystemCapacity returns an OS capacity observation for an existing
+// filesystem path. Read-only measurement follows symlinks and junctions to the
+// physical filesystem domain; cleanup identity remains redirect-strict.
 func ProbeFilesystemCapacity(path string, now time.Time) (Capacity, error) {
-	canonical, _, err := inspectFilesystemPath(path)
+	domain, err := ProbeFilesystemCapacityDomain(path, now)
 	if err != nil {
 		return Capacity{}, err
 	}
-	available, total, err := platformFilesystemCapacity(canonical)
+	return domain.Capacity, nil
+}
+
+// ProbeFilesystemCapacityDomain resolves an existing path for read-only
+// measurement and returns its stable Windows volume or Unix filesystem domain.
+func ProbeFilesystemCapacityDomain(path string, now time.Time) (CapacityDomain, error) {
+	canonical, err := inspectFilesystemCapacityPath(path)
 	if err != nil {
-		return Capacity{}, fmt.Errorf("probe filesystem capacity for %q: %w", canonical, err)
+		return CapacityDomain{}, err
 	}
-	return Capacity{Known: true, AvailableBytes: available, TotalBytes: total, ObservedAt: now.UTC()}, nil
+	identity, domainPath, available, total, err := platformFilesystemCapacityDomain(canonical)
+	if err != nil {
+		return CapacityDomain{}, fmt.Errorf("probe filesystem capacity domain for %q: %w", canonical, err)
+	}
+	provenance := "unix-filesystem-probe"
+	if runtime.GOOS == "windows" {
+		provenance = "windows-volume-probe"
+	}
+	return CapacityDomain{
+		ID:         identity,
+		Kind:       SurfaceHostFilesystem,
+		Identity:   identity,
+		Path:       domainPath,
+		Provenance: provenance,
+		Confidence: "authoritative-filesystem-probe",
+		Capacity:   Capacity{Known: true, AvailableBytes: available, TotalBytes: total, ObservedAt: now.UTC()},
+	}, nil
 }
 
 // SnapshotFilesystemTarget binds a regular file or real directory to a stable
@@ -110,6 +133,33 @@ func inspectFilesystemPath(path string) (string, os.FileInfo, error) {
 		return "", nil, fmt.Errorf("storage filesystem path %q contains a symlink, junction, or reparse redirection", absolute)
 	}
 	return canonicalSpelling, info, nil
+}
+
+func inspectFilesystemCapacityPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" || strings.ContainsRune(path, 0) {
+		return "", errors.New("storage filesystem path is empty or contains NUL")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absolute = filepath.Clean(absolute)
+	evaluated, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	evaluated, err = filepath.Abs(evaluated)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(evaluated); err != nil {
+		return "", err
+	}
+	canonical, err := platformCanonicalFilesystemPath(evaluated)
+	if err != nil {
+		return "", fmt.Errorf("normalize storage filesystem capacity path %q: %w", evaluated, err)
+	}
+	return filepath.Clean(canonical), nil
 }
 
 func rejectRedirectedAncestors(path string) error {

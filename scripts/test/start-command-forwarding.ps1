@@ -47,9 +47,9 @@ if ($Forwarded.Count -eq 1 -and $Forwarded[0] -eq 'version') {
     if ($LASTEXITCODE -ne 0) { throw "start.ps1 forwarding exited $LASTEXITCODE" }
     Assert-ForwardedArguments @('run', './cmd/ephemeral-action-runner', 'start', '--config', '.local\config with spaces.yml', '--label', 'value "with quotes"')
 
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $startPowerShell storage status --config '.local\config with spaces.yml'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $startPowerShell storage status --operation template-build --provider docker-sandboxes --config '.local\config with spaces.yml' --project-root .
     if ($LASTEXITCODE -ne 0) { throw "start.ps1 explicit-command forwarding exited $LASTEXITCODE" }
-    Assert-ForwardedArguments @('run', './cmd/ephemeral-action-runner', 'storage', 'status', '--config', '.local\config with spaces.yml')
+    Assert-ForwardedArguments @('run', './cmd/ephemeral-action-runner', 'storage', 'status', '--operation', 'template-build', '--provider', 'docker-sandboxes', '--config', '.local\config with spaces.yml', '--project-root', '.')
 
     $removedAdapter = Join-Path $ProjectRoot ('start' + '.cmd')
     if (Test-Path -LiteralPath $removedAdapter) {

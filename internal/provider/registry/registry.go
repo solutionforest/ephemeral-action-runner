@@ -1,15 +1,14 @@
 package registry
 
 import (
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockercontainer"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/storagepath"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
@@ -165,73 +164,158 @@ func New(cfg config.Config, projectRoot string, dryRun bool) (Runtime, error) {
 }
 
 func providerStorage(cfg config.Config, projectRoot string) provider.StorageContribution {
-	roots := []provider.StorageRoot{{ID: cfg.Provider.Type + "-project", Location: projectRoot}}
-	minimumExpansions := map[string]uint64{}
+	roots := []provider.StorageRoot{{ID: cfg.Provider.Type + "-project", Role: storage.StorageRoleProject, Path: projectRoot}}
+	discoveries := []provider.StorageRootDiscovery{}
 	switch cfg.Provider.Type {
 	case "docker-container":
-		roots = append(roots, provider.StorageRoot{ID: "docker-engine-backing", Kind: storage.SurfaceDockerEngine, Location: dockerBackingRoot()})
+		discoveries = append(discoveries, dockerStorageRoots)
 	case "docker-sandboxes":
-		roots = append(roots,
-			provider.StorageRoot{
-				ID:       "docker-engine-backing",
-				Kind:     storage.SurfaceDockerEngine,
-				Location: dockerBackingRoot(),
-				MinimumExpansions: map[string]uint64{
-					"image-pull":     0,
-					"image-build":    0,
-					"source-update":  0,
-					"template-build": 0,
-				},
-			},
-			provider.StorageRoot{
-				ID:                "docker-sandboxes-backing",
-				Kind:              storage.SurfaceSandboxCache,
-				Location:          dockerSandboxesBackingRoot(),
-				MinimumExpansions: map[string]uint64{"instance-create": 0, "template-build": 0},
-			},
-			provider.StorageRoot{ID: "docker-sandboxes-staging", Location: config.ProjectPath(projectRoot, cfg.DockerSandboxes.StagingRoot)},
-		)
+		roots = append(roots, provider.StorageRoot{ID: "docker-sandboxes-staging", Path: config.ProjectPath(projectRoot, cfg.DockerSandboxes.StagingRoot)})
+		discoveries = append(discoveries, dockerStorageRoots, dockerSandboxesStorageRoots)
 	case "wsl":
 		roots = append(roots,
-			provider.StorageRoot{ID: "wsl-install-root", Location: config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)},
-			provider.StorageRoot{ID: "docker-engine-backing", Kind: storage.SurfaceDockerEngine, Location: dockerBackingRoot()},
+			provider.StorageRoot{ID: "wsl-install-root", Role: storage.StorageRoleWSLDistribution, Path: config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)},
 		)
+		discoveries = append(discoveries, dockerStorageRoots)
 	case "tart":
-		roots = append(roots, provider.StorageRoot{ID: "tart-vm-store", Location: tartBackingRoot()})
+		discoveries = append(discoveries, tartStorageRoots)
 	}
-	return provider.NewMultiFilesystemStorageWithMinimumExpansions(cfg.Provider.Type, roots, minimumExpansions)
+	return provider.NewFilesystemStorageWithDiscovery(cfg.Provider.Type, roots, discoveries...)
 }
 
-func dockerBackingRoot() string {
-	switch runtime.GOOS {
-	case "windows":
-		return filepath.Join(os.Getenv("LOCALAPPDATA"), "Docker", "wsl", "disk")
-	case "darwin":
-		home, _ := os.UserHomeDir()
-		return filepath.Join(home, "Library", "Containers", "com.docker.docker", "Data", "vms", "0", "data")
-	default:
-		return "/var/lib/docker"
+var discoverCurrentDockerStorage = storagepath.DiscoverCurrentDockerStorage
+var currentStorageEnvironment = storagepath.CurrentEnvironment
+
+func dockerStorageRoots(ctx context.Context, request provider.StorageRequest) ([]provider.StorageRoot, error) {
+	if !storageRequestUsesRole(request, storage.StorageRoleDockerEngine, storage.StorageRoleContainerdStore) {
+		return nil, nil
 	}
+	discovered, err := discoverCurrentDockerStorage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	roots := make([]provider.StorageRoot, 0, len(discovered.Roots)+1)
+	containerdFound := false
+	var engineRoot *provider.StorageRoot
+	for _, root := range discovered.Roots {
+		role := storage.StorageRoleDockerEngine
+		id := "docker-engine-backing"
+		if root.ID == "containerd" {
+			containerdFound = true
+			role = storage.StorageRoleContainerdStore
+			id = "containerd-store-backing"
+		}
+		mapped := provider.StorageRoot{
+			ID:           id,
+			Role:         role,
+			Kind:         storage.SurfaceDockerEngine,
+			Path:         root.Path,
+			CapacityPath: root.CapacityPath,
+			Provenance:   string(root.Provenance),
+			Confidence:   string(root.Confidence),
+			Warnings:     append([]string(nil), root.Warnings...),
+		}
+		roots = append(roots, mapped)
+		if root.ID == "engine" {
+			copy := mapped
+			engineRoot = &copy
+		}
+	}
+	if !containerdFound && engineRoot != nil {
+		imageStore := *engineRoot
+		imageStore.ID = "containerd-store-backing"
+		imageStore.Role = storage.StorageRoleContainerdStore
+		imageStore.Provenance += "-image-store-alias"
+		roots = append(roots, imageStore)
+	}
+	return roots, nil
 }
 
-func dockerSandboxesBackingRoot() string {
-	switch runtime.GOOS {
-	case "windows":
-		return filepath.Join(os.Getenv("LOCALAPPDATA"), "DockerSandboxes", "sandboxes", "data")
-	case "darwin":
-		home, _ := os.UserHomeDir()
-		return filepath.Join(home, "Library", "Containers", "com.docker.docker", "Data", "docker-sandboxes")
-	default:
-		return "/var/lib/docker-sandboxes"
+func dockerSandboxesStorageRoots(_ context.Context, request provider.StorageRequest) ([]provider.StorageRoot, error) {
+	if !storageRequestUsesRole(request, storage.StorageRoleSandboxRuntime, storage.StorageRoleSandboxTemplateCache) {
+		return nil, nil
 	}
+	environment, err := currentStorageEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	discovered, err := storagepath.DockerSandboxesRoots(environment)
+	if err != nil {
+		return nil, err
+	}
+	var roots []provider.StorageRoot
+	for _, root := range discovered {
+		base := provider.StorageRoot{
+			Kind:       storage.SurfaceSandboxCache,
+			Path:       root.Path,
+			Provenance: string(root.Provenance),
+			Confidence: string(root.Confidence),
+		}
+		switch root.ID {
+		case "state":
+			runtimeRoot := base
+			runtimeRoot.ID = "docker-sandboxes-runtime"
+			runtimeRoot.Role = storage.StorageRoleSandboxRuntime
+			roots = append(roots, runtimeRoot)
+			if environment.GOOS != "linux" {
+				templateRoot := base
+				templateRoot.ID = "docker-sandboxes-template-cache"
+				templateRoot.Role = storage.StorageRoleSandboxTemplateCache
+				roots = append(roots, templateRoot)
+			}
+		case "cache":
+			base.ID = "docker-sandboxes-template-cache"
+			base.Role = storage.StorageRoleSandboxTemplateCache
+			roots = append(roots, base)
+		case "config":
+			base.ID = "docker-sandboxes-config"
+			base.ReportOnly = true
+			roots = append(roots, base)
+		}
+	}
+	return roots, nil
 }
 
-func tartBackingRoot() string {
-	if root := os.Getenv("TART_HOME"); root != "" {
-		return filepath.Join(root, "vms")
+func tartStorageRoots(_ context.Context, request provider.StorageRequest) ([]provider.StorageRoot, error) {
+	if !storageRequestUsesRole(request, storage.StorageRoleTartStore) {
+		return nil, nil
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tart", "vms")
+	environment, err := currentStorageEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	root, err := storagepath.TartRoot(environment)
+	if err != nil {
+		return nil, err
+	}
+	return []provider.StorageRoot{{
+		ID:         "tart-vm-store",
+		Role:       storage.StorageRoleTartStore,
+		Path:       root.Path,
+		Provenance: string(root.Provenance),
+		Confidence: string(root.Confidence),
+	}}, nil
+}
+
+func storageRequestUsesRole(request provider.StorageRequest, roles ...storage.StorageRole) bool {
+	if len(request.OperationPlan.Phases) == 0 {
+		return true
+	}
+	wanted := make(map[storage.StorageRole]struct{}, len(roles))
+	for _, role := range roles {
+		wanted[role] = struct{}{}
+	}
+	for _, phase := range request.OperationPlan.Phases {
+		for _, allocation := range phase.Allocations {
+			if allocation.SurfaceID != "" {
+				return true
+			}
+			if _, found := wanted[allocation.Role]; found {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func adaptLegacy(legacy provider.Provider, storageContribution provider.StorageContribution, dryRun bool) Runtime {

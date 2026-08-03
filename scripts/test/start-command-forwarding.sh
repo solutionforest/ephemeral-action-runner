@@ -54,6 +54,9 @@ assert_forwarded "quoted start" run ./cmd/ephemeral-action-runner start --config
 "$repo_root/start" storage prune --provider docker-sandboxes
 assert_forwarded "explicit command" run ./cmd/ephemeral-action-runner storage prune --provider docker-sandboxes
 
+"$repo_root/start" storage status --operation template-build --provider docker-sandboxes --config .local/custom-config.yml --project-root .
+assert_forwarded "storage operation" run ./cmd/ephemeral-action-runner storage status --operation template-build --provider docker-sandboxes --config .local/custom-config.yml --project-root .
+
 "$repo_root/start" image update --config .local/custom-config.yml
 assert_forwarded "image update" run ./cmd/ephemeral-action-runner image update --config .local/custom-config.yml
 

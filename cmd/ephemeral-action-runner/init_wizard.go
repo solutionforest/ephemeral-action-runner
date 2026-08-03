@@ -67,10 +67,21 @@ type initArtifactEstimate struct {
 	Platform                  string
 	DownloadBytes             uint64
 	ExpandedBytes             uint64
-	IncrementalPeakBytes      uint64
-	AvailablePhysicalSpace    string
+	CapacityDomains           []initCapacityDomainEstimate
+	CapacityWarnings          []string
 	LogicalRootMaximumBytes   uint64
 	LogicalDockerMaximumBytes uint64
+}
+
+type initCapacityDomainEstimate struct {
+	Roles          string
+	Location       string
+	AvailableBytes uint64
+	AvailableKnown bool
+	PhasePeakBytes uint64
+	ReserveBytes   uint64
+	Confidence     string
+	Status         string
 }
 
 type initWizardDraft struct {
@@ -358,9 +369,22 @@ func renderInitArtifactEstimate(out io.Writer, estimate *initArtifactEstimate) {
 	fmt.Fprintf(out, "  Platform: %s\n", estimate.Platform)
 	fmt.Fprintf(out, "  Estimated download: %s compressed layers\n", formatInitUintByteCount(estimate.DownloadBytes))
 	fmt.Fprintf(out, "  Estimated expanded source: %s\n", formatInitUintByteCount(estimate.ExpandedBytes))
-	fmt.Fprintf(out, "  Estimated incremental physical peak: %s\n", formatInitUintByteCount(estimate.IncrementalPeakBytes))
-	fmt.Fprintf(out, "  Available physical space: %s\n", estimate.AvailablePhysicalSpace)
-	fmt.Fprintln(out, "  Fixed free-space reserve: 1GiB")
+	fmt.Fprintln(out, "  Capacity domains (non-blocking estimate; startup admission remains authoritative):")
+	if len(estimate.CapacityDomains) == 0 {
+		fmt.Fprintln(out, "    unavailable — review the warning below and use storage status after creating the configuration")
+	}
+	for _, domain := range estimate.CapacityDomains {
+		available := "unknown"
+		if domain.AvailableKnown {
+			available = formatInitUintByteCount(domain.AvailableBytes)
+		}
+		fmt.Fprintf(out, "    role=%s\n", domain.Roles)
+		fmt.Fprintf(out, "      location=%s\n", domain.Location)
+		fmt.Fprintf(out, "      available=%s  phase peak=%s  reserve=%s  confidence=%s  status=%s\n", available, formatInitUintByteCount(domain.PhasePeakBytes), formatInitUintByteCount(domain.ReserveBytes), domain.Confidence, domain.Status)
+	}
+	for _, warning := range estimate.CapacityWarnings {
+		fmt.Fprintf(out, "  *** STORAGE DISCOVERY WARNING *** %s\n", warning)
+	}
 	if estimate.LogicalRootMaximumBytes > 0 {
 		fmt.Fprintf(out, "  Automatic sandbox root limit: %s (sparse logical maximum)\n", formatInitUintByteCount(estimate.LogicalRootMaximumBytes))
 		fmt.Fprintf(out, "  Inner Docker limit: %s (independent sparse logical maximum)\n", formatInitUintByteCount(estimate.LogicalDockerMaximumBytes))

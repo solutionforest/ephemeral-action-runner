@@ -705,17 +705,29 @@ func (m *Coordinator) ensureDockerSandboxesTemplateFromState(ctx context.Context
 	return m.ensureDockerSandboxesTemplateResolved(ctx, false, *state.LastResolvedManifest, *state.LastResolvedSource)
 }
 
-func estimatedDockerSandboxesExpansion(source ResolvedDockerSource) uint64 {
+func (m *Coordinator) dockerSandboxesStoragePlan(source ResolvedDockerSource, cached bool, operationID string) (ArtifactStoragePlan, error) {
 	estimate, err := EstimateSourceSize(source.CompressedLayerBytes, 0)
 	if err != nil {
-		return ^uint64(0)
+		return ArtifactStoragePlan{}, err
 	}
-	dockerDisk, _ := config.ParseByteSize(config.DockerSandboxesDefaultDockerDisk)
-	plan, err := PlanArtifactStorage("docker-sandboxes", estimate, false, uint64(dockerDisk))
+	dockerDisk, err := config.ParseByteSize(m.Config.DockerSandboxes.DockerDisk)
 	if err != nil {
-		return ^uint64(0)
+		return ArtifactStoragePlan{}, err
 	}
-	return plan.EstimatedIncrementalPeak
+	plan, err := PlanArtifactStorage("docker-sandboxes", estimate, cached, uint64(dockerDisk))
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	plan.OperationPlan.ID = operationID
+	return plan, nil
+}
+
+func (m *Coordinator) dockerSandboxesImportStoragePlan(source ResolvedDockerSource, archiveBytes uint64) (ArtifactStoragePlan, error) {
+	estimate, err := EstimateSourceSize(source.CompressedLayerBytes, 0)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	return PlanDockerSandboxesImportStorage(estimate, archiveBytes)
 }
 
 func (m *Coordinator) effectiveDockerSandboxesRootDisk(source ResolvedDockerSource) (string, error) {
@@ -741,7 +753,11 @@ func (m *Coordinator) effectiveDockerSandboxesRootDisk(source ResolvedDockerSour
 }
 
 func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, runtime provider.TemplateArtifactRuntime) error {
-	if err := m.preflightStorage("template-build", estimatedDockerSandboxesExpansion(source)); err != nil {
+	plan, err := m.dockerSandboxesStoragePlan(source, false, "template-build")
+	if err != nil {
+		return err
+	}
+	if err := m.preflightStorage(plan.OperationPlan); err != nil {
 		return err
 	}
 	if err := m.verifyDockerSandboxesNativeBuilder(ctx, source.Platform); err != nil {
@@ -1061,7 +1077,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if err != nil {
 		return err
 	}
-	adoptedReusable, activatedAt, err := m.importOrAdoptDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, allowReusable, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+	adoptedReusable, activatedAt, err := m.importOrAdoptDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, allowReusable, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, archiveBytes, runtime)
 	if err != nil {
 		return err
 	}
@@ -1076,7 +1092,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	return nil
 }
 
-func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) (bool, time.Time, error) {
+func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, verifiedArchiveBytes uint64, runtime provider.TemplateArtifactRuntime) (bool, time.Time, error) {
 	adoptedReusable := false
 	activatedAt := time.Time{}
 	err := m.withSandboxBackendLock(ctx, func() error {
@@ -1093,6 +1109,13 @@ func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, 
 				return err
 			}
 			label := fmt.Sprintf("Docker Sandboxes template-cache import for %s", artifact.Reference)
+			importPlan, err := m.dockerSandboxesImportStoragePlan(source, verifiedArchiveBytes)
+			if err != nil {
+				return fmt.Errorf("plan Docker Sandboxes template-cache import storage: %w", err)
+			}
+			if err := m.preflightStorage(importPlan.OperationPlan); err != nil {
+				return err
+			}
 			if err := m.runProgressOperation(label, nil, func() error {
 				return runtime.ImportTemplate(ctx, archivePath)
 			}); err != nil {
@@ -1495,6 +1518,13 @@ func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifes
 	if err := m.withSandboxBackendLock(ctx, func() error {
 		if err := runtime.VerifyImportedTemplate(ctx, artifact); err != nil {
 			if !errors.Is(err, provider.ErrTemplateNotFound) {
+				return err
+			}
+			importPlan, err := m.dockerSandboxesImportStoragePlan(source, metadata.Template.ArchiveBytes)
+			if err != nil {
+				return fmt.Errorf("plan resumed Docker Sandboxes template-cache import storage: %w", err)
+			}
+			if err := m.preflightStorage(importPlan.OperationPlan); err != nil {
 				return err
 			}
 			if err := m.runProgressOperation("Docker Sandboxes resumed template-cache import", nil, func() error {

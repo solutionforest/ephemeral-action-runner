@@ -1311,7 +1311,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			return vm, fmt.Errorf("GitHub runner name %q is already allocated to id=%d", name, runner.ID)
 		}
 	}
-	if err := m.preflightStorage("instance-create", m.instanceCreateExpansion()); err != nil {
+	if err := m.preflightStorage(m.instanceCreateOperationPlan()); err != nil {
 		return vm, err
 	}
 	if err := m.reserveLifecycle(ctx, name); err != nil {

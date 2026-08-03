@@ -271,6 +271,18 @@ func findArtifactByArchiveDigest(t *testing.T, artifacts []storage.Artifact, dig
 	return storage.Artifact{}
 }
 
+func TestCollectTemplatesIgnoresVerifiedEmptyWorkspaceDirectory(t *testing.T) {
+	root := t.TempDir()
+	mustMkdirAll(t, filepath.Join(root, "config-id"))
+	artifacts, warnings, err := collectTemplates(templateOptions{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 0 || len(warnings) != 0 {
+		t.Fatalf("empty workspace inventory = artifacts=%+v warnings=%v", artifacts, warnings)
+	}
+}
+
 func actionForArtifact(plan storage.Plan, id string) storage.Action {
 	for _, decision := range plan.Decisions {
 		if decision.Artifact.ID == id {

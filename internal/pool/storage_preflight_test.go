@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,16 +20,18 @@ func (insufficientStorage) StorageSnapshot(context.Context, provider.StorageRequ
 		Surfaces: []storage.Surface{{
 			ID:       "provider-backing",
 			Provider: "docker-sandboxes",
+			Role:     storage.StorageRoleSandboxRuntime,
 			Kind:     storage.SurfaceHostFilesystem,
+			DomainID: "provider-domain",
 			Location: "test-backing",
-			Capacity: storage.Capacity{Known: true, TotalBytes: 100 * storage.GiB, AvailableBytes: 30 * storage.GiB},
+			Path:     "test-backing",
+			Capacity: storage.Capacity{Known: true, TotalBytes: 100 * storage.GiB, AvailableBytes: 15 * storage.GiB},
 		}},
-		Requirements: []storage.Requirement{{
-			ID:               "instance-create-provider-backing",
-			Provider:         "docker-sandboxes",
-			SurfaceID:        "provider-backing",
-			PeakBytes:        20 * storage.GiB,
-			MinimumFreeBytes: 20 * storage.GiB,
+		Domains: []storage.CapacityDomain{{
+			ID:       "provider-domain",
+			Kind:     storage.SurfaceHostFilesystem,
+			Path:     "test-backing",
+			Capacity: storage.Capacity{Known: true, TotalBytes: 100 * storage.GiB, AvailableBytes: 15 * storage.GiB},
 		}},
 	}, nil
 }
@@ -52,6 +55,7 @@ func TestRunPoolCapacityRejectionDoesNotCleanupUncreatedInstance(t *testing.T) {
 		LifecycleState: state,
 		Storage:        insufficientStorage{},
 		ProjectRoot:    t.TempDir(),
+		ConfigPath:     "config.sbx.yml",
 	}
 
 	err = manager.RunPool(context.Background(), RunOptions{Instances: 1, PoolLockHeld: true, HostTrustLockHeld: true})
@@ -60,12 +64,14 @@ func TestRunPoolCapacityRejectionDoesNotCleanupUncreatedInstance(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Storage location: test-backing",
-		"Available: 30.00 GiB",
-		"Estimated operation growth: 20.00 GiB",
+		"Available: 15.00 GiB",
+		"Estimated operation growth: 10.00 GiB",
 		"Free-space reserve: 20.00 GiB",
-		"Required before starting: 40.00 GiB",
-		"Additional space needed: 10.00 GiB",
+		"Required before starting: 30.00 GiB",
+		"Additional space needed: 15.00 GiB",
 		"./start storage prune --provider docker-sandboxes",
+		"--config config.sbx.yml",
+		"--project-root " + manager.ProjectRoot,
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("RunPool() error = %q, want %q", err, want)
@@ -92,6 +98,30 @@ func TestRunPoolCapacityRejectionDoesNotCleanupUncreatedInstance(t *testing.T) {
 	}
 }
 
+type failedStorageDiscovery struct{}
+
+func (failedStorageDiscovery) StorageSnapshot(context.Context, provider.StorageRequest) (provider.StorageSnapshot, error) {
+	return provider.StorageSnapshot{}, errors.New("discovery failed")
+}
+
+func TestStorageMeasurementHintPreservesConfigAndProjectRoot(t *testing.T) {
+	t.Setenv("EPAR_INVOCATION", "start")
+	manager := Manager{
+		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes"}, Storage: config.StorageConfig{MinimumFree: "1GiB"}},
+		Storage:     failedStorageDiscovery{},
+		ProjectRoot: t.TempDir(),
+		ConfigPath:  "config.sbx.yml",
+	}
+	err := manager.preflightStorage(manager.instanceCreateOperationPlan())
+	if err == nil {
+		t.Fatal("storage discovery failure was accepted")
+	}
+	want := manager.storageStatusCommand("instance-create")
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("measurement error = %q, want exact hint %q", err, want)
+	}
+}
+
 func TestStorageOverrideContinuesOnlyStorageAdmission(t *testing.T) {
 	manager := Manager{
 		Config: config.Config{
@@ -103,7 +133,7 @@ func TestStorageOverrideContinuesOnlyStorageAdmission(t *testing.T) {
 		StorageOverrideCommand:   "./start --allow-insufficient-storage",
 		ProjectRoot:              t.TempDir(),
 	}
-	if err := manager.preflightStorage("instance-create", 20*storage.GiB); err != nil {
+	if err := manager.preflightStorage(manager.instanceCreateOperationPlan()); err != nil {
 		t.Fatalf("storage override rejected storage-only admission: %v", err)
 	}
 }

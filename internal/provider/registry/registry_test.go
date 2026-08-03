@@ -14,6 +14,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockercontainer"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/storagepath"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
@@ -110,61 +111,176 @@ func TestNewWiresDockerSandboxesCapabilitiesWithoutLegacyAdapter(t *testing.T) {
 	}
 }
 
-func TestDockerSandboxesStorageRoutesOperationsToTheirBackingSurfaces(t *testing.T) {
+func TestEveryProviderStorageMapsRolesToConcreteRoots(t *testing.T) {
+	root := t.TempDir()
+	previousDocker := discoverCurrentDockerStorage
+	previousEnvironment := currentStorageEnvironment
+	t.Cleanup(func() {
+		discoverCurrentDockerStorage = previousDocker
+		currentStorageEnvironment = previousEnvironment
+	})
+	discoverCurrentDockerStorage = func(context.Context) (storagepath.DockerStorage, error) {
+		return storagepath.DockerStorage{Roots: []storagepath.Resolution{
+			{ID: "engine", Path: filepath.Join(root, "docker"), CapacityPath: root, Provenance: storagepath.ProvenanceDockerInfo, Confidence: storagepath.ConfidenceObserved},
+			{ID: "containerd", Path: filepath.Join(root, "containerd"), CapacityPath: root, Provenance: storagepath.ProvenanceContainerdConfig, Confidence: storagepath.ConfidenceDerived},
+		}}, nil
+	}
+	currentStorageEnvironment = func() (storagepath.Environment, error) {
+		return storagepath.Environment{
+			GOOS:          runtime.GOOS,
+			HomeDir:       root,
+			LocalAppData:  root,
+			AppData:       root,
+			XDGStateHome:  filepath.Join(root, "state"),
+			XDGCacheHome:  filepath.Join(root, "cache"),
+			XDGConfigHome: filepath.Join(root, "config"),
+			TartHome:      filepath.Join(root, "tart"),
+		}, nil
+	}
+
+	tests := []struct {
+		providerType string
+		wantRoles    []storage.StorageRole
+	}{
+		{providerType: "docker-container", wantRoles: []storage.StorageRole{storage.StorageRoleProject, storage.StorageRoleDockerEngine, storage.StorageRoleContainerdStore}},
+		{providerType: "docker-sandboxes", wantRoles: []storage.StorageRole{storage.StorageRoleProject, storage.StorageRoleDockerEngine, storage.StorageRoleContainerdStore, storage.StorageRoleSandboxRuntime, storage.StorageRoleSandboxTemplateCache}},
+		{providerType: "wsl", wantRoles: []storage.StorageRole{storage.StorageRoleProject, storage.StorageRoleDockerEngine, storage.StorageRoleContainerdStore, storage.StorageRoleWSLDistribution}},
+		{providerType: "tart", wantRoles: []storage.StorageRole{storage.StorageRoleProject, storage.StorageRoleTartStore}},
+	}
+	for _, test := range tests {
+		t.Run(test.providerType, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Provider.Type = test.providerType
+			snapshot, err := providerStorage(cfg, root).StorageSnapshot(context.Background(), provider.StorageRequest{Now: time.Now()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			byRole := make(map[storage.StorageRole]int)
+			for _, surface := range snapshot.Surfaces {
+				if surface.Role != "" {
+					byRole[surface.Role]++
+				}
+				if surface.DomainID == "" {
+					t.Errorf("surface %s has no capacity domain", surface.ID)
+				}
+			}
+			for _, role := range test.wantRoles {
+				if byRole[role] != 1 {
+					t.Errorf("role %q maps to %d surfaces, want exactly 1; surfaces=%#v", role, byRole[role], snapshot.Surfaces)
+				}
+			}
+			if test.providerType == "docker-sandboxes" {
+				for _, surface := range snapshot.Surfaces {
+					if surface.ID == "docker-sandboxes-staging" && surface.Role != "" {
+						t.Errorf("staging surface has allocation role %q", surface.Role)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDockerStorageMapsInactiveContainerdRoleToEngineDomain(t *testing.T) {
+	root := t.TempDir()
+	previous := discoverCurrentDockerStorage
+	t.Cleanup(func() { discoverCurrentDockerStorage = previous })
+	discoverCurrentDockerStorage = func(context.Context) (storagepath.DockerStorage, error) {
+		return storagepath.DockerStorage{Roots: []storagepath.Resolution{{
+			ID: "engine", Path: filepath.Join(root, "docker"), CapacityPath: root, Provenance: storagepath.ProvenanceDockerInfo, Confidence: storagepath.ConfidenceObserved,
+		}}}, nil
+	}
+	roots, err := dockerStorageRoots(context.Background(), provider.StorageRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 2 {
+		t.Fatalf("root count = %d, want engine and image-store alias", len(roots))
+	}
+	byRole := make(map[storage.StorageRole]provider.StorageRoot)
+	for _, root := range roots {
+		byRole[root.Role] = root
+	}
+	engine := byRole[storage.StorageRoleDockerEngine]
+	imageStore := byRole[storage.StorageRoleContainerdStore]
+	if engine.CapacityPath != imageStore.CapacityPath || engine.Path != imageStore.Path {
+		t.Fatalf("inactive containerd alias paths differ: engine=%#v image-store=%#v", engine, imageStore)
+	}
+}
+
+func TestDockerSandboxesOperationRolesExcludeStagingAndRouteMajorGrowth(t *testing.T) {
+	root := t.TempDir()
+	previousDocker := discoverCurrentDockerStorage
+	previousEnvironment := currentStorageEnvironment
+	t.Cleanup(func() {
+		discoverCurrentDockerStorage = previousDocker
+		currentStorageEnvironment = previousEnvironment
+	})
+	discoverCurrentDockerStorage = func(context.Context) (storagepath.DockerStorage, error) {
+		return storagepath.DockerStorage{Roots: []storagepath.Resolution{{ID: "engine", Path: filepath.Join(root, "docker"), CapacityPath: root}}}, nil
+	}
+	currentStorageEnvironment = func() (storagepath.Environment, error) {
+		return storagepath.Environment{GOOS: runtime.GOOS, HomeDir: root, LocalAppData: root, AppData: root, XDGStateHome: filepath.Join(root, "state"), XDGCacheHome: filepath.Join(root, "cache"), XDGConfigHome: filepath.Join(root, "config")}, nil
+	}
 	cfg := config.Default()
 	cfg.Provider.Type = "docker-sandboxes"
-	cfg.DockerSandboxes.RootDisk = "30GiB"
-	cfg.DockerSandboxes.DockerDisk = "100GiB"
-	contribution := providerStorage(cfg, t.TempDir())
-
-	create, err := contribution.StorageSnapshot(context.Background(), provider.StorageRequest{
-		Operation:        "instance-create",
-		Now:              time.Now(),
-		PeakBytes:        10 << 30,
-		MinimumFreeBytes: 50 << 30,
-	})
+	snapshot, err := providerStorage(cfg, root).StorageSnapshot(context.Background(), provider.StorageRequest{Now: time.Now()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	createRequirements := map[string]uint64{}
-	for _, requirement := range create.Requirements {
-		createRequirements[requirement.SurfaceID] = requirement.PeakBytes
+	tests := []struct {
+		operation string
+		role      storage.StorageRole
+		want      string
+	}{
+		{operation: "image-build", role: storage.StorageRoleContainerdStore, want: "containerd-store-backing"},
+		{operation: "template-build", role: storage.StorageRoleSandboxTemplateCache, want: "docker-sandboxes-template-cache"},
+		{operation: "instance-create", role: storage.StorageRoleSandboxRuntime, want: "docker-sandboxes-runtime"},
 	}
-	if got, want := createRequirements["docker-sandboxes-backing"], uint64(10<<30); got != want {
-		t.Fatalf("sandbox backing create expansion = %d, want %d", got, want)
+	for _, test := range tests {
+		t.Run(test.operation, func(t *testing.T) {
+			plan := storage.OperationPlan{ID: test.operation, Phases: []storage.OperationPhase{{ID: "growth", Allocations: []storage.Allocation{{ID: "major-growth", Role: test.role, Bytes: 1}}}}}
+			resolved, err := storage.ResolveOperationPlan(plan, snapshot.Surfaces, snapshot.Domains)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := resolved.Allocations[0].SurfaceID; got != test.want {
+				t.Fatalf("resolved surface = %q, want %q", got, test.want)
+			}
+			if resolved.Allocations[0].SurfaceID == "docker-sandboxes-staging" {
+				t.Fatal("major growth resolved to staging")
+			}
+		})
 	}
-	if _, found := createRequirements["docker-engine-backing"]; found {
-		t.Fatalf("sandbox create incorrectly reserved Docker Engine storage: %v", createRequirements)
-	}
-	createSurfaces := map[string]storage.SurfaceKind{}
-	for _, surface := range create.Surfaces {
-		createSurfaces[surface.ID] = surface.Kind
-	}
-	if got, want := createSurfaces["docker-engine-backing"], storage.SurfaceDockerEngine; got != want {
-		t.Fatalf("Docker Engine surface kind = %q, want %q", got, want)
-	}
-	if got, want := createSurfaces["docker-sandboxes-backing"], storage.SurfaceSandboxCache; got != want {
-		t.Fatalf("Docker Sandboxes surface kind = %q, want %q", got, want)
-	}
+}
 
-	pull, err := contribution.StorageSnapshot(context.Background(), provider.StorageRequest{
-		Operation:        "image-pull",
-		Now:              time.Now(),
-		PeakBytes:        20 << 30,
-		MinimumFreeBytes: 50 << 30,
-	})
+func TestLinuxDockerSandboxesConfigRootIsReportOnly(t *testing.T) {
+	previousEnvironment := currentStorageEnvironment
+	t.Cleanup(func() { currentStorageEnvironment = previousEnvironment })
+	currentStorageEnvironment = func() (storagepath.Environment, error) {
+		return storagepath.Environment{GOOS: "linux", HomeDir: "/home/runner", XDGStateHome: "/mnt/state", XDGCacheHome: "/mnt/cache", XDGConfigHome: "/mnt/config"}, nil
+	}
+	roots, err := dockerSandboxesStorageRoots(context.Background(), provider.StorageRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	pullRequirements := map[string]uint64{}
-	for _, requirement := range pull.Requirements {
-		pullRequirements[requirement.SurfaceID] = requirement.PeakBytes
+	for _, root := range roots {
+		if root.ID == "docker-sandboxes-config" {
+			if !root.ReportOnly {
+				t.Fatal("Linux Docker Sandboxes config root is not marked report-only")
+			}
+			return
+		}
 	}
-	if _, found := pullRequirements["docker-sandboxes-backing"]; found {
-		t.Fatalf("Docker image pull incorrectly reserved sandbox instance storage: %v", pullRequirements)
+	t.Fatal("Linux Docker Sandboxes config surface was not reported")
+}
+
+func TestStorageDiscoveryIsScopedToAllocatedRoles(t *testing.T) {
+	request := provider.StorageRequest{OperationPlan: storage.OperationPlan{ID: "template-import", Phases: []storage.OperationPhase{{ID: "import", Allocations: []storage.Allocation{{ID: "cache", Role: storage.StorageRoleSandboxTemplateCache, Bytes: storage.GiB}}}}}}
+	if storageRequestUsesRole(request, storage.StorageRoleDockerEngine, storage.StorageRoleContainerdStore) {
+		t.Fatal("Sandbox cache-only operation requested Docker Engine discovery")
 	}
-	if got, want := pullRequirements["docker-engine-backing"], uint64(20<<30); got != want {
-		t.Fatalf("Docker Engine pull expansion = %d, want %d", got, want)
+	if !storageRequestUsesRole(request, storage.StorageRoleSandboxRuntime, storage.StorageRoleSandboxTemplateCache) {
+		t.Fatal("Sandbox cache-only operation skipped Sandbox storage discovery")
 	}
 }
 

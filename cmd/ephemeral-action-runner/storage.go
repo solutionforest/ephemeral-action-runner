@@ -49,6 +49,7 @@ func runStorage(args []string) error {
 	projectRootFlag := fs.String("project-root", cwd, "project root containing EPAR state and artifacts")
 	configPathFlag := fs.String("config", "", "config file path; defaults to EPAR_CONFIG or .local/config.yml when present")
 	providerFlag := fs.String("provider", "", "limit provider-specific inventory")
+	operationFlag := fs.String("operation", "", "show the capacity plan for an operation such as template-build or instance-create")
 	jsonOutput := fs.Bool("json", false, "write the complete storage report as JSON")
 	execute := fs.Bool("execute", false, "execute the exact policy-selected prune plan")
 	legacy := fs.Bool("legacy", false, "include prefix-era EPAR resources in an operator-approved exact preview")
@@ -64,6 +65,9 @@ func runStorage(args []string) error {
 	}
 	if subcommand == "status" && (*legacy || strings.TrimSpace(*approvedPlan) != "") {
 		return fmt.Errorf("storage status does not support --legacy or --plan")
+	}
+	if subcommand == "prune" && strings.TrimSpace(*operationFlag) != "" {
+		return fmt.Errorf("storage prune does not support --operation")
 	}
 	if !*legacy && strings.TrimSpace(*approvedPlan) != "" {
 		return fmt.Errorf("--plan is valid only with storage prune --legacy --execute")
@@ -167,27 +171,32 @@ func runStorage(args []string) error {
 	if effectiveMinimumFree > minimumFree {
 		minimumFree = effectiveMinimumFree
 	}
-	requirements := []storage.Requirement{{
-		ID:               "controller-bootstrap",
-		Provider:         *providerFlag,
-		SurfaceID:        inventory.ProjectSurfaceID,
-		MinimumFreeBytes: minimumFree,
-	}}
+	operationName := strings.TrimSpace(*operationFlag)
+	if operationName == "" {
+		operationName = "controller-bootstrap"
+	}
+	operationPlan, err := storageStatusOperationPlan(context.Background(), storageConfig, projectRoot, operationName, minimumFree)
+	if err != nil {
+		return err
+	}
+	var capacityDomains []storage.CapacityDomain
+	var operationPlans []storage.OperationPlan
 	providerRuntime, runtimeErr := providerregistry.New(storageConfig, projectRoot, true)
 	if runtimeErr != nil {
 		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Provider storage surfaces are unavailable: %v", runtimeErr))
 	} else {
 		providerSnapshot, snapshotErr := providerRuntime.Storage.StorageSnapshot(context.Background(), provider.StorageRequest{
-			Operation:        "storage-status",
-			Now:              now,
-			MinimumFreeBytes: minimumFree,
+			OperationPlan: operationPlan,
+			Now:           now,
 		})
 		if snapshotErr != nil {
 			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("Provider storage surfaces are unavailable: %v", snapshotErr))
 		} else {
-			snapshot.Surfaces = append(snapshot.Surfaces, providerSnapshot.Surfaces...)
+			snapshot.Surfaces = mergeStorageSurfaces(snapshot.Surfaces, providerSnapshot.Surfaces)
 			snapshot.Artifacts = append(snapshot.Artifacts, providerSnapshot.Artifacts...)
-			requirements = append(requirements, providerSnapshot.Requirements...)
+			snapshot.Warnings = append(snapshot.Warnings, providerSnapshot.Warnings...)
+			capacityDomains = append(capacityDomains, providerSnapshot.Domains...)
+			operationPlans = append(operationPlans, operationPlan)
 		}
 	}
 	if storageProvider == "docker-sandboxes" {
@@ -228,7 +237,10 @@ func runStorage(args []string) error {
 		appendLogicalSurface("docker-sandboxes-root-logical", rootDisk)
 		appendLogicalSurface("docker-sandboxes-inner-docker-logical", cfg.DockerSandboxes.DockerDisk)
 	}
-	plan, err := storage.Preview(snapshot.PreviewRequest(policy, requirements))
+	previewRequest := snapshot.PreviewRequest(policy, nil)
+	previewRequest.CapacityDomains = capacityDomains
+	previewRequest.OperationPlans = operationPlans
+	plan, err := storage.Preview(previewRequest)
 	if err != nil {
 		return err
 	}
@@ -285,6 +297,115 @@ func runStorage(args []string) error {
 		fmt.Fprintln(os.Stdout, "Configuration:", configPath)
 	}
 	return nil
+}
+
+func mergeStorageSurfaces(existing, measured []storage.Surface) []storage.Surface {
+	result := append([]storage.Surface(nil), existing...)
+	indices := make(map[string]int, len(result))
+	for index, surface := range result {
+		indices[surface.ID] = index
+	}
+	for _, surface := range measured {
+		if index, found := indices[surface.ID]; found {
+			result[index] = surface
+			continue
+		}
+		indices[surface.ID] = len(result)
+		result = append(result, surface)
+	}
+	return result
+}
+
+func storageStatusOperationPlan(ctx context.Context, cfg config.Config, projectRoot, operation string, minimumFree uint64) (storage.OperationPlan, error) {
+	projectOnly := func(id string, bytes uint64) storage.OperationPlan {
+		return storage.OperationPlan{
+			ID:               id,
+			Provider:         cfg.Provider.Type,
+			MinimumFreeBytes: minimumFree,
+			Phases: []storage.OperationPhase{{
+				ID: id,
+				Allocations: []storage.Allocation{{
+					ID: "project-" + id, Role: storage.StorageRoleProject, Bytes: bytes,
+				}},
+			}},
+		}
+	}
+	switch operation {
+	case "controller-bootstrap", "storage-status":
+		return projectOnly(operation, 0), nil
+	case "source-update", "image-update", "image-update-upstream":
+		return projectOnly(operation, 5*storage.GiB), nil
+	case "instance-create":
+		role := storage.StorageRoleProject
+		switch cfg.Provider.Type {
+		case "docker-container":
+			role = storage.StorageRoleDockerEngine
+		case "docker-sandboxes":
+			role = storage.StorageRoleSandboxRuntime
+		case "wsl":
+			role = storage.StorageRoleWSLDistribution
+		case "tart":
+			role = storage.StorageRoleTartStore
+		}
+		return storage.OperationPlan{ID: operation, Provider: cfg.Provider.Type, MinimumFreeBytes: minimumFree, Phases: []storage.OperationPhase{{ID: operation, Allocations: []storage.Allocation{{ID: "provider-runtime-instance", Role: role, Bytes: 10 * storage.GiB}}}}}, nil
+	case "template-build", "image-build", "image-pull", "template-import":
+		estimate, err := storageStatusSourceEstimate(ctx, cfg, projectRoot)
+		if err != nil {
+			return storage.OperationPlan{}, fmt.Errorf("resolve %s storage estimate: %w", operation, err)
+		}
+		if operation == "template-import" {
+			artifactPlan, err := artifactimage.PlanDockerSandboxesImportStorage(estimate, 0)
+			if err != nil {
+				return storage.OperationPlan{}, err
+			}
+			artifactPlan.OperationPlan.MinimumFreeBytes = minimumFree
+			return artifactPlan.OperationPlan, nil
+		}
+		dockerDiskBytes := uint64(0)
+		if cfg.Provider.Type == "docker-sandboxes" {
+			parsed, err := config.ParseByteSize(cfg.DockerSandboxes.DockerDisk)
+			if err != nil {
+				return storage.OperationPlan{}, err
+			}
+			dockerDiskBytes = uint64(parsed)
+		}
+		artifactPlan, err := artifactimage.PlanArtifactStorage(cfg.Provider.Type, estimate, false, dockerDiskBytes)
+		if err != nil {
+			return storage.OperationPlan{}, err
+		}
+		artifactPlan.OperationPlan.ID = operation
+		artifactPlan.OperationPlan.MinimumFreeBytes = minimumFree
+		return artifactPlan.OperationPlan, nil
+	default:
+		return storage.OperationPlan{}, fmt.Errorf("unsupported storage operation %q", operation)
+	}
+}
+
+func storageStatusSourceEstimate(ctx context.Context, cfg config.Config, projectRoot string) (artifactimage.SourceSizeEstimate, error) {
+	if cfg.Provider.Type == "tart" {
+		return artifactimage.SourceSizeEstimate{Confidence: artifactimage.EstimateDerived}, nil
+	}
+	if cfg.Provider.Type == "wsl" && cfg.Image.SourceType == config.ImageSourceRootFSTar {
+		info, err := os.Stat(config.ProjectPath(projectRoot, cfg.Image.SourceImage))
+		if err != nil {
+			return artifactimage.SourceSizeEstimate{}, err
+		}
+		if info.Size() < 0 {
+			return artifactimage.SourceSizeEstimate{}, fmt.Errorf("source rootfs reports a negative size")
+		}
+		return artifactimage.EstimateSourceSize(uint64(info.Size()), uint64(info.Size()))
+	}
+	guestPlatform, err := initDockerGuestPlatform(cfg.Provider.Type, initSandboxPromotionPlatform())
+	if err != nil {
+		return artifactimage.SourceSizeEstimate{}, err
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	source, err := initResolveDockerSandboxesSource(resolveCtx, cfg.Image.SourceImage, guestPlatform)
+	if err != nil {
+		return artifactimage.SourceSizeEstimate{}, err
+	}
+	return artifactimage.EstimateSourceSize(source.CompressedLayerBytes, 0)
 }
 
 func runEffectiveGoCacheLimit(args []string) error {
@@ -405,7 +526,27 @@ func printStorageReport(subcommand string, report storageCommandReport) {
 		}
 		fmt.Fprintf(os.Stdout, "Surface %s\tprovider=%s\tkind=%s\tclassification=%s\tsparse=%t\tavailable=%s\tallocated=%s\tvirtualMaximum=%s\tconfidence=%s\tauthoritative=%t\tadvisory=%t\tlocation=%s\n", surface.ID, valueOrDash(surface.Provider), surface.Kind, valueOrDash(surface.Classification), surface.Sparse, available, formatStorageOptionalBytes(surface.AllocatedBytes), formatStorageOptionalBytes(surface.VirtualMaximumBytes), valueOrDash(surface.Confidence), surface.AdmissionAuthoritative, surface.Advisory, surface.Location)
 	}
+	for _, domain := range report.Plan.CapacityDomains {
+		available := "unknown"
+		if domain.Capacity.Known {
+			available = formatStorageBytes(domain.Capacity.AvailableBytes)
+		}
+		fmt.Fprintf(os.Stdout, "Domain %s\tkind=%s\tavailable=%s\tconfidence=%s\tprovenance=%s\tlocation=%s\n", domain.ID, domain.Kind, available, valueOrDash(domain.Confidence), valueOrDash(domain.Provenance), domain.Path)
+	}
+	for _, operation := range report.Plan.OperationPlans {
+		fmt.Fprintf(os.Stdout, "Operation %s\tprovider=%s\treserve=%s\n", operation.ID, valueOrDash(operation.Provider), formatStorageBytes(operation.MinimumFreeBytes))
+		for _, phase := range operation.Phases {
+			fmt.Fprintf(os.Stdout, "Phase %s\toperation=%s\n", phase.ID, operation.ID)
+		}
+	}
+	for _, allocation := range report.Plan.ResolvedAllocations {
+		fmt.Fprintf(os.Stdout, "Allocation %s\toperation=%s\tphase=%s\trole=%s\tsurface=%s\tdomain=%s\tbytes=%s\n", allocation.AllocationID, allocation.OperationID, allocation.PhaseID, valueOrDash(string(allocation.Role)), allocation.SurfaceID, allocation.DomainID, formatStorageBytes(allocation.Bytes))
+	}
 	for _, check := range report.Plan.CapacityChecks {
+		if check.DomainRequirement != nil {
+			fmt.Fprintf(os.Stdout, "Capacity %s\toperation=%s\tdomain=%s\tstatus=%s\tavailable=%s\tphasePeak=%s\treserve=%s\trequired=%s\n", check.Requirement.ID, check.DomainRequirement.OperationID, check.DomainRequirement.DomainID, check.Status, formatStorageBytes(check.Capacity.AvailableBytes), formatStorageBytes(check.DomainRequirement.PeakBytes), formatStorageBytes(check.DomainRequirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes))
+			continue
+		}
 		fmt.Fprintf(os.Stdout, "Capacity %s\tstatus=%s\tavailable=%s\testimated=%s\treserve=%s\trequired=%s\n", check.Requirement.ID, check.Status, formatStorageBytes(check.Capacity.AvailableBytes), formatStorageBytes(check.Requirement.PeakBytes), formatStorageBytes(check.Requirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes))
 	}
 	for _, decision := range report.Plan.Decisions {
