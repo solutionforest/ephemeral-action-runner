@@ -40,7 +40,7 @@ type startupTiming struct {
 	logger        *slog.Logger
 }
 
-// StartStartupTiming records the initial Docker Container or WSL start path.
+// StartStartupTiming records the initial supported provider start path.
 func (m *Manager) StartStartupTiming() (string, error) {
 	provider := m.Config.Provider.Type
 	if !supportsStartupTiming(provider) {
@@ -189,13 +189,15 @@ func (t *startupTiming) eventLocked(stage, outcome string, elapsed time.Duration
 }
 
 func supportsStartupTiming(provider string) bool {
-	return provider == "docker-container" || provider == "wsl"
+	return provider == "docker-container" || provider == "docker-sandboxes" || provider == "wsl"
 }
 
 func startupTimingLabel(provider string) string {
 	switch provider {
 	case "docker-container":
 		return "Docker Container"
+	case "docker-sandboxes":
+		return "Docker Sandboxes"
 	case "wsl":
 		return "WSL"
 	default:
