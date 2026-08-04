@@ -32,12 +32,14 @@ if ((${#epar_args[@]})) && [[ "${epar_args[0]}" == "--use-old" ]]; then
   use_old=1
   epar_args=("${epar_args[@]:1}")
 fi
-for epar_argument in "${epar_args[@]}"; do
-  if [[ "$epar_argument" == "--use-old" ]]; then
-    echo '--use-old is a wrapper option and must be the first argument: ./start --use-old <command> [arguments...]' >&2
-    exit 2
-  fi
-done
+if ((${#epar_args[@]})); then
+  for epar_argument in "${epar_args[@]}"; do
+    if [[ "$epar_argument" == "--use-old" ]]; then
+      echo '--use-old is a wrapper option and must be the first argument: ./start --use-old <command> [arguments...]' >&2
+      exit 2
+    fi
+  done
+fi
 if ((${#epar_args[@]} == 0)); then
   epar_args=(start)
 elif [[ "${epar_args[0]}" == -* ]]; then
