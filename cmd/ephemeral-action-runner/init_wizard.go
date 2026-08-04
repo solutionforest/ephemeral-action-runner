@@ -132,7 +132,7 @@ func runInitConfigurationWizard(opts initOptions, reader *bufio.Reader, githubCo
 				draft.RunnerGroup = result.Value
 			}
 		case initWizardProvider:
-			result, err := promptInitProviderWizard(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck, true, draft.ProviderType)
+			result, err := promptInitProviderWizard(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck, true)
 			if err != nil {
 				return initWizardOutcome{}, err
 			}
@@ -433,11 +433,11 @@ func promptProviderSetupWizard(ctx context.Context, projectRoot, providerType st
 	}
 }
 
-func promptInitProviderWizard(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool, preferredProvider string) (initWizardResult[string], error) {
+func promptInitProviderWizard(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool) (initWizardResult[string], error) {
 	hostPlatform := initSandboxPromotionPlatform()
 	record, promoted := initSandboxPromotionLookup(hostPlatform)
 	for {
-		result, _, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, allowBack, preferredProvider)
+		result, _, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, allowBack)
 		if err != nil {
 			return initWizardResult[string]{}, err
 		}

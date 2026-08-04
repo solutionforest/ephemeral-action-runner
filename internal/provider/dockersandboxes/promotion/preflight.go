@@ -65,7 +65,7 @@ func LocalPreflight(ctx context.Context, record Record, projectRoot string, nati
 	if os.Getenv(DisableEnvironment) == "1" {
 		return PreflightResult{Failures: []Failure{{
 			Gate:       "operator kill switch",
-			Detail:     DisableEnvironment + "=1 disables Docker Sandboxes admission and automatic selection",
+			Detail:     DisableEnvironment + "=1 disables Docker Sandboxes admission",
 			Resolution: "Unset the kill switch only after the Docker Sandboxes issue is resolved, or explicitly choose another provider.",
 		}}}
 	}

@@ -33,24 +33,12 @@ type entry struct {
 
 var entries = []entry{
 	{
-		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "1", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
-		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
-			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
-			environment := map[string]string{
-				"HTTP_PROXY":  cfg.Docker.HTTPProxy,
-				"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
-				"NO_PROXY":    cfg.Docker.NoProxy,
-			}
-			return adaptLegacy(dockercontainer.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), providerStorage(cfg, projectRoot), dryRun)
-		},
-	},
-	{
 		descriptor: provider.Descriptor{
 			Type:                   "docker-sandboxes",
 			DisplayName:            "Docker Sandboxes",
 			WizardSupported:        true,
-			WizardNumber:           "2",
-			WizardLabel:            "Docker Sandboxes — recommended when ready",
+			WizardNumber:           "1",
+			WizardLabel:            "Docker Sandboxes — recommended",
 			WizardAliases:          []string{"docker-sandboxes", "sandboxes"},
 			ConfigurationDecoder:   true,
 			ConfigurationDefaults:  true,
@@ -68,6 +56,18 @@ var entries = []entry{
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			sandboxes := dockersandboxes.NewWithDryRun("", dryRun)
 			return Runtime{Lifecycle: sandboxes, PolicyManager: sandboxes, Storage: providerStorage(cfg, projectRoot)}
+		},
+	},
+	{
+		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "2", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
+		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
+			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
+			environment := map[string]string{
+				"HTTP_PROXY":  cfg.Docker.HTTPProxy,
+				"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
+				"NO_PROXY":    cfg.Docker.NoProxy,
+			}
+			return adaptLegacy(dockercontainer.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},
 	},
 	{
@@ -89,8 +89,6 @@ func catthehackerProfiles() []provider.WizardImageProfile {
 	return []provider.WizardImageProfile{
 		{Name: "full", Tag: "full-latest"},
 		{Name: "act", Tag: "act-latest"},
-		{Name: "dotnet", Tag: "dotnet-latest"},
-		{Name: "js", Tag: "js-latest"},
 	}
 }
 

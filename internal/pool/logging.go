@@ -157,7 +157,10 @@ func (m *Manager) runHostBuildxLogged(ctx context.Context, logPath, name string,
 		return err
 	}
 	prefix := "Docker image build"
-	if m.Config.Provider.Type == "docker-sandboxes" {
+	switch m.Config.Provider.Type {
+	case "docker-container":
+		prefix = "Docker Container image build"
+	case "docker-sandboxes":
 		prefix = "Docker Sandboxes template build"
 	}
 	attributes := []any{"provider", m.Config.Provider.Type, "operation", "buildx-build", "logPath", logPath}
@@ -178,7 +181,7 @@ func (m *Manager) runHostBuildxLogged(ctx context.Context, logPath, name string,
 			}
 		}
 		if interactive {
-			_, _ = fmt.Fprintf(dockerPullProgressConsole, "\r\033[2K%s", line)
+			writeInteractiveProgressLine(dockerPullProgressConsole, line)
 			return
 		}
 		m.logger().Info(line, attributes...)

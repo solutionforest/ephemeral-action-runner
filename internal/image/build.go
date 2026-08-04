@@ -282,7 +282,7 @@ func (m *Coordinator) buildDockerContainerImageAttempt(ctx context.Context, upst
 		m.infof("image build dry run complete: %s\n", targetImage)
 		return nil
 	}
-	if err := m.runHostLogged(ctx, buildLogPath, "docker", args...); err != nil {
+	if err := m.runHostBuildxLogged(ctx, buildLogPath, "docker", args...); err != nil {
 		return err
 	}
 	if !m.hostTrustEnabled() {

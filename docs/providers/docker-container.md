@@ -46,6 +46,8 @@ Use `configs/docker-container.act.example.yml` for a smaller Docker-focused Catt
 
 The outer container has no host Docker socket mount and does not publish host ports by default. The inner daemon defaults to the reliable nested-Docker `vfs` storage driver. Use a different `EPAR_DOCKERD_STORAGE_DRIVER` only in a derived image after validating the exact host runtime.
 
+When EPAR builds or updates the reusable Docker Container image, the manager reports `Docker Container image build` progress with downloaded bytes, completed layers, the active BuildKit step, and elapsed time. In a non-interactive console these are periodic log records; in an interactive text console EPAR redraws one bounded line so long updates do not wrap. The complete unmodified Buildx output remains in the printed build transcript under `work/logs/builds/` by default. If `logging.transcriptSinks` includes `console`, EPAR displays that raw Buildx output and suppresses the duplicate summarized progress records.
+
 ## Limitations
 
 - The inner Docker daemon is private, but its CPU, memory, and disk use still comes from the host.
@@ -70,4 +72,4 @@ Expected output is `x86_64`.
 
 ## Troubleshooting
 
-See [Troubleshooting](../troubleshooting.md) for privileged-container checks, nested-Docker storage-driver failures, architecture emulation, disk pressure, and TLS errors.
+See [Troubleshooting](../troubleshooting.md) for privileged-container checks, nested-Docker storage-driver failures, architecture emulation, disk pressure, TLS errors, and how to use the Buildx transcript when a summarized image-build update is insufficient.

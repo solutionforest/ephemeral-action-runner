@@ -839,16 +839,15 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 }
 
 func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, bool, bool, error) {
-	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false, "")
+	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false)
 	if err != nil {
 		return "", false, false, err
 	}
 	return result.Value, promotionPassed, result.Action == initWizardRefresh, nil
 }
 
-func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool, preferredProvider string) (initWizardResult[string], bool, error) {
+func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool) (initWizardResult[string], bool, error) {
 	prerequisites := detectInitProviderPrerequisites(ctx, hostPlatform, skipDockerCheck)
-	operationalDefault := !promoted && prerequisites.DockerSandboxesAvailable
 	promotionPassed := false
 	var promotionFailures []sandboxpromotion.Failure
 	if promoted {
@@ -856,7 +855,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		if os.Getenv(sandboxpromotion.DisableEnvironment) == "1" {
 			preflight.Failures = append(preflight.Failures, sandboxpromotion.Failure{
 				Gate:       "operator kill switch",
-				Detail:     sandboxpromotion.DisableEnvironment + "=1 disables Docker Sandboxes admission and automatic selection",
+				Detail:     sandboxpromotion.DisableEnvironment + "=1 disables Docker Sandboxes admission",
 				Resolution: "Unset the kill switch only after the Docker Sandboxes issue is resolved, or explicitly choose another provider.",
 			})
 		} else if err := sandboxpromotion.Validate(record); err != nil {
@@ -873,7 +872,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		promotionPassed = preflight.Passed() && prerequisites.DockerSandboxesAvailable
 		promotionFailures = preflight.Failures
 		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Docker Sandboxes automatic-default preflight:")
+		fmt.Fprintln(out, "Docker Sandboxes admission preflight:")
 		if promotionPassed {
 			fmt.Fprintln(out, "  PASS: the exact promoted platform, host, sbx, template, policy, and resource gates passed.")
 		} else {
@@ -889,13 +888,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		}
 	}
 
-	defaultProvider := "docker-container"
-	if promotionPassed || operationalDefault {
-		defaultProvider = "docker-sandboxes"
-	} else if promoted || !prerequisites.DockerAvailable {
-		defaultProvider = ""
-	}
-	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider, allowBack, preferredProvider)
+	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, allowBack)
 	if err != nil {
 		return initWizardResult[string]{}, false, err
 	}
@@ -1454,15 +1447,7 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 	return result
 }
 
-func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string) (string, bool, error) {
-	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider, false, "")
-	if err != nil {
-		return "", false, err
-	}
-	return result.Value, result.Action == initWizardRefresh, nil
-}
-
-func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string, allowBack bool, preferredProvider string) (initWizardResult[string], error) {
+func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, allowBack bool) (initWizardResult[string], error) {
 	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
 	for _, descriptor := range providerregistry.Descriptors() {
 		option := initProviderOption{
@@ -1478,11 +1463,6 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 		case provider.WizardPrerequisiteDockerSandboxes:
 			option.Available = prerequisites.DockerSandboxesAvailable && (!promoted || promotionPassed)
 			option.Status = prerequisites.DockerSandboxesStatus
-			if operationalDefault {
-				option.Label = "Docker Sandboxes — recommended"
-			} else if promoted {
-				option.Label = "Docker Sandboxes (independently certified for this exact platform)"
-			}
 		case provider.WizardPrerequisiteWSL2:
 			option.Available = prerequisites.WSLAvailable
 			option.Status = prerequisites.WSLStatus
@@ -1497,10 +1477,7 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 	if err := validateWizardProviderOptions(options); err != nil {
 		return initWizardResult[string]{}, err
 	}
-	if preferredProvider != "" {
-		defaultProvider = preferredProvider
-	}
-	defaultNumber := prioritizeDefaultProviderOption(options, defaultProvider)
+	defaultNumber := markDefaultProviderOption(options, "docker-sandboxes")
 
 	fmt.Fprintln(out, "")
 	if defaultNumber == "" {
@@ -1582,22 +1559,13 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 	}
 }
 
-func prioritizeDefaultProviderOption(options []initProviderOption, defaultProvider string) string {
+func markDefaultProviderOption(options []initProviderOption, defaultProvider string) string {
 	defaultIndex := -1
 	for index := range options {
 		options[index].Default = false
-		if options[index].Type == defaultProvider && options[index].Available {
+		if options[index].Type == defaultProvider {
 			defaultIndex = index
 		}
-	}
-	if defaultIndex > 0 {
-		selected := options[defaultIndex]
-		copy(options[1:defaultIndex+1], options[:defaultIndex])
-		options[0] = selected
-		defaultIndex = 0
-	}
-	for index := range options {
-		options[index].Number = strconv.Itoa(index + 1)
 	}
 	if defaultIndex < 0 {
 		return ""

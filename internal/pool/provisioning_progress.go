@@ -39,7 +39,7 @@ func (m *Manager) runDockerSandboxesCreateProgress(instance string, operation fu
 					elapsed := time.Since(startedAt).Round(time.Second)
 					line := fmt.Sprintf("%s: still working; elapsed %s", label, elapsed)
 					if interactive {
-						_, _ = fmt.Fprintf(dockerPullProgressConsole, "\r\033[2K%s", line)
+						writeInteractiveProgressLine(dockerPullProgressConsole, line)
 						interactiveRendered = true
 						continue
 					}

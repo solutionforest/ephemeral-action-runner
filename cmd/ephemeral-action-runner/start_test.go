@@ -155,7 +155,7 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n\n\n\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -203,7 +203,7 @@ func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\nn\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n\n\nn\n"),
 		Out:         &out,
 		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
 			t.Fatal("manager factory should not run after choosing to review the new config")

@@ -42,6 +42,14 @@ var dockerPullProgressTerminal = func() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
 }
 
+var progressTerminalWidth = func() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width <= 0 {
+		return 0
+	}
+	return width
+}
+
 var dockerPullProgressConsole io.Writer = os.Stdout
 
 var (
