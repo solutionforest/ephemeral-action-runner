@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+[[ -x "$source_root/scripts/build-native-controller.sh" ]] || { echo 'scripts/build-native-controller.sh must be tracked as executable because the start wrappers execute it directly' >&2; exit 1; }
 test_root="$(mktemp -d)"
 cleanup() { rm -rf -- "$test_root"; }
 trap cleanup EXIT INT TERM
