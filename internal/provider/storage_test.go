@@ -11,6 +11,10 @@ import (
 
 func TestFilesystemStoragePublishesRoleAndCapacityDomain(t *testing.T) {
 	root := t.TempDir()
+	capacityRoot, err := nearestExistingDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	contribution := NewMultiFilesystemStorage("example", []StorageRoot{{ID: "project", Role: storage.StorageRoleProject, Path: root}})
 
 	snapshot, err := contribution.StorageSnapshot(context.Background(), StorageRequest{
@@ -33,8 +37,8 @@ func TestFilesystemStoragePublishesRoleAndCapacityDomain(t *testing.T) {
 	if surface.DomainID == "" || surface.DomainID != snapshot.Domains[0].ID {
 		t.Fatalf("surface domain = %q, domains = %#v", surface.DomainID, snapshot.Domains)
 	}
-	if surface.Path != root || surface.Location != root {
-		t.Fatalf("surface paths = logical %q capacity %q, want %q", surface.Path, surface.Location, root)
+	if surface.Path != root || surface.Location != capacityRoot {
+		t.Fatalf("surface paths = logical %q capacity %q, want logical %q capacity %q", surface.Path, surface.Location, root, capacityRoot)
 	}
 }
 
@@ -75,15 +79,23 @@ func TestFilesystemStorageSkipsUnallocatedProviderDiscovery(t *testing.T) {
 func TestFilesystemStorageKeepsDifferentCapacityDomainsSeparate(t *testing.T) {
 	first := t.TempDir()
 	second := t.TempDir()
+	firstCapacityRoot, err := nearestExistingDirectory(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCapacityRoot, err := nearestExistingDirectory(second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	contribution := NewMultiFilesystemStorage("example", []StorageRoot{
 		{ID: "first", Path: first},
 		{ID: "second", Path: second},
 	}).(*filesystemStorage)
 	contribution.domainProbe = func(path string, now time.Time) (storage.CapacityDomain, error) {
 		switch path {
-		case first:
+		case firstCapacityRoot:
 			return storage.CapacityDomain{ID: "volume:first", Identity: "volume:first", Path: path, Capacity: storage.Capacity{Known: true, ObservedAt: now}}, nil
-		case second:
+		case secondCapacityRoot:
 			return storage.CapacityDomain{ID: "volume:second", Identity: "volume:second", Path: path, Capacity: storage.Capacity{Known: true, ObservedAt: now}}, nil
 		default:
 			t.Fatalf("unexpected capacity path %q", path)
@@ -104,6 +116,10 @@ func TestFilesystemStorageKeepsDifferentCapacityDomainsSeparate(t *testing.T) {
 
 func TestFilesystemStorageIncludesDiscoveredEvidenceAndWarnings(t *testing.T) {
 	root := t.TempDir()
+	capacityRoot, err := nearestExistingDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	contribution := NewFilesystemStorageWithDiscovery("example", nil, func(context.Context, StorageRequest) ([]StorageRoot, error) {
 		return []StorageRoot{{
 			ID:           "runtime",
@@ -122,8 +138,8 @@ func TestFilesystemStorageIncludesDiscoveredEvidenceAndWarnings(t *testing.T) {
 		t.Fatal(err)
 	}
 	surface := snapshot.Surfaces[0]
-	if surface.Path == surface.Location || surface.Location != root {
-		t.Fatalf("logical path %q capacity path %q", surface.Path, surface.Location)
+	if surface.Path == surface.Location || surface.Location != capacityRoot {
+		t.Fatalf("logical path %q capacity path %q, want %q", surface.Path, surface.Location, capacityRoot)
 	}
 	if surface.Provenance != "documented-default-assumed" || surface.Confidence != "assumed" {
 		t.Fatalf("surface evidence = %#v", surface)

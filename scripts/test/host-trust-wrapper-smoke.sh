@@ -54,11 +54,6 @@ PLIST
   [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
   cat >"$valid_plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>trustSettings</key><array><dict><key>kSecTrustSettingsPolicy</key><data/><key>kSecTrustSettingsPolicyName</key><string>sslServer</string><key>kSecTrustSettingsResult</key><integer>2</integer></dict></array></dict></dict></dict></plist>
-PLIST
-  [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
-  cat >"$valid_plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict><key>$fingerprint</key><dict><key>issuerName</key><data>AQID</data><key>serialNumber</key><data>BAUG</data></dict></dict></dict></plist>
 PLIST
   [[ "$(osascript -l JavaScript "$project_root/scripts/host-trust/macos-trust-settings.js" "$valid_plist")" == "allow $fingerprint" ]]
@@ -207,26 +202,29 @@ missing_output="$("$helper" sync --project-root "$project_root" --config "$missi
 missing_build_output="$("$helper" sync --project-root "$project_root" --config "$missing_config" --purpose build)"
 [[ -s "$missing_build_output" ]] || { echo "missing config did not produce automatic system build trust" >&2; exit 1; }
 
-native_project="$temporary/native-go-project"
+native_project="$temporary/native-project"
 fake_go="$temporary/fake-go"
-fake_go_log="$temporary/fake-go.log"
+fake_native_builder_log="$temporary/fake-native-builder.log"
 mkdir -p "$native_project/scripts/host-trust"
 cp "$project_root/start" "$native_project/start"
 cp "$project_root/scripts/host-trust/wrapper-lib.sh" "$project_root/scripts/host-trust/host-trust-feed.sh" "$project_root/scripts/host-trust/macos-trust-settings.js" "$native_project/scripts/host-trust/"
 cat >"$fake_go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == version ]]; then
-  echo 'go version go1.25.0 test/arch'
-  exit 0
-fi
-printf '%s\n' "$*" >>"$FAKE_GO_LOG"
-printf 'trust build=<%s> runner=<%s> os=<%s> deferred=<%s>\n' "${EPAR_BUILD_TRUST_FEED:-}" "${EPAR_HOST_TRUST_FEED:-}" "${EPAR_CONTROLLER_HOST_OS:-}" "${EPAR_HOST_TRUST_INIT_DEFERRED:-}" >>"$FAKE_GO_LOG"
+[[ "${1:-}" == version ]]
+echo 'go version go1.25.0 test/arch'
 SH
 chmod +x "$fake_go"
-(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_GO_LOG="$fake_go_log" EPAR_BUILD_TRUST_FEED=stale-build EPAR_HOST_TRUST_FEED=stale-runner EPAR_CONTROLLER_HOST_OS=darwin EPAR_HOST_TRUST_INIT_DEFERRED=1 ./start)
-grep -Fxq 'run ./cmd/ephemeral-action-runner start' "$fake_go_log"
-grep -Fxq 'trust build=<> runner=<> os=<> deferred=<>' "$fake_go_log"
+cat >"$native_project/scripts/build-native-controller.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_NATIVE_BUILDER_LOG:?}"
+printf 'handoff backend=<%s> go=<%s>\n' "${EPAR_NATIVE_CONTROLLER_BACKEND:-}" "${EPAR_NATIVE_GO_BIN:-}" >>"${FAKE_NATIVE_BUILDER_LOG:?}"
+SH
+chmod +x "$native_project/scripts/build-native-controller.sh"
+(cd "$native_project" && EPAR_GO_BIN="$fake_go" FAKE_NATIVE_BUILDER_LOG="$fake_native_builder_log" ./start)
+grep -Fxq 'start' "$fake_native_builder_log"
+grep -Fxq "handoff backend=<local-go> go=<$fake_go>" "$fake_native_builder_log"
 
 nested_root="$temporary/nested-project"
 mkdir -p "$nested_root/.local"
