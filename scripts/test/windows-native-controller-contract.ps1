@@ -105,6 +105,7 @@ exit /b %ERRORLEVEL%
             $ErrorActionPreference = 'Continue'
             $output = @(& $hostExecutable @arguments 2>&1 | ForEach-Object { "$_" })
             $exitCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
