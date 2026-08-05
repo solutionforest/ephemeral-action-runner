@@ -1202,7 +1202,13 @@ func (m *Coordinator) enforceDedicatedBuildxCache(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := m.runHostOutput(ctx, "docker", "buildx", "inspect", metadata.Builder); err != nil {
+	inspectOutput, err := m.runHostOutput(ctx, "docker", "buildx", "inspect", metadata.Builder)
+	if err != nil {
+		return nil
+	}
+	if buildxInspectShowsStoppedBuilder(inspectOutput) {
+		// A stopped worker cannot grow its cache. The cache ceiling is checked
+		// again after the next build starts this exact worker.
 		return nil
 	}
 	usageOutput, err := m.runHostOutput(ctx, "docker", "buildx", "du", "--builder", metadata.Builder, "--format", "json")
@@ -1217,6 +1223,27 @@ func (m *Coordinator) enforceDedicatedBuildxCache(ctx context.Context) error {
 		return nil
 	}
 	return m.runHostQuiet(ctx, "docker", "buildx", "prune", "--builder", metadata.Builder, "--force", "--max-used-space", strconv.FormatUint(limitBytes, 10)+"B")
+}
+
+func buildxInspectShowsStoppedBuilder(output string) bool {
+	sawStopped := false
+	for _, line := range strings.Split(output, "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), ":")
+		if !found || !strings.EqualFold(strings.TrimSpace(key), "status") {
+			continue
+		}
+		fields := strings.Fields(strings.ToLower(strings.TrimSpace(value)))
+		if len(fields) == 0 {
+			return false
+		}
+		switch fields[0] {
+		case "stopped", "inactive":
+			sawStopped = true
+		default:
+			return false
+		}
+	}
+	return sawStopped
 }
 
 func (m *Coordinator) effectiveBuildCacheLimit() (uint64, error) {

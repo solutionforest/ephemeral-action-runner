@@ -3,6 +3,7 @@ package image
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -528,10 +529,16 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	metadata.Template.Archive = filepath.Base(archivePath)
 	metadata.Template.ArchiveSHA256 = archiveSHA
 	metadata.Template.ArchiveBytes = archiveBytes
-	metadata.Compatibility.TemplateSchemaVersion = 1
+	metadata.Compatibility.TemplateSchemaVersion = 2
 	metadata.Compatibility.RunnerExecution = "direct-actions-listener"
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
+	metadata.Compatibility.EmulationBackend = "qemu"
+	metadata.Compatibility.EmulationPolicy = "automatic-binfmt-install-all"
+	metadata.Compatibility.EmulationRelease = "qemu-v10.2.3-68"
+	metadata.Compatibility.EmulationSourceDigest = "sha256:" + strings.Repeat("d", 64)
+	metadata.Compatibility.EmulationManifestDigest = "sha256:" + strings.Repeat("e", 64)
+	metadata.Compatibility.QEMUVersion = "10.2.3"
 	if err := writeJSONFile(filepath.Join(root, "buildMetadata.json"), dockerSandboxesBuildMetadata{
 		ImageDigest: templateDigest,
 		Provenance:  json.RawMessage(`{}`),
@@ -576,6 +583,90 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	}
 }
 
+func TestDockerSandboxesEmulationLockAndTemplateAssetsAreExact(t *testing.T) {
+	projectRoot := filepath.Join("..", "..")
+	expected := map[string]struct {
+		digest          string
+		compressedBytes uint64
+	}{
+		"linux/amd64": {digest: "sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705", compressedBytes: 32675086},
+		"linux/arm64": {digest: "sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd", compressedBytes: 31024752},
+	}
+	for platform, want := range expected {
+		t.Run(platform, func(t *testing.T) {
+			lock, err := loadDockerSandboxesSourceLock(projectRoot, platform)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lock.SchemaVersion != 3 || lock.Emulation.SchemaVersion != 1 || lock.Emulation.Backend != "qemu" || lock.Emulation.Source.Release != "qemu-v10.2.3-68" || lock.Emulation.Source.QEMUVersion != "10.2.3" || lock.Emulation.Source.IndexDigest != "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0" {
+				t.Fatalf("unexpected emulation source lock: %+v", lock.Emulation.Source)
+			}
+			platformLock := lock.Emulation.Platforms[platform]
+			if platformLock.ManifestDigest != want.digest || platformLock.CompressedLayerBytes != want.compressedBytes || platformLock.SourceReference != "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@"+want.digest {
+				t.Fatalf("%s emulation platform lock = %+v", platform, platformLock)
+			}
+		})
+	}
+	templateRoot := filepath.Join(projectRoot, "templates", "docker-sandboxes")
+	dockerfile, err := os.ReadFile(filepath.Join(templateRoot, "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"/usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/", "enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation"} {
+		if !strings.Contains(string(dockerfile), required) {
+			t.Fatalf("Dockerfile omits %q", required)
+		}
+	}
+	for _, forbidden := range []string{"emulation-probe", "emulation-manifest", "emulation-interpreters", "mixed-compose", "EMULATION_PROBE_SHA256"} {
+		if strings.Contains(string(dockerfile), forbidden) {
+			t.Fatalf("Dockerfile retains removed per-target asset %q", forbidden)
+		}
+	}
+	helper, err := os.ReadFile(filepath.Join(templateRoot, "guest", "enable-architecture-emulation.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(helper), "--install all") || !strings.Contains(string(helper), "/proc/sys/fs/binfmt_misc") {
+		t.Fatal("architecture emulation helper does not install and structurally verify binfmt handlers")
+	}
+}
+
+func TestDockerSandboxesEmulationStorageEstimateIncludesLockedAssets(t *testing.T) {
+	coordinator := Coordinator{ProjectRoot: filepath.Join("..", "..")}
+	source := ResolvedDockerSource{Platform: "linux/arm64", CompressedLayerBytes: 1024}
+	estimate, err := coordinator.dockerSandboxesSourceEstimate(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := loadDockerSandboxesSourceLock(coordinator.ProjectRoot, source.Platform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate.CompressedBytes != source.CompressedLayerBytes+lock.Emulation.Platforms[source.Platform].CompressedLayerBytes {
+		t.Fatalf("compressed estimate = %d", estimate.CompressedBytes)
+	}
+	if estimate.ExpandedBytes != source.CompressedLayerBytes*ExpandedSizeFallbackMultiplier+dockerSandboxesExpandedEmulationAllowanceBytes || estimate.Confidence != EstimateFallback {
+		t.Fatalf("expanded emulation estimate = %+v", estimate)
+	}
+}
+
+func TestDockerSandboxesArchitectureAssetsNeverInjectDefaultPlatform(t *testing.T) {
+	root := filepath.Join("..", "..", "templates", "docker-sandboxes")
+	inputs, err := fileDigestsRecursive(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range inputs {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(input.Path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(content), "DOCKER_DEFAULT_PLATFORM=") || strings.Contains(string(content), "export DOCKER_DEFAULT_PLATFORM") {
+			t.Fatalf("template input %s injects DOCKER_DEFAULT_PLATFORM", input.Path)
+		}
+	}
+}
+
 func TestDockerSandboxesBuildUsesDirectArchiveAndInventoryTargets(t *testing.T) {
 	sourcePath := filepath.Join("docker_sandboxes.go")
 	content, err := os.ReadFile(sourcePath)
@@ -588,11 +679,18 @@ func TestDockerSandboxesBuildUsesDirectArchiveAndInventoryTargets(t *testing.T) 
 		`"--provenance=false", "--sbom=false"`,
 		`"--target", "software-inventory-export", "--output", "type=local,dest=" + evidenceExportRoot`,
 		`"--provenance", "mode=max", "--sbom", "generator=" + platformLock.SBOMGeneratorReference`,
+		`m.stopBuildxBuilder(ctx, builder, "release archive-build memory before full-image SBOM generation")`,
 		`"-attestation.docker-build.log"`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("Docker Sandboxes build path omitted %q", required)
 		}
+	}
+	archiveBuild := strings.Index(text, `m.runHostBuildxLogged(ctx, buildLogPath, "docker", args...)`)
+	memoryRelease := strings.Index(text, `m.stopBuildxBuilder(ctx, builder, "release archive-build memory before full-image SBOM generation")`)
+	evidenceBuild := strings.Index(text, `m.runHostBuildxLogged(ctx, attestationLogPath, "docker", attestationArgs...)`)
+	if archiveBuild < 0 || memoryRelease <= archiveBuild || evidenceBuild <= memoryRelease {
+		t.Fatalf("Docker Sandboxes build does not release its exact BuildKit worker between archive and evidence phases")
 	}
 	for _, forbidden := range []string{`"--load"`, `"image", "save"`, `"image", "load"`, `"image", "inspect"`, `"type=image,push=false"`} {
 		if strings.Contains(text, forbidden) {
@@ -607,5 +705,33 @@ func TestDockerSandboxesBuildUsesDirectArchiveAndInventoryTargets(t *testing.T) 
 		if !strings.Contains(string(dockerfile), required) {
 			t.Fatalf("Dockerfile omitted %q", required)
 		}
+	}
+}
+
+func TestDockerSandboxesEvidenceBuildErrorExplainsSyftExit137(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "attestation.log")
+	if err := os.WriteFile(logPath, []byte("starting syft scanner\nERROR: process generating sbom did not complete successfully: exit code: 137\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("buildx failed")
+	err := dockerSandboxesEvidenceBuildError(cause, logPath)
+	if !errors.Is(err, cause) {
+		t.Fatalf("evidence error does not preserve cause: %v", err)
+	}
+	for _, required := range []string{"full-image SBOM scanner", "exit code 137", "exhausted memory", "other Docker workloads", "increase the VM memory allocation"} {
+		if !strings.Contains(err.Error(), required) {
+			t.Fatalf("evidence error omitted %q: %v", required, err)
+		}
+	}
+}
+
+func TestDockerSandboxesEvidenceBuildErrorDoesNotMisdiagnoseGenericFailure(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "attestation.log")
+	if err := os.WriteFile(logPath, []byte("ERROR: registry request failed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := dockerSandboxesEvidenceBuildError(errors.New("buildx failed"), logPath)
+	if strings.Contains(err.Error(), "exhausted memory") {
+		t.Fatalf("generic evidence failure was misdiagnosed as memory exhaustion: %v", err)
 	}
 }

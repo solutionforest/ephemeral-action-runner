@@ -29,7 +29,7 @@ Choose Docker Sandboxes when its local checks pass and you want a microVM bounda
 
 ## Support Status
 
-EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage and template admission before any runner starts. Windows x86_64 has the recorded real-host lifecycle evidence. The ARM64 implementation is architecture-complete, but equivalent real-host build, load, lifecycle, and independent-certification evidence has not yet been recorded. macOS and Linux also lack equivalent EPAR real-host evidence in this repository.
+EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and QEMU/binfmt setup admission before any runner starts. Windows x86_64 has the recorded real-host lifecycle evidence. Other host/platform combinations remain preview-only until equivalent real-host build, load, lifecycle, and independent-certification evidence is recorded; bundling generic QEMU handlers does not by itself certify every foreign workload.
 
 ## Prerequisites
 
@@ -81,6 +81,14 @@ dockerSandboxes:
 `provider.sourceImage` is invalid for this provider; use the common `image` section. `rootDisk: auto` derives a sparse logical root maximum from the selected artifact. `dockerDisk` is an independent sparse workload limit whose default is 50 GiB and minimum is 1 GiB. Neither virtual maximum is treated as immediately consumed host space; the only physical reserve is `storage.minimumFree`, whose generated default is 1 GiB. See [Configuration](../configuration.md) for the complete schema.
 
 `networkBaseline: open` adds EPAR-owned sandbox-scoped public egress plus deny-wins guardrails for host aliases; it does not change the host-global Docker Sandboxes policy. Use `balanced` with `additionalAllow` for default-deny public egress. Additional allow/deny entries are exact hostnames or `*.domain[:port]`; they cannot override the Open host-alias denies.
+
+## Cross-Architecture Containers
+
+Architecture emulation is always enabled and has no user-facing configuration switch. The immutable template copies the pinned `tonistiigi/binfmt:qemu-v10.2.3-68` installer and all static QEMU interpreters, then each newly created sandbox runs the equivalent of `binfmt --install all` as root inside its private VM. This does not run a privileged container on the host. Creation fails before GitHub registration only when `binfmt_misc` cannot be enabled or no bundled QEMU handler becomes active; EPAR deliberately does not execute a probe for every architecture.
+
+Native image processes remain native because foreign binfmt handlers match only their foreign ELF signatures. Docker manifest selection is unchanged: EPAR does not set `DOCKER_DEFAULT_PLATFORM`, QEMU cannot create a missing manifest, and a Compose service should use its `platform` property when a multi-platform tag must select a foreign variant deliberately. A single-architecture local image can run without a service override when its image metadata already identifies the foreign platform. Treat actual workload startup, health checks, networking, and performance as the compatibility proof.
+
+The provider keeps emulation selection behind an internal target-agnostic boundary. QEMU is the only implementation today; a future authoritative Docker Sandboxes Rosetta integration can be selected automatically for mappings it supports while QEMU remains available for other foreign executables, without adding a configuration key.
 
 ## Normal Workflow
 

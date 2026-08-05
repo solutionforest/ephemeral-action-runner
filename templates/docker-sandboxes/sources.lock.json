@@ -1,7 +1,10 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "defaultPlatform": "linux/amd64",
-  "supportedPlatforms": ["linux/amd64", "linux/arm64"],
+  "supportedPlatforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
   "dockerfileFrontend": {
     "inspectionReference": "docker.io/docker/dockerfile@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
     "reference": "docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
@@ -21,6 +24,42 @@
   },
   "tini": {
     "version": "0.19.0"
+  },
+  "emulation": {
+    "schemaVersion": 1,
+    "backend": "qemu",
+    "source": {
+      "repository": "docker.io/tonistiigi/binfmt",
+      "release": "qemu-v10.2.3-68",
+      "revision": "e29e7d72c9672c8c8bf846655ab149b50e1a62bd",
+      "qemuVersion": "10.2.3",
+      "indexReference": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+      "indexDigest": "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+      "licenses": [
+        {
+          "name": "tonistiigi-binfmt-MIT.txt",
+          "url": "https://raw.githubusercontent.com/tonistiigi/binfmt/e29e7d72c9672c8c8bf846655ab149b50e1a62bd/LICENSE",
+          "sha256": "bba3332a1e2ec03031b587452cd9254bd7ab6ec701aef20b12e642f47f423dd6"
+        },
+        {
+          "name": "qemu-COPYING.txt",
+          "url": "https://raw.githubusercontent.com/qemu/qemu/v10.2.3/COPYING",
+          "sha256": "dd3ce02338c3a48abb6ba59b48809f7108a8bd242cb0cc8be90daafa30707c28"
+        }
+      ]
+    },
+    "platforms": {
+      "linux/amd64": {
+        "manifestDigest": "sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705",
+        "sourceReference": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705",
+        "compressedLayerBytes": 32675086
+      },
+      "linux/arm64": {
+        "manifestDigest": "sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd",
+        "sourceReference": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd",
+        "compressedLayerBytes": 31024752
+      }
+    }
   },
   "platforms": {
     "linux/amd64": {

@@ -1389,6 +1389,18 @@ func TestLoadDockerSandboxesRejectsRemovedHostReserve(t *testing.T) {
 	}
 }
 
+func TestLoadDockerSandboxesRejectsArchitectureEmulationConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-sandboxes.yml")
+	if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  architectureEmulation: disabled\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "unknown key dockerSandboxes.architectureEmulation") {
+		t.Fatalf("Load() error = %v, want removed emulation-setting rejection", err)
+	}
+}
+
 func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T) {
 	tests := []struct {
 		name   string

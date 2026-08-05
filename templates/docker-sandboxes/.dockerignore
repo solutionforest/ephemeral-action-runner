@@ -11,6 +11,8 @@
 !inputs/
 !inputs/actions-runner.tar.gz
 !inputs/tini
+!inputs/emulation-licenses/
+!inputs/emulation-licenses/*.txt
 !host-trust-certificates/
 !host-trust-certificates/*.crt
 !trusted-ca-certificates/

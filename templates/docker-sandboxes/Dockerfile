@@ -3,6 +3,9 @@
 ARG TEMPLATE_PLATFORM=linux/amd64
 ARG SOURCE_IMAGE=ghcr.io/catthehacker/ubuntu@sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac
 ARG GO_BUILDER_IMAGE=docker.io/library/golang@sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980
+ARG BINFMT_IMAGE=docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705
+
+FROM --platform=${TEMPLATE_PLATFORM} ${BINFMT_IMAGE} AS qemu-source
 
 FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS hook-builder
 ARG TARGETOS
@@ -43,6 +46,8 @@ COPY host-trust-metadata/ /opt/epar/
 COPY helpers.sha256 /opt/epar/helpers.sha256
 COPY profiles/${COMPATIBILITY_FILE} /opt/epar/template-compatibility.json
 COPY --from=hook-builder --chmod=0555 /out/epar-hook-bash /opt/epar/hook-bin/bash
+COPY --from=qemu-source /usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/
+COPY inputs/emulation-licenses/ /usr/share/licenses/epar-emulation/
 COPY --chmod=0755 inputs/tini /usr/local/bin/tini
 COPY inputs/actions-runner.tar.gz /tmp/actions-runner.tar.gz
 
@@ -53,7 +58,11 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && echo "${ACTIONS_RUNNER_SHA256#sha256:}  /tmp/actions-runner.tar.gz" | sha256sum --check - \
     && cd /opt/epar \
     && sha256sum --check helpers.sha256 \
+    && cd /opt/epar \
     && chmod 0555 ./*.sh \
+    && install -m 0555 enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation \
+    && chmod 0555 /opt/epar/emulation/binfmt /opt/epar/emulation/qemu-* \
+    && chmod 0444 /usr/share/licenses/epar-emulation/*.txt \
     && /opt/epar/prepare-template.sh \
     && /opt/epar/install-trusted-ca-certificates.sh \
     && rm -rf /opt/actions-runner \
@@ -88,7 +97,7 @@ ENV HOME=/home/agent \
     DEBIAN_FRONTEND=dialog
 
 LABEL com.docker.sandboxes.start-docker=true \
-    io.solutionforest.epar.template.schema-version="1" \
+    io.solutionforest.epar.template.schema-version="2" \
     io.solutionforest.epar.template.runner-execution="direct-actions-listener" \
     io.solutionforest.epar.template.docker-daemon-owner="docker-sandboxes-runtime" \
     io.solutionforest.epar.template.expected-docker-daemon-count="1" \

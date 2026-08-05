@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -534,6 +535,9 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 		DryRun:                  dryRun,
 		Logging:                 runtime,
 		AutomaticImageLifecycle: true,
+	}
+	if loggerAware, ok := manager.Lifecycle.(interface{ SetLogger(*slog.Logger) }); ok {
+		loggerAware.SetLogger(runtime.Logger())
 	}
 	if cfg.Logging.RetentionEnabled {
 		report, pruneErr := manager.PruneLogs(false)

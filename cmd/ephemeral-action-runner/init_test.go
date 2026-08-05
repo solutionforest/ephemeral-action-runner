@@ -1992,7 +1992,7 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 			t.Fatalf("generated Docker Sandboxes config omitted %q:\n%s", required, configText)
 		}
 	}
-	for _, forbidden := range []string{"dockerSandbox:", "\n  type: docker-sandbox\n", "epar-docker-sandbox]"} {
+	for _, forbidden := range []string{"dockerSandbox:", "\n  type: docker-sandbox\n", "epar-docker-sandbox]", "architectureEmulation:", "epar-cross-architecture"} {
 		if strings.Contains(string(configText), forbidden) {
 			t.Fatalf("generated config used singular Docker Sandbox key %q:\n%s", forbidden, configText)
 		}

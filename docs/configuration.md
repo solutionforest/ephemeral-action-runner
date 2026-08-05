@@ -26,7 +26,7 @@ The canonical config path owns its lifecycle-state namespace and may have only o
 | Provider | Host and artifact model | Image defaults | Provider-only configuration |
 | --- | --- | --- | --- |
 | `docker-container` | A Docker-compatible host creates an outer disposable runner with its own inner Docker daemon. | `docker-image`, `ghcr.io/catthehacker/ubuntu:full-latest`, output `epar-docker-container-catthehacker-ubuntu`. | Optional `provider.platform`; `docker` proxy and mirror settings apply to its private daemon. |
-| `docker-sandboxes` | A host with healthy `sbx diagnose --output json` results builds and imports a Linux runner template. It is preview-only until the exact host/platform combination has independent live evidence. | `image.sourceImage` selects a `ghcr.io/catthehacker/ubuntu` tag; EPAR records the exact artifact in local state. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. |
+| `docker-sandboxes` | A host with healthy `sbx diagnose --output json` results builds and imports a native Linux runner template with default-on QEMU/binfmt support for foreign container executables. It is preview-only until the exact host/platform combination has independent live evidence. | `image.sourceImage` selects a `ghcr.io/catthehacker/ubuntu` tag; EPAR records the exact artifact in local state. | `dockerSandboxes` is required; `provider.platform` is `linux/amd64` or `linux/arm64`; runner-group enforcement must be `enforce`. Architecture emulation has no configuration key. |
 | `wsl` | Windows WSL2 imports a Docker image or rootfs tar into disposable Linux distros. | Docker source defaults to Catthehacker full Ubuntu, x64, with output under `work/images/`. | `provider.installRoot` controls WSL storage. |
 | `tart` | Experimental Apple Silicon Linux VM path. | `ghcr.io/cirruslabs/ubuntu:latest`, output `epar-ubuntu-24-arm64`. | `provider.network` and optional `provider.rosettaTag`. Validate the exact workload before relying on Rosetta. |
 
@@ -173,6 +173,8 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 | `rootDisk` | `auto` or byte size at least `20GiB`; `auto` | Docker Sandboxes. | Sparse guest-root logical maximum. `auto` is recalculated for each artifact as the expanded image estimate plus 5 GiB build allowance and 20 GiB writable headroom, rounded up to 10 GiB. An explicit undersized value is rejected before creation. |
 | `dockerDisk` | byte size at least `1GiB`; `50GiB` | Docker Sandboxes. | Independent sparse logical maximum for the Docker daemon inside the sandbox; it is workload capacity and is not derived from the base image. |
 | `maxConcurrentCreates` | positive integer; `2` | Docker Sandboxes. | Limits concurrent sandbox creation to control capacity pressure. |
+
+Docker Sandboxes templates always bundle the pinned `tonistiigi/binfmt` installer and static QEMU interpreters. EPAR runs `binfmt --install all` inside each sandbox VM and requires at least one enabled bundled handler before creation succeeds; it does not install handlers on the host or verify a fixed target matrix. Docker continues selecting image manifests normally, and EPAR never injects `DOCKER_DEFAULT_PLATFORM`. Use a Compose service's `platform` property or `docker run --platform` when a multi-platform tag must deliberately select a foreign variant.
 
 ### `timeouts`
 
