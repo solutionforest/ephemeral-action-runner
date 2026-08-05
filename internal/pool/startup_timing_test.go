@@ -88,3 +88,67 @@ func TestStartupTimingWritesOneReadableConsoleSummaryAndStructuredRecord(t *test
 		t.Fatalf("structured record missing stage durations: %#v", record["stages"])
 	}
 }
+
+func TestDockerSandboxesStartupTimingRecordsCreatePolicyAndAdmissionStages(t *testing.T) {
+	root := t.TempDir()
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:         filepath.Join(root, "logs"),
+		ManagerSinks:      logging.SinkConsole,
+		ManagerFileFormat: logging.FormatJSON,
+		TranscriptSinks:   logging.SinkNone,
+		Stdout:            &console,
+		Stderr:            &console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := Manager{
+		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes"}, Logging: config.LoggingConfig{Directory: "logs"}},
+		ProjectRoot: root,
+		Logging:     runtime,
+	}
+	path, err := manager.StartStartupTiming()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{
+		"sandbox_create_and_initial_identity_verification",
+		"sandbox_network_policy_apply_and_readback",
+		"sandbox_post_create_admission",
+	} {
+		if err := manager.timeFirstInstanceStage("sandbox-one", stage, func() error { return nil }); err != nil {
+			t.Fatalf("measure %s: %v", stage, err)
+		}
+	}
+	manager.FinishStartupTiming(nil)
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	output := console.String()
+	for _, wanted := range []string{
+		"Docker Sandboxes startup timing:",
+		"sandbox_create_and_initial_identity_verification=",
+		"sandbox_network_policy_apply_and_readback=",
+		"sandbox_post_create_admission=",
+	} {
+		if !strings.Contains(output, wanted) {
+			t.Fatalf("Docker Sandboxes timing summary omitted %q: %q", wanted, output)
+		}
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wanted := range []string{
+		`"provider":"docker-sandboxes"`,
+		`"stage":"sandbox_create_and_initial_identity_verification"`,
+		`"stage":"sandbox_network_policy_apply_and_readback"`,
+		`"stage":"sandbox_post_create_admission"`,
+	} {
+		if !strings.Contains(string(content), wanted) {
+			t.Fatalf("Docker Sandboxes timing JSONL omitted %q:\n%s", wanted, content)
+		}
+	}
+}

@@ -146,15 +146,22 @@ epar_prune_native_controller_cache "$policy_root" "$policy_current"
 [[ -d "${policy_root}/${policy_grace}" ]] || { echo "retention removed a grace-protected revision beyond the byte budget" >&2; exit 1; }
 
 builder_source="$(cat "$builder")"
-for required in 'golang:latest' 'ephemeral-action-runner.manifest' 'schemaVersion=2' 'lease-native-' 'epar_write_bootstrap_acquisition_journal' 'epar_resolve_go_toolchain_image' 'previousDevImageID' 'previous_dev_image_id' 'epar-native-controller-build.log' 'epar_report_tls_failure' 'TLS verification was not disabled' 'epar_prepare_bootstrap_build_trust' '--network none' 'GO111MODULE=off' 'GOTOOLCHAIN=local' 'SSL_CERT_FILE=/run/epar-bootstrap-ca.pem' 'scripts/bootstrap-trust' ':/run/epar-bootstrap-ca.pem:ro'; do
+for required in 'golang:latest' 'controller.receipt' 'schemaVersion=3' 'sourceDigest' 'buildDigest' 'binaryDigest' 'lease-native-' 'epar_write_bootstrap_acquisition_journal' 'epar_resolve_go_toolchain_image' 'previousDevImageID' 'previous_dev_image_id' 'epar-native-controller-build.log' 'epar_report_tls_failure' 'TLS verification was not disabled' 'epar_prepare_bootstrap_build_trust' '--network none' 'GO111MODULE=off' 'GOTOOLCHAIN=local' 'SSL_CERT_FILE=/run/epar-bootstrap-ca.pem' 'scripts/bootstrap-trust' ':/run/epar-bootstrap-ca.pem:ro'; do
   [[ "$builder_source" == *"$required"* ]] || { echo "stable native-controller wrapper contract is missing: ${required}" >&2; exit 1; }
 done
+launch_source="$(sed -n '/^epar_launch_slot()/,/^}/p' "$builder")"
+launch_lock_line="$(printf '%s\n' "$launch_source" | grep -n 'epar_acquire_stable_build_lock' | head -n 1 | cut -d: -f1)"
+launch_lease_line="$(printf '%s\n' "$launch_source" | grep -n 'lease_file=.*mktemp' | head -n 1 | cut -d: -f1)"
+launch_unlock_line="$(printf '%s\n' "$launch_source" | grep -n 'epar_release_stable_build_lock' | tail -n 1 | cut -d: -f1)"
+[[ "$launch_lock_line" =~ ^[0-9]+$ && "$launch_lease_line" =~ ^[0-9]+$ && "$launch_unlock_line" =~ ^[0-9]+$ && "$launch_lock_line" -lt "$launch_lease_line" && "$launch_lease_line" -lt "$launch_unlock_line" ]] || { echo 'Unix launch must hold the promotion lock through runtime lease publication' >&2; exit 1; }
 
 native_smoke_root="${temporary}/native-runtime-smoke"
 native_smoke_project="${native_smoke_root}/project"
 native_smoke_bin="${native_smoke_root}/bin"
 mkdir -p "${native_smoke_project}/scripts/host-trust" "${native_smoke_project}/scripts/docker" "${native_smoke_project}/scripts/bootstrap-trust" "${native_smoke_project}/cmd" "${native_smoke_project}/internal" "$native_smoke_bin"
 cp "$builder" "${native_smoke_project}/scripts/build-native-controller.sh"
+cp "${source_root}/scripts/run-with-docker.sh" "${native_smoke_project}/scripts/run-with-docker.sh"
+cp "${source_root}/scripts/bootstrap-trust/main.go" "${native_smoke_project}/scripts/bootstrap-trust/main.go"
 : >"${native_smoke_project}/scripts/docker/dev.Dockerfile"
 : >"${native_smoke_project}/go.mod"
 : >"${native_smoke_project}/go.sum"
@@ -233,7 +240,11 @@ NATIVE
     ;;
 esac
 SH
-chmod +x "${native_smoke_project}/scripts/build-native-controller.sh" "${native_smoke_project}/scripts/host-trust/host-trust-feed.sh" "${native_smoke_bin}/docker"
+cat >"${native_smoke_bin}/uname" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -s ]]; then printf '%s\n' Linux; else printf '%s\n' x86_64; fi
+SH
+chmod +x "${native_smoke_project}/scripts/build-native-controller.sh" "${native_smoke_project}/scripts/run-with-docker.sh" "${native_smoke_project}/scripts/host-trust/host-trust-feed.sh" "${native_smoke_bin}/docker" "${native_smoke_bin}/uname"
 
 native_smoke_env=(
   "PATH=${native_smoke_bin}:$PATH"
@@ -256,9 +267,28 @@ grep -Fxq 'bootstrap' "${native_smoke_root}/helper.log"
 grep -Fq ':/feed/current.json:ro>' "${native_smoke_root}/docker.log"
 grep -Fq ' <SSL_CERT_FILE=/run/epar-bootstrap-ca.pem>' "${native_smoke_root}/docker.log"
 
+[[ "$(grep -c '^CALL <pull>' "${native_smoke_root}/docker.log")" == 1 ]] || { echo 'first Docker controller build did not pull exactly once' >&2; exit 1; }
+[[ "$(grep -c '^CALL <build>' "${native_smoke_root}/docker.log")" == 1 ]] || { echo 'first Docker controller build did not build the toolchain exactly once' >&2; exit 1; }
+
 : >"${native_smoke_root}/helper.log"
 (cd "$native_smoke_project" && env "${native_smoke_env[@]}" scripts/build-native-controller.sh init)
 grep -Fxq 'runtime build=<> runner=<> os=<> deferred=<> args=<init>' "${native_smoke_root}/native.log"
 grep -Fxq 'post-init' "${native_smoke_root}/helper.log"
+[[ "$(grep -c '^CALL <pull>' "${native_smoke_root}/docker.log")" == 1 ]] || { echo 'reusable Docker receipt unexpectedly pulled a toolchain' >&2; exit 1; }
+[[ "$(grep -c '^CALL <build>' "${native_smoke_root}/docker.log")" == 1 ]] || { echo 'reusable Docker receipt unexpectedly rebuilt a toolchain' >&2; exit 1; }
+
+current_slot="${native_smoke_project}/.local/bin/linux-amd64"
+current_receipt="${current_slot}/controller.receipt"
+before_blocked_digest="$(sed -n 's/^buildDigest=//p' "$current_receipt")"
+printf '%s\n' changed-source >"${native_smoke_project}/internal/changed.txt"
+active_lease="${current_slot}/lease-native-$$.ABC123"
+printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$active_lease"
+set +e
+blocked_output="$(cd "$native_smoke_project" && env "${native_smoke_env[@]}" scripts/build-native-controller.sh start 2>&1)"
+blocked_status=$?
+set -e
+after_blocked_digest="$(sed -n 's/^buildDigest=//p' "$current_receipt")"
+rm -f -- "$active_lease"
+[[ "$blocked_status" != 0 && "$blocked_output" == *'controller is running; stop it before rebuilding'* && "$after_blocked_digest" == "$before_blocked_digest" ]] || { echo 'active Unix controller lease did not block source-triggered rotation' >&2; exit 1; }
 
 echo "Unix native-controller cache retention contract passed"

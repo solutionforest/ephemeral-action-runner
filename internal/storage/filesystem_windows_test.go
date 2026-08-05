@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	winio "github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
 )
 
@@ -34,6 +36,51 @@ func TestSnapshotFilesystemTargetAcceptsWindowsShortPathAlias(t *testing.T) {
 	}
 	if !strings.EqualFold(target.Locator, want) {
 		t.Fatalf("SnapshotFilesystemTarget() locator = %q, want canonical spelling %q", target.Locator, want)
+	}
+}
+
+func TestProbeFilesystemCapacityDomainFollowsWindowsJunction(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	junction := filepath.Join(root, "junction")
+	if err := os.Mkdir(junction, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setWindowsJunction(t, junction, target)
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	targetDomain, err := ProbeFilesystemCapacityDomain(target, now)
+	if err != nil {
+		t.Fatalf("ProbeFilesystemCapacityDomain(target) error = %v", err)
+	}
+	junctionDomain, err := ProbeFilesystemCapacityDomain(junction, now)
+	if err != nil {
+		t.Fatalf("ProbeFilesystemCapacityDomain(junction) error = %v", err)
+	}
+	if targetDomain.ID == "" || targetDomain.ID != junctionDomain.ID {
+		t.Fatalf("target domain=%+v junction domain=%+v, want one Windows volume", targetDomain, junctionDomain)
+	}
+	if _, err := SnapshotFilesystemTarget(junction); err == nil {
+		t.Fatal("SnapshotFilesystemTarget() accepted a junction allowed only for read-only capacity discovery")
+	}
+}
+
+func setWindowsJunction(t *testing.T, junction, target string) {
+	t.Helper()
+	pointer, err := windows.UTF16PtrFromString(junction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(pointer, windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		t.Skipf("Windows junction handle unavailable: %v", err)
+	}
+	defer windows.CloseHandle(handle)
+	data := winio.EncodeReparsePoint(&winio.ReparsePoint{Target: target, IsMountPoint: true})
+	if err := windows.DeviceIoControl(handle, windows.FSCTL_SET_REPARSE_POINT, &data[0], uint32(len(data)), nil, 0, nil, nil); err != nil {
+		t.Skipf("Windows junction creation unavailable: %v", err)
 	}
 }
 

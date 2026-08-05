@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -535,6 +536,9 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 		Logging:                 runtime,
 		AutomaticImageLifecycle: true,
 	}
+	if loggerAware, ok := manager.Lifecycle.(interface{ SetLogger(*slog.Logger) }); ok {
+		loggerAware.SetLogger(runtime.Logger())
+	}
 	if cfg.Logging.RetentionEnabled {
 		report, pruneErr := manager.PruneLogs(false)
 		if pruneErr != nil {
@@ -548,65 +552,74 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 	return manager, nil
 }
 
-func preflightControllerStorage(projectRoot string, cfg config.Config, contributions ...provider.StorageContribution) error {
+func preflightControllerStorage(configPath, projectRoot string, cfg config.Config, contributions ...provider.StorageContribution) error {
 	minimumFree, err := config.EffectiveMinimumFreeBytes(cfg)
 	if err != nil {
 		return err
 	}
+	operationPlan := storage.OperationPlan{
+		ID:               "controller-bootstrap",
+		Provider:         cfg.Provider.Type,
+		MinimumFreeBytes: minimumFree,
+		Phases: []storage.OperationPhase{{
+			ID: "controller-bootstrap",
+			Allocations: []storage.Allocation{{
+				ID: "project-controller-bootstrap", Role: storage.StorageRoleProject,
+			}},
+		}},
+	}
+	statusCommand := invocation.ScopedCommand(configPath, projectRoot, "storage", "status", "--operation", operationPlan.ID, "--provider", cfg.Provider.Type)
+	pruneCommand := invocation.ScopedCommand(configPath, projectRoot, "storage", "prune", "--provider", cfg.Provider.Type)
 	if len(contributions) != 0 && contributions[0] != nil {
 		snapshot, err := contributions[0].StorageSnapshot(context.Background(), provider.StorageRequest{
-			Operation:        "controller-bootstrap",
-			Now:              time.Now(),
-			MinimumFreeBytes: minimumFree,
+			OperationPlan: operationPlan,
+			Now:           time.Now(),
 		})
 		if err != nil {
-			return fmt.Errorf("provider storage surface cannot be measured before controller bootstrap: %w\n\nInspect storage with:\n  %s", err, invocation.Command("storage", "status", "--provider", cfg.Provider.Type))
+			return fmt.Errorf("provider storage capacity domains cannot be measured before controller bootstrap: %w\n\nInspect the same operation with:\n  %s", err, statusCommand)
 		}
-		surfaces := make(map[string]storage.Surface, len(snapshot.Surfaces))
-		for _, surface := range snapshot.Surfaces {
-			surfaces[surface.ID] = surface
+		evaluation, err := storage.EvaluateOperationPlan(operationPlan, snapshot.Surfaces, snapshot.Domains)
+		if err != nil {
+			return fmt.Errorf("resolve controller bootstrap storage: %w", err)
 		}
-		for _, requirement := range snapshot.Requirements {
-			surface, found := surfaces[requirement.SurfaceID]
-			if !found {
-				return fmt.Errorf("controller storage requirement %q references unknown surface %q", requirement.ID, requirement.SurfaceID)
-			}
-			check, err := storage.EvaluateCapacity(surface, requirement)
-			if err != nil {
-				return err
-			}
+		for _, check := range evaluation.CapacityChecks {
 			if check.Status != storage.CapacityReady {
-				return storage.CapacityAdmissionError("initialize the EPAR controller", surface, requirement, check, invocation.Command("storage", "prune", "--provider", cfg.Provider.Type))
+				return operationCapacityAdmissionError("initialize the EPAR controller", snapshot.Domains, check, cfg.Provider.Type, pruneCommand)
 			}
 		}
 		return nil
 	}
-	capacity, err := storage.ProbeFilesystemCapacity(projectRoot, time.Now())
+	domain, err := storage.ProbeFilesystemCapacityDomain(projectRoot, time.Now())
 	if err != nil {
-		return fmt.Errorf("controller storage surface %q cannot be measured before bootstrap: %w\n\nInspect storage with:\n  %s", projectRoot, err, invocation.Command("storage", "status", "--provider", cfg.Provider.Type))
+		return fmt.Errorf("controller storage capacity domain %q cannot be measured before bootstrap: %w\n\nInspect the same operation with:\n  %s", projectRoot, err, statusCommand)
 	}
-	check, err := storage.EvaluateCapacity(storage.Surface{
-		ID:       "project",
-		Provider: cfg.Provider.Type,
-		Kind:     storage.SurfaceHostFilesystem,
-		Location: projectRoot,
-		Capacity: capacity,
-	}, storage.Requirement{
-		ID:               "controller-bootstrap",
-		Provider:         cfg.Provider.Type,
-		SurfaceID:        "project",
-		MinimumFreeBytes: minimumFree,
-	})
+	domain.ID = "project-domain"
+	surface := storage.Surface{ID: "project", Provider: cfg.Provider.Type, Role: storage.StorageRoleProject, Kind: storage.SurfaceHostFilesystem, DomainID: domain.ID, Path: projectRoot, Location: projectRoot, Provenance: domain.Provenance, Confidence: domain.Confidence, AdmissionAuthoritative: true, Capacity: domain.Capacity}
+	evaluation, err := storage.EvaluateOperationPlan(operationPlan, []storage.Surface{surface}, []storage.CapacityDomain{domain})
 	if err != nil {
 		return fmt.Errorf("evaluate controller storage capacity: %w", err)
 	}
-	if check.Status != storage.CapacityReady {
-		return storage.CapacityAdmissionError("initialize the EPAR controller", storage.Surface{
-			Location: projectRoot,
-			Capacity: check.Capacity,
-		}, check.Requirement, check, invocation.Command("storage", "prune", "--provider", cfg.Provider.Type))
+	for _, check := range evaluation.CapacityChecks {
+		if check.Status != storage.CapacityReady {
+			return operationCapacityAdmissionError("initialize the EPAR controller", []storage.CapacityDomain{domain}, check, cfg.Provider.Type, pruneCommand)
+		}
 	}
 	return nil
+}
+
+func operationCapacityAdmissionError(action string, domains []storage.CapacityDomain, check storage.CapacityCheck, providerType, pruneCommand string) error {
+	if check.DomainRequirement == nil {
+		return fmt.Errorf("storage capacity check for %s did not identify a capacity domain", action)
+	}
+	for _, domain := range domains {
+		if domain.ID != check.DomainRequirement.DomainID {
+			continue
+		}
+		surface := storage.Surface{ID: domain.ID, Provider: providerType, Kind: domain.Kind, DomainID: domain.ID, Path: domain.Path, Location: domain.Path, Provenance: domain.Provenance, Confidence: domain.Confidence, Capacity: domain.Capacity}
+		requirement := storage.Requirement{ID: check.DomainRequirement.OperationID + "-" + domain.ID, Provider: providerType, SurfaceID: domain.ID, PeakBytes: check.DomainRequirement.PeakBytes, MinimumFreeBytes: check.DomainRequirement.MinimumFreeBytes}
+		return storage.CapacityAdmissionError(action, surface, requirement, check, pruneCommand)
+	}
+	return fmt.Errorf("storage capacity check for %s references unknown domain %q", action, check.DomainRequirement.DomainID)
 }
 
 func rejectDockerSandboxesImageCommand(manager *pool.Manager, command string) error {
@@ -693,7 +706,7 @@ Commands:
   ephemeral-action-runner logs path
   ephemeral-action-runner logs list
   ephemeral-action-runner logs prune [--dry-run]
-  ephemeral-action-runner storage status [--provider NAME] [--json]
+  ephemeral-action-runner storage status [--operation NAME] [--provider NAME] [--json]
   ephemeral-action-runner storage prune [--provider NAME] [--json] [--execute]
   ephemeral-action-runner version
 `)

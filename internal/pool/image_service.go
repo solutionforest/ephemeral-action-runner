@@ -13,6 +13,7 @@ import (
 	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 	"golang.org/x/term"
 )
 
@@ -39,6 +40,14 @@ var pullDockerSourceCommand = (*Manager).pullDockerSource
 
 var dockerPullProgressTerminal = func() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+var progressTerminalWidth = func() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width <= 0 {
+		return 0
+	}
+	return width
 }
 
 var dockerPullProgressConsole io.Writer = os.Stdout
@@ -272,8 +281,11 @@ type imageEnvironment struct {
 	manager *Manager
 }
 
-func (environment imageEnvironment) PreflightStorage(operation string, peakBytes uint64) error {
-	return environment.manager.preflightStorage(operation, peakBytes)
+func (environment imageEnvironment) PreflightStorage(operation string, plan storage.OperationPlan) error {
+	if plan.ID == "" {
+		plan.ID = operation
+	}
+	return environment.manager.preflightStorage(plan)
 }
 
 func (environment imageEnvironment) BuildLogPath(name string) string {

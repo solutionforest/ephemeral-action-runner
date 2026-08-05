@@ -320,6 +320,7 @@ func TestConcurrentDockerSandboxesPublicationPrecedesSecondConfigReuse(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	archiveBytes := uint64(len("verified archive\n"))
 
 	runtime := &publicationRaceRuntime{
 		cached:                 firstArtifact,
@@ -335,7 +336,7 @@ func TestConcurrentDockerSandboxesPublicationPrecedesSecondConfigReuse(t *testin
 	}
 	firstDone := make(chan result, 1)
 	go func() {
-		adopted, _, publishErr := first.importOrAdoptDockerSandboxesTemplate(context.Background(), manifest, source, manifestHash, firstArtifact.RootDisk, true, firstArtifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+		adopted, _, publishErr := first.importOrAdoptDockerSandboxesTemplate(context.Background(), manifest, source, manifestHash, firstArtifact.RootDisk, true, firstArtifact, metadataPath, metadataSHA, archivePath, archiveSHA, archiveBytes, runtime)
 		firstDone <- result{adopted: adopted, err: publishErr}
 	}()
 	select {
@@ -348,7 +349,7 @@ func TestConcurrentDockerSandboxesPublicationPrecedesSecondConfigReuse(t *testin
 	secondDone := make(chan result, 1)
 	go func() {
 		close(secondStarted)
-		adopted, _, adoptErr := second.importOrAdoptDockerSandboxesTemplate(context.Background(), manifest, source, manifestHash, secondArtifact.RootDisk, true, secondArtifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+		adopted, _, adoptErr := second.importOrAdoptDockerSandboxesTemplate(context.Background(), manifest, source, manifestHash, secondArtifact.RootDisk, true, secondArtifact, metadataPath, metadataSHA, archivePath, archiveSHA, archiveBytes, runtime)
 		secondDone <- result{adopted: adopted, err: adoptErr}
 	}()
 	<-secondStarted

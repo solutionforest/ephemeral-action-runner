@@ -5,8 +5,9 @@ set -euo pipefail
 # ./start storage status.
 #
 # Uses local Go if present. Otherwise a containerized Go toolchain builds a
-# CGO-disabled native host controller cached under .local/bin, then runs it on
-# the host. The no-Go fallback requires Docker. See docs/advanced/no-go-install.md.
+# CGO-disabled native host controller cached under .local/bin/<platform>, then
+# runs it on the host. The no-Go fallback requires Docker. See
+# docs/advanced/no-go-install.md.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 export EPAR_INVOCATION=start
@@ -25,51 +26,45 @@ EPAR_HOST_TRUST_HELPER="${script_dir}/scripts/host-trust/host-trust-feed.sh"
 
 GO_BIN="${EPAR_GO_BIN:-go}"
 USE_DOCKER_RUN="${EPAR_USE_DOCKER_RUN:-auto}"
+use_old=0
 epar_args=("$@")
+if ((${#epar_args[@]})) && [[ "${epar_args[0]}" == "--use-old" ]]; then
+  use_old=1
+  epar_args=("${epar_args[@]:1}")
+fi
+if ((${#epar_args[@]})); then
+  for epar_argument in "${epar_args[@]}"; do
+    if [[ "$epar_argument" == "--use-old" ]]; then
+      echo '--use-old is a wrapper option and must be the first argument: ./start --use-old <command> [arguments...]' >&2
+      exit 2
+    fi
+  done
+fi
 if ((${#epar_args[@]} == 0)); then
   epar_args=(start)
 elif [[ "${epar_args[0]}" == -* ]]; then
   epar_args=(start "${epar_args[@]}")
 fi
-controller_command="${epar_args[0]}"
-
 # A present-but-broken `go` (wrong architecture, ancient pre-modules install
 # left over on PATH, etc.) must not look "usable" just because it exists.
 go_usable() {
   command -v "$1" >/dev/null 2>&1 && "$1" version >/dev/null 2>&1
 }
 
+if ((use_old == 1)); then
+  exec env EPAR_NATIVE_USE_OLD=1 "${script_dir}/scripts/build-native-controller.sh" "${epar_args[@]}"
+fi
+
 if [[ "${USE_DOCKER_RUN}" == "1" ]] || { [[ "${USE_DOCKER_RUN}" == "auto" ]] && ! go_usable "${GO_BIN}"; }; then
-  echo "Go not found or not runnable (or EPAR_USE_DOCKER_RUN=1); building and running a cached native controller with the Docker toolchain..." >&2
-  exec "${script_dir}/scripts/run-with-docker.sh" "${epar_args[@]}"
+  echo "Go not found or not runnable (or EPAR_USE_DOCKER_RUN=1); using the Docker compiler for the cached native controller..." >&2
+  exec env EPAR_NATIVE_CONTROLLER_BACKEND=docker "${script_dir}/scripts/build-native-controller.sh" "${epar_args[@]}"
 fi
 
 if ! go_usable "${GO_BIN}"; then
   echo "Go not found or not runnable: ${GO_BIN}" >&2
-  echo "Install Go, set EPAR_GO_BIN, or set EPAR_USE_DOCKER_RUN=1 to run with a containerized Go toolchain instead." >&2
+  echo "Install Go, set EPAR_GO_BIN, or set EPAR_USE_DOCKER_RUN=1 to use a containerized compiler instead." >&2
   echo "See docs/advanced/no-go-install.md." >&2
   exit 1
 fi
 
-# The local controller reads the host trust stores itself. Feed variables are
-# exclusively for the legacy controller-in-Docker bridge, so do not let a
-# caller's bridge state bypass native first-run preflight or stale its build.
-unset EPAR_BUILD_TRUST_FEED EPAR_HOST_TRUST_FEED EPAR_CONTROLLER_HOST_OS EPAR_HOST_TRUST_INIT_DEFERRED
-
-# The native controller resolves operational and runner trust directly. Keep
-# the established explicit-init post-write verification, but never prepare a
-# pre-wizard feed for the embedded first-run start continuation.
-if [[ "$controller_command" != "init" ]]; then
-  exec "${GO_BIN}" run ./cmd/ephemeral-action-runner "${epar_args[@]}"
-fi
-
-epar_host_trust_prepare "${script_dir}" "$controller_command" "${epar_args[@]}"
-trap epar_host_trust_cleanup EXIT INT TERM
-status=0
-"${GO_BIN}" run ./cmd/ephemeral-action-runner "${epar_args[@]}" || status=$?
-if [[ "$status" == "0" ]]; then
-  epar_host_trust_post_init "${script_dir}" || status=$?
-fi
-epar_host_trust_cleanup
-trap - EXIT INT TERM
-exit "$status"
+exec env EPAR_NATIVE_CONTROLLER_BACKEND=local-go EPAR_NATIVE_GO_BIN="${GO_BIN}" "${script_dir}/scripts/build-native-controller.sh" "${epar_args[@]}"

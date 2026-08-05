@@ -11,15 +11,14 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
-const (
-	instanceCreateExpansionBytes = 10 * storage.GiB
-)
+const instanceCreateExpansionBytes = 10 * storage.GiB
 
-func (m *Manager) preflightStorage(operation string, peakBytes uint64) error {
-	return m.preflightStorageAttempt(operation, peakBytes, false)
+func (m *Manager) preflightStorage(plan storage.OperationPlan) error {
+	return m.preflightStorageAttempt(plan, false)
 }
 
-func (m *Manager) preflightStorageAttempt(operation string, peakBytes uint64, housekeepingRetried bool) error {
+func (m *Manager) preflightStorageAttempt(plan storage.OperationPlan, housekeepingRetried bool) error {
+	operation := plan.ID
 	if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
 		pending, pendingErr := m.imageCoordinator().StorageCleanupPending()
 		if pendingErr != nil {
@@ -35,92 +34,96 @@ func (m *Manager) preflightStorageAttempt(operation string, peakBytes uint64, ho
 	if err != nil {
 		return err
 	}
+	plan.MinimumFreeBytes = minimumFree
+	if plan.Provider == "" || plan.Provider == "shared" {
+		plan.Provider = m.Config.Provider.Type
+	}
 	if m.Storage != nil {
-		snapshot, err := m.Storage.StorageSnapshot(context.Background(), provider.StorageRequest{
-			Operation:        operation,
-			Now:              m.currentTime(),
-			PeakBytes:        peakBytes,
-			MinimumFreeBytes: minimumFree,
-		})
+		snapshot, err := m.Storage.StorageSnapshot(context.Background(), provider.StorageRequest{OperationPlan: plan, Now: m.currentTime()})
 		if err != nil {
-			measurementErr := fmt.Errorf("provider storage surface cannot be measured before %s: %w\n\nInspect storage with:\n  %s", operation, err, invocation.Command("storage", "status", "--provider", m.Config.Provider.Type))
+			measurementErr := fmt.Errorf("provider storage capacity domains cannot be measured before %s: %w\n\nInspect the same operation with:\n  %s", operation, err, m.storageStatusCommand(operation))
 			if m.AllowInsufficientStorage {
 				m.warnStorageOverride(operation, measurementErr)
 				return nil
 			}
 			return measurementErr
 		}
-		if len(snapshot.Surfaces) == 0 || len(snapshot.Requirements) == 0 {
-			return fmt.Errorf("provider %q returned no required storage surface for %s", m.Config.Provider.Type, operation)
+		m.warnStorageDiscovery(snapshot.Warnings)
+		if len(snapshot.Surfaces) == 0 || len(snapshot.Domains) == 0 {
+			return fmt.Errorf("provider %q returned no measurable storage capacity domains for %s", m.Config.Provider.Type, operation)
 		}
-		surfaces := make(map[string]storage.Surface, len(snapshot.Surfaces))
-		for _, surface := range snapshot.Surfaces {
-			surfaces[surface.ID] = surface
+		evaluation, err := storage.EvaluateOperationPlan(plan, snapshot.Surfaces, snapshot.Domains)
+		if err != nil {
+			return fmt.Errorf("resolve storage operation %s: %w", operation, err)
 		}
-		for _, requirement := range snapshot.Requirements {
-			surface, found := surfaces[requirement.SurfaceID]
-			if !found {
-				return fmt.Errorf("provider storage requirement %q references unknown surface %q", requirement.ID, requirement.SurfaceID)
+		for _, check := range evaluation.CapacityChecks {
+			if check.Status == storage.CapacityReady {
+				continue
 			}
-			check, err := storage.EvaluateCapacity(surface, requirement)
-			if err != nil {
-				return fmt.Errorf("evaluate storage capacity before %s: %w", operation, err)
-			}
-			if check.Status != storage.CapacityReady {
-				if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
-					if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
-						m.warnf("EPAR storage housekeeping retry before %s was deferred: %v\n", operation, cleanupErr)
-					}
-					return m.preflightStorageAttempt(operation, peakBytes, true)
+			if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
+				if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
+					m.warnf("EPAR storage housekeeping retry before %s was deferred: %v\n", operation, cleanupErr)
 				}
-				admissionErr := storageAdmissionError(operation, surface, requirement, check, m.Config.Provider.Type, m.StorageOverrideCommand)
-				if m.AllowInsufficientStorage {
-					m.warnStorageOverride(operation, admissionErr)
-					continue
-				}
-				return admissionErr
+				return m.preflightStorageAttempt(plan, true)
 			}
+			admissionErr := operationAdmissionError(operation, snapshot.Domains, check, m.Config.Provider.Type, m.storagePruneCommand(), m.StorageOverrideCommand)
+			if m.AllowInsufficientStorage {
+				m.warnStorageOverride(operation, admissionErr)
+				continue
+			}
+			return admissionErr
 		}
 		return nil
 	}
-	capacity, err := storage.ProbeFilesystemCapacity(m.ProjectRoot, m.currentTime())
+
+	domain, err := storage.ProbeFilesystemCapacityDomain(m.ProjectRoot, m.currentTime())
 	if err != nil {
-		measurementErr := fmt.Errorf("storage surface %q cannot be measured before %s: %w\n\nInspect storage with:\n  %s", m.ProjectRoot, operation, err, invocation.Command("storage", "status", "--provider", m.Config.Provider.Type))
+		measurementErr := fmt.Errorf("project storage capacity domain %q cannot be measured before %s: %w\n\nInspect the same operation with:\n  %s", m.ProjectRoot, operation, err, m.storageStatusCommand(operation))
 		if m.AllowInsufficientStorage {
 			m.warnStorageOverride(operation, measurementErr)
 			return nil
 		}
 		return measurementErr
 	}
+	domain.ID = "project-domain"
+	projectPlan := plan
+	projectPlan.Phases = append([]storage.OperationPhase(nil), plan.Phases...)
+	for phaseIndex := range projectPlan.Phases {
+		projectPlan.Phases[phaseIndex].Allocations = append([]storage.Allocation(nil), projectPlan.Phases[phaseIndex].Allocations...)
+		for allocationIndex := range projectPlan.Phases[phaseIndex].Allocations {
+			projectPlan.Phases[phaseIndex].Allocations[allocationIndex].Role = ""
+			projectPlan.Phases[phaseIndex].Allocations[allocationIndex].SurfaceID = "project"
+		}
+	}
 	surface := storage.Surface{
 		ID:                     "project",
 		Provider:               m.Config.Provider.Type,
+		Role:                   storage.StorageRoleProject,
 		Kind:                   storage.SurfaceHostFilesystem,
+		DomainID:               domain.ID,
+		Path:                   m.ProjectRoot,
 		Location:               m.ProjectRoot,
 		Classification:         "physical",
-		Confidence:             "authoritative-filesystem-probe",
+		Provenance:             domain.Provenance,
+		Confidence:             domain.Confidence,
 		AdmissionAuthoritative: true,
-		Capacity:               capacity,
+		Capacity:               domain.Capacity,
 	}
-	requirement := storage.Requirement{
-		ID:               operation,
-		Provider:         m.Config.Provider.Type,
-		SurfaceID:        surface.ID,
-		PeakBytes:        peakBytes,
-		MinimumFreeBytes: minimumFree,
-	}
-	check, err := storage.EvaluateCapacity(surface, requirement)
+	evaluation, err := storage.EvaluateOperationPlan(projectPlan, []storage.Surface{surface}, []storage.CapacityDomain{domain})
 	if err != nil {
-		return fmt.Errorf("evaluate storage capacity before %s: %w", operation, err)
+		return fmt.Errorf("resolve project storage operation %s: %w", operation, err)
 	}
-	if check.Status != storage.CapacityReady {
+	for _, check := range evaluation.CapacityChecks {
+		if check.Status == storage.CapacityReady {
+			continue
+		}
 		if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
 			if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
 				m.warnf("EPAR storage housekeeping retry before %s was deferred: %v\n", operation, cleanupErr)
 			}
-			return m.preflightStorageAttempt(operation, peakBytes, true)
+			return m.preflightStorageAttempt(plan, true)
 		}
-		admissionErr := storageAdmissionError(operation, surface, requirement, check, m.Config.Provider.Type, m.StorageOverrideCommand)
+		admissionErr := operationAdmissionError(operation, []storage.CapacityDomain{domain}, check, m.Config.Provider.Type, m.storagePruneCommand(), m.StorageOverrideCommand)
 		if m.AllowInsufficientStorage {
 			m.warnStorageOverride(operation, admissionErr)
 			return nil
@@ -130,20 +133,69 @@ func (m *Manager) preflightStorageAttempt(operation string, peakBytes uint64, ho
 	return nil
 }
 
-func (m *Manager) instanceCreateExpansion() uint64 {
-	return uint64(instanceCreateExpansionBytes)
+func (m *Manager) instanceCreateOperationPlan() storage.OperationPlan {
+	role := storage.StorageRoleProject
+	switch m.Config.Provider.Type {
+	case "docker-container":
+		role = storage.StorageRoleDockerEngine
+	case "docker-sandboxes":
+		role = storage.StorageRoleSandboxRuntime
+	case "wsl":
+		role = storage.StorageRoleWSLDistribution
+	case "tart":
+		role = storage.StorageRoleTartStore
+	}
+	return storage.OperationPlan{
+		ID:       "instance-create",
+		Provider: m.Config.Provider.Type,
+		Phases: []storage.OperationPhase{{
+			ID: "instance-create",
+			Allocations: []storage.Allocation{{
+				ID: "provider-runtime-instance", Role: role, Bytes: instanceCreateExpansionBytes,
+			}},
+		}},
+	}
 }
 
-func storageAdmissionError(operation string, surface storage.Surface, requirement storage.Requirement, check storage.CapacityCheck, providerType, overrideCommand string) error {
+func (m *Manager) storageStatusCommand(operation string) string {
+	return invocation.ScopedCommand(m.ConfigPath, m.ProjectRoot, "storage", "status", "--operation", operation, "--provider", m.Config.Provider.Type)
+}
+
+func (m *Manager) storagePruneCommand() string {
+	return invocation.ScopedCommand(m.ConfigPath, m.ProjectRoot, "storage", "prune", "--provider", m.Config.Provider.Type)
+}
+
+func operationAdmissionError(operation string, domains []storage.CapacityDomain, check storage.CapacityCheck, providerType, pruneCommand, overrideCommand string) error {
+	if check.DomainRequirement == nil {
+		return fmt.Errorf("storage capacity check for %s did not identify a capacity domain", operation)
+	}
+	var domain storage.CapacityDomain
+	for _, candidate := range domains {
+		if candidate.ID == check.DomainRequirement.DomainID {
+			domain = candidate
+			break
+		}
+	}
+	if domain.ID == "" {
+		return fmt.Errorf("storage capacity check for %s references unknown domain %q", operation, check.DomainRequirement.DomainID)
+	}
 	action := "complete " + strings.ReplaceAll(operation, "-", " ")
 	if operation == "instance-create" {
 		action = "initialize the runner"
 	}
-	err := storage.CapacityAdmissionError(action, surface, requirement, check, invocation.Command("storage", "prune", "--provider", providerType))
+	surface := storage.Surface{ID: domain.ID, Provider: providerType, Kind: domain.Kind, Location: domain.Path, Path: domain.Path, DomainID: domain.ID, Provenance: domain.Provenance, Confidence: domain.Confidence, Capacity: domain.Capacity}
+	requirement := storage.Requirement{ID: check.DomainRequirement.OperationID + "-" + domain.ID, Provider: providerType, SurfaceID: domain.ID, PeakBytes: check.DomainRequirement.PeakBytes, MinimumFreeBytes: check.DomainRequirement.MinimumFreeBytes}
+	err := storage.CapacityAdmissionError(action, surface, requirement, check, pruneCommand)
 	if overrideCommand != "" {
 		return fmt.Errorf("%w\n\nContinue this invocation despite the storage risk with:\n  %s", err, overrideCommand)
 	}
 	return err
+}
+
+func (m *Manager) warnStorageDiscovery(warnings []string) {
+	for _, warning := range warnings {
+		m.warnf("\n*** STORAGE DISCOVERY WARNING ***\n%s\nCapacity evidence does not grant EPAR cleanup authority.\n\n", warning)
+	}
 }
 
 func (m *Manager) warnStorageOverride(operation string, err error) {
@@ -151,7 +203,7 @@ func (m *Manager) warnStorageOverride(operation string, err error) {
 }
 
 // PreflightProviderStorage lets provider-side controllers apply the same
-// fail-closed reserve rule to an exact operation before provider side effects.
-func (m *Manager) PreflightProviderStorage(operation string, peakBytes uint64) error {
-	return m.preflightStorage(operation, peakBytes)
+// fail-closed domain evaluator to an exact operation before provider side effects.
+func (m *Manager) PreflightProviderStorage(plan storage.OperationPlan) error {
+	return m.preflightStorage(plan)
 }

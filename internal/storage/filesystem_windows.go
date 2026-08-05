@@ -5,6 +5,7 @@ package storage
 import (
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -20,6 +21,37 @@ func platformFilesystemCapacity(path string) (uint64, uint64, error) {
 		return 0, 0, err
 	}
 	return available, total, nil
+}
+
+func platformFilesystemCapacityDomain(path string) (string, string, uint64, uint64, error) {
+	available, total, err := platformFilesystemCapacity(path)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	pointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	volumePathBuffer := make([]uint16, 32768)
+	if err := windows.GetVolumePathName(pointer, &volumePathBuffer[0], uint32(len(volumePathBuffer))); err != nil {
+		return "", "", 0, 0, err
+	}
+	volumePath := windows.UTF16ToString(volumePathBuffer)
+	volumePathPointer, err := windows.UTF16PtrFromString(volumePath)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	volumeNameBuffer := make([]uint16, 1024)
+	if err := windows.GetVolumeNameForVolumeMountPoint(volumePathPointer, &volumeNameBuffer[0], uint32(len(volumeNameBuffer))); err != nil {
+		return "", "", 0, 0, err
+	}
+	volumeName := windows.UTF16ToString(volumeNameBuffer)
+	var volumeSerial uint32
+	if err := windows.GetVolumeInformation(volumePathPointer, nil, 0, &volumeSerial, nil, nil, nil, 0); err != nil {
+		return "", "", 0, 0, err
+	}
+	identity := fmt.Sprintf("windows-volume:%s:%08x", strings.ToLower(strings.TrimSuffix(volumeName, `\`)), volumeSerial)
+	return identity, volumePath, available, total, nil
 }
 
 func platformFilesystemIdentity(path string, directory bool) (string, error) {

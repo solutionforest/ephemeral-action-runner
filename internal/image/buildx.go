@@ -354,6 +354,25 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 	return builder, nil
 }
 
+// stopBuildxBuilder releases the config-scoped BuildKit daemon's resident
+// memory while preserving the builder definition, cache state, and ownership
+// metadata. A later build automatically starts the same builder again.
+func (m *Coordinator) stopBuildxBuilder(ctx context.Context, builder, reason string) error {
+	builder = strings.TrimSpace(builder)
+	if builder == "" {
+		return errors.New("stop EPAR Buildx builder: builder name is required")
+	}
+	if m.DryRun {
+		m.infof("[dry-run] stop EPAR-owned Buildx builder %s to %s while preserving cache state\n", builder, reason)
+		return nil
+	}
+	if err := m.runHost(ctx, "docker", "buildx", "stop", builder); err != nil {
+		return fmt.Errorf("stop EPAR-owned Buildx builder %q to %s while preserving cache state: %w", builder, reason, err)
+	}
+	m.infof("stopped EPAR-owned Buildx builder %s to %s; its definition and cache state were preserved\n", builder, reason)
+	return nil
+}
+
 func buildxOwnershipMatches(actual, expected BuildxMetadata) bool {
 	return actual.Builder == expected.Builder &&
 		actual.Driver == expected.Driver &&

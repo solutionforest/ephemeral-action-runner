@@ -26,7 +26,7 @@ import (
 
 const (
 	dockerSandboxesReceiptSchema  = 3
-	dockerSandboxesMetadataSchema = 5
+	dockerSandboxesMetadataSchema = 6
 )
 
 var dockerTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
@@ -96,6 +96,7 @@ type dockerSandboxesSourceLock struct {
 	Tini struct {
 		Version string `json:"version"`
 	} `json:"tini"`
+	Emulation dockerSandboxesEmulationLock `json:"emulation"`
 	Platforms map[string]struct {
 		GoBuilderReference               string `json:"goBuilderReference"`
 		GoBuilderManifestDigest          string `json:"goBuilderManifestDigest"`
@@ -106,6 +107,29 @@ type dockerSandboxesSourceLock struct {
 			URL    string `json:"url"`
 			SHA256 string `json:"sha256"`
 		} `json:"tini"`
+	} `json:"platforms"`
+}
+
+type dockerSandboxesEmulationLock struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	Backend       string `json:"backend"`
+	Source        struct {
+		Repository     string `json:"repository"`
+		Release        string `json:"release"`
+		Revision       string `json:"revision"`
+		QEMUVersion    string `json:"qemuVersion"`
+		IndexReference string `json:"indexReference"`
+		IndexDigest    string `json:"indexDigest"`
+		Licenses       []struct {
+			Name   string `json:"name"`
+			URL    string `json:"url"`
+			SHA256 string `json:"sha256"`
+		} `json:"licenses"`
+	} `json:"source"`
+	Platforms map[string]struct {
+		ManifestDigest       string `json:"manifestDigest"`
+		SourceReference      string `json:"sourceReference"`
+		CompressedLayerBytes uint64 `json:"compressedLayerBytes"`
 	} `json:"platforms"`
 }
 
@@ -135,6 +159,12 @@ type dockerSandboxesTemplateMetadata struct {
 		RunnerExecution           string `json:"runnerExecution"`
 		DockerDaemonOwner         string `json:"dockerDaemonOwner"`
 		ExpectedDockerDaemonCount int    `json:"expectedDockerDaemonCount"`
+		EmulationBackend          string `json:"emulationBackend"`
+		EmulationPolicy           string `json:"emulationPolicy"`
+		EmulationRelease          string `json:"emulationRelease"`
+		EmulationSourceDigest     string `json:"emulationSourceDigest"`
+		EmulationManifestDigest   string `json:"emulationManifestDigest"`
+		QEMUVersion               string `json:"qemuVersion"`
 	} `json:"compatibility"`
 	Artifacts map[string]artifactEvidence `json:"artifacts"`
 }
@@ -156,7 +186,7 @@ func NormalizeCatthehackerSource(input string) (string, error) {
 	case "full", "act", "dotnet", "js":
 		value += "-latest"
 	}
-	const repository = "ghcr.io/catthehacker/ubuntu"
+	const repository = catthehackerUbuntuRepository
 	if strings.HasPrefix(value, repository+":") {
 		value = strings.TrimPrefix(value, repository+":")
 	}
@@ -302,6 +332,7 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 	}
 	indexRaw, err := m.runHostOutput(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", reference)
 	if err != nil {
+		err = m.explainBuiltInCatthehackerAuthFailure(ctx, reference, err)
 		return ResolvedDockerSource{}, fmt.Errorf("resolve source image %s: %w", reference, err)
 	}
 	var index dockerManifestDocument
@@ -329,6 +360,8 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 	}
 	platformRaw, err := m.runHostOutput(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", repository+"@"+platformDigest)
 	if err != nil {
+		platformReference := repository + "@" + platformDigest
+		err = m.explainBuiltInCatthehackerAuthFailure(ctx, platformReference, err)
 		return ResolvedDockerSource{}, fmt.Errorf("resolve source platform manifest %s: %w", platform, err)
 	}
 	return parseResolvedDockerSource(reference, platform, []byte(indexRaw), []byte(platformRaw))
@@ -705,21 +738,58 @@ func (m *Coordinator) ensureDockerSandboxesTemplateFromState(ctx context.Context
 	return m.ensureDockerSandboxesTemplateResolved(ctx, false, *state.LastResolvedManifest, *state.LastResolvedSource)
 }
 
-func estimatedDockerSandboxesExpansion(source ResolvedDockerSource) uint64 {
+const dockerSandboxesExpandedEmulationAllowanceBytes = 64 * storage.MiB
+
+func (m *Coordinator) dockerSandboxesSourceEstimate(source ResolvedDockerSource) (SourceSizeEstimate, error) {
 	estimate, err := EstimateSourceSize(source.CompressedLayerBytes, 0)
 	if err != nil {
-		return ^uint64(0)
+		return SourceSizeEstimate{}, err
 	}
-	dockerDisk, _ := config.ParseByteSize(config.DockerSandboxesDefaultDockerDisk)
-	plan, err := PlanArtifactStorage("docker-sandboxes", estimate, false, uint64(dockerDisk))
+	lock, err := loadDockerSandboxesSourceLock(m.ProjectRoot, source.Platform)
 	if err != nil {
-		return ^uint64(0)
+		return SourceSizeEstimate{}, err
 	}
-	return plan.EstimatedIncrementalPeak
+	platform := lock.Emulation.Platforms[source.Platform]
+	estimate.CompressedBytes, err = sumStorageBytes(estimate.CompressedBytes, platform.CompressedLayerBytes)
+	if err != nil {
+		return SourceSizeEstimate{}, errors.New("Docker Sandboxes emulation download estimate overflows uint64")
+	}
+	estimate.ExpandedBytes, err = sumStorageBytes(estimate.ExpandedBytes, dockerSandboxesExpandedEmulationAllowanceBytes)
+	if err != nil {
+		return SourceSizeEstimate{}, errors.New("Docker Sandboxes expanded emulation estimate overflows uint64")
+	}
+	estimate.Confidence = EstimateFallback
+	return estimate, nil
+}
+
+func (m *Coordinator) dockerSandboxesStoragePlan(source ResolvedDockerSource, cached bool, operationID string) (ArtifactStoragePlan, error) {
+	estimate, err := m.dockerSandboxesSourceEstimate(source)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	dockerDisk, err := config.ParseByteSize(m.Config.DockerSandboxes.DockerDisk)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	plan, err := PlanArtifactStorage("docker-sandboxes", estimate, cached, uint64(dockerDisk))
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	plan.OperationPlan.ID = operationID
+	plan.Notes = append(plan.Notes, "Emulation storage includes the exact compressed size of the pinned binfmt manifest layers plus a conservative 64MiB expanded allowance for the installer, static QEMU interpreters, and license evidence; the estimate is not marked exact.")
+	return plan, nil
+}
+
+func (m *Coordinator) dockerSandboxesImportStoragePlan(source ResolvedDockerSource, archiveBytes uint64) (ArtifactStoragePlan, error) {
+	estimate, err := m.dockerSandboxesSourceEstimate(source)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	return PlanDockerSandboxesImportStorage(estimate, archiveBytes)
 }
 
 func (m *Coordinator) effectiveDockerSandboxesRootDisk(source ResolvedDockerSource) (string, error) {
-	estimate, err := EstimateSourceSize(source.CompressedLayerBytes, 0)
+	estimate, err := m.dockerSandboxesSourceEstimate(source)
 	if err != nil {
 		return "", err
 	}
@@ -741,7 +811,11 @@ func (m *Coordinator) effectiveDockerSandboxesRootDisk(source ResolvedDockerSour
 }
 
 func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, runtime provider.TemplateArtifactRuntime) error {
-	if err := m.preflightStorage("template-build", estimatedDockerSandboxesExpansion(source)); err != nil {
+	plan, err := m.dockerSandboxesStoragePlan(source, false, "template-build")
+	if err != nil {
+		return err
+	}
+	if err := m.preflightStorage(plan.OperationPlan); err != nil {
 		return err
 	}
 	if err := m.verifyDockerSandboxesNativeBuilder(ctx, source.Platform); err != nil {
@@ -766,15 +840,28 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		return fmt.Errorf("record Docker Sandboxes archive workspace ownership: %w", err)
 	}
 	platformLock := lock.Platforms[source.Platform]
+	emulationPlatformLock := lock.Emulation.Platforms[source.Platform]
 	builder, err := m.ensureBuildxBuilder(ctx, []string{
 		source.ImmutableReference,
 		lock.DockerfileFrontend.Reference,
 		platformLock.GoBuilderReference,
 		platformLock.SBOMGeneratorReference,
+		emulationPlatformLock.SourceReference,
 	})
 	if err != nil {
 		return err
 	}
+	builderNeedsStop := !m.DryRun
+	defer func() {
+		if !builderNeedsStop {
+			return
+		}
+		stopContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if stopErr := m.stopBuildxBuilder(stopContext, builder, "release resident memory after the Docker Sandboxes build"); stopErr != nil {
+			m.warnf("EPAR Buildx builder shutdown warning: %v\n", stopErr)
+		}
+	}()
 	buildTrust, err := m.resolveBuildTrust(ctx)
 	if err != nil {
 		return err
@@ -786,6 +873,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	inputRoot := filepath.Join(artifactRoot, "inputs")
 	actionsRunnerPath := filepath.Join(inputRoot, "actions-runner.tar.gz")
 	tiniPath := filepath.Join(inputRoot, "tini")
+	emulationLicenseRoot := filepath.Join(inputRoot, "emulation-licenses")
 	actionsRunnerCachePath, err := m.acquireActionsRunner(ctx, manifest)
 	if err != nil {
 		return err
@@ -795,6 +883,14 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	}
 	if err := verifiedDownload(ctx, downloadClient, platformLock.Tini.URL, tiniPath, platformLock.Tini.SHA256, 0o700); err != nil {
 		return fmt.Errorf("acquire locked tini: %w", err)
+	}
+	if err := os.MkdirAll(emulationLicenseRoot, 0o755); err != nil {
+		return err
+	}
+	for _, license := range lock.Emulation.Source.Licenses {
+		if err := verifiedDownload(ctx, downloadClient, license.URL, filepath.Join(emulationLicenseRoot, license.Name), license.SHA256, 0o600); err != nil {
+			return fmt.Errorf("acquire locked emulation license %s: %w", license.Name, err)
+		}
 	}
 	buildMetadataPath := filepath.Join(artifactRoot, "build-metadata.json")
 	attestationMetadataPath := filepath.Join(artifactRoot, "attestation-metadata.json")
@@ -838,13 +934,21 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		}
 		compatibilityPath := filepath.Join(contextRoot, "profiles", "generated.compatibility.json")
 		compatibility := map[string]any{
-			"schemaVersion":             2,
-			"templateSchemaVersion":     1,
+			"schemaVersion":             3,
+			"templateSchemaVersion":     2,
 			"profile":                   profile,
 			"platform":                  source.Platform,
 			"runnerExecution":           "direct-actions-listener",
 			"dockerDaemonOwner":         "docker-sandboxes-runtime",
 			"expectedDockerDaemonCount": 1,
+			"architectureEmulation": map[string]any{
+				"backend":              lock.Emulation.Backend,
+				"policy":               "automatic-binfmt-install-all",
+				"release":              lock.Emulation.Source.Release,
+				"sourceIndexDigest":    lock.Emulation.Source.IndexDigest,
+				"sourceManifestDigest": emulationPlatformLock.ManifestDigest,
+				"qemuVersion":          lock.Emulation.Source.QEMUVersion,
+			},
 		}
 		if err := writeJSONFile(compatibilityPath, compatibility); err != nil {
 			return err
@@ -871,6 +975,9 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		if err := copyFile(tiniPath, filepath.Join(contextRoot, "inputs", "tini"), 0o755); err != nil {
 			return err
 		}
+		if err := copyDirectory(emulationLicenseRoot, filepath.Join(contextRoot, "inputs", "emulation-licenses")); err != nil {
+			return err
+		}
 		for _, path := range []string{buildMetadataPath, attestationMetadataPath, provenancePath, sbomPath, inventoryPath, archivePath, partialArchivePath, metadataPath} {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return err
@@ -895,6 +1002,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"TEMPLATE_PLATFORM=" + source.Platform,
 			"SOURCE_IMAGE=" + source.ImmutableReference,
 			"GO_BUILDER_IMAGE=" + platformLock.GoBuilderReference,
+			"BINFMT_IMAGE=" + emulationPlatformLock.SourceReference,
 			"HOOK_LAUNCHER_SHA256=" + lock.HookLauncher.SHA256,
 			"SOURCE_PROFILE=" + profile,
 			"SOURCE_INDEX_DIGEST=" + source.IndexDigest,
@@ -945,6 +1053,10 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if err := os.RemoveAll(evidenceExportRoot); err != nil {
 		return err
 	}
+	if err := m.stopBuildxBuilder(ctx, builder, "release archive-build memory before full-image SBOM generation"); err != nil {
+		return err
+	}
+	builderNeedsStop = false
 	attestationArgs := []string{
 		"buildx", "build", "--builder", builder, "--platform", source.Platform, "--progress", "plain",
 		"--target", "software-inventory-export", "--output", "type=local,dest=" + evidenceExportRoot,
@@ -961,8 +1073,9 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		return err
 	}
 	m.infof("full Docker Sandboxes provenance, SBOM, and software-inventory progress: %s\n", attestationLogPath)
+	builderNeedsStop = !m.DryRun
 	if err := m.runHostBuildxLogged(ctx, attestationLogPath, "docker", attestationArgs...); err != nil {
-		return fmt.Errorf("generate Docker Sandboxes template evidence: %w%s", err, boundedRedactedLogTail(attestationLogPath, 16*1024))
+		return dockerSandboxesEvidenceBuildError(err, attestationLogPath)
 	}
 	var attestationMetadata dockerSandboxesBuildMetadata
 	if err := readJSONFile(attestationMetadataPath, &attestationMetadata); err != nil {
@@ -1032,10 +1145,16 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	metadata.Template.Archive = filepath.Base(archivePath)
 	metadata.Template.ArchiveSHA256 = archiveSHA
 	metadata.Template.ArchiveBytes = archiveBytes
-	metadata.Compatibility.TemplateSchemaVersion = 1
+	metadata.Compatibility.TemplateSchemaVersion = 2
 	metadata.Compatibility.RunnerExecution = "direct-actions-listener"
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
+	metadata.Compatibility.EmulationBackend = lock.Emulation.Backend
+	metadata.Compatibility.EmulationPolicy = "automatic-binfmt-install-all"
+	metadata.Compatibility.EmulationRelease = lock.Emulation.Source.Release
+	metadata.Compatibility.EmulationSourceDigest = lock.Emulation.Source.IndexDigest
+	metadata.Compatibility.EmulationManifestDigest = emulationPlatformLock.ManifestDigest
+	metadata.Compatibility.QEMUVersion = lock.Emulation.Source.QEMUVersion
 	for name, path := range map[string]string{
 		"buildMetadata":       buildMetadataPath,
 		"attestationMetadata": attestationMetadataPath,
@@ -1061,7 +1180,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	if err != nil {
 		return err
 	}
-	adoptedReusable, activatedAt, err := m.importOrAdoptDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, allowReusable, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, runtime)
+	adoptedReusable, activatedAt, err := m.importOrAdoptDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, allowReusable, artifact, metadataPath, metadataSHA, archivePath, archiveSHA, archiveBytes, runtime)
 	if err != nil {
 		return err
 	}
@@ -1076,7 +1195,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	return nil
 }
 
-func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, runtime provider.TemplateArtifactRuntime) (bool, time.Time, error) {
+func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk string, allowReusable bool, artifact provider.TemplateArtifact, metadataPath, metadataSHA, archivePath, archiveSHA string, verifiedArchiveBytes uint64, runtime provider.TemplateArtifactRuntime) (bool, time.Time, error) {
 	adoptedReusable := false
 	activatedAt := time.Time{}
 	err := m.withSandboxBackendLock(ctx, func() error {
@@ -1093,6 +1212,13 @@ func (m *Coordinator) importOrAdoptDockerSandboxesTemplate(ctx context.Context, 
 				return err
 			}
 			label := fmt.Sprintf("Docker Sandboxes template-cache import for %s", artifact.Reference)
+			importPlan, err := m.dockerSandboxesImportStoragePlan(source, verifiedArchiveBytes)
+			if err != nil {
+				return fmt.Errorf("plan Docker Sandboxes template-cache import storage: %w", err)
+			}
+			if err := m.preflightStorage(importPlan.OperationPlan); err != nil {
+				return err
+			}
 			if err := m.runProgressOperation(label, nil, func() error {
 				return runtime.ImportTemplate(ctx, archivePath)
 			}); err != nil {
@@ -1497,6 +1623,13 @@ func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifes
 			if !errors.Is(err, provider.ErrTemplateNotFound) {
 				return err
 			}
+			importPlan, err := m.dockerSandboxesImportStoragePlan(source, metadata.Template.ArchiveBytes)
+			if err != nil {
+				return fmt.Errorf("plan resumed Docker Sandboxes template-cache import storage: %w", err)
+			}
+			if err := m.preflightStorage(importPlan.OperationPlan); err != nil {
+				return err
+			}
 			if err := m.runProgressOperation("Docker Sandboxes resumed template-cache import", nil, func() error {
 				return runtime.ImportTemplate(ctx, archivePath)
 			}); err != nil {
@@ -1545,7 +1678,7 @@ func verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePat
 	if !validSHA256(metadata.Template.Digest) || metadata.Template.CacheID != strings.TrimPrefix(metadata.Template.Digest, "sha256:")[:12] || metadata.Template.Tag == "" || metadata.Template.RootDisk == "" || metadata.Template.Archive != filepath.Base(archivePath) {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
-	if metadata.Compatibility.TemplateSchemaVersion != 1 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 {
+	if metadata.Compatibility.TemplateSchemaVersion != 2 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 || metadata.Compatibility.EmulationBackend != "qemu" || metadata.Compatibility.EmulationPolicy != "automatic-binfmt-install-all" || metadata.Compatibility.EmulationRelease == "" || !validSHA256(metadata.Compatibility.EmulationSourceDigest) || !validSHA256(metadata.Compatibility.EmulationManifestDigest) || metadata.Compatibility.QEMUVersion == "" {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
 	archiveInfo, err := os.Lstat(archivePath)
@@ -1712,15 +1845,29 @@ func loadDockerSandboxesSourceLock(projectRoot, platform string) (dockerSandboxe
 	if err := readJSONFile(path, &lock); err != nil {
 		return lock, fmt.Errorf("read Docker Sandboxes source lock: %w", err)
 	}
-	if lock.SchemaVersion != 2 {
+	if lock.SchemaVersion != 3 {
 		return lock, fmt.Errorf("unsupported Docker Sandboxes source lock schema %d", lock.SchemaVersion)
 	}
-	if lock.DockerfileFrontend.Reference == "" || lock.SBOMGenerator.InspectionReference == "" || lock.GoBuilder.Version == "" || lock.GoBuilder.IndexDigest == "" || lock.HookLauncher.SHA256 == "" || lock.Tini.Version == "" {
+	expectedIndexReference := lock.Emulation.Source.Repository + ":" + lock.Emulation.Source.Release + "@" + lock.Emulation.Source.IndexDigest
+	if lock.DockerfileFrontend.Reference == "" || lock.SBOMGenerator.InspectionReference == "" || lock.GoBuilder.Version == "" || lock.GoBuilder.IndexDigest == "" || lock.HookLauncher.SHA256 == "" || lock.Tini.Version == "" || lock.Emulation.SchemaVersion != 1 || lock.Emulation.Backend != "qemu" || lock.Emulation.Source.Repository != "docker.io/tonistiigi/binfmt" || lock.Emulation.Source.Release == "" || lock.Emulation.Source.Revision == "" || lock.Emulation.Source.QEMUVersion == "" || !validSHA256(lock.Emulation.Source.IndexDigest) || lock.Emulation.Source.IndexReference != expectedIndexReference {
 		return lock, errors.New("Docker Sandboxes source lock has incomplete shared build inputs")
 	}
 	platformLock, ok := lock.Platforms[platform]
 	if !ok || platformLock.GoBuilderReference == "" || platformLock.GoBuilderManifestDigest == "" || platformLock.SBOMGeneratorReference == "" || platformLock.SBOMGeneratorManifestDigest == "" || platformLock.DockerfileFrontendManifestDigest == "" || platformLock.Tini.URL == "" || platformLock.Tini.SHA256 == "" {
 		return lock, fmt.Errorf("Docker Sandboxes source lock has incomplete build inputs for %s", platform)
+	}
+	emulationPlatform, ok := lock.Emulation.Platforms[platform]
+	expectedManifestReference := lock.Emulation.Source.Repository + ":" + lock.Emulation.Source.Release + "@" + emulationPlatform.ManifestDigest
+	if !ok || !validSHA256(emulationPlatform.ManifestDigest) || emulationPlatform.SourceReference != expectedManifestReference || emulationPlatform.CompressedLayerBytes == 0 {
+		return lock, fmt.Errorf("Docker Sandboxes source lock has incomplete emulation inputs for %s", platform)
+	}
+	if len(lock.Emulation.Source.Licenses) < 2 {
+		return lock, errors.New("Docker Sandboxes source lock has incomplete emulation license evidence")
+	}
+	for _, license := range lock.Emulation.Source.Licenses {
+		if filepath.Base(license.Name) != license.Name || !strings.HasSuffix(license.Name, ".txt") || !strings.HasPrefix(license.URL, "https://") || !validSHA256("sha256:"+license.SHA256) {
+			return lock, errors.New("Docker Sandboxes source lock has invalid emulation license evidence")
+		}
 	}
 	return lock, nil
 }
@@ -1844,6 +1991,15 @@ func boundedRedactedLogTail(path string, maximumBytes int64) string {
 		text = "[earlier Buildx output omitted]\n" + text
 	}
 	return "\nBuildx error tail:\n" + text
+}
+
+func dockerSandboxesEvidenceBuildError(cause error, logPath string) error {
+	tail := boundedRedactedLogTail(logPath, 16*1024)
+	lower := strings.ToLower(tail)
+	if strings.Contains(lower, "exit code: 137") && (strings.Contains(lower, "syft") || strings.Contains(lower, "generating sbom")) {
+		return fmt.Errorf("generate Docker Sandboxes template evidence: the full-image SBOM scanner was killed with exit code 137, which indicates that the Docker or BuildKit VM exhausted memory; EPAR preserves other configurations' builders, so inspect other Docker workloads or increase the VM memory allocation if this repeats: %w%s", cause, tail)
+	}
+	return fmt.Errorf("generate Docker Sandboxes template evidence: %w%s", cause, tail)
 }
 
 func copyDirectory(source, destination string) error {

@@ -13,26 +13,21 @@ abandoned_build_grace_seconds=$((24 * 60 * 60))
 bootstrap_minimum_free_bytes="${EPAR_BOOTSTRAP_MIN_FREE_BYTES:-$((1 * 1024 * 1024 * 1024))}"
 go_cache_limit_bytes="${EPAR_GO_CACHE_LIMIT_BYTES:-$((10 * 1024 * 1024 * 1024))}"
 
-command -v docker >/dev/null 2>&1 || { echo "docker command not found. Install Docker and make sure it is available on PATH." >&2; exit 1; }
-command -v shasum >/dev/null 2>&1 || { echo "shasum is required to build the native EPAR cache key." >&2; exit 1; }
-[[ "$bootstrap_minimum_free_bytes" =~ ^[1-9][0-9]*$ ]] || { echo "EPAR_BOOTSTRAP_MIN_FREE_BYTES must be a positive integer byte count." >&2; exit 1; }
-[[ "$go_cache_limit_bytes" =~ ^[1-9][0-9]*$ ]] || { echo "EPAR_GO_CACHE_LIMIT_BYTES must be a positive integer byte count." >&2; exit 1; }
-project_id="$(printf '%s' "$repo_root" | shasum -a 256 | awk '{print substr($1,1,12)}')"
+if command -v shasum >/dev/null 2>&1; then
+  epar_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+  epar_sha256_stream() { shasum -a 256 | awk '{print $1}'; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  epar_sha256() { sha256sum "$1" | awk '{print $1}'; }
+  epar_sha256_stream() { sha256sum | awk '{print $1}'; }
+else
+  echo "shasum or sha256sum is required to build the native EPAR controller identity." >&2
+  exit 1
+fi
+project_id="$(printf '%s' "$repo_root" | epar_sha256_stream | cut -c1-12)"
 gomod_volume="${EPAR_GOMOD_VOLUME:-epar-${project_id}-gomod}"
 gocache_volume="${EPAR_GOCACHE_VOLUME:-epar-${project_id}-gocache}"
 manage_go_cache=0
 if [[ -z "${EPAR_GOMOD_VOLUME:-}" && -z "${EPAR_GOCACHE_VOLUME:-}" ]]; then manage_go_cache=1; fi
-bootstrap_available_kib="$(df -Pk "$repo_root" | awk 'NR == 2 { print $4 }')"
-[[ "$bootstrap_available_kib" =~ ^[0-9]+$ ]] || { echo "cannot measure bootstrap storage for ${repo_root}" >&2; exit 1; }
-bootstrap_available_bytes=$((bootstrap_available_kib * 1024))
-if ((bootstrap_available_bytes < bootstrap_minimum_free_bytes)); then
-  if [[ " $* " == *" --allow-insufficient-storage "* ]]; then
-    echo "WARNING: bootstrap storage is below the ${bootstrap_minimum_free_bytes}-byte reserve; continuing because --allow-insufficient-storage was explicitly supplied." >&2
-  else
-    echo "insufficient bootstrap storage for ${repo_root}: available=${bootstrap_available_bytes} required-reserve=${bootstrap_minimum_free_bytes}. Free space, inspect storage, or retry this invocation with --allow-insufficient-storage." >&2
-    exit 1
-  fi
-fi
 
 epar_ensure_go_cache_volume() {
   local volume="$1"
@@ -130,7 +125,7 @@ epar_prepare_bootstrap_build_trust() {
   config_path="$(epar_host_trust_config_path "$repo_root" "$@")"
   feed_path="$("$EPAR_HOST_TRUST_HELPER" sync --project-root "$repo_root" --config "$config_path" --purpose build)"
   [[ -n "$feed_path" && -f "$feed_path" && ! -L "$feed_path" ]] || { echo "the host trust publisher did not return a regular build feed" >&2; return 1; }
-  config_id="$(printf '%s' "$config_path" | shasum -a 256 | awk '{print substr($1,1,32)}')"
+  config_id="$(printf '%s' "$config_path" | epar_sha256_stream | cut -c1-32)"
   bundle_directory="${repo_root}/.local/storage/bootstrap-trust/${config_id}"
   mkdir -p "$bundle_directory"
   [[ -d "$bundle_directory" && ! -L "$bundle_directory" ]] || { echo "bootstrap build trust directory must be a regular directory: ${bundle_directory}" >&2; return 1; }
@@ -336,104 +331,161 @@ case "$(uname -s)/$(uname -m)" in
   *) echo "unsupported native EPAR controller platform: $(uname -s)/$(uname -m)" >&2; exit 1 ;;
 esac
 
-previous_dev_image_id="$(epar_docker_image_id "$dev_image")"
-epar_resolve_go_toolchain_image
-go_toolchain_previous_id="$EPAR_GO_PREVIOUS_IMAGE_ID"
-go_toolchain_resolved_id="$EPAR_GO_RESOLVED_IMAGE_ID"
-docker build --quiet \
-  --provenance=false \
-  --build-arg "GO_IMAGE=${go_image}" \
-  -t "$dev_image" \
-  -f "${repo_root}/scripts/docker/dev.Dockerfile" \
-  "${repo_root}/scripts/docker" >/dev/null
-dev_image_id="$(epar_docker_image_id "$dev_image")"
-[[ "$dev_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "could not resolve the immutable Docker toolchain image ID for ${dev_image}" >&2; exit 1; }
-epar_write_bootstrap_acquisition_journal toolchain-built "$go_toolchain_previous_id" "$go_toolchain_resolved_id" "$dev_image_id" "$previous_dev_image_id"
-if ((manage_go_cache == 1)); then
-  epar_ensure_go_cache_volume "$gomod_volume" gomod
-  epar_ensure_go_cache_volume "$gocache_volume" gobuild
-  epar_enforce_go_cache_limit
-fi
+native_backend="${EPAR_NATIVE_CONTROLLER_BACKEND:-docker}"
+native_use_old="${EPAR_NATIVE_USE_OLD:-0}"
+[[ "$native_backend" == local-go || "$native_backend" == docker ]] || { echo "invalid EPAR_NATIVE_CONTROLLER_BACKEND: ${native_backend}" >&2; exit 1; }
+[[ "$native_use_old" == 0 || "$native_use_old" == 1 ]] || { echo "invalid EPAR_NATIVE_USE_OLD: ${native_use_old}" >&2; exit 1; }
+controller_args=("$@")
 
-git_commit=unknown
-source_state=unknown
-if command -v git >/dev/null 2>&1; then
-  git_commit_candidate="$(git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null || true)"
-  if [[ "$git_commit_candidate" =~ ^[0-9a-f]{40}$ ]]; then
-    git_commit="$git_commit_candidate"
-    if git -C "$repo_root" status --porcelain=v1 --untracked-files=all >/dev/null 2>&1; then
-      if [[ -z "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" ]]; then source_state=clean; else source_state=dirty; fi
-    fi
-  fi
-fi
-
-source_manifest="$(
-  printf '%s\n%s\n%s\n%s\n' "${goos}/${goarch}" "$dev_image_id" "$git_commit" "$source_state"
-  {
-    find "${repo_root}/cmd" "${repo_root}/internal" -type f -name '*.go' -print
-    find "${repo_root}/scripts/docker" -type f -print
-    printf '%s\n' "${repo_root}/go.mod" "${repo_root}/go.sum" "${repo_root}/scripts/build-native-controller.sh"
-  } | LC_ALL=C sort | while IFS= read -r file; do
-    printf '%s\n' "${file#"${repo_root}/"}"
-    shasum -a 256 "$file" | awk '{print $1}'
-  done
-)"
-fingerprint="$(printf '%s' "$source_manifest" | shasum -a 256 | awk '{print $1}')"
-case "$source_state" in
-  clean) controller_source_revision="sha256:${fingerprint}" ;;
-  dirty) controller_source_revision="dirty:sha256:${fingerprint}" ;;
-  *) controller_source_revision=unknown ;;
-esac
 cache_root="${repo_root}/.local/bin"
-binary="${cache_root}/ephemeral-action-runner"
-manifest_path="${cache_root}/ephemeral-action-runner.manifest"
-lock_directory="${cache_root}/.native-controller.lock"
-
+target="${goos}-${goarch}"
+current_slot="${cache_root}/${target}"
+old_slot="${cache_root}/${target}-old"
+lock_directory="${cache_root}/.native-controller-${target}.lock"
+native_executable=ephemeral-action-runner
+receipt_name=controller.receipt
 temporary_directory=""
 lease_file=""
 build_lease_file=""
 retention_inventory_file=""
-manifest_temporary=""
 lock_lease_file=""
+
 cleanup_build() {
-  if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then rm -rf -- "$temporary_directory"; fi
-  if [[ -n "$lease_file" && -f "$lease_file" ]]; then rm -f -- "$lease_file"; fi
-  if [[ -n "$build_lease_file" && -f "$build_lease_file" ]]; then rm -f -- "$build_lease_file"; fi
+  if [[ -n "$temporary_directory" && -d "$temporary_directory" && ! -L "$temporary_directory" ]]; then rm -rf -- "$temporary_directory"; fi
+  if [[ -n "$lease_file" && -f "$lease_file" && ! -L "$lease_file" ]]; then rm -f -- "$lease_file"; fi
+  if [[ -n "$build_lease_file" && -f "$build_lease_file" && ! -L "$build_lease_file" ]]; then rm -f -- "$build_lease_file"; fi
   if [[ -n "$retention_inventory_file" && -f "$retention_inventory_file" ]]; then rm -f -- "$retention_inventory_file"; fi
-  if [[ -n "$manifest_temporary" && -f "$manifest_temporary" ]]; then rm -f -- "$manifest_temporary"; fi
-  if [[ -n "$lock_lease_file" && -f "$lock_lease_file" ]]; then rm -f -- "$lock_lease_file"; fi
-  if [[ -n "$lock_directory" && -d "$lock_directory" ]]; then rmdir -- "$lock_directory" 2>/dev/null || true; fi
+  if [[ -n "$lock_lease_file" && -f "$lock_lease_file" && ! -L "$lock_lease_file" ]]; then rm -f -- "$lock_lease_file"; fi
+  if [[ -n "$lock_directory" && -d "$lock_directory" && ! -L "$lock_directory" ]]; then rmdir -- "$lock_directory" 2>/dev/null || true; fi
 }
 trap cleanup_build EXIT INT TERM
 
-mkdir -p "$cache_root"
-# Retire only old hash-directory revisions whose manifest and inactive lease
-# prove ownership. Unknown paths remain available to storage's legacy preview.
-native_cache_keep_previous=0
-native_cache_max_bytes=1
-native_cache_grace_seconds=0
-if ! epar_prune_native_controller_cache "$cache_root" "$(printf '%064d' 0)" 1; then
-  echo "warning: native-controller legacy revision cleanup skipped after an error" >&2
-fi
+epar_reset_receipt() {
+  receipt_schemaVersion= receipt_artifactKind= receipt_distribution= receipt_targetOS= receipt_targetArch= receipt_executable=
+  receipt_sourceDigest= receipt_buildDigest= receipt_binaryDigest= receipt_sourceRevision= receipt_builder= receipt_toolchain= receipt_completedAtUtc=
+  receipt_error=""
+}
 
-epar_stable_manifest_matches() {
-  [[ -f "$manifest_path" && ! -L "$manifest_path" && -x "$binary" && ! -L "$binary" ]] || return 1
-  grep -Fqx 'schemaVersion=2' "$manifest_path" && grep -Fqx "fingerprint=${fingerprint}" "$manifest_path" && grep -Fqx 'executable=ephemeral-action-runner' "$manifest_path" && grep -Fqx "toolchainImageID=${dev_image_id}" "$manifest_path"
+epar_read_receipt() {
+  local path="$1" line key value seen='|' count=0
+  epar_reset_receipt
+  [[ -f "$path" && ! -L "$path" ]] || { receipt_error="receipt is missing or is not a regular file"; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *=* ]] || { receipt_error="receipt contains a malformed line"; return 1; }
+    key="${line%%=*}"; value="${line#*=}"
+    [[ -n "$key" && "$seen" != *"|${key}|"* ]] || { receipt_error="receipt contains duplicate or empty keys"; return 1; }
+    seen+="${key}|"; count=$((count + 1))
+    case "$key" in
+      schemaVersion) receipt_schemaVersion="$value" ;;
+      artifactKind) receipt_artifactKind="$value" ;;
+      distribution) receipt_distribution="$value" ;;
+      targetOS) receipt_targetOS="$value" ;;
+      targetArch) receipt_targetArch="$value" ;;
+      executable) receipt_executable="$value" ;;
+      sourceDigest) receipt_sourceDigest="$value" ;;
+      buildDigest) receipt_buildDigest="$value" ;;
+      binaryDigest) receipt_binaryDigest="$value" ;;
+      sourceRevision) receipt_sourceRevision="$value" ;;
+      builder) receipt_builder="$value" ;;
+      toolchain) receipt_toolchain="$value" ;;
+      completedAtUtc) receipt_completedAtUtc="$value" ;;
+      *) receipt_error="receipt contains an unknown key: ${key}"; return 1 ;;
+    esac
+  done <"$path"
+  [[ "$count" == 13 && "$receipt_schemaVersion" == 3 && "$receipt_artifactKind" == native-controller && "$receipt_distribution" == source ]] || { receipt_error="receipt schema or artifact identity is unsupported"; return 1; }
+  [[ "$receipt_targetOS" =~ ^(darwin|linux)$ && "$receipt_targetArch" =~ ^(amd64|arm64)$ && "$receipt_executable" == "$native_executable" ]] || { receipt_error="receipt target or executable is invalid"; return 1; }
+  [[ "$receipt_sourceDigest" =~ ^sha256:[0-9a-f]{64}$ && "$receipt_buildDigest" =~ ^sha256:[0-9a-f]{64}$ && "$receipt_binaryDigest" =~ ^sha256:[0-9a-f]{64}$ ]] || { receipt_error="receipt digest is invalid"; return 1; }
+  [[ -n "$receipt_sourceRevision" && ( "$receipt_builder" == local-go || "$receipt_builder" == docker ) && -n "$receipt_toolchain" ]] || { receipt_error="receipt provenance is incomplete"; return 1; }
+  [[ "$receipt_completedAtUtc" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || { receipt_error="receipt timestamp is invalid"; return 1; }
+}
+
+epar_slot_has_only_owned_entries() {
+  local slot="$1" entry name
+  for entry in "$slot"/* "$slot"/.[!.]* "$slot"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    name="${entry##*/}"
+    case "$name" in
+      "$native_executable"|"$receipt_name") [[ -f "$entry" && ! -L "$entry" ]] || return 1 ;;
+      lease-native-[1-9][0-9]*.[0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z]) [[ -f "$entry" && ! -L "$entry" ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+epar_read_owned_slot() {
+  local slot="$1" expected_name="$2"
+  [[ -d "$slot" && ! -L "$slot" && "$(dirname "$slot")" == "$cache_root" && "$(basename "$slot")" == "$expected_name" ]] || { receipt_error="slot is not an exact regular project-local directory"; return 1; }
+  epar_slot_has_only_owned_entries "$slot" || { receipt_error="slot contains unknown, symlinked, or non-regular entries"; return 1; }
+  epar_read_receipt "$slot/$receipt_name"
+}
+
+epar_source_digest() {
+  local manifest
+  manifest="$({
+    printf '%s\n' 'schema=native-controller-source-v1'
+    {
+      find "${repo_root}/cmd" "${repo_root}/internal" -type f ! -name '*_test.go' -print
+      printf '%s\n' "${repo_root}/go.mod" "${repo_root}/go.sum"
+    } | LC_ALL=C sort -u | while IFS= read -r file; do
+      [[ -f "$file" && ! -L "$file" ]] || { echo "missing or symlinked source input: $file" >&2; exit 1; }
+      printf '%s\n%s\n' "${file#"${repo_root}/"}" "$(epar_sha256 "$file")"
+    done
+  })" || return 1
+  printf 'sha256:%s\n' "$(printf '%s' "$manifest" | epar_sha256_stream)"
+}
+
+epar_recipe_digest() {
+  local manifest
+  manifest="$({
+    printf '%s\n' 'schema=native-controller-recipe-v1'
+    printf '%s\n' "${repo_root}/scripts/build-native-controller.sh" "${repo_root}/scripts/run-with-docker.sh" "${repo_root}/scripts/docker/dev.Dockerfile" "${repo_root}/scripts/bootstrap-trust/main.go" | while IFS= read -r file; do
+      [[ -f "$file" && ! -L "$file" ]] || { echo "missing or symlinked build recipe input: $file" >&2; exit 1; }
+      printf '%s\n%s\n' "${file#"${repo_root}/"}" "$(epar_sha256 "$file")"
+    done
+  })" || return 1
+  printf 'sha256:%s\n' "$(printf '%s' "$manifest" | epar_sha256_stream)"
+}
+
+epar_build_digest() {
+  local source_digest="$1" backend="$2" toolchain="$3" recipe_digest="$4"
+  printf '%s\n' 'schema=native-controller-build-v1' "sourceDigest=${source_digest}" "target=${goos}/${goarch}" "builder=${backend}" "toolchain=${toolchain}" 'CGO_ENABLED=0' 'trimpath=true' 'ldflags=sourceRevision,sourceDigest,buildDigest' "recipeDigest=${recipe_digest}" | epar_sha256_stream | awk '{print "sha256:" $1}'
+}
+
+epar_source_revision_diagnostic() {
+  local commit state
+  if command -v git >/dev/null 2>&1; then
+    commit="$(git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null || true)"
+    if [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+      state=clean
+      [[ -z "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)" ]] || state=dirty
+      printf 'git:%s:%s\n' "$commit" "$state"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$source_digest"
+}
+
+epar_validate_slot() {
+  local slot="$1" expected_name="$2" compare_source="$3" expected_source="$4" expected_build="$5" expected_backend="$6" expected_toolchain="$7" actual_binary
+  epar_read_owned_slot "$slot" "$expected_name" || return 1
+  [[ "$receipt_targetOS" == "$goos" && "$receipt_targetArch" == "$goarch" ]] || { receipt_error="receipt target is ${receipt_targetOS}/${receipt_targetArch}, not ${goos}/${goarch}"; return 1; }
+  [[ -x "$slot/$native_executable" && ! -L "$slot/$native_executable" ]] || { receipt_error="controller executable is missing or not executable"; return 1; }
+  actual_binary="sha256:$(epar_sha256 "$slot/$native_executable")"
+  [[ "$actual_binary" == "$receipt_binaryDigest" ]] || { receipt_error="controller binary digest mismatch"; return 1; }
+  if [[ "$compare_source" == 1 ]]; then
+    [[ "$receipt_sourceDigest" == "$expected_source" ]] || { receipt_error="source digest mismatch (installed=${receipt_sourceDigest}, current=${expected_source})"; return 1; }
+    [[ "$receipt_buildDigest" == "$expected_build" && "$receipt_builder" == "$expected_backend" && "$receipt_toolchain" == "$expected_toolchain" ]] || { receipt_error="build identity mismatch"; return 1; }
+  fi
 }
 
 epar_acquire_stable_build_lock() {
-  local deadline=$(( $(date +%s) + 120 ))
+  local deadline=$(( $(date +%s) + 120 )) valid candidate unexpected
   while ! mkdir "$lock_directory" 2>/dev/null; do
     if [[ -d "$lock_directory" && ! -L "$lock_directory" ]]; then
-      local valid=0 candidate unexpected
-      for candidate in "$lock_directory"/lease-build-*; do
-        epar_native_controller_build_lease_valid "$candidate" && valid=$((valid + 1))
-      done
+      valid=0
+      for candidate in "$lock_directory"/lease-build-*; do epar_native_controller_build_lease_valid "$candidate" && valid=$((valid + 1)); done
       unexpected="$(find "$lock_directory" -mindepth 1 -maxdepth 1 ! \( -type f -name 'lease-build-*' \) -print -quit)"
-      if ((valid == 1)) && [[ -z "$unexpected" ]] && ! epar_native_controller_lease_active "$lock_directory"; then
-        rm -rf -- "$lock_directory"
-        continue
-      fi
+      if ((valid == 1)) && [[ -z "$unexpected" ]] && ! epar_native_controller_lease_active "$lock_directory"; then rm -rf -- "$lock_directory"; continue; fi
     fi
     (( $(date +%s) < deadline )) || { echo 'another EPAR native-controller build is still in progress; wait for it to finish and retry.' >&2; return 1; }
     sleep 0.2
@@ -442,101 +494,193 @@ epar_acquire_stable_build_lock() {
   printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$lock_lease_file"
 }
 
-if ! epar_stable_manifest_matches; then
-  epar_acquire_stable_build_lock
-  if ! epar_stable_manifest_matches; then
-    if epar_native_controller_lease_active "$cache_root"; then
-      echo 'EPAR source or its Go toolchain changed while a native EPAR controller is running. Stop the running EPAR process, then run ./start again; EPAR keeps one stable native controller binary and will not create another versioned copy.' >&2
-      exit 1
-    fi
-    epar_prepare_bootstrap_build_trust "$@"
-    build_log_directory="${repo_root}/work/logs"
-    build_log_path="${build_log_directory}/epar-native-controller-build.log"
-    mkdir -p "$build_log_directory"
-    printf '%s\n' \
-      "EPAR native-controller build started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      "Toolchain image: ${dev_image}" \
-      "Target: ${goos}/${goarch}" \
-      "Bootstrap build trust: ${bootstrap_trust_summary}" \
-      '' >"$build_log_path"
-    printf 'Native controller build log: %s\n' "$build_log_path"
-    temporary_directory="$(mktemp -d "${cache_root}/.build.XXXXXX")"
-    build_stderr="${temporary_directory}/native-controller-build.stderr"
-    build_lease_file="$(mktemp "${temporary_directory}/lease-build-$$.XXXXXX")"
-    printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$build_lease_file"
-    set +e
-    docker run --rm \
-      -e CGO_ENABLED=0 \
-      -e "GOOS=${goos}" \
-      -e "GOARCH=${goarch}" \
-      -e GOTOOLCHAIN=local \
-      -e SSL_CERT_FILE=/run/epar-bootstrap-ca.pem \
-      -v "${repo_root}:/src:ro" \
-      -v "${temporary_directory}:/out" \
-      -v "${gomod_volume}:/go/pkg/mod" \
-      -v "${gocache_volume}:/root/.cache/go-build" \
-      -v "${bootstrap_trust_bundle}:/run/epar-bootstrap-ca.pem:ro" \
-      -w /src \
-      "$dev_image" \
-      go build -trimpath -ldflags "-X main.sourceRevision=${controller_source_revision}" -o /out/ephemeral-action-runner ./cmd/ephemeral-action-runner 2>"$build_stderr"
-    native_build_exit_code=$?
-    set -e
-    if [[ -s "$build_stderr" ]]; then cat "$build_stderr" >>"$build_log_path"; fi
-    if ((native_build_exit_code != 0)); then
-      tls_failure_host="$(epar_tls_failure_host "$build_stderr")"
-      if [[ -n "$tls_failure_host" ]]; then
-        printf 'Native controller build failed while downloading dependencies from https://%s.\n' "$tls_failure_host" >&2
-        printf '%s\n' '  The build container rejected the presented TLS certificate as an unknown issuer.' >&2
-        printf '  Full compiler output: %s\n' "$build_log_path" >&2
-      elif [[ -s "$build_stderr" ]]; then
-        cat "$build_stderr" >&2
-      fi
-      epar_report_tls_failure "$build_stderr" "$build_log_path"
-      exit "$native_build_exit_code"
-    fi
-    if [[ -s "$build_stderr" ]]; then cat "$build_stderr" >&2; fi
-    [[ -f "${temporary_directory}/ephemeral-action-runner" ]] || { echo "native EPAR build did not produce the expected binary" >&2; exit 1; }
-    chmod 0755 "${temporary_directory}/ephemeral-action-runner"
-    mv -f -- "${temporary_directory}/ephemeral-action-runner" "$binary"
-    manifest_temporary="$(mktemp "${cache_root}/.native-controller-manifest.XXXXXX")"
-    printf '%s\n' 'schemaVersion=2' "fingerprint=${fingerprint}" 'executable=ephemeral-action-runner' "toolchainImageID=${dev_image_id}" "sourceRevision=${controller_source_revision}" "completedAtUnix=$(date +%s)" >"$manifest_temporary"
-    mv -f -- "$manifest_temporary" "$manifest_path"
-    manifest_temporary=""
+epar_release_stable_build_lock() {
+  if [[ -n "$lock_lease_file" && -f "$lock_lease_file" && ! -L "$lock_lease_file" ]]; then rm -f -- "$lock_lease_file"; fi
+  lock_lease_file=""
+  if [[ -d "$lock_directory" && ! -L "$lock_directory" ]]; then rmdir -- "$lock_directory" 2>/dev/null || true; fi
+}
+
+epar_prepare_docker_toolchain() {
+  local available_kib available_bytes previous_dev_image_id dev_image_id
+  command -v docker >/dev/null 2>&1 || { echo 'docker command not found. Install Docker and make sure it is available on PATH.' >&2; return 1; }
+  [[ "$bootstrap_minimum_free_bytes" =~ ^[1-9][0-9]*$ ]] || { echo 'EPAR_BOOTSTRAP_MIN_FREE_BYTES must be a positive integer byte count.' >&2; return 1; }
+  [[ "$go_cache_limit_bytes" =~ ^[1-9][0-9]*$ ]] || { echo 'EPAR_GO_CACHE_LIMIT_BYTES must be a positive integer byte count.' >&2; return 1; }
+  available_kib="$(df -Pk "$repo_root" | awk 'NR == 2 { print $4 }')"
+  [[ "$available_kib" =~ ^[0-9]+$ ]] || { echo "cannot measure bootstrap storage for ${repo_root}" >&2; return 1; }
+  available_bytes=$((available_kib * 1024))
+  if ((available_bytes < bootstrap_minimum_free_bytes)) && [[ " $* " != *" --allow-insufficient-storage "* ]]; then
+    echo "insufficient bootstrap storage for ${repo_root}: available=${available_bytes} required-reserve=${bootstrap_minimum_free_bytes}. Free space, inspect storage, or retry this invocation with --allow-insufficient-storage." >&2
+    return 1
   fi
-fi
-if ((manage_go_cache == 1)); then
-  go_cache_limit_bytes="$("$binary" storage effective-go-cache-limit --project-root "$repo_root")"
-  [[ "$go_cache_limit_bytes" =~ ^[1-9][0-9]*$ ]] || { echo "EPAR returned an invalid configured Go cache limit" >&2; exit 1; }
+  if ((available_bytes < bootstrap_minimum_free_bytes)); then echo "WARNING: bootstrap storage is below the ${bootstrap_minimum_free_bytes}-byte reserve; continuing because --allow-insufficient-storage was explicitly supplied." >&2; fi
+  previous_dev_image_id="$(epar_docker_image_id "$dev_image")"
+  epar_resolve_go_toolchain_image
+  docker build --quiet --provenance=false --build-arg "GO_IMAGE=${go_image}" -t "$dev_image" -f "${repo_root}/scripts/docker/dev.Dockerfile" "${repo_root}/scripts/docker" >/dev/null
+  dev_image_id="$(epar_docker_image_id "$dev_image")"
+  [[ "$dev_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "could not resolve the immutable Docker toolchain image ID for ${dev_image}" >&2; return 1; }
+  epar_write_bootstrap_acquisition_journal toolchain-built "$EPAR_GO_PREVIOUS_IMAGE_ID" "$EPAR_GO_RESOLVED_IMAGE_ID" "$dev_image_id" "$previous_dev_image_id"
+  if ((manage_go_cache == 1)); then epar_ensure_go_cache_volume "$gomod_volume" gomod; epar_ensure_go_cache_volume "$gocache_volume" gobuild; epar_enforce_go_cache_limit; fi
+  docker_toolchain="$dev_image_id"
+}
+
+epar_build_candidate() {
+  local source_digest="$1" recipe_digest="$2" toolchain build_digest build_stderr build_exit build_log_directory build_log_path
+  temporary_directory="$(mktemp -d "${cache_root}/.build.XXXXXX")"
+  build_lease_file="$(mktemp "${temporary_directory}/lease-build-$$.XXXXXX")"
+  printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$build_lease_file"
+  build_log_directory="${repo_root}/work/logs"; build_log_path="${build_log_directory}/epar-native-controller-build.log"; mkdir -p "$build_log_directory"
+  build_stderr="${temporary_directory}/native-controller-build.stderr"
+  case "$native_backend" in
+    local-go)
+      native_go_bin="${EPAR_NATIVE_GO_BIN:-${EPAR_GO_BIN:-go}}"
+      command -v "$native_go_bin" >/dev/null 2>&1 && "$native_go_bin" version >/dev/null 2>&1 || { echo "local Go is not runnable: ${native_go_bin}" >&2; return 1; }
+      toolchain="$("$native_go_bin" version)"
+      build_digest="$(epar_build_digest "$source_digest" local-go "$toolchain" "$recipe_digest")"
+      printf '%s\n' "EPAR native-controller build started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" "Builder: local-go" "Toolchain: ${toolchain}" "Target: ${goos}/${goarch}" '' >"$build_log_path"
+      set +e
+      CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$native_go_bin" build -trimpath -ldflags "-X main.sourceRevision=${source_digest} -X main.sourceDigest=${source_digest} -X main.buildDigest=${build_digest}" -o "${temporary_directory}/${native_executable}" ./cmd/ephemeral-action-runner 2>"$build_stderr"
+      build_exit=$?
+      set -e
+      ;;
+    docker)
+      epar_prepare_docker_toolchain "${controller_args[@]}" || return 1
+      toolchain="$docker_toolchain"
+      build_digest="$(epar_build_digest "$source_digest" docker "$toolchain" "$recipe_digest")"
+      epar_prepare_bootstrap_build_trust "${controller_args[@]}"
+      printf '%s\n' "EPAR native-controller build started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" 'Builder: docker' "Toolchain: ${toolchain}" "Target: ${goos}/${goarch}" "Bootstrap build trust: ${bootstrap_trust_summary}" '' >"$build_log_path"
+      set +e
+      docker run --rm -e CGO_ENABLED=0 -e "GOOS=${goos}" -e "GOARCH=${goarch}" -e GOTOOLCHAIN=local -e SSL_CERT_FILE=/run/epar-bootstrap-ca.pem -v "${repo_root}:/src:ro" -v "${temporary_directory}:/out" -v "${gomod_volume}:/go/pkg/mod" -v "${gocache_volume}:/root/.cache/go-build" -v "${bootstrap_trust_bundle}:/run/epar-bootstrap-ca.pem:ro" -w /src "$dev_image" go build -trimpath -ldflags "-X main.sourceRevision=${source_digest} -X main.sourceDigest=${source_digest} -X main.buildDigest=${build_digest}" -o "/out/${native_executable}" ./cmd/ephemeral-action-runner 2>"$build_stderr"
+      build_exit=$?
+      ;;
+  esac
+  [[ -s "$build_stderr" ]] && cat "$build_stderr" >>"$build_log_path"
+  if ((build_exit != 0)); then
+    [[ -s "$build_stderr" ]] && cat "$build_stderr" >&2
+    [[ "$native_backend" != docker ]] || epar_report_tls_failure "$build_stderr" "$build_log_path"
+    return "$build_exit"
+  fi
+  rm -f -- "$build_stderr" "$build_lease_file"; build_lease_file=""
+  [[ -f "${temporary_directory}/${native_executable}" && ! -L "${temporary_directory}/${native_executable}" ]] || { echo 'native EPAR build did not produce the expected binary' >&2; return 1; }
+  chmod 0755 "${temporary_directory}/${native_executable}"
+  printf '%s\n' 'schemaVersion=3' 'artifactKind=native-controller' 'distribution=source' "targetOS=${goos}" "targetArch=${goarch}" "executable=${native_executable}" "sourceDigest=${source_digest}" "buildDigest=${build_digest}" "binaryDigest=sha256:$(epar_sha256 "${temporary_directory}/${native_executable}")" "sourceRevision=$(epar_source_revision_diagnostic)" "builder=${native_backend}" "toolchain=${toolchain}" "completedAtUtc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${temporary_directory}/${receipt_name}"
+  epar_slot_has_only_owned_entries "$temporary_directory" && epar_read_receipt "${temporary_directory}/${receipt_name}" && [[ "$receipt_sourceDigest" == "$source_digest" && "$receipt_buildDigest" == "$build_digest" ]] || { echo 'native EPAR candidate receipt validation failed' >&2; return 1; }
+  expected_toolchain="$toolchain"
+  expected_build_digest="$build_digest"
+}
+
+epar_rotate_candidate() {
+  if [[ -e "$current_slot" || -L "$current_slot" ]]; then
+    epar_read_owned_slot "$current_slot" "$target" || { echo "refusing to replace current native-controller slot: ${receipt_error}" >&2; return 1; }
+    epar_native_controller_lease_active "$current_slot" && { echo 'a current native EPAR controller is running; stop it before rebuilding.' >&2; return 1; }
+  fi
+  if [[ -e "$old_slot" || -L "$old_slot" ]]; then
+    epar_read_owned_slot "$old_slot" "${target}-old" || { echo "refusing to remove old native-controller slot: ${receipt_error}" >&2; return 1; }
+    epar_native_controller_lease_active "$old_slot" && { echo 'an old native EPAR controller is running; stop it before rebuilding.' >&2; return 1; }
+    rm -rf -- "$old_slot"
+  fi
+  if [[ -e "$current_slot" ]]; then mv -- "$current_slot" "$old_slot"; fi
+  if ! mv -- "$temporary_directory" "$current_slot"; then
+    if [[ -d "$old_slot" && ! -e "$current_slot" ]]; then mv -- "$old_slot" "$current_slot" || true; fi
+    echo 'native-controller promotion failed; restored the previous current slot.' >&2
+    return 1
+  fi
+  temporary_directory=""
+}
+
+epar_enforce_configured_go_cache_limit() {
+  [[ "$native_backend" == docker && "$manage_go_cache" == 1 ]] || return 0
+  go_cache_limit_bytes="$("${current_slot}/${native_executable}" storage effective-go-cache-limit --project-root "$repo_root")"
+  [[ "$go_cache_limit_bytes" =~ ^[1-9][0-9]*$ ]] || { echo 'EPAR returned an invalid configured Go cache limit' >&2; return 1; }
   epar_enforce_go_cache_limit
+}
+
+epar_launch_slot() {
+  local slot="$1" label="$2" controller_command status=0
+  shift 2
+  epar_acquire_stable_build_lock || return $?
+  if [[ "$label" == old ]]; then
+    if ! epar_validate_slot "$slot" "${target}-old" 0 '' '' '' ''; then
+      epar_release_stable_build_lock
+      echo "selected old native-controller slot became invalid before launch: ${receipt_error}" >&2
+      return 1
+    fi
+  elif ! epar_validate_slot "$slot" "$target" 1 "$source_digest" "$expected_build_digest" "$native_backend" "$expected_toolchain"; then
+    epar_release_stable_build_lock
+    echo "selected current native-controller slot became invalid before launch: ${receipt_error}" >&2
+    return 1
+  fi
+  lease_file="$(mktemp "${slot}/lease-native-$$.XXXXXX")"
+  printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$lease_file"
+  # Promotion uses this same exclusive gate. Release it only after the runtime
+  # lease is complete, so rotation can never pass its lease check in the gap
+  # between launch validation and lease publication.
+  epar_release_stable_build_lock
+  export EPAR_NATIVE_CONTROLLER=1 EPAR_CONTROLLER_SLOT="$label" DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}" EPAR_HOST_NAME="${EPAR_HOST_NAME:-$(hostname 2>/dev/null || true)}"
+  unset EPAR_BUILD_TRUST_FEED EPAR_HOST_TRUST_FEED EPAR_CONTROLLER_HOST_OS EPAR_HOST_TRUST_INIT_DEFERRED
+  if [[ "$label" == current ]]; then epar_enforce_configured_go_cache_limit; fi
+  controller_command="${1:-start}"
+  if [[ "$controller_command" == init ]]; then epar_host_trust_prepare "$repo_root" "$controller_command" "$@"; fi
+  "$slot/$native_executable" "$@" || status=$?
+  if [[ "$status" == 0 && "$controller_command" == init ]]; then epar_host_trust_post_init "$repo_root" || status=$?; fi
+  epar_host_trust_cleanup
+  rm -f -- "$lease_file"; lease_file=""
+  return "$status"
+}
+
+mkdir -p "$cache_root"
+if [[ "$native_use_old" == 1 ]]; then
+  epar_validate_slot "$old_slot" "${target}-old" 0 '' '' '' '' || { echo "old native-controller slot is unavailable or invalid: ${receipt_error}" >&2; exit 1; }
+  echo "WARNING: executing recovery controller slot ${target}-old; it may use an older configuration contract." >&2
+  epar_launch_slot "$old_slot" old "$@"
+  exit $?
 fi
 
-lease_file="$(mktemp "${cache_root}/lease-native-$$.XXXXXX")"
-printf '%s\n' \
-  'schemaVersion=1' \
-  "host=$(hostname 2>/dev/null || true)" \
-  "pid=$$" \
-  "startedAtUnix=$(date +%s)" >"$lease_file"
-export EPAR_NATIVE_CONTROLLER=1
-export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"
-export EPAR_HOST_NAME="${EPAR_HOST_NAME:-$(hostname 2>/dev/null || true)}"
-controller_command="${1:-start}"
+# Retire only old hash-directory revisions whose manifest and inactive lease
+# prove ownership. Current and old platform slots are deliberately excluded.
+native_cache_keep_previous=0; native_cache_max_bytes=1; native_cache_grace_seconds=0
+if ! epar_prune_native_controller_cache "$cache_root" "$(printf '%064d' 0)" 1; then echo 'warning: native-controller legacy revision cleanup skipped after an error' >&2; fi
 
-# Bootstrap trust is mounted only into the compiler container above. The cached
-# native controller reads the host stores directly, so legacy bridge state must
-# not survive into first-run continuation or suppress its native preflight.
-unset EPAR_BUILD_TRUST_FEED EPAR_HOST_TRUST_FEED EPAR_CONTROLLER_HOST_OS EPAR_HOST_TRUST_INIT_DEFERRED
+source_digest="$(epar_source_digest)" || { echo 'cannot calculate the native-controller source digest' >&2; exit 1; }
+recipe_digest="$(epar_recipe_digest)" || { echo 'cannot calculate the native-controller build recipe digest' >&2; exit 1; }
+expected_toolchain=""; expected_build_digest=""
+case "$native_backend" in
+  local-go)
+    native_go_bin="${EPAR_NATIVE_GO_BIN:-${EPAR_GO_BIN:-go}}"
+    command -v "$native_go_bin" >/dev/null 2>&1 && "$native_go_bin" version >/dev/null 2>&1 || { echo "local Go is not runnable: ${native_go_bin}" >&2; exit 1; }
+    expected_toolchain="$("$native_go_bin" version)"
+    expected_build_digest="$(epar_build_digest "$source_digest" local-go "$expected_toolchain" "$recipe_digest")"
+    ;;
+  docker)
+    if [[ -e "$current_slot" && ! -L "$current_slot" ]] && epar_read_owned_slot "$current_slot" "$target" && [[ "$receipt_builder" == docker ]]; then
+      expected_toolchain="$receipt_toolchain"
+      local_docker_toolchain="$(epar_docker_image_id "$dev_image")"
+      [[ -z "$local_docker_toolchain" ]] || expected_toolchain="$local_docker_toolchain"
+      expected_build_digest="$(epar_build_digest "$source_digest" docker "$expected_toolchain" "$recipe_digest")"
+    fi
+    ;;
+esac
 
-# Keep explicit-init's post-write verification. Ordinary starts must not create
-# a pre-wizard feed because the native controller resolves the new config itself.
-if [[ "$controller_command" == "init" ]]; then
-  epar_host_trust_prepare "$repo_root" "$controller_command" "$@"
+if [[ -n "$expected_build_digest" ]] && epar_validate_slot "$current_slot" "$target" 1 "$source_digest" "$expected_build_digest" "$native_backend" "$expected_toolchain"; then
+  epar_launch_slot "$current_slot" current "$@"
+  exit $?
 fi
-status=0
-"$binary" "$@" || status=$?
-if [[ "$status" == "0" && "$controller_command" == "init" ]]; then
-  epar_host_trust_post_init "$repo_root" || status=$?
+if [[ -e "$current_slot" || -L "$current_slot" ]]; then echo "Native controller rebuild required: ${receipt_error:-installed slot has no verifiable build identity}." >&2; else echo 'Native controller build required: no current project-local slot exists.' >&2; fi
+
+epar_acquire_stable_build_lock
+if [[ "$native_backend" == local-go ]]; then
+  expected_toolchain="$("$native_go_bin" version)"; expected_build_digest="$(epar_build_digest "$source_digest" local-go "$expected_toolchain" "$recipe_digest")"
+elif [[ -e "$current_slot" && ! -L "$current_slot" ]] && epar_read_owned_slot "$current_slot" "$target" && [[ "$receipt_builder" == docker ]]; then
+  expected_toolchain="$receipt_toolchain"
+  local_docker_toolchain="$(epar_docker_image_id "$dev_image")"
+  [[ -z "$local_docker_toolchain" ]] || expected_toolchain="$local_docker_toolchain"
+  expected_build_digest="$(epar_build_digest "$source_digest" docker "$expected_toolchain" "$recipe_digest")"
 fi
-epar_host_trust_cleanup
-cleanup_build
-trap - EXIT INT TERM
-exit "$status"
+if [[ -n "$expected_build_digest" ]] && epar_validate_slot "$current_slot" "$target" 1 "$source_digest" "$expected_build_digest" "$native_backend" "$expected_toolchain"; then
+  epar_release_stable_build_lock
+  epar_launch_slot "$current_slot" current "$@"
+  exit $?
+fi
+epar_build_candidate "$source_digest" "$recipe_digest" "$@"
+epar_rotate_candidate
+epar_release_stable_build_lock
+epar_launch_slot "$current_slot" current "$@"

@@ -839,16 +839,15 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 }
 
 func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, bool, bool, error) {
-	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false, "")
+	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false)
 	if err != nil {
 		return "", false, false, err
 	}
 	return result.Value, promotionPassed, result.Action == initWizardRefresh, nil
 }
 
-func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool, preferredProvider string) (initWizardResult[string], bool, error) {
+func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool) (initWizardResult[string], bool, error) {
 	prerequisites := detectInitProviderPrerequisites(ctx, hostPlatform, skipDockerCheck)
-	operationalDefault := !promoted && prerequisites.DockerSandboxesAvailable
 	promotionPassed := false
 	var promotionFailures []sandboxpromotion.Failure
 	if promoted {
@@ -856,7 +855,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		if os.Getenv(sandboxpromotion.DisableEnvironment) == "1" {
 			preflight.Failures = append(preflight.Failures, sandboxpromotion.Failure{
 				Gate:       "operator kill switch",
-				Detail:     sandboxpromotion.DisableEnvironment + "=1 disables Docker Sandboxes admission and automatic selection",
+				Detail:     sandboxpromotion.DisableEnvironment + "=1 disables Docker Sandboxes admission",
 				Resolution: "Unset the kill switch only after the Docker Sandboxes issue is resolved, or explicitly choose another provider.",
 			})
 		} else if err := sandboxpromotion.Validate(record); err != nil {
@@ -873,7 +872,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		promotionPassed = preflight.Passed() && prerequisites.DockerSandboxesAvailable
 		promotionFailures = preflight.Failures
 		fmt.Fprintln(out, "")
-		fmt.Fprintln(out, "Docker Sandboxes automatic-default preflight:")
+		fmt.Fprintln(out, "Docker Sandboxes admission preflight:")
 		if promotionPassed {
 			fmt.Fprintln(out, "  PASS: the exact promoted platform, host, sbx, template, policy, and resource gates passed.")
 		} else {
@@ -889,13 +888,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		}
 	}
 
-	defaultProvider := "docker-container"
-	if promotionPassed || operationalDefault {
-		defaultProvider = "docker-sandboxes"
-	} else if promoted || !prerequisites.DockerAvailable {
-		defaultProvider = ""
-	}
-	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider, allowBack, preferredProvider)
+	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, allowBack)
 	if err != nil {
 		return initWizardResult[string]{}, false, err
 	}
@@ -1011,18 +1004,14 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 	if err != nil {
 		return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 	}
-	var availableText = "unknown"
-	if capacity, probeErr := storage.ProbeFilesystemCapacity(projectRoot, time.Now()); probeErr == nil && capacity.Known {
-		availableText = formatInitUintByteCount(capacity.AvailableBytes)
-	}
 	estimate := &initArtifactEstimate{
-		Source:                 source.Reference,
-		Platform:               source.Platform,
-		DownloadBytes:          source.CompressedLayerBytes,
-		ExpandedBytes:          sourceEstimate.ExpandedBytes,
-		IncrementalPeakBytes:   artifactPlan.EstimatedIncrementalPeak,
-		AvailablePhysicalSpace: availableText,
+		Source:        source.Reference,
+		Platform:      source.Platform,
+		DownloadBytes: source.CompressedLayerBytes,
+		ExpandedBytes: sourceEstimate.ExpandedBytes,
 	}
+	artifactPlan.OperationPlan.ID = "template-build"
+	populateInitArtifactCapacityEstimate(ctx, projectRoot, providerType, artifactPlan.OperationPlan, estimate)
 	if providerType == "docker-sandboxes" {
 		estimate.LogicalRootMaximumBytes = artifactPlan.LogicalRootMaximumBytes
 		estimate.LogicalDockerMaximumBytes = artifactPlan.LogicalDockerMaximumBytes
@@ -1037,6 +1026,93 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		DockerDisk:        dockerDisk,
 	}
 	return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardNext, Value: profile}, estimate, nil
+}
+
+func populateInitArtifactCapacityEstimate(ctx context.Context, projectRoot, providerType string, operationPlan storage.OperationPlan, estimate *initArtifactEstimate) {
+	if estimate == nil {
+		return
+	}
+	cfg := config.Default()
+	cfg.Provider.Type = providerType
+	operationPlan.Provider = providerType
+	operationPlan.MinimumFreeBytes = storage.DefaultMinimumFreeBytes
+	runtime, err := providerregistry.New(cfg, projectRoot, true)
+	if err != nil {
+		estimate.CapacityWarnings = append(estimate.CapacityWarnings, fmt.Sprintf("capacity-domain discovery is unavailable: %v", err))
+		return
+	}
+	snapshot, err := runtime.Storage.StorageSnapshot(ctx, provider.StorageRequest{OperationPlan: operationPlan, Now: time.Now()})
+	if err != nil {
+		estimate.CapacityWarnings = append(estimate.CapacityWarnings, fmt.Sprintf("capacity-domain discovery is unavailable: %v", err))
+		return
+	}
+	estimate.CapacityWarnings = append(estimate.CapacityWarnings, snapshot.Warnings...)
+	evaluation, err := storage.EvaluateOperationPlan(operationPlan, snapshot.Surfaces, snapshot.Domains)
+	if err != nil {
+		estimate.CapacityWarnings = append(estimate.CapacityWarnings, fmt.Sprintf("capacity-domain plan cannot be resolved: %v", err))
+		return
+	}
+	surfaceByID := make(map[string]storage.Surface, len(snapshot.Surfaces))
+	for _, surface := range snapshot.Surfaces {
+		surfaceByID[surface.ID] = surface
+	}
+	domainByID := make(map[string]storage.CapacityDomain, len(snapshot.Domains))
+	for _, domain := range snapshot.Domains {
+		domainByID[domain.ID] = domain
+	}
+	rolesByDomain := make(map[string]map[string]struct{})
+	locationsByDomain := make(map[string]map[string]struct{})
+	for _, allocation := range evaluation.Allocations {
+		if rolesByDomain[allocation.DomainID] == nil {
+			rolesByDomain[allocation.DomainID] = make(map[string]struct{})
+			locationsByDomain[allocation.DomainID] = make(map[string]struct{})
+		}
+		rolesByDomain[allocation.DomainID][string(allocation.Role)] = struct{}{}
+		if surface, ok := surfaceByID[allocation.SurfaceID]; ok {
+			location := surface.Path
+			if location == "" {
+				location = surface.Location
+			}
+			if location != "" {
+				locationsByDomain[allocation.DomainID][location] = struct{}{}
+			}
+		}
+	}
+	checkByDomain := make(map[string]storage.CapacityCheck, len(evaluation.CapacityChecks))
+	for _, check := range evaluation.CapacityChecks {
+		if check.DomainRequirement != nil {
+			checkByDomain[check.DomainRequirement.DomainID] = check
+		}
+	}
+	for _, requirement := range evaluation.Requirements {
+		domain := domainByID[requirement.DomainID]
+		roles := sortedInitEstimateValues(rolesByDomain[requirement.DomainID])
+		locations := sortedInitEstimateValues(locationsByDomain[requirement.DomainID])
+		location := strings.Join(locations, ", ")
+		if location == "" {
+			location = domain.Path
+		}
+		check := checkByDomain[requirement.DomainID]
+		estimate.CapacityDomains = append(estimate.CapacityDomains, initCapacityDomainEstimate{
+			Roles:          strings.Join(roles, ","),
+			Location:       location,
+			AvailableBytes: domain.Capacity.AvailableBytes,
+			AvailableKnown: domain.Capacity.Known,
+			PhasePeakBytes: requirement.PeakBytes,
+			ReserveBytes:   requirement.MinimumFreeBytes,
+			Confidence:     domain.Confidence,
+			Status:         string(check.Status),
+		})
+	}
+}
+
+func sortedInitEstimateValues(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func promptDockerImageProfile(ctx context.Context, projectRoot, providerType string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
@@ -1371,15 +1447,7 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 	return result
 }
 
-func promptProviderOptions(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string) (string, bool, error) {
-	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, operationalDefault, defaultProvider, false, "")
-	if err != nil {
-		return "", false, err
-	}
-	return result.Value, result.Action == initWizardRefresh, nil
-}
-
-func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, operationalDefault bool, defaultProvider string, allowBack bool, preferredProvider string) (initWizardResult[string], error) {
+func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, allowBack bool) (initWizardResult[string], error) {
 	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
 	for _, descriptor := range providerregistry.Descriptors() {
 		option := initProviderOption{
@@ -1395,11 +1463,6 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 		case provider.WizardPrerequisiteDockerSandboxes:
 			option.Available = prerequisites.DockerSandboxesAvailable && (!promoted || promotionPassed)
 			option.Status = prerequisites.DockerSandboxesStatus
-			if operationalDefault {
-				option.Label = "Docker Sandboxes — recommended"
-			} else if promoted {
-				option.Label = "Docker Sandboxes (independently certified for this exact platform)"
-			}
 		case provider.WizardPrerequisiteWSL2:
 			option.Available = prerequisites.WSLAvailable
 			option.Status = prerequisites.WSLStatus
@@ -1414,10 +1477,7 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 	if err := validateWizardProviderOptions(options); err != nil {
 		return initWizardResult[string]{}, err
 	}
-	if preferredProvider != "" {
-		defaultProvider = preferredProvider
-	}
-	defaultNumber := prioritizeDefaultProviderOption(options, defaultProvider)
+	defaultNumber := markDefaultProviderOption(options, "docker-sandboxes")
 
 	fmt.Fprintln(out, "")
 	if defaultNumber == "" {
@@ -1499,22 +1559,13 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 	}
 }
 
-func prioritizeDefaultProviderOption(options []initProviderOption, defaultProvider string) string {
+func markDefaultProviderOption(options []initProviderOption, defaultProvider string) string {
 	defaultIndex := -1
 	for index := range options {
 		options[index].Default = false
-		if options[index].Type == defaultProvider && options[index].Available {
+		if options[index].Type == defaultProvider {
 			defaultIndex = index
 		}
-	}
-	if defaultIndex > 0 {
-		selected := options[defaultIndex]
-		copy(options[1:defaultIndex+1], options[:defaultIndex])
-		options[0] = selected
-		defaultIndex = 0
-	}
-	for index := range options {
-		options[index].Number = strconv.Itoa(index + 1)
 	}
 	if defaultIndex < 0 {
 		return ""

@@ -95,6 +95,10 @@ func collectTemplates(options templateOptions) ([]storage.Artifact, []string, er
 			warnings = append(warnings, fmt.Sprintf("Docker Sandboxes template entry %q is not a safe artifact directory", entry.Name()))
 			continue
 		}
+		children, childrenErr := os.ReadDir(path)
+		if childrenErr == nil && len(children) == 0 {
+			continue
+		}
 		record, unknown, inspectErr := inspectTemplateDirectory(path)
 		if inspectErr != nil {
 			artifacts = append(artifacts, unknown)

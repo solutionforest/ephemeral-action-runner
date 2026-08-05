@@ -33,10 +33,12 @@ Run `./start` with no configuration. The Docker Sandboxes wizard offers `full-la
 After configuration, prewarm the selected template outside the job path:
 
 ```powershell
-.\start.ps1 pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
+./start pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
 ```
 
-Do not add `--register-only`. This creates, verifies, and exactly removes one unregistered sandbox without requesting a GitHub registration token. The first create can still be slow; later creates reuse the host-level template cache.
+Do not add `--register-only`. This creates, verifies, and exactly removes one unregistered sandbox without requesting a GitHub registration token. The first create can still be slow while Docker Sandboxes materializes cached template layers and prepares the private Docker filesystem and VM; later creates reuse the host-level cache. EPAR reports a five-second elapsed-time heartbeat during this otherwise silent preparation, redraws one line in an interactive text terminal, and emits durable manager records when stdout is not an interactive terminal. The startup timing record separates initial Sandbox preparation and identity verification, network-policy application/readback, post-create admission, start, and runtime validation.
+
+Docker Sandboxes does not expose a supported command that evicts only its opaque materialized-layer cache while retaining the imported template. `sbx rm` removes an exact sandbox but cached template data persists, `sbx template rm` removes the imported reusable template, and `sbx reset` clears broad host state. Do not delete files beneath the Sandbox containerd or EROFS directories to manufacture a cold benchmark. To run a controlled fresh-template first-create experiment without rebuilding a large production template, use a separate smaller template selector and configuration.
 
 ## Capacity
 

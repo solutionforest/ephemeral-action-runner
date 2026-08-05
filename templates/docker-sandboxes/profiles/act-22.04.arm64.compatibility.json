@@ -1,6 +1,6 @@
 {
-  "schemaVersion": 2,
-  "templateSchemaVersion": 1,
+  "schemaVersion": 3,
+  "templateSchemaVersion": 2,
   "profile": "act-22.04",
   "validationStatus": "unvalidated",
   "platform": "linux/arm64",
@@ -23,5 +23,13 @@
     "expectedDaemonCount": 1,
     "imagePreloadsVarLibDocker": false,
     "buildRequiresPrivilegedBuildkit": false
+  },
+  "architectureEmulation": {
+    "backend": "qemu",
+    "policy": "automatic-binfmt-install-all",
+    "release": "qemu-v10.2.3-68",
+    "sourceIndexDigest": "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+    "sourceManifestDigest": "sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd",
+    "qemuVersion": "10.2.3"
   }
 }

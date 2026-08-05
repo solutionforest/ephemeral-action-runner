@@ -51,7 +51,7 @@ function Test-RemoteIndex {
 }
 
 Write-Host '[1/6] Checking pinned constants and exact plural naming.'
-Assert-Equal 'source lock schema' $lock.schemaVersion 2
+Assert-Equal 'source lock schema' $lock.schemaVersion 3
 Assert-Equal 'default platform' $lock.defaultPlatform 'linux/amd64'
 Assert-Equal 'supported platform count' @($lock.supportedPlatforms).Count 2
 Assert-Equal 'first supported platform' $lock.supportedPlatforms[0] 'linux/amd64'
@@ -62,6 +62,16 @@ Assert-Equal 'Go builder version' $lock.goBuilder.version '1.25.12'
 Assert-Equal 'Go builder index' $lock.goBuilder.indexDigest 'sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980'
 Assert-Equal 'hook launcher source checksum' $lock.hookLauncher.sha256 '7fe07f10f484fa6888481a4165e81570187c0aeff422738d3ea5add6b95dd9b7'
 Assert-Equal 'Tini version' $lock.tini.version '0.19.0'
+Assert-Equal 'emulation schema' $lock.emulation.schemaVersion 1
+Assert-Equal 'emulation backend' $lock.emulation.backend 'qemu'
+Assert-Equal 'binfmt release' $lock.emulation.source.release 'qemu-v10.2.3-68'
+Assert-Equal 'binfmt source revision' $lock.emulation.source.revision 'e29e7d72c9672c8c8bf846655ab149b50e1a62bd'
+Assert-Equal 'QEMU version' $lock.emulation.source.qemuVersion '10.2.3'
+Assert-Equal 'binfmt OCI index' $lock.emulation.source.indexDigest 'sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0'
+Assert-Equal 'binfmt OCI index reference' $lock.emulation.source.indexReference 'docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0'
+Assert-Equal 'emulation license count' @($lock.emulation.source.licenses).Count 2
+Assert-Equal 'binfmt MIT license checksum' $lock.emulation.source.licenses[0].sha256 'bba3332a1e2ec03031b587452cd9254bd7ab6ec701aef20b12e642f47f423dd6'
+Assert-Equal 'QEMU license checksum' $lock.emulation.source.licenses[1].sha256 'dd3ce02338c3a48abb6ba59b48809f7108a8bd242cb0cc8be90daafa30707c28'
 $expectedPlatforms = [ordered]@{
     'linux/amd64' = [ordered]@{
         architecture = 'amd64'
@@ -70,6 +80,8 @@ $expectedPlatforms = [ordered]@{
         sbomManifest = 'sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7'
         tiniUrl = 'https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64'
         tiniSha256 = '93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c'
+        binfmtManifest = 'sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705'
+        binfmtCompressedBytes = 32675086
     }
     'linux/arm64' = [ordered]@{
         architecture = 'arm64'
@@ -78,6 +90,8 @@ $expectedPlatforms = [ordered]@{
         sbomManifest = 'sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d'
         tiniUrl = 'https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm64'
         tiniSha256 = '07952557df20bfd2a95f9bef198b445e006171969499a1d361bd9e6f8e5e0e81'
+        binfmtManifest = 'sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd'
+        binfmtCompressedBytes = 31024752
     }
 }
 foreach ($platformName in $expectedPlatforms.Keys) {
@@ -91,6 +105,10 @@ foreach ($platformName in $expectedPlatforms.Keys) {
     Assert-Equal "$platformName SBOM generator reference" $platformRecord.sbomGeneratorReference ("docker.io/docker/buildkit-syft-scanner@{0}" -f $expectedPlatform.sbomManifest)
     Assert-Equal "$platformName Tini URL" $platformRecord.tini.url $expectedPlatform.tiniUrl
     Assert-Equal "$platformName Tini checksum" $platformRecord.tini.sha256 $expectedPlatform.tiniSha256
+    $emulationPlatform = $lock.emulation.platforms.PSObject.Properties[$platformName].Value
+    Assert-Equal "$platformName binfmt manifest" $emulationPlatform.manifestDigest $expectedPlatform.binfmtManifest
+    Assert-Equal "$platformName binfmt reference" $emulationPlatform.sourceReference ("docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@{0}" -f $expectedPlatform.binfmtManifest)
+    Assert-Equal "$platformName binfmt compressed bytes" $emulationPlatform.compressedLayerBytes $expectedPlatform.binfmtCompressedBytes
 }
 $expectedProfiles = [ordered]@{
     'act-22.04' = [ordered]@{
@@ -161,7 +179,7 @@ $guestScripts = @($guestAssetFiles | Where-Object Extension -EQ '.sh')
 Assert-Equal 'helper manifest entry count' $manifestEntries.Count $guestAssetFiles.Count
 $manifestFileNames = @()
 foreach ($line in $manifestEntries) {
-    if ($line -notmatch '^([0-9a-f]{64})  \./((?:[a-z0-9.-]+\.sh)|docker-daemon\.json)$') {
+    if ($line -notmatch '^([0-9a-f]{64})  \./((?:[a-z0-9.-]+\.(?:sh|py))|docker-daemon\.json)$') {
         throw "Invalid helper hash entry: $line"
     }
     $manifestFileNames += $Matches[2]
@@ -181,8 +199,12 @@ $dockerignore = Get-Content -Raw -LiteralPath (Join-Path $templateDirectory '.do
 foreach ($required in @(
     '# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e',
     'FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS hook-builder',
+    'FROM --platform=${TEMPLATE_PLATFORM} ${BINFMT_IMAGE} AS qemu-source',
     'FROM --platform=${TEMPLATE_PLATFORM} ${SOURCE_IMAGE}',
     'COPY --from=hook-builder --chmod=0555 /out/epar-hook-bash /opt/epar/hook-bin/bash',
+    'COPY --from=qemu-source /usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/',
+    'install -m 0555 enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation',
+    'io.solutionforest.epar.template.schema-version="2"',
     'com.docker.sandboxes.start-docker=true',
     'USER agent',
     'ENTRYPOINT ["/usr/local/bin/tini", "-g", "--", "/opt/epar/template-entrypoint.sh"]',
@@ -199,7 +221,7 @@ foreach ($required in @(
 if ($dockerfile -match '(?im)apt-get\s+update|(?im)\blatest\b|(?im)COPY\s+.*var/lib/docker|(?im)--privileged|(?im)--secret') {
     throw 'Dockerfile contains an unpinned, privileged, secret, or /var/lib/docker preload pattern'
 }
-foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!guest/docker-daemon.json', '!hook-launcher/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
+foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!guest/docker-daemon.json', '!inputs/emulation-licenses/*.txt', '!hook-launcher/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
     if (-not ($dockerignore -split "`r?`n").Contains($requiredContextEntry)) {
         throw ".dockerignore is missing deterministic context entry: $requiredContextEntry"
     }
@@ -216,6 +238,10 @@ $runnerDiagnostics = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templa
 if ($runnerDiagnostics -match '(?im)\btail\b|_diag|(?:^|,)cmd=') {
     throw 'collect-runner-diagnostics.sh must not emit command lines or runner/job log content'
 }
+$emulationHelper = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'enable-architecture-emulation.sh')
+if (-not $emulationHelper.Contains('--install all') -or -not $emulationHelper.Contains('mount -t binfmt_misc') -or -not $emulationHelper.Contains('/proc/sys/fs/binfmt_misc') -or $emulationHelper.Contains('DOCKER_DEFAULT_PLATFORM')) {
+    throw 'enable-architecture-emulation.sh must install all bundled handlers, verify binfmt_misc structurally, and leave Docker platform selection unchanged'
+}
 if ($guestText -match '(?im)\btail\s+(?:-[^\s]+\s+)*["'']?\$\{?(?:log_file|runner_log|job_log)') {
     throw 'Guest helpers must not copy runner or job log content into controller-visible output'
 }
@@ -227,8 +253,8 @@ foreach ($profileName in $expectedProfiles.Keys) {
         $profilePlatform = $profile.platforms.PSObject.Properties[$platformName].Value
         $compatibilityPath = Join-Path (Join-Path $templateDirectory 'profiles') $profilePlatform.compatibilityFile
         $compatibility = Get-Content -Raw -LiteralPath $compatibilityPath | ConvertFrom-Json
-        Assert-Equal "$profileName $platformName compatibility schema" $compatibility.schemaVersion 2
-        Assert-Equal "$profileName $platformName template schema" $compatibility.templateSchemaVersion 1
+        Assert-Equal "$profileName $platformName compatibility schema" $compatibility.schemaVersion 3
+        Assert-Equal "$profileName $platformName template schema" $compatibility.templateSchemaVersion 2
         Assert-Equal "$profileName $platformName compatibility profile" $compatibility.profile $profileName
         Assert-Equal "$profileName $platformName compatibility status" $compatibility.validationStatus $profilePlatform.validationStatus
         Assert-Equal "$profileName $platformName compatibility platform" $compatibility.platform $platformName
@@ -238,6 +264,12 @@ foreach ($profileName in $expectedProfiles.Keys) {
         Assert-Equal "$profileName $platformName daemon count" $compatibility.docker.expectedDaemonCount 1
         Assert-Equal "$profileName $platformName daemon owner" $compatibility.docker.daemonOwner 'docker-sandboxes-runtime'
         Assert-Equal "$profileName $platformName /var/lib/docker preload" $compatibility.docker.imagePreloadsVarLibDocker $false
+        Assert-Equal "$profileName $platformName emulation backend" $compatibility.architectureEmulation.backend 'qemu'
+        Assert-Equal "$profileName $platformName architecture policy" $compatibility.architectureEmulation.policy 'automatic-binfmt-install-all'
+        Assert-Equal "$profileName $platformName emulation release" $compatibility.architectureEmulation.release 'qemu-v10.2.3-68'
+        Assert-Equal "$profileName $platformName QEMU version" $compatibility.architectureEmulation.qemuVersion '10.2.3'
+        Assert-Equal "$profileName $platformName emulation index" $compatibility.architectureEmulation.sourceIndexDigest $lock.emulation.source.indexDigest
+        Assert-Equal "$profileName $platformName emulation manifest" $compatibility.architectureEmulation.sourceManifestDigest $lock.emulation.platforms.PSObject.Properties[$platformName].Value.manifestDigest
     }
 }
 
@@ -276,6 +308,7 @@ if ($VerifyRemote) {
     Test-RemoteIndex 'Dockerfile frontend' $lock.dockerfileFrontend.inspectionReference $lock.dockerfileFrontend.indexDigest $platformLock.dockerfileFrontendManifestDigest $Platform
     Test-RemoteIndex 'SBOM generator' $lock.sbomGenerator.inspectionReference $lock.sbomGenerator.indexDigest $platformLock.sbomGeneratorManifestDigest $Platform
     Test-RemoteIndex 'Go hook-launcher builder' $lock.goBuilder.inspectionReference $lock.goBuilder.indexDigest $platformLock.goBuilderManifestDigest $Platform
+    Test-RemoteIndex 'QEMU binfmt source' $lock.emulation.source.indexReference $lock.emulation.source.indexDigest $lock.emulation.platforms.PSObject.Properties[$Platform].Value.manifestDigest $Platform
     foreach ($profileName in $expectedProfiles.Keys) {
         $profile = $lock.profiles.PSObject.Properties[$profileName].Value
         $profilePlatform = $profile.platforms.PSObject.Properties[$Platform].Value
@@ -301,7 +334,8 @@ if ($DockerfileCheck) {
     foreach ($profileName in $expectedProfiles.Keys) {
         $profile = $lock.profiles.PSObject.Properties[$profileName].Value
         $profilePlatform = $profile.platforms.PSObject.Properties[$Platform].Value
-        & docker buildx build --builder $Builder --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg 'ACTIONS_RUNNER_VERSION=0.0.0' --build-arg ('ACTIONS_RUNNER_SHA256=sha256:' + ('0' * 64)) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
+        $emulationPlatform = $lock.emulation.platforms.PSObject.Properties[$Platform].Value
+        & docker buildx build --builder $Builder --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("BINFMT_IMAGE={0}" -f $emulationPlatform.sourceReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg 'ACTIONS_RUNNER_VERSION=0.0.0' --build-arg ('ACTIONS_RUNNER_SHA256=sha256:' + ('0' * 64)) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
         if ($LASTEXITCODE -ne 0) {
             throw "Dockerfile frontend check failed for $profileName"
         }

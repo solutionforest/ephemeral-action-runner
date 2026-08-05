@@ -83,3 +83,31 @@ func TestProbeFilesystemCapacity(t *testing.T) {
 		t.Fatalf("ProbeFilesystemCapacity() = %+v", capacity)
 	}
 }
+
+func TestProbeFilesystemCapacityDomainFollowsRedirectButCleanupSnapshotRejectsIt(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	realDirectory := filepath.Join(root, "real")
+	if err := os.Mkdir(realDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	redirect := filepath.Join(root, "redirect")
+	if err := os.Symlink(realDirectory, redirect); err != nil {
+		t.Skipf("symlink creation unavailable on %s: %v", runtime.GOOS, err)
+	}
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	realDomain, err := ProbeFilesystemCapacityDomain(realDirectory, now)
+	if err != nil {
+		t.Fatalf("ProbeFilesystemCapacityDomain(real) error = %v", err)
+	}
+	redirectDomain, err := ProbeFilesystemCapacityDomain(redirect, now)
+	if err != nil {
+		t.Fatalf("ProbeFilesystemCapacityDomain(redirect) error = %v", err)
+	}
+	if realDomain.ID == "" || realDomain.Identity == "" || realDomain.ID != redirectDomain.ID {
+		t.Fatalf("capacity domains real=%+v redirect=%+v, want the same physical domain", realDomain, redirectDomain)
+	}
+	if _, err := SnapshotFilesystemTarget(redirect); err == nil {
+		t.Fatal("SnapshotFilesystemTarget() accepted redirect used safely by the read-only probe")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -21,6 +22,42 @@ func platformFilesystemCapacity(path string) (uint64, uint64, error) {
 		return 0, 0, fmt.Errorf("filesystem space result overflow")
 	}
 	return available * blockSize, total * blockSize, nil
+}
+
+func platformFilesystemCapacityDomain(path string) (string, string, uint64, uint64, error) {
+	available, total, err := platformFilesystemCapacity(path)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", "", 0, 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", "", 0, 0, fmt.Errorf("filesystem did not expose a stable capacity-domain identity")
+	}
+	device := uint64(stat.Dev)
+	domainPath := path
+	if !info.IsDir() {
+		domainPath = filepath.Dir(path)
+	}
+	for {
+		parent := filepath.Dir(domainPath)
+		if parent == domainPath {
+			break
+		}
+		parentInfo, statErr := os.Stat(parent)
+		if statErr != nil {
+			break
+		}
+		parentStat, statOK := parentInfo.Sys().(*syscall.Stat_t)
+		if !statOK || uint64(parentStat.Dev) != device {
+			break
+		}
+		domainPath = parent
+	}
+	return fmt.Sprintf("unix-filesystem:%x", device), domainPath, available, total, nil
 }
 
 func platformFilesystemIdentity(path string, _ bool) (string, error) {

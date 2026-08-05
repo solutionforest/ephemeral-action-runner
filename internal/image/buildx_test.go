@@ -35,6 +35,16 @@ func TestBuildxBuilderNameIsStableAndProjectScoped(t *testing.T) {
 	}
 }
 
+func TestConfigScopedBuildxWorkersAreStoppedAfterImageBuilds(t *testing.T) {
+	sandboxBuild, err := os.ReadFile("docker_sandboxes.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sandboxBuild), `m.stopBuildxBuilder(stopContext, builder, "release resident memory after the Docker Sandboxes build")`) {
+		t.Fatal("Docker Sandboxes template build does not stop its exact BuildKit worker on exit")
+	}
+}
+
 func TestBuildxScopeSeparatesConfigurationsInOneProject(t *testing.T) {
 	root := t.TempDir()
 	firstConfig := filepath.Join(root, ".local", "config.yml")

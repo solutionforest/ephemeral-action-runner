@@ -12,8 +12,8 @@ const (
 	DefaultGoCacheMaxBytes  = 10 * GiB
 )
 
-// SurfaceKind identifies a capacity and reclaim domain. Reclaim on one surface
-// must not be reported as free space on another surface.
+// SurfaceKind identifies a logical storage backend. CapacityDomain carries the
+// physical identity used for admission and reclaim accounting.
 type SurfaceKind string
 
 const (
@@ -23,8 +23,23 @@ const (
 	SurfaceExternal       SurfaceKind = "external"
 )
 
-// Capacity is an observation for one storage surface. Unknown capacity is a
-// first-class fail-closed state, not zero available bytes.
+// StorageRole is a provider-neutral purpose for storage consumed by an
+// operation. Providers bind roles to concrete surfaces; operation planners do
+// not need to know platform paths or capacity-domain identities.
+type StorageRole string
+
+const (
+	StorageRoleProject              StorageRole = "project"
+	StorageRoleDockerEngine         StorageRole = "docker-engine"
+	StorageRoleSandboxTemplateCache StorageRole = "sandbox-template-cache"
+	StorageRoleSandboxRuntime       StorageRole = "sandbox-runtime"
+	StorageRoleContainerdStore      StorageRole = "containerd-store"
+	StorageRoleWSLDistribution      StorageRole = "wsl-distribution"
+	StorageRoleTartStore            StorageRole = "tart-store"
+)
+
+// Capacity is one capacity observation. Unknown capacity is a first-class
+// fail-closed state, not zero available bytes.
 type Capacity struct {
 	Known          bool      `json:"known"`
 	AvailableBytes uint64    `json:"availableBytes,omitempty"`
@@ -32,13 +47,17 @@ type Capacity struct {
 	ObservedAt     time.Time `json:"observedAt,omitempty"`
 }
 
-// Surface identifies one capacity and reclaim domain.
+// Surface identifies one logical storage purpose and its diagnostic evidence.
 type Surface struct {
 	ID                     string      `json:"id"`
 	Provider               string      `json:"provider,omitempty"`
+	Role                   StorageRole `json:"role,omitempty"`
 	Kind                   SurfaceKind `json:"kind"`
+	DomainID               string      `json:"domainId,omitempty"`
+	Path                   string      `json:"path,omitempty"`
 	Location               string      `json:"location,omitempty"`
 	Classification         string      `json:"classification,omitempty"`
+	Provenance             string      `json:"provenance,omitempty"`
 	Sparse                 bool        `json:"sparse,omitempty"`
 	VirtualMaximumBytes    uint64      `json:"virtualMaximumBytes,omitempty"`
 	AllocatedBytes         uint64      `json:"allocatedBytes,omitempty"`
@@ -46,6 +65,81 @@ type Surface struct {
 	AdmissionAuthoritative bool        `json:"admissionAuthoritative"`
 	Advisory               bool        `json:"advisory,omitempty"`
 	Capacity               Capacity    `json:"capacity"`
+}
+
+// CapacityDomain identifies one physical pool of available bytes. Multiple
+// logical surfaces may resolve to the same domain and must then share one
+// capacity check and one free-space reserve.
+type CapacityDomain struct {
+	ID         string      `json:"id"`
+	Kind       SurfaceKind `json:"kind"`
+	Identity   string      `json:"identity,omitempty"`
+	Path       string      `json:"path,omitempty"`
+	Provenance string      `json:"provenance,omitempty"`
+	Confidence string      `json:"confidence,omitempty"`
+	Capacity   Capacity    `json:"capacity"`
+}
+
+// OperationPlan describes storage growth as overlapping phases. The reserve
+// defaults to DefaultMinimumFreeBytes when it is zero.
+type OperationPlan struct {
+	ID               string           `json:"id"`
+	Provider         string           `json:"provider,omitempty"`
+	MinimumFreeBytes uint64           `json:"minimumFreeBytes"`
+	Phases           []OperationPhase `json:"phases"`
+}
+
+// OperationPhase is one interval during which all of its allocations overlap.
+// Different phases do not overlap for peak-capacity calculation.
+type OperationPhase struct {
+	ID          string       `json:"id"`
+	Allocations []Allocation `json:"allocations,omitempty"`
+}
+
+// Allocation is additional capacity consumed by one role during a phase.
+// SurfaceID is an optional compatibility/direct-binding override; new
+// provider-neutral plans normally set Role and leave SurfaceID empty.
+type Allocation struct {
+	ID        string      `json:"id"`
+	Role      StorageRole `json:"role,omitempty"`
+	SurfaceID string      `json:"surfaceId,omitempty"`
+	Bytes     uint64      `json:"bytes"`
+}
+
+// ResolvedAllocation records the exact surface and capacity domain selected
+// for one logical phase allocation.
+type ResolvedAllocation struct {
+	OperationID  string      `json:"operationId"`
+	PhaseID      string      `json:"phaseId"`
+	AllocationID string      `json:"allocationId"`
+	Role         StorageRole `json:"role,omitempty"`
+	SurfaceID    string      `json:"surfaceId"`
+	DomainID     string      `json:"domainId"`
+	Bytes        uint64      `json:"bytes"`
+}
+
+// DomainRequirement is the peak growth plus one reserve required from one
+// physical capacity domain for one operation.
+type DomainRequirement struct {
+	OperationID            string `json:"operationId"`
+	DomainID               string `json:"domainId"`
+	PeakBytes              uint64 `json:"peakBytes"`
+	MinimumFreeBytes       uint64 `json:"minimumFreeBytes"`
+	RequiredAvailableBytes uint64 `json:"requiredAvailableBytes"`
+}
+
+// ResolvedOperationPlan is a normalized plan together with its exact physical
+// allocation bindings and per-domain peak requirements.
+type ResolvedOperationPlan struct {
+	Plan         OperationPlan        `json:"plan"`
+	Allocations  []ResolvedAllocation `json:"allocations,omitempty"`
+	Requirements []DomainRequirement  `json:"requirements,omitempty"`
+}
+
+// OperationEvaluation adds fail-closed capacity checks to a resolved plan.
+type OperationEvaluation struct {
+	ResolvedOperationPlan
+	CapacityChecks []CapacityCheck `json:"capacityChecks,omitempty"`
 }
 
 // Requirement is the peak additional capacity needed by an operation on one
@@ -70,12 +164,13 @@ const (
 // CapacityCheck binds a requirement to the exact capacity observation used to
 // evaluate it.
 type CapacityCheck struct {
-	Requirement            Requirement    `json:"requirement"`
-	Capacity               Capacity       `json:"capacity"`
-	Status                 CapacityStatus `json:"status"`
-	RequiredAvailableBytes uint64         `json:"requiredAvailableBytes"`
-	DeficitBytes           uint64         `json:"deficitBytes,omitempty"`
-	Reason                 string         `json:"reason"`
+	Requirement            Requirement        `json:"requirement"`
+	DomainRequirement      *DomainRequirement `json:"domainRequirement,omitempty"`
+	Capacity               Capacity           `json:"capacity"`
+	Status                 CapacityStatus     `json:"status"`
+	RequiredAvailableBytes uint64             `json:"requiredAvailableBytes"`
+	DeficitBytes           uint64             `json:"deficitBytes,omitempty"`
+	Reason                 string             `json:"reason"`
 }
 
 // ArtifactKind selects the retention policy applicable to an artifact.
@@ -241,24 +336,30 @@ type Decision struct {
 
 // PreviewRequest supplies a complete storage snapshot and an explicit clock.
 type PreviewRequest struct {
-	Now          time.Time     `json:"now"`
-	Policy       Policy        `json:"policy"`
-	Surfaces     []Surface     `json:"surfaces"`
-	Requirements []Requirement `json:"requirements,omitempty"`
-	Artifacts    []Artifact    `json:"artifacts,omitempty"`
+	Now             time.Time        `json:"now"`
+	Policy          Policy           `json:"policy"`
+	Surfaces        []Surface        `json:"surfaces"`
+	CapacityDomains []CapacityDomain `json:"capacityDomains,omitempty"`
+	OperationPlans  []OperationPlan  `json:"operationPlans,omitempty"`
+	Requirements    []Requirement    `json:"requirements,omitempty"`
+	Artifacts       []Artifact       `json:"artifacts,omitempty"`
 }
 
 // Plan is an immutable, deterministic preview. Hash is the SHA-256 of the plan
 // with the Hash field empty.
 type Plan struct {
-	SchemaVersion    int             `json:"schemaVersion"`
-	CreatedAt        time.Time       `json:"createdAt"`
-	Policy           Policy          `json:"policy"`
-	Surfaces         []Surface       `json:"surfaces"`
-	CapacityChecks   []CapacityCheck `json:"capacityChecks,omitempty"`
-	Decisions        []Decision      `json:"decisions,omitempty"`
-	RemovalCount     int             `json:"removalCount"`
-	ReclaimableBytes uint64          `json:"reclaimableBytes"`
-	Warnings         []string        `json:"warnings,omitempty"`
-	Hash             string          `json:"hash"`
+	SchemaVersion       int                  `json:"schemaVersion"`
+	CreatedAt           time.Time            `json:"createdAt"`
+	Policy              Policy               `json:"policy"`
+	Surfaces            []Surface            `json:"surfaces"`
+	CapacityDomains     []CapacityDomain     `json:"capacityDomains,omitempty"`
+	OperationPlans      []OperationPlan      `json:"operationPlans,omitempty"`
+	ResolvedAllocations []ResolvedAllocation `json:"resolvedAllocations,omitempty"`
+	DomainRequirements  []DomainRequirement  `json:"domainRequirements,omitempty"`
+	CapacityChecks      []CapacityCheck      `json:"capacityChecks,omitempty"`
+	Decisions           []Decision           `json:"decisions,omitempty"`
+	RemovalCount        int                  `json:"removalCount"`
+	ReclaimableBytes    uint64               `json:"reclaimableBytes"`
+	Warnings            []string             `json:"warnings,omitempty"`
+	Hash                string               `json:"hash"`
 }

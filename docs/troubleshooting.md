@@ -91,7 +91,9 @@ docker buildx imagetools inspect IMAGE
 docker compose config
 ```
 
-`no matching manifest` means the image does not publish the requested platform; emulation cannot create a missing manifest. A platform warning alone does not prove failure, and exit code `139` alone does not prove an architecture mismatch. Use the exact image and workload evidence. For the architecture model, QEMU setup, provider scope, and verification commands, see [Cross-architecture containers](advanced/cross-architecture-containers.md).
+`no matching manifest` means the image does not publish the requested platform; emulation cannot create a missing manifest. A platform warning alone does not prove failure, and exit code `139` alone does not prove an architecture mismatch. Enabling emulation does not change normal manifest selection, so request the foreign image with `docker run --platform ...` or the affected Compose service's `platform:` property. EPAR does not inject `DOCKER_DEFAULT_PLATFORM`.
+
+For Docker Sandboxes, keep `provider.platform` native. EPAR always installs the template's pinned QEMU handlers inside the sandbox VM and does not expose an emulation setting. If creation reports that `binfmt_misc` is unavailable or that no bundled handler was registered, rebuild the current template and inspect the helper output; do not add a privileged installer to the workflow. A particular foreign image can still fail later because QEMU does not support it, its manifest is missing, or the workload depends on unsupported CPU behavior. For other providers, QEMU setup remains a trusted workflow responsibility. See [Cross-architecture containers](advanced/cross-architecture-containers.md) for image selection and workload-level verification.
 
 ## Docker Sandboxes is unavailable or its preflight fails
 
@@ -113,15 +115,15 @@ EPAR requires a controller architecture with an available Linux guest template a
 
 ### Symptom
 
-Startup reports a template identity/digest mismatch, policy-generation drift, an admission failure, or insufficient capacity.
+Startup reports a template identity/digest mismatch, policy-generation drift, QEMU/binfmt setup failure, or insufficient capacity.
 
 ### Diagnosis and remediation
 
-Docker Sandboxes resolves the configured source selector, records the exact OCI identities in a local artifact receipt, and verifies the host-global policy fingerprint. If the desired source, platform, scripts, template inputs, runner inputs, or trust inputs change, rerun `./start`; EPAR builds and imports a replacement and activates it only after exact readback succeeds.
+Docker Sandboxes resolves the configured source selector, records the exact OCI identities in a local artifact receipt, verifies the host-global policy fingerprint, and binds the immutable `tonistiigi/binfmt` release and native-platform manifest into the reusable template evidence. If the desired source, platform, scripts, template inputs, runner inputs, trust inputs, or locked emulation artifact changes, rerun `./start`; EPAR builds and imports a replacement and activates it only after exact readback succeeds.
 
 An imported Docker Sandboxes template does not require a matching Docker image. EPAR builds directly to a verified archive, imports that archive, and then removes the transient workspace. If startup reports a missing Docker staging image, the controller is stale; rebuild the native controller and rerun `./start`. If direct archive verification or `sbx template load` fails, use the printed Buildx transcript and archive error; EPAR does not fall back to the memory-heavy Docker load/save path.
 
-Capacity admission accounts for estimated incremental physical growth on each measurable backing filesystem plus the fixed `storage.minimumFree` reserve. Docker Sandboxes root and inner-Docker sizes are independent sparse logical maxima and are not added as immediate host usage. Inspect the reported physical surface, run the matching `storage status` and prune-preview commands, or deliberately retry only that invocation with `--allow-insufficient-storage`. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
+Capacity admission accounts for phase-overlapping physical growth on each resolved capacity domain and applies the fixed `storage.minimumFree` reserve once per domain. The checkout, Docker Engine, Docker Desktop disk, Docker Sandboxes state/cache, WSL distribution backing, and Tart store can be on different filesystems. Docker Sandboxes root and inner-Docker sizes are independent sparse logical maxima and are not added as immediate host usage. Inspect the matching operation with `./start storage status --operation template-build --provider docker-sandboxes --config <path> --project-root <path>`, then use the exact prune preview or deliberately retry only that invocation with `--allow-insufficient-storage`. A `documented-default-assumed` warning means EPAR verified a local Docker Desktop context but could only measure the documented default/system location; it never grants cleanup authority. Avoid broad cleanup commands: they can delete stopped containers and intentionally retained resources.
 
 ## Docker Sandboxes creation fails after a runtime-helper prompt
 
@@ -187,6 +189,12 @@ A GitHub 429/5xx response or an `sbx` command timeout makes runner health tempor
 The public `actions/runner` Releases API has a separate unauthenticated rate limit. An EPAR GitHub App installation token is not used for that public repository because it may not have permission to read it. On a 403, 429, timeout, or transient server response, EPAR prints the HTTP status and any safe rate-limit, retry, and request-ID headers, then uses the reviewed exact release in `third_party/actions-runner-release.lock.json`. This is an explicit metadata-only fallback: the selected version must match `image.runnerVersion` when that value is pinned, the expected asset name and canonical GitHub URL are checked, and the downloaded package must still match the lock's SHA-256 before it is installed.
 
 If EPAR says the checked-in fallback is unusable, restore that file from the EPAR release or update to a release with a refreshed lock; do not replace the digest with an unverified value. Authentication, malformed successful API responses, selector mismatches, missing assets, and other non-transient API failures remain errors rather than using the fallback.
+
+## A public Catthehacker GHCR source reports HTTP 401 or 403
+
+Docker Desktop can supply a stored `ghcr.io` credential to Buildx even when the requested Catthehacker image is public. A stale, revoked, wrong-account, or insufficiently scoped credential can then fail authorization instead of using anonymous public access. When the failed operation is authorization-shaped, EPAR performs one separate read-only anonymous OCI descriptor probe using the configured build-trust roots. If that exact built-in source is anonymously readable, the error explains the credential conflict. EPAR does not retry the failed pull anonymously, run `docker logout` or `tart logout`, or alter Docker Desktop's credential store.
+
+For public-only GHCR use, remove or refresh the stored credential yourself. For private GHCR use, sign in again with a valid credential that has package pull access. Removing a host credential may also remove access to private packages, so EPAR never performs that action automatically. If the anonymous diagnostic probe cannot prove public access, EPAR preserves the original failure without speculating about the credential.
 
 ## A scheduled image check or update fails
 
@@ -285,11 +293,11 @@ Use `[system]` on Linux. Overlay mode collects the current host roots, validates
 Use the normal host entry point so EPAR can inspect the real Windows certificate stores or macOS Keychain:
 
 ```powershell
-.\start.ps1
-.\start.ps1 image build --replace
+./start
+./start image build --replace
 ```
 
-On no-Go Windows, use `.\start.ps1 image build --replace`; on macOS/Linux, use `./start image build --replace`. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. The legacy containerized controller still requires the separate native-host feed bridge. A bare Linux toolchain container is not a replacement for either path.
+Use `./start image build --replace` on every supported shell, including native Windows PowerShell. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. A bare Linux toolchain container is not a replacement for the project-local native-controller path.
 
 ## Windows Docker Desktop WSL2 disk is smaller than expected
 

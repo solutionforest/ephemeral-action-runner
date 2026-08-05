@@ -33,3 +33,12 @@ func TestUnknownMarkerCannotReplaceCommand(t *testing.T) {
 		t.Fatalf("commandPrefix() = %q, want direct binary", got)
 	}
 }
+
+func TestScopedCommandPreservesConfigAndProjectRoot(t *testing.T) {
+	t.Setenv(Environment, "start")
+	got := ScopedCommand(`D:\repo\EPAR Config\config.yml`, `D:\repo\EPAR`, "storage", "status", "--provider", "docker-sandboxes")
+	want := `./start storage status --provider docker-sandboxes --config "D:\repo\EPAR Config\config.yml" --project-root D:\repo\EPAR`
+	if got != want {
+		t.Fatalf("ScopedCommand() = %q, want %q", got, want)
+	}
+}

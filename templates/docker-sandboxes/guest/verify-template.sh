@@ -67,8 +67,16 @@ docker info >/dev/null
 [[ -x /opt/actions-runner/bin/Runner.Listener ]]
 [[ -x /opt/epar/check-host-trust-generation.sh ]]
 [[ -x /opt/epar/hook-bin/bash ]]
+sudo -n test -x /opt/epar/enable-architecture-emulation
+sudo -n test ! -L /opt/epar/enable-architecture-emulation
+sudo -n cmp -s /opt/epar/enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation
+[[ "$(sudo -n stat -c '%U:%G:%a' /opt/epar/enable-architecture-emulation)" == "root:root:555" ]]
 [[ "$(PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v bash)" == "/opt/epar/hook-bin/bash" ]]
 [[ -x /usr/bin/python3 ]]
+sudo -n test -x /opt/epar/emulation/binfmt
+sudo -n test ! -L /opt/epar/emulation/binfmt
+sudo -n bash -c '[[ "$(stat -c "%U:%G:%a" /opt/epar/emulation/binfmt)" == "root:root:555" ]]'
+sudo -n bash -c 'shopt -s nullglob; qemu=(/opt/epar/emulation/qemu-*); (( ${#qemu[@]} > 0 )); for interpreter in "${qemu[@]}"; do [[ -f "${interpreter}" && ! -L "${interpreter}" && -x "${interpreter}" && "$(stat -c "%U:%G:%a" "${interpreter}")" == "root:root:555" ]]; done'
 [[ -s /opt/epar/actions-runner-version ]]
 [[ "$(sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version)" == "$(cat /opt/epar/actions-runner-version)" ]]
 case "${EPAR_TEMPLATE_PLATFORM}" in

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,10 +56,12 @@ docker info --format '{{json .ServerVersion}}'`
 type Provider struct {
 	Binary string
 
-	runCommand     runCommandFunc
-	activeMu       sync.RWMutex
-	activeTemplate provider.TemplateArtifact
-	dryRun         bool
+	runCommand            runCommandFunc
+	activeMu              sync.RWMutex
+	activeTemplate        provider.TemplateArtifact
+	dryRun                bool
+	architectureEmulation architectureEmulationEnabler
+	logger                *slog.Logger
 }
 
 type instanceReceipt struct {
@@ -105,10 +108,20 @@ func New(binary string) *Provider {
 }
 
 func NewWithDryRun(binary string, dryRun bool) *Provider {
+	return newWithArchitectureEmulation(binary, dryRun, qemuBinfmtEnabler{})
+}
+
+func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectureEmulationEnabler) *Provider {
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary, dryRun: dryRun}
+	return &Provider{Binary: binary, dryRun: dryRun, architectureEmulation: enabler}
+}
+
+// SetLogger attaches the controller's structured logger before any concurrent
+// lifecycle operations begin. Standalone provider consumers may omit it.
+func (p *Provider) SetLogger(logger *slog.Logger) {
+	p.logger = logger
 }
 
 // StartDaemon asks Docker Sandboxes to start its host daemon in the
@@ -240,6 +253,17 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			}
 			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
 				return instance, err
+			}
+			if p.architectureEmulation == nil {
+				return instance, fmt.Errorf("Docker Sandboxes architecture emulation enabler is unavailable")
+			}
+			emulation, err := p.architectureEmulation.Enable(ctx, p, item.Instance)
+			if err != nil {
+				return instance, err
+			}
+			if p.logger != nil {
+				message := fmt.Sprintf("Docker Sandboxes architecture emulation enabled: backend=%s registeredHandlers=%d", emulation.Backend, emulation.HandlerCount)
+				p.logger.Info(message, "provider", "docker-sandboxes", "instance", item.Instance.Name, "backend", emulation.Backend, "registeredHandlers", emulation.HandlerCount)
 			}
 			return instance, nil
 		}
@@ -718,7 +742,18 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 	}
 	var receipt instanceReceipt
 	if p.runCommand == nil {
-		if instance.ReceiptVersion != "v1" || json.Unmarshal(instance.Receipt, &receipt) != nil || receipt.SchemaVersion != 1 || receipt.StagingPath == "" || receipt.StagingIdentity == "" {
+		switch instance.ReceiptVersion {
+		case "v1":
+			if json.Unmarshal(instance.Receipt, &receipt) != nil || receipt.SchemaVersion != 1 || receipt.StagingPath == "" || receipt.StagingIdentity == "" {
+				return fmt.Errorf("refusing Docker Sandbox deletion without an exact staging ownership receipt")
+			}
+		case "v2":
+			var parseErr error
+			receipt, parseErr = parseExperimentalInstanceReceipt(instance.Receipt)
+			if parseErr != nil {
+				return fmt.Errorf("refusing Docker Sandbox deletion without an exact staging ownership receipt: %w", parseErr)
+			}
+		default:
 			return fmt.Errorf("refusing Docker Sandbox deletion without an exact staging ownership receipt")
 		}
 	}

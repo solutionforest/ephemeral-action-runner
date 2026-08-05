@@ -64,6 +64,7 @@ Use `cleanup --no-github` only when you intentionally want to leave GitHub runne
 
 ```bash
 ./start storage status
+./start storage status --operation template-build
 ./start storage prune
 ./start storage prune --execute
 ./start storage prune --legacy

@@ -160,16 +160,15 @@ type StorageContribution interface {
 }
 
 type StorageRequest struct {
-	Operation        string
-	Now              time.Time
-	PeakBytes        uint64
-	MinimumFreeBytes uint64
+	OperationPlan storage.OperationPlan
+	Now           time.Time
 }
 
 type StorageSnapshot struct {
-	Surfaces     []storage.Surface
-	Requirements []storage.Requirement
-	Artifacts    []storage.Artifact
+	Surfaces  []storage.Surface
+	Domains   []storage.CapacityDomain
+	Artifacts []storage.Artifact
+	Warnings  []string
 }
 
 // AdmissionVerifier rechecks provider-wide state that can change independently

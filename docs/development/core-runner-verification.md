@@ -90,7 +90,7 @@ Cancellation after a controller error is expected. Diagnose the first controller
 Create an untracked config based on `configs/docker-container.core.example.yml` with the same organization, GitHub App key path, and `pool.namePrefix: epar-ci-core`, then run:
 
 ```bash
-go run ./cmd/ephemeral-action-runner cleanup \
+./start cleanup \
   --config .local/core-cleanup.yml \
   --project-root .
 ```

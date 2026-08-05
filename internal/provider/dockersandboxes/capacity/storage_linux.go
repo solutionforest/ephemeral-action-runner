@@ -3,24 +3,26 @@
 package capacity
 
 import (
-	"errors"
-	"os"
-	"path/filepath"
+	"fmt"
+
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/storagepath"
 )
 
 // DockerSandboxesStorageRoot returns the documented XDG state root that
 // contains Docker Sandboxes' persistent sandbox data.
 func DockerSandboxesStorageRoot() (string, error) {
-	stateHome := os.Getenv("XDG_STATE_HOME")
-	if stateHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
+	environment, err := storagepath.CurrentEnvironment()
+	if err != nil {
+		return "", err
+	}
+	roots, err := storagepath.DockerSandboxesRoots(environment)
+	if err != nil {
+		return "", err
+	}
+	for _, root := range roots {
+		if root.ID == "state" {
+			return root.Path, nil
 		}
-		stateHome = filepath.Join(home, ".local", "state")
 	}
-	if !filepath.IsAbs(stateHome) {
-		return "", errors.New("XDG state home is not an absolute path")
-	}
-	return filepath.Join(stateHome, "sandboxes"), nil
+	return "", fmt.Errorf("Docker Sandboxes state root was not discovered")
 }

@@ -19,3 +19,23 @@ for tool_name in bash docker dockerd git go java node npm python3; do
 done
 printf 'actions-runner\t/opt/actions-runner/bin/Runner.Listener\t%s\n' "$(/opt/actions-runner/bin/Runner.Listener --version)"
 printf 'tini\t/usr/local/bin/tini\t%s\n' "$(/usr/local/bin/tini --version 2>&1)"
+printf '\n[architecture-emulation]\n'
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+compatibility = json.loads(Path('/opt/epar/template-compatibility.json').read_text(encoding='utf-8'))
+emulation = compatibility['architectureEmulation']
+print(f"backend\t{emulation['backend']}")
+print(f"policy\t{emulation['policy']}")
+print(f"release\t{emulation['release']}")
+print(f"source-index-digest\t{emulation['sourceIndexDigest']}")
+print(f"source-manifest-digest\t{emulation['sourceManifestDigest']}")
+print(f"qemu-version\t{emulation['qemuVersion']}")
+PY
+for asset_path in /opt/epar/emulation/binfmt /opt/epar/emulation/qemu-*; do
+  printf 'asset\t%s\t%s\t%s\n' "$(basename "${asset_path}")" "$(stat -c '%s' "${asset_path}")" "$(sha256sum "${asset_path}" | cut -d' ' -f1)"
+done
+for license_path in /usr/share/licenses/epar-emulation/*.txt; do
+  printf 'license\t%s\t%s\t%s\n' "$(basename "${license_path}")" "$(stat -c '%s' "${license_path}")" "$(sha256sum "${license_path}" | cut -d' ' -f1)"
+done

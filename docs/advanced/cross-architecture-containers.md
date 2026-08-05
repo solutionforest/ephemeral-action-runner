@@ -54,16 +54,18 @@ The setup helper is privileged. Use it only in trusted workflows and treat its p
 | Docker Container | Run the setup action inside the disposable job before Docker or Compose uses a foreign image. No EPAR configuration key enables universal emulation. |
 | WSL | Run the setup action inside the WSL runner if its Linux Docker daemon needs a foreign image. An x64 WSL runner does not gain ARM64 execution merely by pulling an ARM64 image. |
 | Tart on Apple Silicon | The guest is ARM64. The optional Rosetta path is experimental and not equivalent to QEMU/binfmt. Use a distinct label and validate the exact image/workload. |
-| Docker Sandboxes | The pinned template and `provider.platform` determine the guest architecture. Treat unsupported host/template combinations as preview-only and use only independently validated combinations. |
+| Docker Sandboxes | Keep `provider.platform` native. EPAR automatically runs the pinned `tonistiigi/binfmt --install all` equivalent inside every sandbox VM; no emulation configuration or workflow-level privileged installer is required. |
 | GitHub-hosted Windows or macOS | These labels do not replace a Linux Docker daemon for container actions or service containers. Use a suitable Linux execution surface. |
 
 Keep architecture-specific jobs on a distinct `runs-on` label. Do not label an ARM64 runner as `ubuntu-latest`: GitHub's `ubuntu-latest` is a GitHub-managed environment, and x64 assumptions can fail on ARM64.
 
 ## Operational examples
 
-For an amd64-only service on an ARM64 host, first try a published ARM64 or multi-platform image. If none exists, use a trusted Linux runner with the emulation setup above, then prove the actual service starts and passes its health check. If the service is performance-sensitive or fails under emulation, route it to a native x64 Docker Container, WSL x64, or another native x64 Linux runner instead.
+For an amd64-only service on an ARM64 host, first try a published ARM64 or multi-platform image. With Docker Sandboxes, use the native ARM64 template and request the AMD64 image through the service-level `platform` property when manifest selection needs to be explicit; do not set a project-wide `DOCKER_DEFAULT_PLATFORM`. EPAR verifies that generic QEMU handlers were registered but trusts the real service startup and health check as the compatibility proof. If the service is performance-sensitive or fails under emulation, route it to a native x64 runner instead.
 
 For an ARM64 image on an x64 Linux runner, follow the same process with `platforms: arm64` and `--platform linux/arm64`. Never treat a successful `docker pull` as the proof; run a container and check both the expected architecture output and the real workload.
+
+Docker Sandboxes has no fixed advertised target matrix. It installs every handler present in the immutable host-platform `tonistiigi/binfmt` artifact and lets QEMU handle the executable when a registered ELF signature matches. Unsupported images or workloads fail normally at execution time rather than preventing unrelated native and foreign services from sharing the runner.
 
 ## References
 
@@ -71,4 +73,3 @@ For an ARM64 image on an x64 Linux runner, follow the same process with `platfor
 - [Docker multi-platform build strategies](https://docs.docker.com/build/building/multi-platform/)
 - [GitHub-hosted runner labels and limitations](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 - [GitHub self-hosted runner container requirements](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#requirements-for-self-hosted-runner-machines)
-

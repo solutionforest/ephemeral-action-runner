@@ -1311,7 +1311,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			return vm, fmt.Errorf("GitHub runner name %q is already allocated to id=%d", name, runner.ID)
 		}
 	}
-	if err := m.preflightStorage("instance-create", m.instanceCreateExpansion()); err != nil {
+	if err := m.preflightStorage(m.instanceCreateOperationPlan()); err != nil {
 		return vm, err
 	}
 	if err := m.reserveLifecycle(ctx, name); err != nil {
@@ -1401,12 +1401,24 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
 		return vm, err
 	}
-	m.logger().Info("cloning instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "clone", "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
+	creationMessage := "cloning instance"
+	creationOperation := "clone"
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		creationMessage = "creating Docker Sandboxes instance"
+		creationOperation = "create"
+	}
+	m.logger().Info(creationMessage, "provider", m.Config.Provider.Type, "instance", name, "operation", creationOperation, "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
 	var created provider.Instance
-	createStageErr := m.timeFirstInstanceStage(name, "instance_container_create", func() error {
-		var createErr error
-		created, createErr = m.createProviderInstance(ctx, name)
-		return createErr
+	createStage := "instance_container_create"
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		createStage = "sandbox_create_and_initial_identity_verification"
+	}
+	createStageErr := m.timeFirstInstanceStage(name, createStage, func() error {
+		return m.runDockerSandboxesCreateProgress(name, func() error {
+			var createErr error
+			created, createErr = m.createProviderInstance(ctx, name)
+			return createErr
+		})
 	})
 	if created.Name != "" || created.ProviderID != "" || created.ReceiptVersion != "" || len(created.Receipt) != 0 {
 		if created.Name != name || created.ProviderID == "" {
@@ -1448,11 +1460,33 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	if err := m.recordLifecycleValidationIntent(ctx, name); err != nil {
 		return vm, fmt.Errorf("record runtime validation intent: %w", err)
 	}
-	if err := m.applyProviderNetworkPolicy(ctx, created); err != nil {
-		return vm, fmt.Errorf("apply provider network policy: %w", err)
+	applyNetworkPolicy := func() error {
+		return m.applyProviderNetworkPolicy(ctx, created)
 	}
-	if err := m.verifyProviderAdmission(ctx, created); err != nil {
-		return vm, err
+	var networkPolicyErr error
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		networkPolicyErr = m.timeFirstInstanceStage(name, "sandbox_network_policy_apply_and_readback", func() error {
+			return m.runDockerSandboxesPostCreateStage(name, "sandbox-network-policy", "Docker Sandboxes network policy application and readback", applyNetworkPolicy)
+		})
+	} else {
+		networkPolicyErr = applyNetworkPolicy()
+	}
+	if networkPolicyErr != nil {
+		return vm, fmt.Errorf("apply provider network policy: %w", networkPolicyErr)
+	}
+	verifyAdmission := func() error {
+		return m.verifyProviderAdmission(ctx, created)
+	}
+	var admissionErr error
+	if m.Config.Provider.Type == "docker-sandboxes" {
+		admissionErr = m.timeFirstInstanceStage(name, "sandbox_post_create_admission", func() error {
+			return m.runDockerSandboxesPostCreateStage(name, "sandbox-post-create-admission", "Docker Sandboxes post-create admission verification", verifyAdmission)
+		})
+	} else {
+		admissionErr = verifyAdmission()
+	}
+	if admissionErr != nil {
+		return vm, admissionErr
 	}
 	m.logger().Info("starting instance", "provider", m.Config.Provider.Type, "instance", name, "operation", "start", "logPath", logPath)
 	if err := m.timeFirstInstanceStage(name, m.startupInstanceStartStage(), func() error {

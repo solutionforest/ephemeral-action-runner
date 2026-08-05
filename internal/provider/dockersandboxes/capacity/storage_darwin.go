@@ -3,20 +3,26 @@
 package capacity
 
 import (
-	"errors"
-	"os"
-	"path/filepath"
+	"fmt"
+
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/storagepath"
 )
 
 // DockerSandboxesStorageRoot returns the documented macOS state root that
 // contains Docker Sandboxes' persistent sandbox data.
 func DockerSandboxesStorageRoot() (string, error) {
-	home, err := os.UserHomeDir()
+	environment, err := storagepath.CurrentEnvironment()
 	if err != nil {
 		return "", err
 	}
-	if !filepath.IsAbs(home) {
-		return "", errors.New("home directory is not an absolute path")
+	roots, err := storagepath.DockerSandboxesRoots(environment)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(home, "Library", "Application Support", "com.docker.sandboxes"), nil
+	for _, root := range roots {
+		if root.ID == "state" {
+			return root.Path, nil
+		}
+	}
+	return "", fmt.Errorf("Docker Sandboxes state root was not discovered")
 }

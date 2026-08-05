@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,6 +125,17 @@ type cancellationSignalWriter struct {
 	started chan struct{}
 }
 
+type fakeArchitectureEmulationEnabler struct {
+	calls  int
+	result architectureEmulationResult
+	err    error
+}
+
+func (enabler *fakeArchitectureEmulationEnabler) Enable(context.Context, *Provider, provider.Instance) (architectureEmulationResult, error) {
+	enabler.calls++
+	return enabler.result, enabler.err
+}
+
 func (writer *cancellationSignalWriter) Write(data []byte) (int, error) {
 	writer.once.Do(func() { close(writer.started) })
 	return len(data), nil
@@ -132,6 +144,7 @@ func (writer *cancellationSignalWriter) Write(data []byte) (int, error) {
 func scriptedProvider(t *testing.T, steps ...commandStep) (*Provider, func()) {
 	t.Helper()
 	p := New("sbx-test-double")
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{result: architectureEmulationResult{Backend: "qemu", HandlerCount: 1}}
 	index := 0
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 		t.Helper()
@@ -198,6 +211,8 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
 		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
 	)
+	var logOutput bytes.Buffer
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
 	instance, err := p.Create(context.Background(), provider.CreateRequest{
 		Name:           testName,
 		Template:       testTemplate,
@@ -214,7 +229,73 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	if instance.Name != testName || instance.ProviderID != testID {
 		t.Fatalf("instance = %#v", instance)
 	}
+	if calls := p.architectureEmulation.(*fakeArchitectureEmulationEnabler).calls; calls != 1 {
+		t.Fatalf("architecture emulation calls = %d, want 1", calls)
+	}
+	for _, expected := range []string{`"msg":"Docker Sandboxes architecture emulation enabled: backend=qemu registeredHandlers=1"`, `"backend":"qemu"`, `"registeredHandlers":1`} {
+		if !strings.Contains(logOutput.String(), expected) {
+			t.Fatalf("architecture emulation success log %q does not contain %q", logOutput.String(), expected)
+		}
+	}
 	done()
+}
+
+func TestExperimentalV2ReceiptRemainsReadableForCleanup(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"schemaVersion":   2,
+		"stagingPath":     testWorkspace,
+		"stagingIdentity": "test-staging-identity",
+		"template":        testTemplate,
+		"templateDigest":  testDigest,
+		"architectureEmulation": map[string]any{
+			"linux/amd64": map[string]any{"backend": "qemu", "handler": "qemu-x86_64"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := parseExperimentalInstanceReceipt(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.SchemaVersion != 2 || receipt.StagingPath != testWorkspace || receipt.TemplateDigest != testDigest {
+		t.Fatalf("experimental cleanup receipt = %#v", receipt)
+	}
+}
+
+func TestQEMUBinfmtEnablerUsesExactGuestHelper(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{
+			args:   []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper},
+			result: provider.ExecResult{Stdout: `{"backend":"qemu","handlerCount":9}`},
+		},
+	)
+	result, err := (qemuBinfmtEnabler{}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Backend != "qemu" || result.HandlerCount != 9 {
+		t.Fatalf("architecture emulation result = %#v", result)
+	}
+	done()
+}
+
+func TestQEMUBinfmtEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
+	for _, output := range []string{
+		`{"backend":"qemu","handlerCount":0}`,
+		`{"backend":"rosetta","handlerCount":1}`,
+		`not-json`,
+	} {
+		t.Run(output, func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, result: provider.ExecResult{Stdout: output}},
+			)
+			if _, err := (qemuBinfmtEnabler{}).Enable(context.Background(), p, testInstance); err == nil || !strings.Contains(err.Error(), "unsupported evidence") {
+				t.Fatalf("Enable() error = %v", err)
+			}
+			done()
+		})
+	}
 }
 
 func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) {
@@ -242,6 +323,32 @@ func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) 
 	}
 	if receipt.StagingPath != testWorkspace || receipt.StagingIdentity == "" || receipt.Template != testTemplate || receipt.TemplateDigest != testDigest {
 		t.Fatalf("Create() receipt = %#v", receipt)
+	}
+	done()
+}
+
+func TestCreateReturnsExactReceiptWhenArchitectureEmulationSetupFails(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+	)
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{err: errors.New("binfmt_misc is unavailable")}
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || !strings.Contains(err.Error(), "binfmt_misc is unavailable") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("Create() partial instance = %#v, want exact receipted identity", instance)
+	}
+	if calls := p.architectureEmulation.(*fakeArchitectureEmulationEnabler).calls; calls != 1 {
+		t.Fatalf("architecture emulation calls = %d, want 1", calls)
 	}
 	done()
 }

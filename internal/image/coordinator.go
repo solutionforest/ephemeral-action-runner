@@ -23,7 +23,7 @@ const (
 // while creating reusable artifacts. The pool supplies these operations but
 // does not own image policy or provider-specific build selection.
 type Environment interface {
-	PreflightStorage(operation string, peakBytes uint64) error
+	PreflightStorage(operation string, plan storage.OperationPlan) error
 	BuildLogPath(name string) string
 	ReleaseTranscript(path string) error
 	Infof(format string, args ...any)
@@ -80,8 +80,8 @@ func (m *Coordinator) now() time.Time {
 	return time.Now()
 }
 
-func (m *Coordinator) preflightStorage(operation string, peakBytes uint64) error {
-	return m.environment.PreflightStorage(operation, peakBytes)
+func (m *Coordinator) preflightStorage(plan storage.OperationPlan) error {
+	return m.environment.PreflightStorage(plan.ID, plan)
 }
 
 func (m *Coordinator) buildLogPath(name string) string {

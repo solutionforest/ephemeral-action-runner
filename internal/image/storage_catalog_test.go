@@ -61,6 +61,28 @@ func TestNonTartControllerPreservesTartCatalogEvidence(t *testing.T) {
 	}
 }
 
+func TestBuildxInspectShowsStoppedBuilderOnlyWhenEveryReportedNodeIsStopped(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "stopped", output: "Name: epar-example\nDriver: docker-container\nStatus: stopped\n", want: true},
+		{name: "inactive", output: "Name: epar-example\nStatus: inactive\n", want: true},
+		{name: "running", output: "Name: epar-example\nStatus: running\n", want: false},
+		{name: "mixed nodes", output: "Status: stopped\nStatus: running\n", want: false},
+		{name: "missing status", output: "Name: epar-example\nDriver: docker-container\n", want: false},
+		{name: "unknown status", output: "Status: error\n", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := buildxInspectShowsStoppedBuilder(test.output); got != test.want {
+				t.Fatalf("buildxInspectShowsStoppedBuilder() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCurrentReferenceUpdateWaitsForBackendLock(t *testing.T) {
 	t.Setenv("EPAR_STATE_HOME", filepath.Join(t.TempDir(), "host-state"))
 	projectRoot := t.TempDir()

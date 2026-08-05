@@ -29,7 +29,7 @@ Choose Docker Sandboxes when its local checks pass and you want a microVM bounda
 
 ## Support Status
 
-EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage and template admission before any runner starts. Windows x86_64 has the recorded real-host lifecycle evidence. The ARM64 implementation is architecture-complete, but equivalent real-host build, load, lifecycle, and independent-certification evidence has not yet been recorded. macOS and Linux also lack equivalent EPAR real-host evidence in this repository.
+EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and QEMU/binfmt setup admission before any runner starts. Windows x86_64 has the recorded real-host lifecycle evidence. Other host/platform combinations remain preview-only until equivalent real-host build, load, lifecycle, and independent-certification evidence is recorded; bundling generic QEMU handlers does not by itself certify every foreign workload.
 
 ## Prerequisites
 
@@ -37,7 +37,7 @@ EPAR recommends this provider in the wizard by capability, not by an operating-s
 - Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Before the first-run provider assessment, the wizard runs `sbx daemon start --detach` when the `sbx` executable is installed, then runs diagnostics. Warnings and skipped checks do not make the provider unavailable.
 - A native `amd64` or `arm64` controller with matching `linux/amd64` or `linux/arm64` image support. EPAR does not use emulation to admit a mismatched template.
 - Enough capacity to resolve, build, export, import, and retain the selected runner template.
-- Enough physical backing storage for the estimated incremental template and sandbox bootstrap work while retaining `storage.minimumFree`. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
+- Enough physical backing storage in every resolved Engine, project, Sandbox cache, and Sandbox state capacity domain for the phase-overlapping template and sandbox bootstrap work while retaining `storage.minimumFree` once per domain. Use `./start storage status --operation template-build --provider docker-sandboxes --config <path> --project-root <path>` to inspect the same plan. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
 - A GitHub runner group that meets enforced policy. Docker Sandboxes requires `security.runnerGroup.enforcement: enforce` and `runner.ephemeral: true`.
 
 The wizard builds and imports the template. The recipes in `templates/docker-sandboxes` are build inputs, not prebuilt images.
@@ -82,6 +82,14 @@ dockerSandboxes:
 
 `networkBaseline: open` adds EPAR-owned sandbox-scoped public egress plus deny-wins guardrails for host aliases; it does not change the host-global Docker Sandboxes policy. Use `balanced` with `additionalAllow` for default-deny public egress. Additional allow/deny entries are exact hostnames or `*.domain[:port]`; they cannot override the Open host-alias denies.
 
+## Cross-Architecture Containers
+
+Architecture emulation is always enabled and has no user-facing configuration switch. The immutable template copies the pinned `tonistiigi/binfmt:qemu-v10.2.3-68` installer and all static QEMU interpreters, then each newly created sandbox runs the equivalent of `binfmt --install all` as root inside its private VM. This does not run a privileged container on the host. Creation fails before GitHub registration only when `binfmt_misc` cannot be enabled or no bundled QEMU handler becomes active; EPAR deliberately does not execute a probe for every architecture.
+
+Native image processes remain native because foreign binfmt handlers match only their foreign ELF signatures. Docker manifest selection is unchanged: EPAR does not set `DOCKER_DEFAULT_PLATFORM`, QEMU cannot create a missing manifest, and a Compose service should use its `platform` property when a multi-platform tag must select a foreign variant deliberately. A single-architecture local image can run without a service override when its image metadata already identifies the foreign platform. Treat actual workload startup, health checks, networking, and performance as the compatibility proof.
+
+The provider keeps emulation selection behind an internal target-agnostic boundary. QEMU is the only implementation today; a future authoritative Docker Sandboxes Rosetta integration can be selected automatically for mappings it supports while QEMU remains available for other foreign executables, without adding a configuration key.
+
 ## Normal Workflow
 
 1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the proven Catthehacker `full-latest` or `act-latest` profile, then review the non-blocking physical-growth estimate, sparse logical limits, and reserve. The generated config uses no custom install scripts; add them afterward when needed. Specialized and custom tags remain available to Docker Container and WSL, but Docker Sandboxes rejects them because they do not guarantee the private Docker daemon and runtime closure required by its template contract.
@@ -89,7 +97,7 @@ dockerSandboxes:
 3. Prewarm the selected template without GitHub registration:
 
    ```powershell
-   .\start.ps1 pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
+   ./start pool verify --config .local\docker-sandboxes.yml --project-root . --instances 1 --cleanup
    ```
 
 4. Start the pool with `./start`. EPAR reuses the verified imported template without a registry check until the configured update schedule is due; local input changes and missing templates still rebuild immediately.
