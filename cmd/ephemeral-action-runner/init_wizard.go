@@ -118,6 +118,7 @@ func runInitConfigurationWizard(opts initOptions, reader *bufio.Reader, githubCo
 	history := make(initWizardHistory, 0, 8)
 	editHistory := make(initWizardHistory, 0, 3)
 	editing := false
+	providerMenuState := initProviderMenuState{}
 
 	for {
 		var action initWizardAction
@@ -132,7 +133,7 @@ func runInitConfigurationWizard(opts initOptions, reader *bufio.Reader, githubCo
 				draft.RunnerGroup = result.Value
 			}
 		case initWizardProvider:
-			result, err := promptInitProviderWizard(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck, true)
+			result, err := promptInitProviderWizard(opts.Context, opts.ProjectRoot, opts.Out, reader, opts.SkipDockerCheck, true, &providerMenuState)
 			if err != nil {
 				return initWizardOutcome{}, err
 			}
@@ -397,8 +398,6 @@ func promptProviderSetupWizard(ctx context.Context, projectRoot, providerType st
 		return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("unsupported provider.type %q", providerType)
 	}
 	switch descriptor.WizardOnboarding {
-	case provider.WizardOnboardingNone:
-		return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardNext}, nil, nil
 	case provider.WizardOnboardingCatthehackerDocker:
 		if existing != nil && existing.Provider == providerType {
 			fmt.Fprintln(out, "")
@@ -433,11 +432,11 @@ func promptProviderSetupWizard(ctx context.Context, projectRoot, providerType st
 	}
 }
 
-func promptInitProviderWizard(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool) (initWizardResult[string], error) {
+func promptInitProviderWizard(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool, menuState *initProviderMenuState) (initWizardResult[string], error) {
 	hostPlatform := initSandboxPromotionPlatform()
 	record, promoted := initSandboxPromotionLookup(hostPlatform)
 	for {
-		result, _, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, allowBack)
+		result, _, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, allowBack, menuState)
 		if err != nil {
 			return initWizardResult[string]{}, err
 		}
@@ -471,9 +470,6 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 			return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q review requires an image profile", draft.ProviderType)
 		}
 		fmt.Fprintf(out, "  Runner image: %s\n", draft.Profile.SourceImage)
-	case provider.WizardReviewNativeImage:
-		fmt.Fprintf(out, "  Runner image: %s\n", descriptor.WizardReviewSource)
-		fmt.Fprintf(out, "  Reusable artifact: %s\n", descriptor.WizardReviewOutput)
 	default:
 		return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q has unknown wizard review contribution %q", draft.ProviderType, descriptor.WizardReview)
 	}
@@ -539,8 +535,6 @@ func renderInitWizardConfig(draft initWizardDraft) (string, error) {
 		return defaultDockerContainerConfig(draft.AppID, draft.Organization, draft.PrivateKeyPath, draft.PoolNamePrefix, draft.HostTrustMode, draft.HostTrustScopes, draft.RunnerGroup, *draft.Profile, draft.UpdatePolicy), nil
 	case "wsl":
 		return defaultWSLConfig(draft.AppID, draft.Organization, draft.PrivateKeyPath, draft.PoolNamePrefix, draft.RunnerGroup, *draft.Profile, draft.UpdatePolicy), nil
-	case "tart":
-		return defaultTartConfig(draft.AppID, draft.Organization, draft.PrivateKeyPath, draft.PoolNamePrefix, draft.RunnerGroup, draft.UpdatePolicy), nil
 	case "docker-sandboxes":
 		guestPlatform, runnerArchitectureLabel, err := dockerSandboxesPlatform(draft.Profile.HostPlatform)
 		if err != nil {

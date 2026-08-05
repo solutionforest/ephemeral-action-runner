@@ -1,14 +1,14 @@
 # Docker Container Provider
 
-Docker Container creates one privileged Ubuntu runner container per EPAR instance. The outer container starts a private inner Docker daemon, so workflow containers, networks, volumes, and image cache stay inside that disposable runner.
+Docker Container is a compatibility provider that creates one privileged Ubuntu runner container per EPAR instance. The outer container starts a private inner Docker daemon, so workflow containers, networks, volumes, and image cache stay inside that disposable runner. The first-run wizard keeps it behind `C. Show compatibility providers`; existing configurations continue to use the shared lifecycle and cleanup contracts.
 
 ## When To Use It
 
-Choose Docker Container on a Docker-capable host when privileged containers are acceptable and you want strong per-runner Docker resource separation. It is a practical fit for Compose-heavy jobs, including jobs that reuse fixed Compose project names or ports. EPAR does not support a host-Docker-socket provider.
+Choose Docker Container on a Docker-capable host when privileged containers are acceptable and you want strong per-runner Docker resource separation. It is a practical fit for Compose-heavy jobs, including jobs that reuse fixed Compose project names or ports. EPAR does not support a host-Docker-socket provider, and a new setup should start with Docker Sandboxes when its capability checks pass.
 
 ## Support Status
 
-This is a supported provider on hosts whose Docker runtime can run privileged Linux containers. It is trusted-job infrastructure: `--privileged` weakens the normal container boundary, so do not use it for arbitrary untrusted workflow code.
+This is a supported compatibility provider on hosts whose Docker runtime can run privileged Linux containers. It is trusted-job infrastructure: `--privileged` weakens the normal container boundary, so do not use it for arbitrary untrusted workflow code.
 
 ## Prerequisites
 

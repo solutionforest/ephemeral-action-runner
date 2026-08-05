@@ -50,8 +50,6 @@ var initHostTrustOS = detectedInitHostTrustOS()
 
 var initWSLStatus = wslStatus
 
-var initTartVersion = tartVersion
-
 var initResolveHostTrust = hosttrust.Resolve
 
 var initSandboxPromotionPlatform = sandboxpromotion.CurrentPlatform
@@ -800,15 +798,18 @@ type initProviderPrerequisites struct {
 	DockerSandboxesStatus    string
 	WSLAvailable             bool
 	WSLStatus                string
-	TartAvailable            bool
-	TartStatus               string
+}
+
+type initProviderMenuState struct {
+	CompatibilityRevealed bool
 }
 
 func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, sandboxpromotion.Record, *initDockerSandboxesProfile, error) {
 	hostPlatform := initSandboxPromotionPlatform()
 	record, promoted := initSandboxPromotionLookup(hostPlatform)
+	menuState := initProviderMenuState{}
 	for {
-		providerType, _, refresh, err := promptInitProviderChoice(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck)
+		providerType, _, refresh, err := promptInitProviderChoice(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, &menuState)
 		if err != nil {
 			return "", sandboxpromotion.Record{}, nil, err
 		}
@@ -821,8 +822,6 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 			return "", sandboxpromotion.Record{}, nil, fmt.Errorf("provider %q has no registry contribution", providerType)
 		}
 		switch descriptor.WizardOnboarding {
-		case provider.WizardOnboardingNone:
-			return providerType, sandboxpromotion.Record{}, nil, nil
 		case provider.WizardOnboardingCatthehackerDocker:
 			profile, accepted, profileErr := promptDockerImageProfile(ctx, projectRoot, providerType, hostPlatform, out, reader)
 			if profileErr != nil {
@@ -838,15 +837,15 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 	}
 }
 
-func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck bool) (string, bool, bool, error) {
-	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false)
+func promptInitProviderChoice(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck bool, menuState *initProviderMenuState) (string, bool, bool, error) {
+	result, promotionPassed, err := promptInitProviderChoiceWizard(ctx, projectRoot, hostPlatform, record, promoted, out, reader, skipDockerCheck, false, menuState)
 	if err != nil {
 		return "", false, false, err
 	}
 	return result.Value, promotionPassed, result.Action == initWizardRefresh, nil
 }
 
-func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool) (initWizardResult[string], bool, error) {
+func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, record sandboxpromotion.Record, promoted bool, out io.Writer, reader *bufio.Reader, skipDockerCheck, allowBack bool, menuState *initProviderMenuState) (initWizardResult[string], bool, error) {
 	prerequisites := detectInitProviderPrerequisites(ctx, hostPlatform, skipDockerCheck)
 	promotionPassed := false
 	var promotionFailures []sandboxpromotion.Failure
@@ -856,13 +855,13 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 			preflight.Failures = append(preflight.Failures, sandboxpromotion.Failure{
 				Gate:       "operator kill switch",
 				Detail:     sandboxpromotion.DisableEnvironment + "=1 disables Docker Sandboxes admission",
-				Resolution: "Unset the kill switch only after the Docker Sandboxes issue is resolved, or explicitly choose another provider.",
+				Resolution: "Unset the kill switch only after the Docker Sandboxes issue is resolved, or choose C in the provider menu to show compatibility providers.",
 			})
 		} else if err := sandboxpromotion.Validate(record); err != nil {
 			preflight.Failures = append(preflight.Failures, sandboxpromotion.Failure{
 				Gate:       "promotion record",
 				Detail:     err.Error(),
-				Resolution: "Explicitly choose Docker Container or another provider and report the invalid embedded promotion record.",
+				Resolution: "Choose C in the provider menu to show compatibility providers, and report the invalid embedded promotion record.",
 			})
 		} else if prerequisites.DockerSandboxesAvailable {
 			preflightContext, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -878,7 +877,7 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		} else {
 			for _, failure := range promotionFailures {
 				fmt.Fprintf(out, "  FAIL [%s]: %s\n", failure.Gate, failure.Detail)
-				fmt.Fprintf(out, "    Action: %s\n", failure.Resolution)
+				fmt.Fprintf(out, "    Action: %s\n", collapsedProviderResolution(failure.Resolution))
 			}
 			if len(promotionFailures) == 0 {
 				fmt.Fprintf(out, "  FAIL [prerequisites]: %s\n", prerequisites.DockerSandboxesStatus)
@@ -888,11 +887,19 @@ func promptInitProviderChoiceWizard(ctx context.Context, projectRoot string, hos
 		}
 	}
 
-	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, allowBack)
+	result, err := promptProviderOptionsWizard(out, reader, prerequisites, promoted, promotionPassed, allowBack, menuState)
 	if err != nil {
 		return initWizardResult[string]{}, false, err
 	}
 	return result, promotionPassed, nil
+}
+
+func collapsedProviderResolution(resolution string) string {
+	normalized := strings.ToLower(resolution)
+	if strings.Contains(normalized, "docker container") || strings.Contains(normalized, "another provider") {
+		return "Choose C in the provider menu to show compatibility providers; EPAR will not select one automatically. Resolve the failure above before retrying Docker Sandboxes."
+	}
+	return resolution
 }
 
 func promptDockerSandboxesProfile(ctx context.Context, projectRoot string, hostPlatform sandboxpromotion.Platform, out io.Writer, reader *bufio.Reader) (*initDockerSandboxesProfile, bool, error) {
@@ -1435,21 +1442,18 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 		result.WSLStatus = "READY — Docker and WSL2 are available"
 	}
 
-	switch {
-	case initGOOS != "darwin":
-		result.TartStatus = "UNAVAILABLE — native macOS and tart are required"
-	case !tartAvailable():
-		result.TartStatus = "UNAVAILABLE — tart --version failed"
-	default:
-		result.TartAvailable = true
-		result.TartStatus = "READY — tart is available"
-	}
 	return result
 }
 
-func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, allowBack bool) (initWizardResult[string], error) {
+func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisites initProviderPrerequisites, promoted, promotionPassed, allowBack bool, menuState *initProviderMenuState) (initWizardResult[string], error) {
+	if menuState == nil {
+		menuState = &initProviderMenuState{}
+	}
 	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
 	for _, descriptor := range providerregistry.Descriptors() {
+		if !descriptor.WizardSupported {
+			continue
+		}
 		option := initProviderOption{
 			Number:  descriptor.WizardNumber,
 			Type:    descriptor.Type,
@@ -1466,9 +1470,6 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 		case provider.WizardPrerequisiteWSL2:
 			option.Available = prerequisites.WSLAvailable
 			option.Status = prerequisites.WSLStatus
-		case provider.WizardPrerequisiteTart:
-			option.Available = prerequisites.TartAvailable
-			option.Status = prerequisites.TartStatus
 		default:
 			return initWizardResult[string]{}, fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
 		}
@@ -1477,84 +1478,104 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 	if err := validateWizardProviderOptions(options); err != nil {
 		return initWizardResult[string]{}, err
 	}
-	defaultNumber := markDefaultProviderOption(options, "docker-sandboxes")
+	markDefaultProviderOption(options, "docker-sandboxes")
 
-	fmt.Fprintln(out, "")
-	if defaultNumber == "" {
-		fmt.Fprintln(out, "Runner provider (explicit choice required):")
-	} else {
-		fmt.Fprintln(out, "Runner provider:")
-	}
-	for _, option := range options {
-		defaultLabel := ""
-		if option.Default {
-			defaultLabel = " (default)"
-		}
-		fmt.Fprintf(out, "  %s. %s%s\n", option.Number, option.Label, defaultLabel)
-		fmt.Fprintf(out, "     Prerequisites: %s\n", option.Status)
-	}
-	fmt.Fprintln(out, "  R. Refresh provider prerequisites")
-	if allowBack {
-		fmt.Fprintln(out, "  0. Back")
-	}
 	for {
-		var value string
-		var hitEOF bool
-		var err error
+		visible := make([]initProviderOption, 0, len(options))
+		for _, option := range options {
+			descriptor, _ := providerregistry.DescriptorFor(option.Type)
+			if descriptor.WizardTier == provider.WizardTierPrimary || menuState.CompatibilityRevealed {
+				visible = append(visible, option)
+			}
+		}
+		defaultNumber := markDefaultProviderOption(visible, "docker-sandboxes")
+		fmt.Fprintln(out, "")
 		if defaultNumber == "" {
-			fmt.Fprint(out, "Runner provider: ")
-			value, err = reader.ReadString('\n')
-			if err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(out, "Runner provider (explicit choice required):")
+		} else {
+			fmt.Fprintln(out, "Runner provider:")
+		}
+		for _, option := range visible {
+			defaultLabel := ""
+			if option.Default {
+				defaultLabel = " (default)"
+			}
+			fmt.Fprintf(out, "  %s. %s%s\n", option.Number, option.Label, defaultLabel)
+			fmt.Fprintf(out, "     Prerequisites: %s\n", option.Status)
+		}
+		if !menuState.CompatibilityRevealed {
+			fmt.Fprintln(out, "  C. Show compatibility providers")
+		}
+		fmt.Fprintln(out, "  R. Refresh provider prerequisites")
+		if allowBack {
+			fmt.Fprintln(out, "  0. Back")
+		}
+		for {
+			var value string
+			var hitEOF bool
+			var err error
+			if defaultNumber == "" {
+				fmt.Fprint(out, "Runner provider: ")
+				value, err = reader.ReadString('\n')
+				if err != nil && !errors.Is(err, io.EOF) {
+					return initWizardResult[string]{}, err
+				}
+				hitEOF = errors.Is(err, io.EOF)
+				if hitEOF {
+					err = nil
+				}
+				value = strings.TrimSpace(value)
+			} else {
+				value, hitEOF, err = promptDefault(out, reader, "Runner provider", defaultNumber)
+			}
+			if err != nil {
 				return initWizardResult[string]{}, err
 			}
-			hitEOF = errors.Is(err, io.EOF)
-			if hitEOF {
-				err = nil
+			normalized := strings.ToLower(value)
+			if normalized == "r" || normalized == "refresh" {
+				return initWizardResult[string]{Action: initWizardRefresh}, nil
 			}
-			value = strings.TrimSpace(value)
-		} else {
-			value, hitEOF, err = promptDefault(out, reader, "Runner provider", defaultNumber)
-		}
-		if err != nil {
-			return initWizardResult[string]{}, err
-		}
-		normalized := strings.ToLower(value)
-		if normalized == "r" || normalized == "refresh" {
-			return initWizardResult[string]{Action: initWizardRefresh}, nil
-		}
-		if allowBack && (normalized == "0" || normalized == "back") {
-			return initWizardResult[string]{Action: initWizardBack}, nil
-		}
-		var selected *initProviderOption
-		for index := range options {
-			option := &options[index]
-			if normalized == option.Number || normalized == option.Type {
-				selected = option
+			if !menuState.CompatibilityRevealed && (normalized == "c" || normalized == "compatibility") {
+				menuState.CompatibilityRevealed = true
 				break
 			}
-			for _, alias := range option.Aliases {
-				if normalized == alias {
+			if allowBack && (normalized == "0" || normalized == "back") {
+				return initWizardResult[string]{Action: initWizardBack}, nil
+			}
+			var selected *initProviderOption
+			for index := range visible {
+				option := &visible[index]
+				if normalized == option.Number || normalized == option.Type {
 					selected = option
 					break
 				}
+				for _, alias := range option.Aliases {
+					if normalized == alias {
+						selected = option
+						break
+					}
+				}
+				if selected != nil {
+					break
+				}
+			}
+			if selected != nil && selected.Available {
+				return initWizardResult[string]{Action: initWizardNext, Value: selected.Type}, nil
 			}
 			if selected != nil {
-				break
+				fmt.Fprintf(out, "%s is unavailable: %s\n", selected.Label, selected.Status)
+				if selected.Type == "docker-sandboxes" {
+					fmt.Fprintln(out, "Action: Install or start Docker and Docker Sandboxes, verify Docker with 'docker info', then run 'sbx diagnose --output json' and resolve each failed-check hint. Choose R to refresh; EPAR will not fall back to another provider.")
+				}
+			} else {
+				fmt.Fprintln(out, "Choose an available provider number or name shown above, C to show compatibility providers, R to refresh, or 0 to go back when shown.")
 			}
-		}
-		if selected != nil && selected.Available {
-			return initWizardResult[string]{Action: initWizardNext, Value: selected.Type}, nil
-		}
-		if selected != nil {
-			fmt.Fprintf(out, "%s is unavailable: %s\n", selected.Label, selected.Status)
-		} else {
-			fmt.Fprintln(out, "Choose an available provider number or name shown above, R to refresh, or 0 to go back when shown.")
-		}
-		if hitEOF {
-			if selected != nil {
-				return initWizardResult[string]{}, fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
+			if hitEOF {
+				if selected != nil {
+					return initWizardResult[string]{}, fmt.Errorf("runner provider %q is unavailable: %s", value, selected.Status)
+				}
+				return initWizardResult[string]{}, fmt.Errorf("invalid runner provider %q", value)
 			}
-			return initWizardResult[string]{}, fmt.Errorf("invalid runner provider %q", value)
 		}
 	}
 }
@@ -1783,19 +1804,6 @@ func wslStatus(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("wsl.exe --status output exceeds %d bytes", maxOutputBytes)
 	}
 	return output.Bytes(), nil
-}
-
-func tartAvailable() bool {
-	if initGOOS != "darwin" {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	return initTartVersion(ctx) == nil
-}
-
-func tartVersion(ctx context.Context) error {
-	return exec.CommandContext(ctx, "tart", "--version").Run()
 }
 
 type boundedBuffer struct {
@@ -2119,94 +2127,6 @@ timeouts:
   githubOnlineSeconds: 180
   commandSeconds: 900
 `, appID, organization, privateKeyPath, profile.SourceImage, profile.GuestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
-}
-
-func defaultTartConfig(appID int64, organization, privateKeyPath string, poolNamePrefix string, runnerGroup initRunnerGroupSelection, updatePolicy initImageUpdatePolicy) string {
-	return fmt.Sprintf(`# Experimental: this default is a basic Ubuntu ARM64 Tart VM, not a GitHub-hosted runner image.
-# It does not include the broad dependency set from https://github.com/actions/runner-images.
-github:
-  appId: %d
-  organization: %s
-  privateKeyPath: %s
-  apiBaseUrl: https://api.github.com
-  webBaseUrl: https://github.com
-
-image:
-  sourceImage: ghcr.io/cirruslabs/ubuntu:latest
-  outputImage: epar-ubuntu-24-arm64
-  upstreamDir: third_party/runner-images
-  upstreamLock: third_party/runner-images.lock
-  runnerVersion: latest
-  updateFrequency: %s
-  updateTime: "%s"
-  customInstallScripts:
-    # - examples/custom-install/install-extra-apt-tools.sh
-
-pool:
-  instances: 1
-  # Must be unique for this machine/config within the GitHub organization.
-  namePrefix: %s
-  replacementRetryInitialSeconds: 15
-  replacementRetryMaxSeconds: 1800
-  replacementRetryMultiplier: 2
-  replacementRetryJitterPercent: 20
-
-storage:
-  minimumFree: 1GiB
-  gracePeriod: 168h
-  keepPrevious: 0
-  automaticHousekeeping: conservative
-  buildCacheLimit: 20GiB
-  goCacheLimit: 10GiB
-
-logging:
-  directory: work/logs
-  managerSinks: [console]
-  managerConsoleFormat: text
-  managerConsoleTextFormat: "{time} [{level}] {message}"
-  managerFileFormat: json
-  transcriptSinks: [file]
-  transcriptConsoleFormat: text
-  maxFileSizeMiB: 100
-  maxBackups: 3
-  compressBackups: true
-  retentionEnabled: true
-  retentionMaxTotalMiB: 1024
-  managerMaxAgeDays: 14
-  instanceMaxAgeDays: 14
-  buildMaxAgeDays: 14
-  errorMaxAgeDays: 30
-  benchmarkMaxAgeDays: 90
-  retentionIntervalMinutes: 60
-
-runner:
-  group: %s
-  labels: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-base]
-  includeHostLabel: true
-  ephemeral: true
-
-security:
-  runnerGroup:
-    enforcement: %s
-    requireExplicitGroup: %t
-    requireNonDefaultGroup: %t
-    requiredRepositoryAccess: %s
-    requirePublicRepositoriesDisabled: %t
-
-provider:
-  type: tart
-  sourceImage: epar-ubuntu-24-arm64
-  network: default
-
-docker:
-  registryMirrors:
-    # - https://mirror.example.test
-
-timeouts:
-  bootSeconds: 180
-  githubOnlineSeconds: 180
-  commandSeconds: 900
-`, appID, organization, privateKeyPath, updatePolicy.Frequency, updatePolicy.Time, poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled)
 }
 
 var stdinIsInteractive = func() bool {

@@ -15,6 +15,8 @@ func TestWizardContributionKindsRejectMissingAndUnknownValues(t *testing.T) {
 		"unknown host trust":   WizardHostTrustKind("future").Valid(),
 		"missing review":       WizardReviewKind("").Valid(),
 		"unknown review":       WizardReviewKind("future").Valid(),
+		"missing tier":         WizardTier("").Valid(),
+		"unknown tier":         WizardTier("future").Valid(),
 	} {
 		if valid {
 			t.Errorf("%s contribution was accepted", name)
@@ -27,13 +29,12 @@ func TestWizardContributionKindsAcceptRegisteredStrategies(t *testing.T) {
 		"Docker prerequisite":           WizardPrerequisiteDocker.Valid(),
 		"Docker Sandboxes prerequisite": WizardPrerequisiteDockerSandboxes.Valid(),
 		"WSL2 prerequisite":             WizardPrerequisiteWSL2.Valid(),
-		"Tart prerequisite":             WizardPrerequisiteTart.Valid(),
-		"no onboarding":                 WizardOnboardingNone.Valid(),
 		"Catthehacker onboarding":       WizardOnboardingCatthehackerDocker.Valid(),
 		"no host trust":                 WizardHostTrustNone.Valid(),
 		"overlay host trust":            WizardHostTrustOverlay.Valid(),
 		"Docker image review":           WizardReviewDockerImage.Valid(),
-		"native image review":           WizardReviewNativeImage.Valid(),
+		"primary tier":                  WizardTierPrimary.Valid(),
+		"compatibility tier":            WizardTierCompatibility.Valid(),
 	} {
 		if !valid {
 			t.Errorf("%s contribution was rejected", name)
@@ -44,6 +45,7 @@ func TestWizardContributionKindsAcceptRegisteredStrategies(t *testing.T) {
 func TestValidateWizardContributionsRejectsIncompatibleStrategies(t *testing.T) {
 	base := Descriptor{
 		WizardSupported:     true,
+		WizardTier:          WizardTierPrimary,
 		WizardNumber:        "1",
 		WizardLabel:         "Example",
 		WizardAliases:       []string{"example"},
@@ -58,12 +60,12 @@ func TestValidateWizardContributionsRejectsIncompatibleStrategies(t *testing.T) 
 	tests := map[string]Descriptor{
 		"onboarding without compatible review": func() Descriptor {
 			value := base
-			value.WizardReview = WizardReviewNativeImage
+			value.WizardReview = "future"
 			return value
 		}(),
 		"review without compatible onboarding": func() Descriptor {
 			value := base
-			value.WizardOnboarding = WizardOnboardingNone
+			value.WizardOnboarding = "future"
 			return value
 		}(),
 		"Docker onboarding without profiles": func() Descriptor {
@@ -81,28 +83,25 @@ func TestValidateWizardContributionsRejectsIncompatibleStrategies(t *testing.T) 
 	}
 }
 
-func TestValidateWizardContributionsAcceptsNativeProviderWithoutOnboarding(t *testing.T) {
+func TestValidateWizardContributionsIgnoresRuntimeOnlyProvider(t *testing.T) {
 	descriptor := Descriptor{
-		WizardSupported:    true,
-		WizardNumber:       "4",
-		WizardLabel:        "Native",
-		WizardAliases:      []string{"native"},
-		ImageMode:          ImageModeNative,
-		WizardPrerequisite: WizardPrerequisiteTart,
-		WizardOnboarding:   WizardOnboardingNone,
-		WizardHostTrust:    WizardHostTrustNone,
-		WizardReview:       WizardReviewNativeImage,
-		WizardReviewSource: "example/source",
-		WizardReviewOutput: "example-output",
+		Type:                   "native",
+		ConfigurationDecoder:   true,
+		ConfigurationDefaults:  true,
+		ConfigurationValidator: true,
+		LifecycleSupported:     true,
+		StorageSupported:       true,
+		ImageMode:              ImageModeNative,
 	}
 	if err := ValidateWizardContributions(descriptor); err != nil {
-		t.Fatalf("compatible native provider was rejected: %v", err)
+		t.Fatalf("runtime-only provider was rejected by wizard validation: %v", err)
 	}
 }
 
 func TestValidateWizardContributionsExplainsMissingAndUnknownContributions(t *testing.T) {
 	base := Descriptor{
 		WizardSupported:     true,
+		WizardTier:          WizardTierPrimary,
 		WizardNumber:        "1",
 		WizardLabel:         "Example",
 		WizardAliases:       []string{"example"},
@@ -120,6 +119,7 @@ func TestValidateWizardContributionsExplainsMissingAndUnknownContributions(t *te
 		edit func(*Descriptor)
 	}{
 		{name: "missing prerequisite", want: "prerequisite", edit: func(value *Descriptor) { value.WizardPrerequisite = "" }},
+		{name: "missing tier", want: "tier", edit: func(value *Descriptor) { value.WizardTier = "" }},
 		{name: "unknown onboarding", want: "onboarding", edit: func(value *Descriptor) { value.WizardOnboarding = "future" }},
 		{name: "missing host trust", want: "host-trust", edit: func(value *Descriptor) { value.WizardHostTrust = "" }},
 		{name: "unknown review", want: "review", edit: func(value *Descriptor) { value.WizardReview = "future" }},

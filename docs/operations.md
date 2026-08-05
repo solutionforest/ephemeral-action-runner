@@ -2,6 +2,8 @@
 
 EPAR is a foreground supervisor. Keep it running while the pool should accept jobs; it creates, monitors, retires, and replaces disposable runners within the configured capacity.
 
+Docker Sandboxes is the primary provider on Linux, macOS, and Windows hosts when its admission checks pass. Docker Container and WSL remain compatibility providers, and Tart runtime/cleanup support is retained only for existing configurations; startup never silently changes a configured provider.
+
 ```mermaid
 flowchart LR
   Start["Start or resume pool"] --> Ready["Maintain ready runners"]

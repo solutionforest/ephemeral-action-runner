@@ -53,7 +53,7 @@ The setup helper is privileged. Use it only in trusted workflows and treat its p
 | --- | --- |
 | Docker Container | Run the setup action inside the disposable job before Docker or Compose uses a foreign image. No EPAR configuration key enables universal emulation. |
 | WSL | Run the setup action inside the WSL runner if its Linux Docker daemon needs a foreign image. An x64 WSL runner does not gain ARM64 execution merely by pulling an ARM64 image. |
-| Tart on Apple Silicon | The guest is ARM64. The optional Rosetta path is experimental and not equivalent to QEMU/binfmt. Use a distinct label and validate the exact image/workload. |
+| Tart on Apple Silicon (retired) | The guest is ARM64. The optional Rosetta path is retained for existing configurations and is not equivalent to QEMU/binfmt. Use a distinct label and validate the exact image/workload. |
 | Docker Sandboxes | Keep `provider.platform` native. EPAR automatically runs the pinned `tonistiigi/binfmt --install all` equivalent inside every sandbox VM; no emulation configuration or workflow-level privileged installer is required. |
 | GitHub-hosted Windows or macOS | These labels do not replace a Linux Docker daemon for container actions or service containers. Use a suitable Linux execution surface. |
 

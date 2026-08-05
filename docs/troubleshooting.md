@@ -109,7 +109,7 @@ Check the diagnostic result before editing configuration:
 sbx diagnose --output json
 ```
 
-EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose Refresh in the provider menu to recheck availability; do not manually force a provider selection or substitute Docker Container for a configured Docker Sandboxes pool.
+EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose `R` to refresh availability; do not manually force a provider selection or substitute a compatibility provider for a configured Docker Sandboxes pool. Use `C. Show compatibility providers` only when you deliberately intend to create or maintain a compatibility configuration.
 
 ## Docker Sandboxes rejects template, policy, or capacity
 

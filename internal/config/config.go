@@ -229,8 +229,6 @@ func Default() Config {
 			WebBaseURL: "https://github.com",
 		},
 		Image: ImageConfig{
-			SourceImage:     "ghcr.io/cirruslabs/ubuntu:latest",
-			OutputImage:     "epar-ubuntu-24-arm64",
 			UpstreamDir:     "third_party/runner-images",
 			UpstreamLock:    "third_party/runner-images.lock",
 			RunnerVersion:   "latest",
@@ -277,7 +275,6 @@ func Default() Config {
 			RetentionIntervalMinutes: 60,
 		},
 		Runner: RunnerConfig{
-			Labels:           []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
 			IncludeHostLabel: true,
 			Ephemeral:        true,
 		},
@@ -289,12 +286,6 @@ func Default() Config {
 				RequiredRepositoryAccess:          RunnerGroupRepositoryAccessSelected,
 				RequirePublicRepositoriesDisabled: true,
 			},
-		},
-		Provider: ProviderConfig{
-			Type:        "tart",
-			SourceImage: "epar-ubuntu-24-arm64",
-			Network:     "default",
-			InstallRoot: "work/wsl",
 		},
 		DockerSandboxes: DockerSandboxesConfig{
 			NetworkBaseline:      DockerSandboxesNetworkBaselineOpen,
@@ -791,7 +782,26 @@ func isKnownSection(section string) bool {
 
 func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 	switch cfg.Provider.Type {
+	case "tart":
+		if !explicit["image.sourceImage"] {
+			cfg.Image.SourceImage = "ghcr.io/cirruslabs/ubuntu:latest"
+		}
+		if !explicit["image.outputImage"] {
+			cfg.Image.OutputImage = "epar-ubuntu-24-arm64"
+		}
+		if !explicit["provider.sourceImage"] {
+			cfg.Provider.SourceImage = cfg.Image.OutputImage
+		}
+		if !explicit["provider.network"] {
+			cfg.Provider.Network = "default"
+		}
+		if !explicit["runner.labels"] {
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}
+		}
 	case "wsl":
+		if !explicit["provider.installRoot"] {
+			cfg.Provider.InstallRoot = "work/wsl"
+		}
 		sourceType := cfg.Image.SourceType
 		if !explicit["image.sourceType"] {
 			sourceType = ImageSourceDockerImage

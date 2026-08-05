@@ -77,7 +77,7 @@ func TestLogsPathListAndPrune(t *testing.T) {
 func TestCLIConfigLoadWarnsForLegacyPoolLogDir(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "legacy.yml")
-	if err := os.WriteFile(configPath, []byte("pool:\n  logDir: legacy/logs\n"), 0o644); err != nil {
+	if err := os.WriteFile(configPath, []byte("provider:\n  type: docker-container\npool:\n  logDir: legacy/logs\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	stderr, err := captureStderr(t, func() error {
@@ -177,7 +177,7 @@ func TestWriteLastErrorReportRedactsSecretsAndRestrictsExistingFile(t *testing.T
 func writeLoggingCommandConfig(t *testing.T, root, directory string) string {
 	t.Helper()
 	path := filepath.Join(root, "config.yml")
-	content := "logging:\n  directory: " + directory + "\n  instanceMaxAgeDays: 1\n"
+	content := "provider:\n  type: docker-container\nlogging:\n  directory: " + directory + "\n  instanceMaxAgeDays: 1\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}

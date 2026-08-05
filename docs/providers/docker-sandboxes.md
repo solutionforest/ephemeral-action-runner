@@ -1,6 +1,6 @@
 # Docker Sandboxes Provider
 
-Docker Sandboxes places each GitHub Actions listener inside a dedicated microVM sandbox with a private guest filesystem and Docker daemon. This is EPAR's strongest current host-isolation boundary. Its protection still depends on the installed Docker Sandboxes runtime, the host platform, EPAR's configuration, and the resources deliberately exposed to the workflow.
+Docker Sandboxes places each GitHub Actions listener inside a dedicated microVM sandbox with a private guest filesystem and Docker daemon. It is EPAR's primary provider on Linux, macOS, and Windows hosts when local capability checks pass, and its strongest current host-isolation boundary. Its protection still depends on the installed Docker Sandboxes runtime, the host platform, EPAR's configuration, and the resources deliberately exposed to the workflow.
 
 ```mermaid
 flowchart TB
@@ -29,7 +29,7 @@ Choose Docker Sandboxes when its local checks pass and you want a microVM bounda
 
 ## Support Status
 
-EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and QEMU/binfmt setup admission before any runner starts. Windows x86_64 has the recorded real-host lifecycle evidence. Other host/platform combinations remain preview-only until equivalent real-host build, load, lifecycle, and independent-certification evidence is recorded; bundling generic QEMU handlers does not by itself certify every foreign workload.
+EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and QEMU/binfmt setup admission before any runner starts. Linux, macOS, and Windows host support is backed by completed cross-platform live build, load, lifecycle, and cleanup testing; this status does not claim independent certification or certify every foreign workload. Bundling generic QEMU handlers does not by itself prove a workload is compatible.
 
 ## Prerequisites
 
@@ -92,7 +92,7 @@ The provider keeps emulation selection behind an internal target-agnostic bounda
 
 ## Normal Workflow
 
-1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the proven Catthehacker `full-latest` or `act-latest` profile, then review the non-blocking physical-growth estimate, sparse logical limits, and reserve. The generated config uses no custom install scripts; add them afterward when needed. Specialized and custom tags remain available to Docker Container and WSL, but Docker Sandboxes rejects them because they do not guarantee the private Docker daemon and runtime closure required by its template contract.
+1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the Catthehacker `full-latest` or `act-latest` profile, then review the non-blocking physical-growth estimate, sparse logical limits, and reserve. The generated config uses no custom install scripts; add them afterward when needed. The wizard's initial screen keeps compatibility providers behind `C. Show compatibility providers`; their specialized and custom tags do not change Docker Sandboxes' requirement for a private Docker daemon and runtime closure.
 2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, performs authoritative storage admission, builds and imports the template, and activates it only after exact readback. On macOS or Linux, review the narrowly scoped helper prompts described in [Private Filesystem and VM Helper Approval](#private-filesystem-and-vm-helper-approval) if the host presents them.
 3. Prewarm the selected template without GitHub registration:
 
@@ -137,7 +137,7 @@ The opt-in `TestLiveRunnerTemplateIsolation` proof also exercises authenticated 
 
 - `networkBaseline: open` permits public egress, which can exfiltrate secrets or data exposed to the workflow. Use least-privilege runner groups and secrets, and choose `balanced` with narrow allow rules for higher-risk workloads.
 - Docker Sandboxes template cache storage is shared host state; it is not a per-sandbox root-disk measurement.
-- macOS ARM64 remains preview-only while Docker Sandboxes and its host-authentication contract continue to evolve. Current v0.37.1 evidence includes three consecutive private Docker Hub pulls with intentionally different host and workflow identities, transparent registry/auth/blob routing, AMD64 image pulls from an ARM64 guest daemon, ephemeral replacement, and exact sandbox cleanup.
+- macOS ARM64 is part of the current host support backed by completed cross-platform live lifecycle and cleanup testing. Operators should still run local admission and workload validation; this support statement does not claim independent certification. Current v0.37.1 evidence includes three consecutive private Docker Hub pulls with intentionally different host and workflow identities, transparent registry/auth/blob routing, AMD64 image pulls from an ARM64 guest daemon, ephemeral replacement, and exact sandbox cleanup.
 - Transparent egress preserves ordinary per-job Docker Hub credentials, but a root-capable workflow can deliberately opt back into the Docker Sandboxes forward proxy. Use Docker Container when that residual host credential capability is outside the trust boundary.
 - A stopped sandbox is diagnostic state, not proof of deletion. Unknown state consumes capacity and blocks replacement.
 - `EPAR_DISABLE_DOCKER_SANDBOXES=1` fails admission closed during an incident or compatibility problem.

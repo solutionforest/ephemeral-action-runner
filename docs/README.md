@@ -1,6 +1,6 @@
 # EPAR documentation
 
-Use these guides after the short [README quick start](../README.md). Start with the task you need to complete, then open a provider guide only when choosing or changing the runner environment.
+Use these guides after the short [README quick start](../README.md). Docker Sandboxes is the primary provider for Linux, macOS, and Windows hosts when its capability checks pass; open a compatibility guide only when an existing configuration needs that provider.
 
 ## Start and configure
 
@@ -11,10 +11,9 @@ Use these guides after the short [README quick start](../README.md). Start with 
 
 ## Choose a provider
 
-- [Docker Container](providers/docker-container.md): disposable containers with a private Docker daemon.
-- [Docker Sandboxes](providers/docker-sandboxes.md): dedicated microVM runners and guided template provisioning.
-- [WSL](providers/wsl.md): disposable Windows WSL2 runners.
-- [Tart](providers/tart.md): experimental Apple Silicon ARM64 Linux VMs.
+- [Docker Sandboxes](providers/docker-sandboxes.md): the primary provider with dedicated microVM runners and guided template provisioning on Linux, macOS, and Windows hosts.
+
+Four provider identities remain accepted at runtime, while three are onboarding-capable. The first-run wizard shows only Docker Sandboxes initially; choose `C. Show compatibility providers` to reveal [Docker Container](providers/docker-container.md) and [WSL2](providers/wsl.md) for existing compatibility deployments. [Tart](providers/tart.md) is retired and has no onboarding path; its guide remains for existing configurations and exact runtime/cleanup compatibility.
 
 ## Operate and maintain
 
@@ -29,7 +28,7 @@ Use these guides after the short [README quick start](../README.md). Start with 
 
 ## Safety and support
 
-- [Security](security.md): provider-dependent isolation, secrets, provider caveats, and private vulnerability reporting.
+- [Security](security.md): Docker Sandboxes isolation, compatibility-provider caveats, secrets, and private vulnerability reporting.
 - [Support](../SUPPORT.md): information to collect before opening an issue.
 
 ## Contribute

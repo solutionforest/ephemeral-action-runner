@@ -9,6 +9,7 @@ type Descriptor struct {
 	Type                   string
 	DisplayName            string
 	WizardSupported        bool
+	WizardTier             WizardTier
 	WizardNumber           string
 	WizardLabel            string
 	WizardAliases          []string
@@ -25,8 +26,6 @@ type Descriptor struct {
 	WizardOnboarding       WizardOnboardingKind
 	WizardHostTrust        WizardHostTrustKind
 	WizardReview           WizardReviewKind
-	WizardReviewSource     string
-	WizardReviewOutput     string
 }
 
 type WizardImageProfile struct {
@@ -46,12 +45,11 @@ const (
 	WizardPrerequisiteDocker          WizardPrerequisiteKind = "docker"
 	WizardPrerequisiteDockerSandboxes WizardPrerequisiteKind = "docker-sandboxes"
 	WizardPrerequisiteWSL2            WizardPrerequisiteKind = "wsl2"
-	WizardPrerequisiteTart            WizardPrerequisiteKind = "tart"
 )
 
 func (kind WizardPrerequisiteKind) Valid() bool {
 	switch kind {
-	case WizardPrerequisiteDocker, WizardPrerequisiteDockerSandboxes, WizardPrerequisiteWSL2, WizardPrerequisiteTart:
+	case WizardPrerequisiteDocker, WizardPrerequisiteDockerSandboxes, WizardPrerequisiteWSL2:
 		return true
 	default:
 		return false
@@ -61,13 +59,12 @@ func (kind WizardPrerequisiteKind) Valid() bool {
 type WizardOnboardingKind string
 
 const (
-	WizardOnboardingNone               WizardOnboardingKind = "none"
 	WizardOnboardingCatthehackerDocker WizardOnboardingKind = "catthehacker-docker"
 )
 
 func (kind WizardOnboardingKind) Valid() bool {
 	switch kind {
-	case WizardOnboardingNone, WizardOnboardingCatthehackerDocker:
+	case WizardOnboardingCatthehackerDocker:
 		return true
 	default:
 		return false
@@ -94,12 +91,27 @@ type WizardReviewKind string
 
 const (
 	WizardReviewDockerImage WizardReviewKind = "docker-image"
-	WizardReviewNativeImage WizardReviewKind = "native-image"
 )
 
 func (kind WizardReviewKind) Valid() bool {
 	switch kind {
-	case WizardReviewDockerImage, WizardReviewNativeImage:
+	case WizardReviewDockerImage:
+		return true
+	default:
+		return false
+	}
+}
+
+type WizardTier string
+
+const (
+	WizardTierPrimary       WizardTier = "primary"
+	WizardTierCompatibility WizardTier = "compatibility"
+)
+
+func (tier WizardTier) Valid() bool {
+	switch tier {
+	case WizardTierPrimary, WizardTierCompatibility:
 		return true
 	default:
 		return false
@@ -111,6 +123,9 @@ func (kind WizardReviewKind) Valid() bool {
 func ValidateWizardContributions(descriptor Descriptor) error {
 	if !descriptor.WizardSupported {
 		return nil
+	}
+	if !descriptor.WizardTier.Valid() {
+		return fmt.Errorf("unknown onboarding tier %q", descriptor.WizardTier)
 	}
 	if descriptor.WizardNumber == "" || descriptor.WizardLabel == "" || len(descriptor.WizardAliases) == 0 {
 		return fmt.Errorf("wizard number, label, and aliases are required")
@@ -138,19 +153,6 @@ func ValidateWizardContributions(descriptor Descriptor) error {
 		}
 		if !descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0 {
 			return fmt.Errorf("Catthehacker onboarding requires guided artifact profiles")
-		}
-	case WizardOnboardingNone:
-		if descriptor.WizardReview != WizardReviewNativeImage {
-			return fmt.Errorf("providers without onboarding require the native-image review contribution")
-		}
-		if descriptor.ImageMode != ImageModeNative {
-			return fmt.Errorf("providers without onboarding require native image mode, got %q", descriptor.ImageMode)
-		}
-		if descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) != 0 {
-			return fmt.Errorf("providers without onboarding cannot declare guided artifact profiles")
-		}
-		if descriptor.WizardReviewSource == "" || descriptor.WizardReviewOutput == "" {
-			return fmt.Errorf("native-image review requires source and output metadata")
 		}
 	}
 	return nil

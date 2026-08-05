@@ -37,6 +37,7 @@ var entries = []entry{
 			Type:                   "docker-sandboxes",
 			DisplayName:            "Docker Sandboxes",
 			WizardSupported:        true,
+			WizardTier:             provider.WizardTierPrimary,
 			WizardNumber:           "1",
 			WizardLabel:            "Docker Sandboxes — recommended",
 			WizardAliases:          []string{"docker-sandboxes", "sandboxes"},
@@ -59,7 +60,7 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "2", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
+		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardTier: provider.WizardTierCompatibility, WizardNumber: "2", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
 			environment := map[string]string{
@@ -71,14 +72,14 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
+		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardTier: provider.WizardTierCompatibility, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			installRoot := config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)
 			return adaptLegacy(wsl.New("", installRoot, projectRoot, dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (experimental)", WizardSupported: true, WizardNumber: "4", WizardLabel: "Tart (experimental)", WizardAliases: []string{"tart"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative, WizardPrerequisite: provider.WizardPrerequisiteTart, WizardOnboarding: provider.WizardOnboardingNone, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewNativeImage, WizardReviewSource: "ghcr.io/cirruslabs/ubuntu:latest", WizardReviewOutput: "epar-ubuntu-24-arm64"},
+		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (retired)", WizardSupported: false, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			return adaptLegacy(tart.New("", dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},

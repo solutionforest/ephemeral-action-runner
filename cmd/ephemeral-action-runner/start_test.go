@@ -155,7 +155,7 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n\n\n\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -203,7 +203,7 @@ func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n\n\nn\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\nn\n"),
 		Out:         &out,
 		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
 			t.Fatal("manager factory should not run after choosing to review the new config")
@@ -245,7 +245,7 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n\n\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n3\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -331,54 +331,6 @@ func TestStartInteractiveMissingConfigCanSelectDockerSandboxes(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Docker Sandboxes — recommended") || !strings.Contains(out.String(), "Continuing with") {
 		t.Fatalf("output did not include capability-ready Docker Sandboxes selection and start continuation:\n%s", out.String())
-	}
-	assertSingleFinalInitReview(t, out.String())
-	if fake.ensureCalls != 1 || fake.runCalls != 1 {
-		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
-	}
-}
-
-func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
-	dir := t.TempDir()
-	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
-	stubTartAvailable(t)
-	oldInteractive := stdinIsInteractive
-	oldDocker := dockerAvailable
-	t.Cleanup(func() {
-		stdinIsInteractive = oldInteractive
-		dockerAvailable = oldDocker
-	})
-	stdinIsInteractive = func() bool { return true }
-	dockerAvailable = func(context.Context) error {
-		return errors.New("Docker is unavailable on this Mac")
-	}
-
-	fake := &fakeStarterManager{}
-	var out bytes.Buffer
-	err := runStartWithOptions(startOptions{
-		Context:     context.Background(),
-		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n4\n\n\n\n"),
-		Out:         &out,
-		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
-			if path != filepath.Join(dir, ".local", "config.yml") {
-				t.Fatalf("config path = %q", path)
-			}
-			return fake, nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(filepath.Join(dir, ".local", "config.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := cfg.Provider.Type, "tart"; got != want {
-		t.Fatalf("provider.type = %q, want %q", got, want)
-	}
-	if !strings.Contains(out.String(), "Continuing with") {
-		t.Fatalf("output missing continuation message:\n%s", out.String())
 	}
 	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {

@@ -30,6 +30,9 @@ import (
 func TestWizardCoversEveryRegisteredProvider(t *testing.T) {
 	options := make([]initProviderOption, 0, len(providerregistry.Descriptors()))
 	for _, descriptor := range providerregistry.Descriptors() {
+		if !descriptor.WizardSupported {
+			continue
+		}
 		options = append(options, initProviderOption{
 			Number:  descriptor.WizardNumber,
 			Type:    descriptor.Type,
@@ -99,7 +102,7 @@ func TestInitCreatesDockerContainerConfigAfterUnavailableSandboxesDefault(t *tes
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\n2\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n\nc\n2\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -200,7 +203,7 @@ func TestInitCreatesDockerContainerConfigAfterUnavailableSandboxesDefault(t *tes
 	if !strings.Contains(out.String(), "4. Change runner image") {
 		t.Fatalf("review did not retain the simplified runner-image edit action:\n%s", out.String())
 	}
-	for _, want := range []string{"1. Docker Sandboxes — recommended (default)", "2. Docker Container — private daemon", "Docker Sandboxes — recommended is unavailable", "Docker Sandboxes unavailable in provider-neutral wizard test"} {
+	for _, want := range []string{"1. Docker Sandboxes — recommended (default)", "C. Show compatibility providers", "2. Docker Container — private daemon", "Docker Sandboxes — recommended is unavailable", "Docker Sandboxes unavailable in provider-neutral wizard test", "verify Docker with 'docker info'", "run 'sbx diagnose --output json'", "EPAR will not fall back to another provider"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("init output did not preserve the fixed provider order and unavailable-default remediation %q:\n%s", want, out.String())
 		}
@@ -224,7 +227,7 @@ func TestInitWizardCanBackAcrossSectionsAndPreservesCompletedAnswers(t *testing.
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"2", "2", "custom-prefix",
+		"c", "2", "2", "custom-prefix",
 		"0", "/back", "0", "0", "1",
 		"2", "1", "", "",
 	}, "\n") + "\n"
@@ -254,7 +257,7 @@ func TestInitWizardQuitAtReviewWritesNoConfig(t *testing.T) {
 	stubNoWSL2(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".local", "config.yml")
-	input := strings.Join([]string{"123456", "solutionforest", ".local/github-app.pem", "1", "2", "", "", "q"}, "\n") + "\n"
+	input := strings.Join([]string{"123456", "solutionforest", ".local/github-app.pem", "1", "c", "2", "", "", "q"}, "\n") + "\n"
 	var out bytes.Buffer
 	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
 		t.Fatal(err)
@@ -274,7 +277,7 @@ func TestInitWizardReviewCanEditPoolDirectly(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"2", "", "",
+		"c", "2", "", "",
 		"5", "edited-prefix", "",
 	}, "\n") + "\n"
 	var out bytes.Buffer
@@ -300,7 +303,7 @@ func TestInitWizardBackAfterDirectEditUsesNaturalHistory(t *testing.T) {
 	path := filepath.Join(dir, ".local", "config.yml")
 	input := strings.Join([]string{
 		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"2", "", "",
+		"c", "2", "", "",
 		"5", "edited-prefix",
 		"0", "/back", "0", "0", "q",
 	}, "\n") + "\n"
@@ -328,34 +331,52 @@ func TestInitWizardBackAfterDirectEditUsesNaturalHistory(t *testing.T) {
 	}
 }
 
-func TestInitWizardProviderEditInvalidatesProviderSpecificDraft(t *testing.T) {
-	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
-	stubNoWSL2(t)
-	stubTartAvailable(t)
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".local", "config.yml")
-	input := strings.Join([]string{
-		"123456", "solutionforest", ".local/github-app.pem", "1",
-		"2", "2", "custom-prefix",
-		"3", "4", "",
-	}, "\n") + "\n"
-	var out bytes.Buffer
-	if err := runInitWithOptions(initOptions{ProjectRoot: dir, ConfigPath: path, SkipDockerCheck: true, SkipHostTrustCheck: true, In: strings.NewReader(input), Out: &out}); err != nil {
-		t.Fatal(err)
+func TestProviderCompatibilityRevealPersistsAcrossBackAndRejectsHiddenChoices(t *testing.T) {
+	prerequisites := initProviderPrerequisites{
+		DockerAvailable:          true,
+		DockerStatus:             "READY",
+		DockerSandboxesAvailable: true,
+		DockerSandboxesStatus:    "READY",
+		WSLAvailable:             true,
+		WSLStatus:                "READY",
 	}
-	cfg, err := config.Load(path)
+	state := initProviderMenuState{}
+	var first bytes.Buffer
+	result, err := promptProviderOptionsWizard(&first, bufio.NewReader(strings.NewReader("3\nwsl\nc\n0\n")), prerequisites, false, false, true, &state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Provider.Type != "tart" || cfg.Pool.NamePrefix != "custom-prefix" {
-		t.Fatalf("provider edit produced provider=%q prefix=%q, want Tart with preserved pool", cfg.Provider.Type, cfg.Pool.NamePrefix)
+	if result.Action != initWizardBack || !state.CompatibilityRevealed {
+		t.Fatalf("first result = %+v state=%+v, want Back with compatibility reveal retained", result, state)
 	}
-	reviews := strings.Split(out.String(), "Configuration review:")
-	if len(reviews) != 3 {
-		t.Fatalf("review count = %d, want 2", len(reviews)-1)
+	beforeReveal := strings.Split(first.String(), "C. Show compatibility providers")[0]
+	if strings.Contains(beforeReveal, "2. Docker Container") || strings.Contains(beforeReveal, "3. WSL2") {
+		t.Fatalf("compatibility providers rendered before reveal:\n%s", first.String())
 	}
-	if !strings.Contains(reviews[1], "Runner artifact estimate:") || strings.Contains(reviews[2], "Runner artifact estimate:") {
-		t.Fatalf("provider-specific estimate was not invalidated after switching to Tart:\n%s", out.String())
+	if got := strings.Count(first.String(), "Choose an available provider number or name shown above"); got != 2 {
+		t.Fatalf("hidden provider number or alias was accepted before reveal; rejection count = %d, want 2:\n%s", got, first.String())
+	}
+
+	var second bytes.Buffer
+	result, err = promptProviderOptionsWizard(&second, bufio.NewReader(strings.NewReader("3\n")), prerequisites, false, false, true, &state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != initWizardNext || result.Value != "wsl" {
+		t.Fatalf("second result = %+v, want revealed WSL selection", result)
+	}
+	if !strings.Contains(second.String(), "2. Docker Container") || !strings.Contains(second.String(), "3. WSL2") || strings.Contains(second.String(), "C. Show compatibility providers") {
+		t.Fatalf("revealed compatibility state did not persist across Back:\n%s", second.String())
+	}
+
+	freshState := initProviderMenuState{}
+	var fresh bytes.Buffer
+	result, err = promptProviderOptionsWizard(&fresh, bufio.NewReader(strings.NewReader("3\n0\n")), prerequisites, false, false, true, &freshState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != initWizardBack || freshState.CompatibilityRevealed || strings.Contains(fresh.String(), "3. WSL2") {
+		t.Fatalf("new wizard invocation inherited compatibility reveal: result=%+v state=%+v\n%s", result, freshState, fresh.String())
 	}
 }
 
@@ -444,7 +465,7 @@ func TestInitAllowsDefaultGroupWithReminderAndWritesMatchingPolicy(t *testing.T)
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n2\n\n\n\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\nc\n2\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -490,7 +511,7 @@ func TestInitCanBackFromBroadGroupAndChooseRestrictedGroup(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\n2\n2\n1\n2\n\n\n\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\n2\n2\n1\nc\n2\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -529,7 +550,7 @@ func TestInitRejectsPublicGroupAndAllowsAnotherSelection(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\nb\n2\n1\n1\n2\n\n\n\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\nb\n2\n1\n1\nc\n2\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -618,7 +639,7 @@ func TestInitRefreshesRunnerGroupsOnlyWhenRequested(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\nr\n1\n2\n\n\n\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\nr\n1\nc\n2\n\n\n\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -647,7 +668,7 @@ func TestInitAllowsInheritedGroupWithAdvisory(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\n2\n\n\n\n\n"),
+		In:                 strings.NewReader("123\nexample\nkey.pem\n1\n1\nc\n2\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -735,7 +756,7 @@ func TestInitDefaultsHostTrustOverlayWithoutPrompt(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -773,7 +794,7 @@ func TestInitDoesNotWriteEnabledConfigWhenHostTrustPreflightFails(t *testing.T) 
 		ProjectRoot:     dir,
 		ConfigPath:      path,
 		SkipDockerCheck: true,
-		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n\n\n\n"),
+		In:              strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\n\n"),
 		Out:             &bytes.Buffer{},
 	})
 	if err == nil || !strings.Contains(err.Error(), "collector unavailable") {
@@ -801,7 +822,7 @@ func TestInitAcceptsCustomPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\ncustom-prefix\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\ncustom-prefix\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -827,7 +848,7 @@ func TestInitRepromptsInvalidPoolNamePrefix(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n2\n\n-bad\nfixed-prefix\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n-bad\nfixed-prefix\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -985,7 +1006,7 @@ func TestInitOffersWSL2ConfigWhenAvailable(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n3\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1032,7 +1053,7 @@ func TestInitWSL2ChoiceRequiresExplicitDockerContainerAfterInvalidValue(t *testi
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ninvalid\n2\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ninvalid\nc\n2\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1044,7 +1065,7 @@ func TestInitWSL2ChoiceRequiresExplicitDockerContainerAfterInvalidValue(t *testi
 	if !strings.Contains(string(configBytes), "type: docker-container") {
 		t.Fatalf("config did not use the explicit Docker Container provider:\n%s", configBytes)
 	}
-	if !strings.Contains(out.String(), "Choose an available provider number or name shown above, R to refresh, or 0 to go back when shown.") {
+	if !strings.Contains(out.String(), "Choose an available provider number or name shown above, C to show compatibility providers, R to refresh, or 0 to go back when shown.") {
 		t.Fatalf("init output did not explain invalid provider input:\n%s", out.String())
 	}
 	if strings.Contains(out.String(), "Start runners now?") {
@@ -1491,7 +1512,7 @@ func TestInitProviderRefreshRechecksAvailabilityAndRedrawsMenu(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	providerType, selectedRecord, profile, err := promptInitProvider(context.Background(), t.TempDir(), &out, bufio.NewReader(strings.NewReader("1\nr\n1\n")), true)
+	providerType, selectedRecord, profile, err := promptInitProvider(context.Background(), t.TempDir(), &out, bufio.NewReader(strings.NewReader("1\nc\nr\n1\n")), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1511,8 +1532,11 @@ func TestInitProviderRefreshRechecksAvailabilityAndRedrawsMenu(t *testing.T) {
 			t.Fatalf("provider refresh output omitted %q:\n%s", want, out.String())
 		}
 	}
-	if got := strings.Count(out.String(), "R. Refresh provider prerequisites"); got != 2 {
-		t.Fatalf("provider menu render count = %d, want 2:\n%s", got, out.String())
+	if got := strings.Count(out.String(), "R. Refresh provider prerequisites"); got != 3 {
+		t.Fatalf("provider menu render count = %d, want 3 for initial, reveal, and refreshed menus:\n%s", got, out.String())
+	}
+	if got := strings.Count(out.String(), "2. Docker Container — private daemon"); got != 2 {
+		t.Fatalf("compatibility reveal did not persist across refresh; Docker Container renders = %d, want 2:\n%s", got, out.String())
 	}
 }
 
@@ -1607,7 +1631,7 @@ func TestInitCapabilityReadyDockerSandboxesIsDefaultWithoutPreviewAcknowledgemen
 			}
 			for _, want := range []string{
 				"1. Docker Sandboxes — recommended (default)",
-				"2. Docker Container — private daemon",
+				"C. Show compatibility providers",
 				"Docker Sandboxes — recommended (default)",
 				"Runner provider (press Enter to use 1):",
 				"Docker Sandboxes image setup:",
@@ -1619,7 +1643,7 @@ func TestInitCapabilityReadyDockerSandboxesIsDefaultWithoutPreviewAcknowledgemen
 					t.Fatalf("capability-default output omitted %q:\n%s", want, out.String())
 				}
 			}
-			for _, forbidden := range []string{"Continue with explicit preview setup?", "Docker Sandboxes preview:"} {
+			for _, forbidden := range []string{"2. Docker Container — private daemon", "3. WSL2", "Continue with explicit preview setup?", "Docker Sandboxes preview:"} {
 				if strings.Contains(out.String(), forbidden) {
 					t.Fatalf("capability-default output retained preview interaction %q:\n%s", forbidden, out.String())
 				}
@@ -2060,7 +2084,7 @@ func TestInitPromotionGateFailuresRequireExplicitProviderAndExplainAction(t *tes
 			preflight := sandboxpromotion.PreflightResult{Failures: []sandboxpromotion.Failure{{
 				Gate:       test.gate,
 				Detail:     test.detail,
-				Resolution: "take the exact corrective action and rerun setup",
+				Resolution: "Use Docker Container or another provider until this failure is resolved.",
 			}}}
 			stubInitSandboxPromotion(t, record, preflight)
 			if test.disable {
@@ -2080,7 +2104,7 @@ func TestInitPromotionGateFailuresRequireExplicitProviderAndExplainAction(t *tes
 				ConfigPath:         path,
 				SkipDockerCheck:    true,
 				SkipHostTrustCheck: true,
-				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ndocker-sandboxes\n2\n1\n\n\n\n"),
+				In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\ndocker-sandboxes\nc\n2\n1\n\n\n\n"),
 				Out:                &out,
 			}); err != nil {
 				t.Fatal(err)
@@ -2095,10 +2119,41 @@ func TestInitPromotionGateFailuresRequireExplicitProviderAndExplainAction(t *tes
 			if !strings.Contains(out.String(), "FAIL ["+test.gate+"]") || !strings.Contains(out.String(), test.detail) || !strings.Contains(out.String(), "Action:") {
 				t.Fatalf("init output omitted actionable %s failure:\n%s", test.gate, out.String())
 			}
+			if !strings.Contains(strings.ToLower(out.String()), "choose c in the provider menu to show compatibility providers") {
+				t.Fatalf("promotion failure did not route compatibility selection through C:\n%s", out.String())
+			}
 			if !strings.Contains(out.String(), "Runner provider:") || !strings.Contains(out.String(), "Docker Sandboxes — recommended is unavailable") {
 				t.Fatalf("init output did not reject explicit unavailable Docker Sandboxes selection:\n%s", out.String())
 			}
+			beforeReveal := strings.Split(out.String(), "C. Show compatibility providers")[0]
+			if strings.Contains(beforeReveal, "Docker Container") || strings.Contains(beforeReveal, "WSL2") {
+				t.Fatalf("promotion failure named a collapsed compatibility provider before reveal:\n%s", beforeReveal)
+			}
 		})
+	}
+}
+
+func TestInvalidPromotionRecordRoutesToCollapsedCompatibilityMenu(t *testing.T) {
+	record := validInitPromotionRecord()
+	record.Template = ""
+	stubInitSandboxPromotion(t, record, sandboxpromotion.PreflightResult{})
+	state := initProviderMenuState{}
+	var out bytes.Buffer
+	result, _, err := promptInitProviderChoiceWizard(context.Background(), t.TempDir(), record.Platform, record, true, &out, bufio.NewReader(strings.NewReader("0\n")), true, true, &state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != initWizardBack {
+		t.Fatalf("result = %+v, want Back", result)
+	}
+	for _, want := range []string{"FAIL [promotion record]", "Action: Choose C in the provider menu to show compatibility providers", "C. Show compatibility providers"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("invalid-promotion output omitted %q:\n%s", want, out.String())
+		}
+	}
+	beforeReveal := strings.Split(out.String(), "C. Show compatibility providers")[0]
+	if strings.Contains(beforeReveal, "Docker Container") || strings.Contains(beforeReveal, "WSL2") {
+		t.Fatalf("invalid-promotion guidance named hidden providers before reveal:\n%s", beforeReveal)
 	}
 }
 
@@ -2116,7 +2171,7 @@ func TestInitFailedPromotionAllowsExplicitWSLSelection(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n3\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n3\n\n\n\n"),
 		Out:                &bytes.Buffer{},
 	}); err != nil {
 		t.Fatal(err)
@@ -2152,83 +2207,6 @@ func TestInitFailedPromotionDoesNotSelectUnavailableSandboxesOnEOF(t *testing.T)
 	}
 	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("config was written after failed explicit selection: %v", statErr)
-	}
-}
-
-func TestInitOffersTartConfigWhenAvailable(t *testing.T) {
-	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
-	stubTartAvailable(t)
-	oldDockerAvailable := dockerAvailable
-	dockerAvailable = func(context.Context) error {
-		return errors.New("Docker is unavailable on this Mac")
-	}
-	t.Cleanup(func() { dockerAvailable = oldDockerAvailable })
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".local", "config.yml")
-	var out bytes.Buffer
-	if err := runInitWithOptions(initOptions{
-		ProjectRoot:        dir,
-		ConfigPath:         path,
-		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("654321\nexample\n.local/github-app.pem\n1\n4\n\n"),
-		Out:                &out,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := os.ReadFile(filepath.Join("..", "..", "configs", "tart.example.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantText := strings.NewReplacer(
-		"appId: 123456", "appId: 654321",
-		"organization: your-org", "organization: example",
-		"privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem", "privateKeyPath: .local/github-app.pem",
-		"namePrefix: CHANGE-ME-unique-machine-prefix", "namePrefix: build-box-01-a4f9c2",
-		"group: your-runner-group", "group: \"restricted group\"",
-	).Replace(string(want))
-	wantText = strings.ReplaceAll(wantText, "\r\n", "\n")
-	if string(got) != wantText {
-		t.Fatalf("Tart config did not match configs/tart.example.yml:\nwant:\n%s\ngot:\n%s", wantText, got)
-	}
-	if !strings.Contains(out.String(), "1. Docker Sandboxes — recommended (default)") || !strings.Contains(out.String(), "3. WSL2") || !strings.Contains(out.String(), "4. Tart (experimental)") || !strings.Contains(out.String(), "Docker CLI or daemon check failed: Docker is unavailable on this Mac") {
-		t.Fatalf("init output did not offer Tart:\n%s", out.String())
-	}
-	if !strings.Contains(out.String(), "Configuration review:") || !strings.Contains(out.String(), "Runner image: ghcr.io/cirruslabs/ubuntu:latest") || !strings.Contains(out.String(), "Reusable artifact: epar-ubuntu-24-arm64") || strings.Contains(out.String(), "Runner artifact estimate:") || strings.Contains(out.String(), "Create this configuration?") {
-		t.Fatalf("Tart review was missing or contained Docker-specific setup output:\n%s", out.String())
-	}
-}
-
-func TestTartAvailabilityRequiresNativeMacOSAndSuccessfulVersion(t *testing.T) {
-	oldGOOS := initGOOS
-	oldTartVersion := initTartVersion
-	t.Cleanup(func() {
-		initGOOS = oldGOOS
-		initTartVersion = oldTartVersion
-	})
-
-	initGOOS = "darwin"
-	initTartVersion = func(context.Context) error { return nil }
-	if !tartAvailable() {
-		t.Fatal("tartAvailable() = false when tart --version succeeds on macOS")
-	}
-	initTartVersion = func(context.Context) error { return errors.New("tart unavailable") }
-	if tartAvailable() {
-		t.Fatal("tartAvailable() = true when tart --version fails")
-	}
-
-	initGOOS = "linux"
-	initTartVersion = func(context.Context) error {
-		t.Fatal("tart --version should not run outside native macOS")
-		return nil
-	}
-	if tartAvailable() {
-		t.Fatal("tartAvailable() = true outside native macOS")
 	}
 }
 
@@ -2425,18 +2403,6 @@ func stubDockerSandboxesUnavailable(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		initDockerSandboxesReadiness = oldReadiness
-	})
-}
-
-func stubTartAvailable(t *testing.T) {
-	t.Helper()
-	oldGOOS := initGOOS
-	oldTartVersion := initTartVersion
-	initGOOS = "darwin"
-	initTartVersion = func(context.Context) error { return nil }
-	t.Cleanup(func() {
-		initGOOS = oldGOOS
-		initTartVersion = oldTartVersion
 	})
 }
 

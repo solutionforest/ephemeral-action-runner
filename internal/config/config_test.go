@@ -356,29 +356,44 @@ func TestLoggingDefaults(t *testing.T) {
 }
 
 func TestCheckedInExampleConfigurationsValidate(t *testing.T) {
-	patterns := []string{
-		filepath.Join("..", "..", "configs", "*.yml"),
-		filepath.Join("..", "..", "examples", "observability", "*.yml"),
+	paths, err := filepath.Glob(filepath.Join("..", "..", "configs", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, pattern := range patterns {
-		paths, err := filepath.Glob(pattern)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(paths) == 0 {
-			t.Fatalf("no examples matched %s", pattern)
-		}
-		for _, path := range paths {
-			t.Run(filepath.Base(path), func(t *testing.T) {
-				cfg, err := Load(path)
-				if err != nil {
-					t.Fatalf("Load(%s): %v", path, err)
-				}
-				if err := Validate(cfg); err != nil {
-					t.Fatalf("Validate(%s): %v", path, err)
-				}
-			})
-		}
+	if len(paths) == 0 {
+		t.Fatal("no configuration examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%s): %v", path, err)
+			}
+			if err := Validate(cfg); err != nil {
+				t.Fatalf("Validate(%s): %v", path, err)
+			}
+		})
+	}
+}
+
+func TestObservabilityExamplesRequireAnExplicitProviderType(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "observability", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no observability examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%s): %v", path, err)
+			}
+			if err := Validate(cfg); err == nil || err.Error() != "provider.type is required" {
+				t.Fatalf("Validate(%s) error = %v, want provider.type is required", path, err)
+			}
+		})
 	}
 }
 
@@ -406,6 +421,8 @@ logging:
   errorMaxAgeDays: 10
   benchmarkMaxAgeDays: 11
   retentionIntervalMinutes: 12
+provider:
+  type: tart
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +442,7 @@ logging:
 func TestLoadCustomConsoleTextFormats(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\n"
+	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\nprovider:\n  type: tart\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +464,7 @@ func TestLoadCustomConsoleTextFormats(t *testing.T) {
 func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\nprovider:\n  type: tart\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
@@ -543,7 +560,7 @@ func TestTrustedCACertificatePathsDefaultToEmpty(t *testing.T) {
 }
 
 func TestValidateRejectsEmptyTrustedCACertificatePath(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Image.TrustedCACertificatePaths = []string{" "}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "image.trustedCaCertificatePaths") {
 		t.Fatalf("Validate() error = %v, want trusted CA path error", err)
@@ -625,10 +642,8 @@ func TestValidateHostTrustAllowsDockerSandboxesOverlay(t *testing.T) {
 }
 
 func TestValidateHostTrustAllowsWSLOverlay(t *testing.T) {
-	cfg := Default()
-	cfg.Provider.Type = "wsl"
+	cfg := defaultWSLConfig()
 	cfg.Provider.SourceImage = "runner-image.tar"
-	cfg.Provider.InstallRoot = "work/wsl"
 	cfg.Runner.Ephemeral = true
 	cfg.Image.HostTrustMode = HostTrustModeOverlay
 	cfg.Image.HostTrustScopes = []string{HostTrustScopeSystem}
@@ -853,6 +868,63 @@ runner:
 	}
 }
 
+func TestProviderTypeIsRequiredAndDoesNotApplyProviderDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  includeHostLabel: false\npool:\n  instances: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider, (ProviderConfig{}); got != want {
+		t.Fatalf("provider defaults = %+v, want %+v", got, want)
+	}
+	if got, want := cfg.Image.SourceImage, ""; got != want {
+		t.Fatalf("image.sourceImage = %q, want empty without provider.type", got)
+	}
+	if got, want := cfg.Image.OutputImage, ""; got != want {
+		t.Fatalf("image.outputImage = %q, want empty without provider.type", got)
+	}
+	if got := cfg.Runner.Labels; len(got) != 0 {
+		t.Fatalf("runner.labels = %#v, want no provider-specific defaults", got)
+	}
+	if err := Validate(cfg); err == nil || err.Error() != "provider.type is required" {
+		t.Fatalf("Validate() error = %v, want provider.type is required", err)
+	}
+}
+
+func TestProviderDefaultsForMinimalTartConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  includeHostLabel: false\nprovider:\n  type: tart\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceImage, "ghcr.io/cirruslabs/ubuntu:latest"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "epar-ubuntu-24-arm64"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
+		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.Network, "default"; got != want {
+		t.Fatalf("provider.network = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels, []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}; !slices.Equal(got, want) {
+		t.Fatalf("runner.labels = %#v, want %#v", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProviderDefaultsForMinimalWSLConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -880,6 +952,9 @@ provider:
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
 		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.InstallRoot, "work/wsl"; got != want {
+		t.Fatalf("provider.installRoot = %q, want %q", got, want)
 	}
 	if got, want := cfg.Pool.NamePrefix, "epar-wsl"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
@@ -1020,22 +1095,21 @@ func TestExampleConfigsLoadAndValidate(t *testing.T) {
 }
 
 func TestValidateRosettaTag(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid rosetta tag rejected: %v", err)
 	}
 
 	for _, tag := range []string{"bad tag", "bad/tag", "../rosetta", "-bad"} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Provider.RosettaTag = tag
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("provider.rosettaTag %q accepted", tag)
 		}
 	}
 
-	cfg = Default()
-	cfg.Provider.Type = "wsl"
+	cfg = defaultWSLConfig()
 	cfg.Provider.SourceImage = "image.tar"
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err == nil {
@@ -1044,8 +1118,7 @@ func TestValidateRosettaTag(t *testing.T) {
 }
 
 func TestValidateDockerPlatform(t *testing.T) {
-	cfg := Default()
-	cfg.Provider.Type = "docker-container"
+	cfg := defaultDockerContainerConfig()
 	cfg.Provider.SourceImage = "runner-image"
 	cfg.Provider.Platform = "linux/amd64"
 	if err := Validate(cfg); err != nil {
@@ -1053,8 +1126,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 	}
 
 	for _, platform := range []string{"bad platform", "-linux/amd64", "linux/$bad"} {
-		cfg := Default()
-		cfg.Provider.Type = "docker-container"
+		cfg := defaultDockerContainerConfig()
 		cfg.Provider.SourceImage = "runner-image"
 		cfg.Provider.Platform = platform
 		if err := Validate(cfg); err == nil {
@@ -1062,8 +1134,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 		}
 	}
 
-	cfg = Default()
-	cfg.Provider.Type = "tart"
+	cfg = defaultTartConfig()
 	cfg.Provider.Platform = "linux/arm64"
 	if err := Validate(cfg); err == nil {
 		t.Fatal("provider.platform accepted for Tart")
@@ -1071,7 +1142,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 }
 
 func TestValidateDockerRegistryMirror(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Docker.RegistryMirrors = []string{"https://mirror.example.test", "http://host.docker.internal:5000/"}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid registry mirrors rejected: %v", err)
@@ -1086,7 +1157,7 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 		"https://mirror example.test",
 		" https://mirror.example.test",
 	} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.RegistryMirrors = []string{mirror}
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.registryMirrors %q accepted", mirror)
@@ -1095,7 +1166,7 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 }
 
 func TestValidateDockerDaemonProxy(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Docker.HTTPProxy = "http://proxy.example.test:3128"
 	cfg.Docker.HTTPSProxy = "https://proxy.example.test:8443"
 	cfg.Docker.NoProxy = "localhost,127.0.0.1,.example.test,10.0.0.0/8,*"
@@ -1111,7 +1182,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 		"http://proxy.example.test?x=1",
 		" http://proxy.example.test",
 	} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.HTTPProxy = proxyURL
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.httpProxy %q accepted", proxyURL)
@@ -1119,7 +1190,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 	}
 
 	for _, noProxy := range []string{"localhost,,example.test", " localhost", "http://example.test", "user@example.test", "10.0.0.0/not-a-prefix"} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.NoProxy = noProxy
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.noProxy %q accepted", noProxy)
@@ -1150,7 +1221,7 @@ func TestValidateRejectsDockerSocketProvider(t *testing.T) {
 }
 
 func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1160,7 +1231,7 @@ func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
 }
 
 func TestValidateRejectsInvalidPoolInstances(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Pool.Instances = 0
 	if err := Validate(cfg); err == nil {
 		t.Fatal("pool.instances=0 accepted")
@@ -1176,6 +1247,8 @@ pool:
   replacementRetryMaxSeconds: 720
   replacementRetryMultiplier: 1.5
   replacementRetryJitterPercent: 0
+provider:
+  type: tart
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1232,7 +1305,7 @@ func TestValidateRejectsInvalidPoolReplacementRetryConfiguration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cfg := Default()
+			cfg := defaultTartConfig()
 			test.mutate(&cfg)
 			if err := Validate(cfg); err == nil {
 				t.Fatal("Validate accepted invalid replacement retry configuration")
@@ -1508,6 +1581,7 @@ func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T)
 func TestValidateDockerSandboxesAcceptsARM64Configuration(t *testing.T) {
 	cfg := validDockerSandboxesConfig()
 	cfg.Provider.Platform = "linux/arm64"
+	cfg.Image.SourcePlatform = cfg.Provider.Platform
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() rejected linux/arm64 Docker Sandboxes configuration: %v", err)
 	}
@@ -1605,13 +1679,35 @@ func TestEffectiveMinimumFreeBytesKeepsStricterCommonReserve(t *testing.T) {
 func validDockerSandboxesConfig() Config {
 	cfg := Default()
 	cfg.Provider.Type = "docker-sandboxes"
-	cfg.Provider.SourceImage = ""
 	cfg.Provider.Platform = "linux/amd64"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true, "provider.platform": true})
+	cfg.Provider.SourceImage = ""
 	cfg.Runner.Ephemeral = true
 	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
 	cfg.DockerSandboxes.PolicyGeneration = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	cfg.DockerSandboxes.AdditionalAllow = []string{"api.github.com"}
 	cfg.DockerSandboxes.RootDisk = "120GiB"
 	cfg.DockerSandboxes.DockerDisk = "50GiB"
+	return cfg
+}
+
+func defaultTartConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "tart"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
+}
+
+func defaultWSLConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "wsl"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
+}
+
+func defaultDockerContainerConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "docker-container"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
 	return cfg
 }
