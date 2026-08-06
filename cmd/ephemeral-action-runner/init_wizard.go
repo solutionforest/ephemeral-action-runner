@@ -470,6 +470,13 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 			return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q review requires an image profile", draft.ProviderType)
 		}
 		fmt.Fprintf(out, "  Runner image: %s\n", draft.Profile.SourceImage)
+		if draft.ProviderType == "docker-sandboxes" {
+			architectureEmulation := initDockerSandboxesArchitectureEmulation()
+			fmt.Fprintf(out, "  Architecture emulation: %s\n", architectureEmulation)
+			if architectureEmulation == config.DockerSandboxesArchitectureEmulationBestEffort {
+				fmt.Fprintln(out, "  QEMU/binfmt will be attempted; unsupported hosts continue with verified native containers and a warning.")
+			}
+		}
 	default:
 		return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q has unknown wizard review contribution %q", draft.ProviderType, descriptor.WizardReview)
 	}
@@ -540,8 +547,12 @@ func renderInitWizardConfig(draft initWizardDraft) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return defaultDockerSandboxesConfig(draft.AppID, draft.Organization, draft.PrivateKeyPath, draft.PoolNamePrefix, draft.HostTrustMode, draft.HostTrustScopes, draft.RunnerGroup, *draft.Profile, draft.UpdatePolicy, guestPlatform, runnerArchitectureLabel), nil
+		return defaultDockerSandboxesConfig(draft.AppID, draft.Organization, draft.PrivateKeyPath, draft.PoolNamePrefix, draft.HostTrustMode, draft.HostTrustScopes, draft.RunnerGroup, *draft.Profile, draft.UpdatePolicy, guestPlatform, runnerArchitectureLabel, initDockerSandboxesArchitectureEmulation()), nil
 	default:
 		return "", fmt.Errorf("unsupported provider.type %q", draft.ProviderType)
 	}
+}
+
+func initDockerSandboxesArchitectureEmulation() string {
+	return config.DockerSandboxesArchitectureEmulationBestEffort
 }

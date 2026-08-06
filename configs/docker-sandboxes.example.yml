@@ -53,7 +53,9 @@ dockerSandboxes:
   # The wizard reads and records the exact active host-global policy fingerprint.
   policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
   networkBaseline: open
-  # Cross-architecture QEMU/binfmt support is enabled automatically inside every sandbox VM.
+  # best-effort attempts bundled QEMU/binfmt, then continues with a warning when the sandbox supports native containers only.
+  # Use required only when every runner must execute foreign-architecture containers.
+  architectureEmulation: best-effort
   additionalAllow:
     - api.github.com
     - '*.githubusercontent.com:443'

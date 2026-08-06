@@ -71,6 +71,10 @@ sudo -n test -x /opt/epar/enable-architecture-emulation
 sudo -n test ! -L /opt/epar/enable-architecture-emulation
 sudo -n cmp -s /opt/epar/enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation
 [[ "$(sudo -n stat -c '%U:%G:%a' /opt/epar/enable-architecture-emulation)" == "root:root:555" ]]
+sudo -n test -x /opt/epar/verify-native-architecture
+sudo -n test ! -L /opt/epar/verify-native-architecture
+sudo -n cmp -s /opt/epar/verify-native-architecture.sh /opt/epar/verify-native-architecture
+[[ "$(sudo -n stat -c '%U:%G:%a' /opt/epar/verify-native-architecture)" == "root:root:555" ]]
 [[ "$(PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin command -v bash)" == "/opt/epar/hook-bin/bash" ]]
 [[ -x /usr/bin/python3 ]]
 sudo -n test -x /opt/epar/emulation/binfmt

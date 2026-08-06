@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -144,7 +145,7 @@ func (writer *cancellationSignalWriter) Write(data []byte) (int, error) {
 func scriptedProvider(t *testing.T, steps ...commandStep) (*Provider, func()) {
 	t.Helper()
 	p := New("sbx-test-double")
-	p.architectureEmulation = &fakeArchitectureEmulationEnabler{result: architectureEmulationResult{Backend: "qemu", HandlerCount: 1}}
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{result: architectureEmulationResult{Mode: architectureEmulationRequired, Backend: "qemu", HandlerCount: 1}}
 	index := 0
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 		t.Helper()
@@ -240,6 +241,57 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	done()
 }
 
+func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`}},
+	)
+	p.architectureEmulation = bestEffortArchitectureEnabler{platform: "linux/amd64"}
+	var logOutput bytes.Buffer
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("instance = %#v, want exact receipted identity", instance)
+	}
+	if !strings.Contains(logOutput.String(), "QEMU/binfmt unavailable; continuing with verified native") {
+		t.Fatalf("best-effort create log = %q, want native fallback warning", logOutput.String())
+	}
+	done()
+}
+
+func TestNewWithArchitectureModeMapsEveryValidatedMode(t *testing.T) {
+	for _, test := range []struct {
+		mode string
+		want any
+	}{
+		{mode: architectureEmulationBestEffort, want: bestEffortArchitectureEnabler{}},
+		{mode: architectureEmulationRequired, want: qemuBinfmtEnabler{}},
+		{mode: architectureEmulationNativeOnly, want: nativeArchitectureEnabler{}},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			p := NewWithArchitectureMode("sbx", false, test.mode, "linux/amd64")
+			if reflect.TypeOf(p.architectureEmulation) != reflect.TypeOf(test.want) {
+				t.Fatalf("architecture enabler type = %T, want %T", p.architectureEmulation, test.want)
+			}
+		})
+	}
+	if p := NewWithArchitectureMode("sbx", false, "invalid", "linux/amd64"); p.architectureEmulation != nil {
+		t.Fatalf("invalid mode enabler = %T, want nil fail-closed enabler", p.architectureEmulation)
+	}
+}
+
 func TestExperimentalV2ReceiptRemainsReadableForCleanup(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{
 		"schemaVersion":   2,
@@ -274,10 +326,164 @@ func TestQEMUBinfmtEnablerUsesExactGuestHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Backend != "qemu" || result.HandlerCount != 9 {
+	if result.Mode != architectureEmulationRequired || result.Backend != "qemu" || result.HandlerCount != 9 {
 		t.Fatalf("architecture emulation result = %#v", result)
 	}
 	done()
+}
+
+func TestNativeArchitectureEnablerUsesExactGuestHelper(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{
+			args:   []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"},
+			result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`},
+		},
+	)
+	result, err := (nativeArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Mode != architectureEmulationNativeOnly || result.Backend != "native" || result.HandlerCount != 0 || result.Platform != "linux/amd64" {
+		t.Fatalf("native-only architecture result = %#v", result)
+	}
+	done()
+}
+
+func TestNativeArchitectureEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
+	for _, output := range []string{
+		`{"backend":"native","handlerCount":1,"platform":"linux/amd64"}`,
+		`{"backend":"native","handlerCount":0,"platform":"linux/arm64"}`,
+		`{"backend":"qemu","handlerCount":1,"platform":"linux/amd64"}`,
+		`not-json`,
+	} {
+		t.Run(output, func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: output}},
+			)
+			if _, err := (nativeArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance); err == nil || !strings.Contains(err.Error(), "unsupported evidence") {
+				t.Fatalf("Enable() error = %v", err)
+			}
+			done()
+		})
+	}
+}
+
+func TestBestEffortArchitectureUsesQEMUWhenAvailable(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{
+			args:   []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper},
+			result: provider.ExecResult{Stdout: `{"backend":"qemu","handlerCount":9}`},
+		},
+	)
+	result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Mode != architectureEmulationBestEffort || result.Backend != "qemu" || result.HandlerCount != 9 || result.Warning != "" {
+		t.Fatalf("best-effort QEMU result = %#v", result)
+	}
+	done()
+}
+
+func TestBestEffortArchitectureFallsBackToVerifiedNative(t *testing.T) {
+	for _, handlerCount := range []int{0, 2} {
+		t.Run(strconv.Itoa(handlerCount), func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+				commandStep{
+					args:   []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"},
+					result: provider.ExecResult{Stdout: fmt.Sprintf(`{"backend":"native","handlerCount":%d,"platform":"linux/amd64"}`, handlerCount)},
+				},
+			)
+			result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Mode != architectureEmulationBestEffort || result.Backend != "native" || result.HandlerCount != handlerCount || result.Platform != "linux/amd64" || !strings.Contains(result.Warning, "binfmt_misc is unavailable") {
+				t.Fatalf("best-effort native result = %#v", result)
+			}
+			done()
+		})
+	}
+}
+
+func TestBestEffortArchitectureBoundsFallbackWarning(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New(strings.Repeat("x", architectureWarningLimit+100))},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`}},
+	)
+	result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warning) != architectureWarningLimit {
+		t.Fatalf("warning length = %d, want %d", len(result.Warning), architectureWarningLimit)
+	}
+	done()
+}
+
+func TestBestEffortArchitectureFailsWhenNativeVerificationFails(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/arm64"}`}},
+	)
+	if _, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance); err == nil || !strings.Contains(err.Error(), "QEMU/binfmt activation failed") || !strings.Contains(err.Error(), "native architecture verification also failed") {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	done()
+}
+
+func TestNativeOnlyArchitectureCapabilityLogsVisibleWarning(t *testing.T) {
+	var logOutput bytes.Buffer
+	p := New("sbx-test-double")
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	p.logArchitectureCapability(testName, architectureEmulationResult{
+		Mode: architectureEmulationNativeOnly, Backend: "native", HandlerCount: 0, Platform: "linux/amd64",
+	})
+	for _, expected := range []string{
+		`"level":"WARN"`,
+		`"msg":"Docker Sandboxes native-only architecture verified: platform=linux/amd64; foreign-architecture containers are unsupported"`,
+		`"architectureEmulation":"native-only"`,
+		`"backend":"native"`,
+		`"platform":"linux/amd64"`,
+		`"registeredHandlers":0`,
+	} {
+		if !strings.Contains(logOutput.String(), expected) {
+			t.Fatalf("native-only architecture warning %q does not contain %q", logOutput.String(), expected)
+		}
+	}
+}
+
+func TestBestEffortNativeFallbackLogsVisibleWarning(t *testing.T) {
+	var logOutput bytes.Buffer
+	p := New("sbx-test-double")
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	p.logArchitectureCapability(testName, architectureEmulationResult{
+		Mode: architectureEmulationBestEffort, Backend: "native", HandlerCount: 0, Platform: "linux/amd64", Warning: "binfmt_misc is unavailable",
+	})
+	for _, expected := range []string{
+		`"level":"WARN"`,
+		`"msg":"Docker Sandboxes QEMU/binfmt unavailable; continuing with verified native platform=linux/amd64; foreign-architecture containers may fail"`,
+		`"architectureEmulation":"best-effort"`,
+		`"backend":"native"`,
+		`"qemuError":"binfmt_misc is unavailable"`,
+	} {
+		if !strings.Contains(logOutput.String(), expected) {
+			t.Fatalf("best-effort architecture warning %q does not contain %q", logOutput.String(), expected)
+		}
+	}
+}
+
+func TestArchitectureCapabilityLogIsEmittedOncePerLiveInstance(t *testing.T) {
+	var logOutput bytes.Buffer
+	p := New("sbx-test-double")
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	evidence := architectureEmulationResult{Mode: architectureEmulationBestEffort, Backend: "native", Platform: "linux/amd64", Warning: "binfmt_misc is unavailable"}
+	p.logArchitectureCapability(testName, evidence)
+	p.logArchitectureCapability(testName, evidence)
+	if got := strings.Count(logOutput.String(), "QEMU/binfmt unavailable; continuing with verified native"); got != 1 {
+		t.Fatalf("fallback warning count = %d, want 1: %s", got, logOutput.String())
+	}
 }
 
 func TestQEMUBinfmtEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
@@ -452,6 +658,18 @@ func TestInstanceAdmissionUsesExactInspectionAndRejectsAttachedCapabilities(t *t
 			done()
 		})
 	}
+}
+
+func TestInstanceAdmissionRechecksConfiguredArchitectureCapability(t *testing.T) {
+	p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}})
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{err: errors.New("required QEMU handlers are unavailable")}
+	if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err == nil || !strings.Contains(err.Error(), "required QEMU handlers are unavailable") {
+		t.Fatalf("VerifyInstanceAdmission() error = %v, want configured architecture rejection", err)
+	}
+	if calls := p.architectureEmulation.(*fakeArchitectureEmulationEnabler).calls; calls != 1 {
+		t.Fatalf("architecture admission calls = %d, want 1", calls)
+	}
+	done()
 }
 
 func TestInstanceAdmissionRejectsPublishedPortInventory(t *testing.T) {

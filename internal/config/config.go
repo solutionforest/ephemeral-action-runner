@@ -170,21 +170,25 @@ type DockerConfig struct {
 // the exact imported template identity is stored in EPAR's local artifact
 // receipt rather than user configuration.
 type DockerSandboxesConfig struct {
-	PolicyGeneration     string
-	NetworkBaseline      string
-	AdditionalAllow      []string
-	AdditionalDeny       []string
-	StagingRoot          string
-	CPUs                 int
-	Memory               string
-	RootDisk             string
-	DockerDisk           string
-	MaxConcurrentCreates int
+	PolicyGeneration      string
+	NetworkBaseline       string
+	ArchitectureEmulation string
+	AdditionalAllow       []string
+	AdditionalDeny        []string
+	StagingRoot           string
+	CPUs                  int
+	Memory                string
+	RootDisk              string
+	DockerDisk            string
+	MaxConcurrentCreates  int
 }
 
 const (
-	DockerSandboxesNetworkBaselineOpen     = "open"
-	DockerSandboxesNetworkBaselineBalanced = "balanced"
+	DockerSandboxesNetworkBaselineOpen             = "open"
+	DockerSandboxesNetworkBaselineBalanced         = "balanced"
+	DockerSandboxesArchitectureEmulationBestEffort = "best-effort"
+	DockerSandboxesArchitectureEmulationRequired   = "required"
+	DockerSandboxesArchitectureEmulationNativeOnly = "native-only"
 )
 
 var dockerSandboxesOpenDefaultDenyResources = []string{
@@ -288,13 +292,14 @@ func Default() Config {
 			},
 		},
 		DockerSandboxes: DockerSandboxesConfig{
-			NetworkBaseline:      DockerSandboxesNetworkBaselineOpen,
-			StagingRoot:          ".local/docker-sandboxes-staging",
-			CPUs:                 4,
-			Memory:               "8GiB",
-			RootDisk:             DockerSandboxesAutomaticRootDisk,
-			DockerDisk:           DockerSandboxesDefaultDockerDisk,
-			MaxConcurrentCreates: 2,
+			NetworkBaseline:       DockerSandboxesNetworkBaselineOpen,
+			ArchitectureEmulation: DockerSandboxesArchitectureEmulationBestEffort,
+			StagingRoot:           ".local/docker-sandboxes-staging",
+			CPUs:                  4,
+			Memory:                "8GiB",
+			RootDisk:              DockerSandboxesAutomaticRootDisk,
+			DockerDisk:            DockerSandboxesDefaultDockerDisk,
+			MaxConcurrentCreates:  2,
 		},
 		Timeouts: TimeoutConfig{
 			BootSeconds:         180,
@@ -716,6 +721,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.DockerSandboxes.PolicyGeneration = value
 		case "networkBaseline":
 			cfg.DockerSandboxes.NetworkBaseline = strings.ToLower(value)
+		case "architectureEmulation":
+			cfg.DockerSandboxes.ArchitectureEmulation = value
 		case "additionalAllow", "additionalDeny":
 			return setListValue(cfg, section, key, parseList(value))
 		case "stagingRoot":
@@ -1292,6 +1299,9 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 	}
 	if sandboxes.NetworkBaseline != DockerSandboxesNetworkBaselineOpen && sandboxes.NetworkBaseline != DockerSandboxesNetworkBaselineBalanced {
 		return fmt.Errorf("unsupported dockerSandboxes.networkBaseline %q; supported values are open and balanced", sandboxes.NetworkBaseline)
+	}
+	if sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationBestEffort && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationRequired && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationNativeOnly {
+		return fmt.Errorf("unsupported dockerSandboxes.architectureEmulation %q; supported values are best-effort, required, and native-only", sandboxes.ArchitectureEmulation)
 	}
 	if err := validateDockerSandboxHostnameList("additionalAllow", sandboxes.AdditionalAllow); err != nil {
 		return err

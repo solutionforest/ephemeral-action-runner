@@ -26,7 +26,7 @@
   },
   "architectureEmulation": {
     "backend": "qemu",
-    "policy": "automatic-binfmt-install-all",
+    "policy": "configured-best-effort-required-or-native-only",
     "release": "qemu-v10.2.3-68",
     "sourceIndexDigest": "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
     "sourceManifestDigest": "sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705",

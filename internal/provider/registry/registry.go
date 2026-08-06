@@ -55,7 +55,7 @@ var entries = []entry{
 			WizardReview:           provider.WizardReviewDockerImage,
 		},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
-			sandboxes := dockersandboxes.NewWithDryRun("", dryRun)
+			sandboxes := dockersandboxes.NewWithArchitectureMode("", dryRun, cfg.DockerSandboxes.ArchitectureEmulation, cfg.Provider.Platform)
 			return Runtime{Lifecycle: sandboxes, PolicyManager: sandboxes, Storage: providerStorage(cfg, projectRoot)}
 		},
 	},

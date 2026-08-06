@@ -943,7 +943,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"expectedDockerDaemonCount": 1,
 			"architectureEmulation": map[string]any{
 				"backend":              lock.Emulation.Backend,
-				"policy":               "automatic-binfmt-install-all",
+				"policy":               "configured-best-effort-required-or-native-only",
 				"release":              lock.Emulation.Source.Release,
 				"sourceIndexDigest":    lock.Emulation.Source.IndexDigest,
 				"sourceManifestDigest": emulationPlatformLock.ManifestDigest,
@@ -1150,7 +1150,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
 	metadata.Compatibility.EmulationBackend = lock.Emulation.Backend
-	metadata.Compatibility.EmulationPolicy = "automatic-binfmt-install-all"
+	metadata.Compatibility.EmulationPolicy = "configured-best-effort-required-or-native-only"
 	metadata.Compatibility.EmulationRelease = lock.Emulation.Source.Release
 	metadata.Compatibility.EmulationSourceDigest = lock.Emulation.Source.IndexDigest
 	metadata.Compatibility.EmulationManifestDigest = emulationPlatformLock.ManifestDigest
@@ -1678,7 +1678,7 @@ func verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePat
 	if !validSHA256(metadata.Template.Digest) || metadata.Template.CacheID != strings.TrimPrefix(metadata.Template.Digest, "sha256:")[:12] || metadata.Template.Tag == "" || metadata.Template.RootDisk == "" || metadata.Template.Archive != filepath.Base(archivePath) {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
-	if metadata.Compatibility.TemplateSchemaVersion != 2 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 || metadata.Compatibility.EmulationBackend != "qemu" || metadata.Compatibility.EmulationPolicy != "automatic-binfmt-install-all" || metadata.Compatibility.EmulationRelease == "" || !validSHA256(metadata.Compatibility.EmulationSourceDigest) || !validSHA256(metadata.Compatibility.EmulationManifestDigest) || metadata.Compatibility.QEMUVersion == "" {
+	if metadata.Compatibility.TemplateSchemaVersion != 2 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 || metadata.Compatibility.EmulationBackend != "qemu" || metadata.Compatibility.EmulationPolicy != "configured-best-effort-required-or-native-only" || metadata.Compatibility.EmulationRelease == "" || !validSHA256(metadata.Compatibility.EmulationSourceDigest) || !validSHA256(metadata.Compatibility.EmulationManifestDigest) || metadata.Compatibility.QEMUVersion == "" {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
 	archiveInfo, err := os.Lstat(archivePath)

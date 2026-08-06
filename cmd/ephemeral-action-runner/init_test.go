@@ -1077,7 +1077,7 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
 	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
-	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.LinuxAMD64, initDockerSandboxesDiscovery{
 		Templates: []initDockerSandboxesTemplate{
 			{Reference: "docker.io/library/epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64", Digest: "sha256:" + strings.Repeat("a", 64), CacheID: strings.Repeat("a", 12), Platform: "linux/amd64", Size: 8 << 30, Label: "Catthehacker Ubuntu Full (recommended)", SourceChannel: "ghcr.io/catthehacker/ubuntu:full-latest"},
 			{Reference: "docker.io/library/epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64", Digest: "sha256:" + strings.Repeat("c", 64), CacheID: strings.Repeat("c", 12), Platform: "linux/amd64", Size: 4 << 30, Label: "Catthehacker Ubuntu Act 22.04 (current lean profile)", SourceChannel: "ghcr.io/catthehacker/ubuntu:act-22.04"},
@@ -1125,6 +1125,12 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 	if got, want := cfg.DockerSandboxes.NetworkBaseline, config.DockerSandboxesNetworkBaselineOpen; got != want {
 		t.Fatalf("dockerSandboxes.networkBaseline = %q, want %q", got, want)
 	}
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationBestEffort; got != want {
+		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want wizard value %q", got, want)
+	}
+	if !strings.Contains(string(configContent), "architectureEmulation: best-effort") {
+		t.Fatalf("wizard config omitted best-effort architecture emulation:\n%s", configContent)
+	}
 	for key, values := range map[string]struct{ got, want string }{
 		"rootDisk":   {cfg.DockerSandboxes.RootDisk, "auto"},
 		"dockerDisk": {cfg.DockerSandboxes.DockerDisk, "50GiB"},
@@ -1136,6 +1142,11 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 	for _, want := range []string{"Docker Sandboxes image setup:", "Runner base image:", "1. full — full-latest (default)", "2. act — act-latest", "Image catalog:", "Runner artifact estimate:", "Source: ghcr.io/catthehacker/ubuntu:act-latest", "Automatic sandbox root limit:"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("init output omitted %q:\n%s", want, out.String())
+		}
+	}
+	for _, want := range []string{"Architecture emulation: best-effort", "QEMU/binfmt will be attempted; unsupported hosts continue with verified native containers and a warning."} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("wizard review omitted %q:\n%s", want, out.String())
 		}
 	}
 	setupHints := "  Choose the Catthehacker Ubuntu image for this runner. EPAR will provision or update the reusable runner artifact during startup.\n  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.\n  Image catalog: https://github.com/catthehacker/docker_images#images-available\n\nRunner base image:"
@@ -1962,6 +1973,16 @@ func TestInitDockerSandboxesKillSwitchDoesNotInvokeDiscovery(t *testing.T) {
 func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing.T) {
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	stubNoWSL2(t)
+	oldGOOS := initGOOS
+	oldWSLStatus := initWSLStatus
+	initGOOS = "windows"
+	initWSLStatus = func(context.Context) ([]byte, error) {
+		return nil, exec.ErrNotFound
+	}
+	t.Cleanup(func() {
+		initGOOS = oldGOOS
+		initWSLStatus = oldWSLStatus
+	})
 	record := validInitPromotionRecord()
 	stubInitSandboxPromotion(t, record, sandboxpromotion.PreflightResult{})
 	dir := t.TempDir()
@@ -1996,6 +2017,9 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if got, want := cfg.DockerSandboxes.PolicyGeneration, record.PolicyFingerprint; got != want {
 		t.Fatalf("dockerSandboxes.policyGeneration = %q, want %q", got, want)
 	}
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationBestEffort; got != want {
+		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want Windows wizard value %q", got, want)
+	}
 	for key, values := range map[string]struct {
 		got  string
 		want string
@@ -2011,18 +2035,23 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint} {
+	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: best-effort"} {
 		if !strings.Contains(string(configText), required) {
 			t.Fatalf("generated Docker Sandboxes config omitted %q:\n%s", required, configText)
 		}
 	}
-	for _, forbidden := range []string{"dockerSandbox:", "\n  type: docker-sandbox\n", "epar-docker-sandbox]", "architectureEmulation:", "epar-cross-architecture"} {
+	for _, forbidden := range []string{"dockerSandbox:", "\n  type: docker-sandbox\n", "epar-docker-sandbox]", "epar-cross-architecture"} {
 		if strings.Contains(string(configText), forbidden) {
 			t.Fatalf("generated config used singular Docker Sandbox key %q:\n%s", forbidden, configText)
 		}
 	}
 	if !strings.Contains(out.String(), "PASS: the exact promoted platform") || !strings.Contains(out.String(), "Docker Sandboxes — recommended (default)") {
 		t.Fatalf("init output did not explain the promoted default:\n%s", out.String())
+	}
+	for _, want := range []string{"Architecture emulation: best-effort", "QEMU/binfmt will be attempted; unsupported hosts continue with verified native containers and a warning."} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("Windows wizard review omitted %q:\n%s", want, out.String())
+		}
 	}
 }
 

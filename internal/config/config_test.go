@@ -1442,6 +1442,9 @@ dockerSandboxes:
 	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
 		t.Fatalf("dockerSandboxes.memory = %q, want %q", got, want)
 	}
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, DockerSandboxesArchitectureEmulationBestEffort; got != want {
+		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want omitted configuration to default to %q", got, want)
+	}
 	if got, want := cfg.DockerSandboxes.AdditionalAllow, []string{"api.github.com", "*.githubusercontent.com:443"}; !slices.Equal(got, want) {
 		t.Fatalf("dockerSandboxes.additionalAllow = %#v, want %#v", got, want)
 	}
@@ -1462,15 +1465,39 @@ func TestLoadDockerSandboxesRejectsRemovedHostReserve(t *testing.T) {
 	}
 }
 
-func TestLoadDockerSandboxesRejectsArchitectureEmulationConfiguration(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "docker-sandboxes.yml")
-	if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  architectureEmulation: disabled\n"), 0644); err != nil {
-		t.Fatal(err)
+func TestLoadDockerSandboxesArchitectureEmulation(t *testing.T) {
+	for _, value := range []string{DockerSandboxesArchitectureEmulationBestEffort, DockerSandboxesArchitectureEmulationRequired, DockerSandboxesArchitectureEmulationNativeOnly} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "docker-sandboxes.yml")
+			if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  architectureEmulation: "+value+"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.DockerSandboxes.ArchitectureEmulation; got != value {
+				t.Fatalf("dockerSandboxes.architectureEmulation = %q, want %q", got, value)
+			}
+			cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+			if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err != nil {
+				t.Fatalf("ValidateDockerSandboxes() rejected %q: %v", value, err)
+			}
+		})
 	}
-	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "unknown key dockerSandboxes.architectureEmulation") {
-		t.Fatalf("Load() error = %v, want removed emulation-setting rejection", err)
+}
+
+func TestValidateDockerSandboxesRejectsInvalidArchitectureEmulation(t *testing.T) {
+	for _, value := range []string{"", "disabled", "Required", "native"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := Default()
+			cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+			cfg.DockerSandboxes.ArchitectureEmulation = value
+			if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err == nil || !strings.Contains(err.Error(), "supported values are best-effort, required, and native-only") {
+				t.Fatalf("ValidateDockerSandboxes() error = %v, want unsupported architecture-emulation rejection", err)
+			}
+		})
 	}
 }
 

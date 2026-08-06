@@ -1938,7 +1938,7 @@ func dockerSandboxesPlatform(platform sandboxpromotion.Platform) (string, string
 	}
 }
 
-func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, updatePolicy initImageUpdatePolicy, guestPlatform, runnerArchitectureLabel string) string {
+func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath string, poolNamePrefix, hostTrustMode string, hostTrustScopes []string, runnerGroup initRunnerGroupSelection, profile initDockerSandboxesProfile, updatePolicy initImageUpdatePolicy, guestPlatform, runnerArchitectureLabel, architectureEmulation string) string {
 	return fmt.Sprintf(`github:
   appId: %d
   organization: %s
@@ -2015,6 +2015,7 @@ provider:
 dockerSandboxes:
   policyGeneration: %s
   networkBaseline: open
+  architectureEmulation: %s
   stagingRoot: .local/docker-sandboxes-staging
   cpus: 4
   memory: 8GiB
@@ -2026,7 +2027,7 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, profile.SourceImage, guestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, profile.RootDisk, profile.DockerDisk)
+`, appID, organization, privateKeyPath, profile.SourceImage, guestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, architectureEmulation, profile.RootDisk, profile.DockerDisk)
 }
 
 func renderInitCustomInstallScripts(paths []string) string {

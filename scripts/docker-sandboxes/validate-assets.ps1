@@ -204,6 +204,7 @@ foreach ($required in @(
     'COPY --from=hook-builder --chmod=0555 /out/epar-hook-bash /opt/epar/hook-bin/bash',
     'COPY --from=qemu-source /usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/',
     'install -m 0555 enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation',
+    'install -m 0555 verify-native-architecture.sh /opt/epar/verify-native-architecture',
     'io.solutionforest.epar.template.schema-version="2"',
     'com.docker.sandboxes.start-docker=true',
     'USER agent',
@@ -239,8 +240,14 @@ if ($runnerDiagnostics -match '(?im)\btail\b|_diag|(?:^|,)cmd=') {
     throw 'collect-runner-diagnostics.sh must not emit command lines or runner/job log content'
 }
 $emulationHelper = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'enable-architecture-emulation.sh')
-if (-not $emulationHelper.Contains('--install all') -or -not $emulationHelper.Contains('mount -t binfmt_misc') -or -not $emulationHelper.Contains('/proc/sys/fs/binfmt_misc') -or $emulationHelper.Contains('DOCKER_DEFAULT_PLATFORM')) {
-    throw 'enable-architecture-emulation.sh must install all bundled handlers, verify binfmt_misc structurally, and leave Docker platform selection unchanged'
+if (-not $emulationHelper.Contains('--install all') -or -not $emulationHelper.Contains('modprobe binfmt_misc') -or -not $emulationHelper.Contains('mount -t binfmt_misc') -or -not $emulationHelper.Contains('/proc/sys/fs/binfmt_misc') -or -not $emulationHelper.Contains('sandbox kernel/module set does not provide usable binfmt_misc support') -or $emulationHelper.Contains('DOCKER_DEFAULT_PLATFORM')) {
+    throw 'enable-architecture-emulation.sh must load or mount binfmt_misc, install all bundled handlers, fail clearly when the sandbox kernel cannot support QEMU, and leave Docker platform selection unchanged'
+}
+$nativeArchitectureHelper = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'verify-native-architecture.sh')
+foreach ($required in @('linux/amd64', 'linux/arm64', 'docker info --format', '/opt/epar/emulation/qemu-', '"backend":"native"', '"handlerCount":%d', 'epar_handler_count')) {
+    if (-not $nativeArchitectureHelper.Contains($required)) {
+        throw "verify-native-architecture.sh is missing required native admission evidence: $required"
+    }
 }
 if ($guestText -match '(?im)\btail\s+(?:-[^\s]+\s+)*["'']?\$\{?(?:log_file|runner_log|job_log)') {
     throw 'Guest helpers must not copy runner or job log content into controller-visible output'
@@ -265,7 +272,7 @@ foreach ($profileName in $expectedProfiles.Keys) {
         Assert-Equal "$profileName $platformName daemon owner" $compatibility.docker.daemonOwner 'docker-sandboxes-runtime'
         Assert-Equal "$profileName $platformName /var/lib/docker preload" $compatibility.docker.imagePreloadsVarLibDocker $false
         Assert-Equal "$profileName $platformName emulation backend" $compatibility.architectureEmulation.backend 'qemu'
-        Assert-Equal "$profileName $platformName architecture policy" $compatibility.architectureEmulation.policy 'automatic-binfmt-install-all'
+        Assert-Equal "$profileName $platformName architecture policy" $compatibility.architectureEmulation.policy 'configured-best-effort-required-or-native-only'
         Assert-Equal "$profileName $platformName emulation release" $compatibility.architectureEmulation.release 'qemu-v10.2.3-68'
         Assert-Equal "$profileName $platformName QEMU version" $compatibility.architectureEmulation.qemuVersion '10.2.3'
         Assert-Equal "$profileName $platformName emulation index" $compatibility.architectureEmulation.sourceIndexDigest $lock.emulation.source.indexDigest

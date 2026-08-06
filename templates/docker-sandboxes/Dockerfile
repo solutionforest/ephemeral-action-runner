@@ -61,6 +61,7 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && cd /opt/epar \
     && chmod 0555 ./*.sh \
     && install -m 0555 enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation \
+    && install -m 0555 verify-native-architecture.sh /opt/epar/verify-native-architecture \
     && chmod 0555 /opt/epar/emulation/binfmt /opt/epar/emulation/qemu-* \
     && chmod 0444 /usr/share/licenses/epar-emulation/*.txt \
     && /opt/epar/prepare-template.sh \

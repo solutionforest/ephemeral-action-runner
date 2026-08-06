@@ -61,6 +61,7 @@ type Provider struct {
 	activeTemplate        provider.TemplateArtifact
 	dryRun                bool
 	architectureEmulation architectureEmulationEnabler
+	architectureLogged    sync.Map
 	logger                *slog.Logger
 }
 
@@ -109,6 +110,19 @@ func New(binary string) *Provider {
 
 func NewWithDryRun(binary string, dryRun bool) *Provider {
 	return newWithArchitectureEmulation(binary, dryRun, qemuBinfmtEnabler{})
+}
+
+func NewWithArchitectureMode(binary string, dryRun bool, mode, platform string) *Provider {
+	var enabler architectureEmulationEnabler
+	switch mode {
+	case architectureEmulationBestEffort:
+		enabler = bestEffortArchitectureEnabler{platform: platform}
+	case architectureEmulationRequired:
+		enabler = qemuBinfmtEnabler{}
+	case architectureEmulationNativeOnly:
+		enabler = nativeArchitectureEnabler{platform: platform}
+	}
+	return newWithArchitectureEmulation(binary, dryRun, enabler)
 }
 
 func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectureEmulationEnabler) *Provider {
@@ -261,14 +275,32 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			if err != nil {
 				return instance, err
 			}
-			if p.logger != nil {
-				message := fmt.Sprintf("Docker Sandboxes architecture emulation enabled: backend=%s registeredHandlers=%d", emulation.Backend, emulation.HandlerCount)
-				p.logger.Info(message, "provider", "docker-sandboxes", "instance", item.Instance.Name, "backend", emulation.Backend, "registeredHandlers", emulation.HandlerCount)
-			}
+			p.logArchitectureCapability(item.Instance.Name, emulation)
 			return instance, nil
 		}
 	}
 	return provider.Instance{}, fmt.Errorf("docker sandbox was not present in inventory after create")
+}
+
+func (p *Provider) logArchitectureCapability(instanceName string, emulation architectureEmulationResult) {
+	if p.logger == nil {
+		return
+	}
+	if _, alreadyLogged := p.architectureLogged.LoadOrStore(instanceName, struct{}{}); alreadyLogged {
+		return
+	}
+	if emulation.Mode == architectureEmulationNativeOnly {
+		message := fmt.Sprintf("Docker Sandboxes native-only architecture verified: platform=%s; foreign-architecture containers are unsupported", emulation.Platform)
+		p.logger.Warn(message, "provider", "docker-sandboxes", "instance", instanceName, "architectureEmulation", emulation.Mode, "backend", emulation.Backend, "platform", emulation.Platform, "registeredHandlers", emulation.HandlerCount)
+		return
+	}
+	if emulation.Mode == architectureEmulationBestEffort && emulation.Backend == "native" {
+		message := fmt.Sprintf("Docker Sandboxes QEMU/binfmt unavailable; continuing with verified native platform=%s; foreign-architecture containers may fail", emulation.Platform)
+		p.logger.Warn(message, "provider", "docker-sandboxes", "instance", instanceName, "architectureEmulation", emulation.Mode, "backend", emulation.Backend, "platform", emulation.Platform, "registeredHandlers", emulation.HandlerCount, "qemuError", emulation.Warning)
+		return
+	}
+	message := fmt.Sprintf("Docker Sandboxes architecture emulation enabled: backend=%s registeredHandlers=%d", emulation.Backend, emulation.HandlerCount)
+	p.logger.Info(message, "provider", "docker-sandboxes", "instance", instanceName, "architectureEmulation", emulation.Mode, "backend", emulation.Backend, "registeredHandlers", emulation.HandlerCount)
 }
 
 // ImportTemplate performs the one exact provider mutation required after the
@@ -417,7 +449,18 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	if err := p.verifyNoPublishedPorts(ctx, instance); err != nil {
 		return err
 	}
-	return p.verifyInspection(ctx, instance, nil)
+	if err := p.verifyInspection(ctx, instance, nil); err != nil {
+		return err
+	}
+	if p.architectureEmulation == nil {
+		return fmt.Errorf("Docker Sandboxes architecture emulation enabler is unavailable")
+	}
+	emulation, err := p.architectureEmulation.Enable(ctx, p, instance)
+	if err != nil {
+		return err
+	}
+	p.logArchitectureCapability(instance.Name, emulation)
+	return nil
 }
 
 func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest) error {
@@ -764,6 +807,7 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 	if err != nil {
 		return err
 	}
+	p.architectureLogged.Delete(instance.Name)
 	if p.runCommand == nil {
 		stagingRoot, openErr := staging.Open(filepath.Dir(receipt.StagingPath))
 		if openErr != nil {

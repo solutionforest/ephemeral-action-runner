@@ -534,7 +534,7 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
 	metadata.Compatibility.EmulationBackend = "qemu"
-	metadata.Compatibility.EmulationPolicy = "automatic-binfmt-install-all"
+	metadata.Compatibility.EmulationPolicy = "configured-best-effort-required-or-native-only"
 	metadata.Compatibility.EmulationRelease = "qemu-v10.2.3-68"
 	metadata.Compatibility.EmulationSourceDigest = "sha256:" + strings.Repeat("d", 64)
 	metadata.Compatibility.EmulationManifestDigest = "sha256:" + strings.Repeat("e", 64)
@@ -612,7 +612,7 @@ func TestDockerSandboxesEmulationLockAndTemplateAssetsAreExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"/usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/", "enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation"} {
+	for _, required := range []string{"/usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/", "enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation", "verify-native-architecture.sh /opt/epar/verify-native-architecture"} {
 		if !strings.Contains(string(dockerfile), required) {
 			t.Fatalf("Dockerfile omits %q", required)
 		}
@@ -626,8 +626,17 @@ func TestDockerSandboxesEmulationLockAndTemplateAssetsAreExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(helper), "--install all") || !strings.Contains(string(helper), "/proc/sys/fs/binfmt_misc") {
+	if !strings.Contains(string(helper), "--install all") || !strings.Contains(string(helper), "modprobe binfmt_misc") || !strings.Contains(string(helper), "/proc/sys/fs/binfmt_misc") || !strings.Contains(string(helper), "sandbox kernel/module set does not provide usable binfmt_misc support") {
 		t.Fatal("architecture emulation helper does not install and structurally verify binfmt handlers")
+	}
+	nativeHelper, err := os.ReadFile(filepath.Join(templateRoot, "guest", "verify-native-architecture.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"linux/amd64", "linux/arm64", "docker info --format", "/opt/epar/emulation/qemu-", `"backend":"native"`, `"handlerCount":%d`, "epar_handler_count"} {
+		if !strings.Contains(string(nativeHelper), required) {
+			t.Fatalf("native architecture helper omits %q", required)
+		}
 	}
 }
 
