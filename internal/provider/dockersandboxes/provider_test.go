@@ -197,7 +197,6 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	}
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{
@@ -244,7 +243,6 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -507,7 +505,6 @@ func TestQEMUBinfmtEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
 func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -536,7 +533,6 @@ func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) 
 func TestCreateReturnsExactReceiptWhenArchitectureEmulationSetupFails(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -582,7 +578,6 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 	mismatch := strings.Replace(templateListJSON, "39cf20eca861", "aaaaaaaaaaaa", 1)
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}},
 	)
 	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "does not match") {
@@ -594,7 +589,6 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -605,19 +599,6 @@ func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T)
 	)
 	if _, err := p.Create(context.Background(), validCreateRequest()); err != nil {
 		t.Fatal(err)
-	}
-	done()
-}
-
-func TestCreateFailsClosedWithoutEchoingGlobalSecretMetadata(t *testing.T) {
-	const listedMetadata = "github registry masked-prefix masked-suffix"
-	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: listedMetadata}},
-	)
-	_, err := p.Create(context.Background(), validCreateRequest())
-	if err == nil || !strings.Contains(err.Error(), "global secrets are configured") || strings.Contains(err.Error(), listedMetadata) {
-		t.Fatalf("global-secret preflight error = %v", err)
 	}
 	done()
 }
@@ -639,25 +620,44 @@ func TestInstanceAdmissionUsesExactInspectionAndRejectsAttachedCapabilities(t *t
 		done()
 	})
 	for _, mutation := range []struct {
-		name string
-		old  string
-		new  string
+		name     string
+		old      string
+		new      string
+		metadata string
 	}{
-		{name: "kit", old: `"kits":[]`, new: `"kits":[{"name":"docker-auth"}]`},
+		{name: "kit", old: `"kits":[]`, new: `"kits":[{"name":"docker-auth","token":"kit-token-metadata"}]`, metadata: "kit-token-metadata"},
 		{name: "mcp", old: `"mcp_gateway":false`, new: `"mcp_gateway":true`},
-		{name: "secret", old: `"state":"running"`, new: `"state":"running","secrets":["registry"]`},
-		{name: "port", old: `"state":"running"`, new: `"state":"running","published_ports":["8080:80"]`},
-		{name: "auth", old: `"state":"running"`, new: `"state":"running","auth_mode":"docker-login"`},
+		{name: "secrets", old: `"state":"running"`, new: `"state":"running","secrets":["registry-secret-metadata"]`, metadata: "registry-secret-metadata"},
+		{name: "published_ports", old: `"state":"running"`, new: `"state":"running","published_ports":["8080:80"]`, metadata: "8080:80"},
+		{name: "ports", old: `"state":"running"`, new: `"state":"running","ports":[{"host_port":8080}]`, metadata: "8080"},
+		{name: "auth", old: `"state":"running"`, new: `"state":"running","auth":{"provider":"registry-auth-metadata"}`, metadata: "registry-auth-metadata"},
+		{name: "auth_mode", old: `"state":"running"`, new: `"state":"running","auth_mode":"docker-login-metadata"`, metadata: "docker-login-metadata"},
+		{name: "docker_auth", old: `"state":"running"`, new: `"state":"running","docker_auth":{"registry":"registry-token-metadata"}`, metadata: "registry-token-metadata"},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
 			fixture := strings.Replace(inspectionJSON, mutation.old, mutation.new, 1)
 			p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
-			if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err == nil {
+			err := p.VerifyInstanceAdmission(context.Background(), testInstance)
+			if err == nil {
 				t.Fatal("attached capability was accepted")
+			}
+			if mutation.metadata != "" && strings.Contains(err.Error(), mutation.metadata) {
+				t.Fatalf("attached capability metadata leaked in error: %v", err)
 			}
 			done()
 		})
 	}
+}
+
+func TestInstanceAdmissionRejectsCredentialMetadataWithoutEchoingIt(t *testing.T) {
+	const metadata = "registry-token-metadata"
+	fixture := strings.Replace(inspectionJSON, `"state":"running"`, `"state":"running","docker_auth":{"registry":"`+metadata+`"}`, 1)
+	p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
+	err := p.VerifyInstanceAdmission(context.Background(), testInstance)
+	if err == nil || !strings.Contains(err.Error(), "forbidden attached capability") || strings.Contains(err.Error(), metadata) {
+		t.Fatalf("credential capability error = %v", err)
+	}
+	done()
 }
 
 func TestInstanceAdmissionRechecksConfiguredArchitectureCapability(t *testing.T) {
@@ -825,10 +825,9 @@ func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {
 	done()
 }
 
-func TestAdmissionUsesDiagnosticsWithoutReadingVersion(t *testing.T) {
+func TestAdmissionUsesDiagnosticsWithoutReadingGlobalSecrets(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
 		t.Fatal(err)
@@ -839,7 +838,6 @@ func TestAdmissionUsesDiagnosticsWithoutReadingVersion(t *testing.T) {
 func TestAdmissionRechecksDiagnostics(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {

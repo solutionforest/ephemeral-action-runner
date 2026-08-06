@@ -15,6 +15,15 @@ RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-true}"
 RUNNER_GROUP="${RUNNER_GROUP:-}"
 RUNNER_NO_DEFAULT_LABELS="${RUNNER_NO_DEFAULT_LABELS:-false}"
 runner_dir="${EPAR_ACTIONS_RUNNER_DIR:-/opt/actions-runner}"
+sandbox_forward_proxy="http://gateway.docker.internal:3128"
+[[ -s /opt/epar/trust/ca-bundle.pem && ! -L /opt/epar/trust/ca-bundle.pem ]]
+
+# Docker Sandboxes may inject a host-authenticated client configuration while
+# creating the sandbox. Scrub only the authentication files immediately before
+# registration; preserve .docker/sandbox/locks and any other runtime state.
+# This runs before workflow steps exist, so it cannot remove later job-created
+# credentials.
+/opt/epar/scrub-docker-auth.sh --runtime
 
 install -d -m 0700 -o agent -g agent \
   /home/agent/.docker \
@@ -68,10 +77,23 @@ configuration_environment=(
   "XDG_STATE_HOME=/home/agent/.local/state"
   "XDG_RUNTIME_DIR=/run/user/1000"
   "DOCKER_CONFIG=/home/agent/.docker"
+  "HTTP_PROXY=${sandbox_forward_proxy}"
+  "HTTPS_PROXY=${sandbox_forward_proxy}"
+  "ALL_PROXY=${sandbox_forward_proxy}"
+  "http_proxy=${sandbox_forward_proxy}"
+  "https_proxy=${sandbox_forward_proxy}"
+  "all_proxy=${sandbox_forward_proxy}"
+	"SSL_CERT_FILE=/opt/epar/trust/ca-bundle.pem"
+	"NODE_EXTRA_CA_CERTS=/opt/epar/trust/ca-bundle.pem"
+	"REQUESTS_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"
+	"PIP_CERT=/opt/epar/trust/ca-bundle.pem"
+	"CURL_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"
+	"GIT_SSL_CAINFO=/opt/epar/trust/ca-bundle.pem"
+	"AWS_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"
   "PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   "LANG=C.UTF-8"
 )
-for environment_name in SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
+for environment_name in JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
   if [[ -n "${!environment_name+x}" ]]; then
     configuration_environment+=("${environment_name}=${!environment_name}")
   fi

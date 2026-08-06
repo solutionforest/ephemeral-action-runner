@@ -7,10 +7,103 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
+
+type policyLogRecord struct {
+	Host      string    `json:"host"`
+	VMName    string    `json:"vm_name"`
+	ProxyType string    `json:"proxy_type"`
+	Rule      string    `json:"rule"`
+	LastSeen  time.Time `json:"last_seen"`
+	Since     time.Time `json:"since"`
+	Count     int       `json:"count_since"`
+	Reason    string    `json:"reason,omitempty"`
+}
+
+type policyLogDocument struct {
+	Blocked []policyLogRecord `json:"blocked_hosts"`
+	Allowed []policyLogRecord `json:"allowed_hosts"`
+}
+
+func validatePolicyCommand(args []string) error {
+	valid := false
+	if len(args) == 4 && args[1] == "ls" && args[2] == "--include-inactive" && args[3] == "--json" {
+		valid = true
+	}
+	if len(args) == 5 && args[1] == "ls" && sandboxNamePattern.MatchString(args[2]) && args[3] == "--include-inactive" && args[4] == "--json" {
+		valid = true
+	}
+	if len(args) == 4 && args[1] == "log" && sandboxNamePattern.MatchString(args[2]) && args[3] == "--json" {
+		valid = true
+	}
+	if len(args) == 6 && (args[1] == "allow" || args[1] == "deny") && args[2] == "network" && args[3] == "--sandbox" && sandboxNamePattern.MatchString(args[4]) && args[5] != "" {
+		valid = true
+	}
+	if len(args) == 7 && args[1] == "rm" && args[2] == "network" && args[3] == "--sandbox" && sandboxNamePattern.MatchString(args[4]) && args[5] == "--id" && providerIDPattern.MatchString(args[6]) {
+		valid = true
+	}
+	if !valid {
+		return fmt.Errorf("only exact Docker Sandboxes network-policy operations are permitted")
+	}
+	return nil
+}
+
+func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance provider.Instance, port int, startedAt time.Time) error {
+	result, err := p.run(ctx, commandRequest{
+		args:        []string{"policy", "log", instance.Name, "--json"},
+		operation:   "verify Docker Sandboxes host-trust relay route",
+		outputLimit: diagnosticOutputLimit,
+	})
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(strings.NewReader(result.Stdout))
+	decoder.DisallowUnknownFields()
+	var document policyLogDocument
+	if err := decoder.Decode(&document); err != nil || requireJSONEOF(decoder) != nil {
+		return fmt.Errorf("Docker Sandboxes policy log returned an unsupported json schema")
+	}
+	cutoff := startedAt.Add(-5 * time.Second)
+	relayHosts := map[string]struct{}{
+		netJoinHostPort("localhost", port):            {},
+		netJoinHostPort("host.docker.internal", port): {},
+	}
+	for _, record := range document.Blocked {
+		if record.VMName == instance.Name && !record.LastSeen.Before(cutoff) {
+			if _, exactRelay := relayHosts[record.Host]; exactRelay {
+				return fmt.Errorf("Docker Sandboxes blocked the exact EPAR host-trust relay endpoint")
+			}
+		}
+	}
+	foundTransparentRelay := false
+	for _, record := range document.Allowed {
+		if record.VMName != instance.Name || record.LastSeen.Before(cutoff) {
+			continue
+		}
+		if record.Host == "registry-1.docker.io:443" && record.ProxyType == "forward" {
+			return fmt.Errorf("Docker Sandboxes routed the relay registry proof through credential-bearing forward egress")
+		}
+		if _, exactRelay := relayHosts[record.Host]; exactRelay {
+			if record.ProxyType != "transparent" {
+				return fmt.Errorf("Docker Sandboxes host-trust relay used unexpected %q routing", record.ProxyType)
+			}
+			foundTransparentRelay = true
+		}
+	}
+	if !foundTransparentRelay {
+		return fmt.Errorf("Docker Sandboxes policy log did not confirm fresh transparent routing for the exact EPAR host-trust relay endpoint")
+	}
+	return nil
+}
+
+func netJoinHostPort(host string, port int) string {
+	return host + ":" + strconv.Itoa(port)
+}
 
 func (p *Provider) ApplyNetworkPolicy(ctx context.Context, instance provider.Instance, rules []provider.NetworkPolicyRule) error {
 	if len(rules) == 0 {

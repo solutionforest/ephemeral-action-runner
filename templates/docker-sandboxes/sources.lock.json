@@ -20,7 +20,10 @@
     "indexDigest": "sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980"
   },
   "hookLauncher": {
-    "sha256": "7fe07f10f484fa6888481a4165e81570187c0aeff422738d3ea5add6b95dd9b7"
+    "sha256": "75c25e1cb5c458840f35e1df5232550f32d90987d32ebc4f2c093ac7268ef799"
+  },
+  "egressBridge": {
+    "sha256": "9b25461c671d8edef8abe046d167516c127e86d65046af6953507ae03bfd4918"
   },
   "tini": {
     "version": "0.19.0"

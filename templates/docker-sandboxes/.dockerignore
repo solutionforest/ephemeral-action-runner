@@ -6,6 +6,8 @@
 !guest/docker-daemon.json
 !hook-launcher/
 !hook-launcher/*.go
+!egress-bridge/
+!egress-bridge/*.go
 !custom-install/
 !custom-install/run.sh
 !inputs/

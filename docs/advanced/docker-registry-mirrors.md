@@ -141,7 +141,7 @@ docker:
 
 A mirror cannot bypass registry authorization.
 
-For Docker Hub private images, keep doing `docker login` inside the GitHub Actions job with repository or organization secrets. Host-side `docker login` is not copied into EPAR runners, and EPAR does not bake Docker credentials into images. EPAR's current Docker Sandboxes template routes its private Docker daemon transparently so the host forward proxy cannot replace the job's registry authorization during normal operation; see [Docker Hub Credentials and Transparent Egress](../providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
+For Docker Hub private images, keep doing `docker login` inside the GitHub Actions job with repository or organization secrets. Host-side `docker login` is not copied into EPAR runners, and EPAR does not bake Docker credentials into images. EPAR gives the Docker Sandboxes gateway proxy only to runner registration and the Actions listener. On Windows overlay runners, host-level workflow HTTPS clients use EPAR's raw authenticated local relay listener and the private daemon uses a separate root-only TLS-terminating listener; both reach the credential-free controller-host relay. Other configurations retain the transparent daemon route. The hook, relay token, local authority, and runtime scrub are scoped to the current runner and do not mutate unrelated sandboxes or global secrets; see [Docker Hub Credentials and Transparent Egress](../providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
 Private pulls can use a mirror in two common ways:
 

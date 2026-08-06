@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,6 +64,12 @@ type Provider struct {
 	architectureEmulation architectureEmulationEnabler
 	architectureLogged    sync.Map
 	logger                *slog.Logger
+	relayMu               sync.Mutex
+	relay                 *egressRelay
+	relayTokens           map[string]string
+	relayConnections      map[string]map[net.Conn]struct{}
+	hostTrustRelayEnabled bool
+	hostTrustRelayPort    int
 }
 
 type instanceReceipt struct {
@@ -129,7 +136,18 @@ func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectu
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary, dryRun: dryRun, architectureEmulation: enabler}
+	return &Provider{Binary: binary, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]string), relayConnections: make(map[string]map[net.Conn]struct{})}
+}
+
+// ConfigureHostTrustRelay enables the Windows-host trust transport used by
+// Docker Sandboxes overlay mode. It is configured once by the provider
+// registry before lifecycle operations begin.
+func (p *Provider) ConfigureHostTrustRelay(enabled bool, stableIdentity ...string) {
+	p.hostTrustRelayEnabled = enabled
+	p.hostTrustRelayPort = 0
+	if enabled && len(stableIdentity) != 0 && stableIdentity[0] != "" {
+		p.hostTrustRelayPort = stableRelayPort(stableIdentity[0])
+	}
 }
 
 // SetLogger attaches the controller's structured logger before any concurrent
@@ -428,14 +446,12 @@ func (p *Provider) ObserveTemplate(ctx context.Context, artifact provider.Templa
 	return false, nil
 }
 
-// VerifyAdmission fail-closes on provider-wide channels Docker Sandboxes can
-// inject into every sandbox. EPAR deliberately does not consume global secrets;
-// repository and workflow input can never opt out of this check.
+// VerifyAdmission checks only host-level Docker Sandboxes readiness. Capability
+// checks that are specific to an EPAR-managed sandbox are performed by
+// VerifyInstanceAdmission after that exact sandbox has been created.
 func (p *Provider) VerifyAdmission(ctx context.Context) error {
-	if _, err := p.VerifyHostReadiness(ctx); err != nil {
-		return err
-	}
-	return p.verifyNoGlobalSecrets(ctx)
+	_, err := p.VerifyHostReadiness(ctx)
+	return err
 }
 
 func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provider.Instance) error {
@@ -547,21 +563,6 @@ func (p *Provider) verifyNoPublishedPorts(ctx context.Context, instance provider
 	}
 	if len(ports) != 0 {
 		return fmt.Errorf("docker sandbox reported a forbidden published port")
-	}
-	return nil
-}
-
-func (p *Provider) verifyNoGlobalSecrets(ctx context.Context) error {
-	result, err := p.run(ctx, commandRequest{
-		args:        []string{"secret", "ls", "-g"},
-		operation:   "verify docker sandboxes global secret isolation",
-		outputLimit: 64 << 10,
-	})
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(strings.ReplaceAll(result.Stdout, "\r\n", "\n")) != `No secrets found for scope "(global)".` {
-		return fmt.Errorf("docker sandboxes global secrets are configured; EPAR refuses to expose shared registry or service credentials to workflow sandboxes")
 	}
 	return nil
 }
@@ -767,6 +768,10 @@ func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error)
 }
 
 func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
+	if err := validateInstance(instance, true); err != nil {
+		return err
+	}
+	defer p.releaseRelayToken(instance.Name)
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		return err
@@ -779,6 +784,10 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 }
 
 func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error {
+	if err := validateInstance(instance, true); err != nil {
+		return err
+	}
+	defer p.releaseRelayToken(instance.Name)
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		return err
@@ -832,7 +841,12 @@ func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryI
 	if err != nil {
 		return nil, err
 	}
-	return parseInventory([]byte(result.Stdout))
+	items, err := parseInventory([]byte(result.Stdout))
+	if err != nil {
+		return nil, err
+	}
+	p.reconcileRelayTokens(items)
+	return items, nil
 }
 
 // CachedTemplates returns the strictly parsed, host-level Docker Sandboxes
@@ -1002,10 +1016,6 @@ func validateCommandRequest(request commandRequest) error {
 	}
 	switch request.args[0] {
 	case "version", "create", "exec", "daemon", "diagnose", "stop", "rm", "ls", "template", "policy", "inspect", "ports":
-	case "secret":
-		if len(request.args) != 3 || request.args[1] != "ls" || request.args[2] != "-g" {
-			return fmt.Errorf("only exact global-secret absence verification is permitted")
-		}
 	default:
 		return fmt.Errorf("docker sandboxes command %q is not permitted", request.args[0])
 	}
@@ -1014,6 +1024,11 @@ func validateCommandRequest(request commandRequest) error {
 	}
 	if request.args[0] == "ports" && (len(request.args) != 3 || !sandboxNamePattern.MatchString(request.args[1]) || request.args[2] != "--json") {
 		return fmt.Errorf("only exact machine-readable published-port absence verification is permitted")
+	}
+	if request.args[0] == "policy" {
+		if err := validatePolicyCommand(request.args); err != nil {
+			return err
+		}
 	}
 	if request.args[0] == "daemon" && (len(request.args) != 3 || !((request.args[1] == "status" && request.args[2] == "--json") || (request.args[1] == "start" && request.args[2] == "--detach"))) {
 		return fmt.Errorf("only exact daemon status or detached-start operations are permitted")

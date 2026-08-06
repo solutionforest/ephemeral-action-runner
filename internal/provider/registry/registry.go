@@ -3,6 +3,8 @@ package registry
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"runtime"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
@@ -56,6 +58,7 @@ var entries = []entry{
 		},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			sandboxes := dockersandboxes.NewWithArchitectureMode("", dryRun, cfg.DockerSandboxes.ArchitectureEmulation, cfg.Provider.Platform)
+			sandboxes.ConfigureHostTrustRelay(runtime.GOOS == "windows" && cfg.Image.HostTrustMode == config.HostTrustModeOverlay, filepath.Clean(projectRoot)+"\x00"+cfg.Pool.NamePrefix)
 			return Runtime{Lifecycle: sandboxes, PolicyManager: sandboxes, Storage: providerStorage(cfg, projectRoot)}
 		},
 	},

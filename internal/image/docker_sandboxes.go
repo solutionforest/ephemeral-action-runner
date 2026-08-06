@@ -93,6 +93,9 @@ type dockerSandboxesSourceLock struct {
 	HookLauncher struct {
 		SHA256 string `json:"sha256"`
 	} `json:"hookLauncher"`
+	EgressBridge struct {
+		SHA256 string `json:"sha256"`
+	} `json:"egressBridge"`
 	Tini struct {
 		Version string `json:"version"`
 	} `json:"tini"`
@@ -1004,6 +1007,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"GO_BUILDER_IMAGE=" + platformLock.GoBuilderReference,
 			"BINFMT_IMAGE=" + emulationPlatformLock.SourceReference,
 			"HOOK_LAUNCHER_SHA256=" + lock.HookLauncher.SHA256,
+			"EGRESS_BRIDGE_SHA256=" + lock.EgressBridge.SHA256,
 			"SOURCE_PROFILE=" + profile,
 			"SOURCE_INDEX_DIGEST=" + source.IndexDigest,
 			"SOURCE_MANIFEST_DIGEST=" + source.PlatformDigest,

@@ -63,42 +63,9 @@ getent group sudo >/dev/null 2>&1 || {
 usermod --append --groups docker,sudo agent
 
 # Never carry registry credentials from the pinned source image into a reusable
-# runner template. Scrub current and legacy Docker client configuration from
-# every absolute passwd home, including source identities renamed to agent.
-credential_homes=(/root /home/runner /home/agent)
-if ! passwd_entries="$(getent passwd)" || [[ -z "${passwd_entries}" ]]; then
-  echo "failed to enumerate pinned source image passwd homes" >&2
-  exit 1
-fi
-while IFS=: read -r _ _ _ _ _ account_home _; do
-  if [[ -z "${account_home}" || "${account_home}" != /* ]]; then
-    echo "pinned source image contains an invalid passwd home ${account_home:-<empty>}" >&2
-    exit 1
-  fi
-  normalized_home="$(readlink -m -- "${account_home}")"
-  if [[ "${normalized_home}" == "/" ]]; then
-    continue
-  fi
-  credential_homes+=("${normalized_home}")
-done <<<"${passwd_entries}"
-
-for root_home_docker_config in /.docker /.dockercfg; do
-  if [[ -e "${root_home_docker_config}" || -L "${root_home_docker_config}" ]]; then
-    echo "pinned source image contains Docker client configuration in a root-filesystem passwd home at ${root_home_docker_config}" >&2
-    exit 1
-  fi
-done
-
-for credential_home in "${credential_homes[@]}"; do
-  rm -rf -- "${credential_home}/.docker"
-  rm -f -- "${credential_home}/.dockercfg"
-  for stale_docker_config in "${credential_home}/.docker" "${credential_home}/.dockercfg"; do
-    if [[ -e "${stale_docker_config}" || -L "${stale_docker_config}" ]]; then
-      echo "failed to scrub source Docker client configuration at ${stale_docker_config}" >&2
-      exit 1
-    fi
-  done
-done
+# runner template. The same root-owned helper is called again before runner
+# registration because Docker Sandboxes may inject fresh auth at boot.
+/opt/epar/scrub-docker-auth.sh --build
 
 install -d -m 0755 -o agent -g agent /home/agent
 install -d -m 0700 -o agent -g agent \
@@ -132,9 +99,9 @@ sudo -u agent -H true
 # Docker Sandboxes' forward proxy can replace registry Authorization headers
 # with a host credential. Keep the sandbox-private daemon's registry traffic on
 # the transparent, policy-enforced path so workflow-scoped Docker credentials
-# remain authoritative. The Actions listener also starts from a clean
-# environment without inherited proxy variables, so ordinary job traffic uses
-# Docker Sandboxes' policy-enforced transparent path by default.
+# remain authoritative. Registration and the listener receive the canonical
+# gateway proxy explicitly; prepare-job-start.sh clears it before workflow
+# steps, while preserving the daemon's no-proxy=* contract.
 install -d -m 0755 -o root -g root /etc/docker
 if [[ -e /etc/docker/daemon.json || -L /etc/docker/daemon.json ]]; then
   echo "pinned source image unexpectedly supplies /etc/docker/daemon.json" >&2

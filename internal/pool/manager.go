@@ -278,8 +278,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if err != nil {
 		return fmt.Errorf("initial over-capacity reconciliation: %w", err)
 	}
+	poolTrustGeneration, err := m.prepareExistingHostTrustRuntimes(ctx, active, opts.Register)
+	if err != nil {
+		return fmt.Errorf("initial host-trust runtime preparation: %w", err)
+	}
 	sequence := 1
-	poolTrustGeneration := ""
 	cleanup := func() error {
 		if opts.KeepOnExit {
 			m.infof("Stopping EPAR pool. --keep-on-exit is enabled, so owned runner resources will remain running.\n")
@@ -1524,6 +1527,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
 			return err
 		}
+		if err := m.activateProviderHostTrustRuntime(ctx, created); err != nil {
+			return err
+		}
 		return m.verifyProviderRuntimeWithRetry(ctx, created, guestLogPath)
 	}); err != nil {
 		return vm, err
@@ -1541,6 +1547,12 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if err := validateHostTrustMarkerAgainstSnapshot(marker, currentTrust); err != nil {
 			if installErr := m.installHostTrustRuntime(ctx, name, currentTrust); installErr != nil {
 				return vm, fmt.Errorf("%w: %v; runtime refresh failed: %v", errHostTrustImageMismatch, err, installErr)
+			}
+			if activateErr := m.activateProviderHostTrustRuntime(ctx, created); activateErr != nil {
+				return vm, fmt.Errorf("%w: %v; provider trust transport refresh failed: %v", errHostTrustImageMismatch, err, activateErr)
+			}
+			if runtimeErr := m.verifyProviderRuntimeWithRetry(ctx, created, guestLogPath); runtimeErr != nil {
+				return vm, fmt.Errorf("%w: %v; refreshed runtime validation failed: %v", errHostTrustImageMismatch, err, runtimeErr)
 			}
 			marker, err = m.readInstanceHostTrustMarker(ctx, name)
 			if err != nil {

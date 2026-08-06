@@ -22,7 +22,7 @@ func TestHostTrustHookInvocationRequiresExactArgument(t *testing.T) {
 	}
 }
 
-func TestIsolatedHookEnvironmentDropsWorkflowStartupAndSecretInputs(t *testing.T) {
+func TestIsolatedHookEnvironmentPassesOnlySafeLocaleAndGithubEnvInputs(t *testing.T) {
 	got := isolatedHookEnvironment([]string{
 		"HOME=/home/agent",
 		"LANG=C.UTF-8",
@@ -37,11 +37,13 @@ func TestIsolatedHookEnvironmentDropsWorkflowStartupAndSecretInputs(t *testing.T
 		"DOTNET_STARTUP_HOOKS=/tmp/attack.dll",
 		"ACTIONS_RUNTIME_TOKEN=sentinel",
 		"GITHUB_TOKEN=sentinel",
+		"GITHUB_ENV=/opt/actions-runner/_work/_temp/_runner_file_commands/set_env_123",
 	})
 	want := []string{
 		"LANG=C.UTF-8",
 		"LC_ALL=C",
 		"TZ=UTC",
+		"GITHUB_ENV=/opt/actions-runner/_work/_temp/_runner_file_commands/set_env_123",
 		"PATH=/usr/bin:/bin",
 		"EPAR_HOOK_LAUNCHER=isolated-v1",
 	}
