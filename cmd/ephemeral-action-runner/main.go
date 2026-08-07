@@ -508,6 +508,7 @@ func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, g
 	}
 	runtime, err := logging.NewRuntime(logging.Options{
 		Directory:                   config.ProjectPath(projectRoot, cfg.Logging.Directory),
+		Level:                       managerLogLevel(cfg.Logging.Level),
 		ManagerSinks:                loggingSinks(cfg.Logging.ManagerSinks),
 		ManagerConsoleFormat:        logging.Format(cfg.Logging.ManagerConsoleFormat),
 		ManagerConsoleTextFormat:    cfg.Logging.ManagerConsoleTextFormat,
@@ -642,6 +643,19 @@ func loggingSinks(values []string) logging.Sinks {
 		}
 	}
 	return sinks
+}
+
+func managerLogLevel(value string) slog.Level {
+	switch value {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func printConfigWarnings(cfg config.Config) {

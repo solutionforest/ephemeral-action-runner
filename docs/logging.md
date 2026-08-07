@@ -20,10 +20,13 @@ The local default sends manager events to the console and transcripts to files:
 
 ```yaml
 logging:
+  level: info
   managerSinks: [console]
   managerConsoleFormat: text
   transcriptSinks: [file]
 ```
+
+`logging.level` sets the minimum manager-event severity for both console and manager-file sinks. The default `info` level keeps periodic health and refresh details quiet; use `debug` temporarily when diagnosing lifecycle or provider behavior. Raw command transcripts are controlled by their sinks and are not severity-filtered.
 
 Manager file events use `epar.log`. Instance transcripts use `instances/`, build and source transcripts use `builds/`, startup timing records use `benchmarks/`, and timestamped error reports use `errors/`. `epar-last-error.log` always points to the latest error report and is never removed by retention.
 

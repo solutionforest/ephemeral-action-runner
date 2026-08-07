@@ -100,6 +100,7 @@ const (
 
 type LoggingConfig struct {
 	Directory                   string
+	Level                       string
 	ManagerSinks                []string
 	ManagerConsoleFormat        string
 	ManagerConsoleTextFormat    string
@@ -261,6 +262,7 @@ func Default() Config {
 		},
 		Logging: LoggingConfig{
 			Directory:                "work/logs",
+			Level:                    "info",
 			ManagerSinks:             []string{"console"},
 			ManagerConsoleFormat:     "text",
 			ManagerFileFormat:        "json",
@@ -542,6 +544,8 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "directory":
 			cfg.Logging.Directory = value
+		case "level":
+			cfg.Logging.Level = strings.ToLower(value)
 		case "managerSinks", "transcriptSinks":
 			return setListValue(cfg, section, key, parseList(value))
 		case "managerConsoleFormat":
@@ -1525,6 +1529,11 @@ func ValidateRunnerGroupSecurity(policy RunnerGroupSecurityConfig) error {
 func ValidateLogging(logging LoggingConfig) error {
 	if strings.TrimSpace(logging.Directory) == "" {
 		return fmt.Errorf("logging.directory is required")
+	}
+	switch logging.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("unsupported logging.level %q; supported values are debug, info, warn, and error", logging.Level)
 	}
 	if err := validateLoggingSinks("managerSinks", logging.ManagerSinks); err != nil {
 		return err

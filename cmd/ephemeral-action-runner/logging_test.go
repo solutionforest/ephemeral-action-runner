@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,21 @@ import (
 	"testing"
 	"time"
 )
+
+func TestManagerLogLevel(t *testing.T) {
+	tests := map[string]slog.Level{
+		"":      slog.LevelInfo,
+		"debug": slog.LevelDebug,
+		"info":  slog.LevelInfo,
+		"warn":  slog.LevelWarn,
+		"error": slog.LevelError,
+	}
+	for input, want := range tests {
+		if got := managerLogLevel(input); got != want {
+			t.Errorf("managerLogLevel(%q) = %s, want %s", input, got, want)
+		}
+	}
+}
 
 func TestLogsPathListAndPrune(t *testing.T) {
 	root := t.TempDir()

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -168,6 +169,8 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 	const ruleID = "22222222-2222-2222-2222-222222222222"
 	p := NewWithDryRun("sbx", false)
 	p.ConfigureHostTrustRelay(true, "commit-test")
+	var logOutput bytes.Buffer
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
 	rulePresent := false
 	committed := false
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
@@ -205,6 +208,21 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 	defer p.releaseRelayToken(testName)
 	if !committed || !rulePresent || len(p.relayTokens) != 1 || p.relay == nil {
 		t.Fatalf("committed activation state = commit %t policy %t tokens %d relay %v", committed, rulePresent, len(p.relayTokens), p.relay)
+	}
+	if strings.Contains(logOutput.String(), "host-trust relay") {
+		t.Fatalf("default info logger emitted relay refresh diagnostics: %s", logOutput.String())
+	}
+}
+
+func TestHostTrustRelayDebugDiagnosticsCanBeEnabled(t *testing.T) {
+	p := NewWithDryRun("sbx", false)
+	var logOutput bytes.Buffer
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if err := p.ActivateHostTrustRuntime(context.Background(), testInstance); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logOutput.String(), "host-trust relay activation skipped") {
+		t.Fatalf("debug logger did not emit relay diagnostic: %s", logOutput.String())
 	}
 }
 

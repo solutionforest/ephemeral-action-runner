@@ -163,7 +163,7 @@ func TestInitCreatesDockerContainerConfigAfterUnavailableSandboxesDefault(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(configText), "logging:\n  directory: work/logs\n  managerSinks: [console]\n") {
+	if !strings.Contains(string(configText), "logging:\n  directory: work/logs\n  level: info\n  managerSinks: [console]\n") {
 		t.Fatalf("generated config did not include logging schema:\n%s", configText)
 	}
 	if !strings.Contains(string(configText), "replacementRetryInitialSeconds: 15\n  replacementRetryMaxSeconds: 1800\n  replacementRetryMultiplier: 2\n  replacementRetryJitterPercent: 20\n") {

@@ -1867,6 +1867,7 @@ storage:
 
 logging:
   directory: work/logs
+  level: info
   managerSinks: [console]
   managerConsoleFormat: text
   managerConsoleTextFormat: "{time} [{level}] {message}"
@@ -1976,6 +1977,7 @@ storage:
 
 logging:
   directory: work/logs
+  level: info
   managerSinks: [console]
   managerConsoleFormat: text
   managerConsoleTextFormat: "{time} [{level}] {message}"
@@ -2081,6 +2083,7 @@ storage:
 
 logging:
   directory: work/logs
+  level: info
   managerSinks: [console]
   managerConsoleFormat: text
   managerConsoleTextFormat: "{time} [{level}] {message}"

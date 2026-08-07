@@ -344,7 +344,7 @@ func TestValidateRunnerGroupSecurityRejectsInvalidValues(t *testing.T) {
 
 func TestLoggingDefaults(t *testing.T) {
 	got := Default().Logging
-	if got.Directory != "work/logs" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
+	if got.Directory != "work/logs" || got.Level != "info" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
 		t.Fatalf("unexpected logging destination defaults: %+v", got)
 	}
 	if got.MaxFileSizeMiB != 100 || got.MaxBackups != 3 || !got.CompressBackups || !got.RetentionEnabled || got.RetentionMaxTotalMiB != 1024 {
@@ -403,6 +403,7 @@ func TestLoadLoggingConfiguration(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 logging:
   directory: custom/logs
+  level: DEBUG
   managerSinks:
     - console
     - file
@@ -431,7 +432,7 @@ provider:
 		t.Fatal(err)
 	}
 	got := cfg.Logging
-	if got.Directory != "custom/logs" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
+	if got.Directory != "custom/logs" || got.Level != "debug" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
 		t.Fatalf("unexpected logging config: %+v", got)
 	}
 	if err := Validate(cfg); err != nil {
@@ -525,6 +526,7 @@ func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
 func TestValidateLoggingRejectsInvalidValues(t *testing.T) {
 	for _, mutate := range []func(*LoggingConfig){
 		func(logging *LoggingConfig) { logging.Directory = " " },
+		func(logging *LoggingConfig) { logging.Level = "trace" },
 		func(logging *LoggingConfig) { logging.ManagerSinks = nil },
 		func(logging *LoggingConfig) { logging.TranscriptSinks = []string{"syslog"} },
 		func(logging *LoggingConfig) { logging.ManagerSinks = []string{"Console"} },

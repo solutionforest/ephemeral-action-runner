@@ -50,12 +50,12 @@ type guestRelayConfiguration struct {
 func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provider.Instance) (activationErr error) {
 	if !p.hostTrustRelayEnabled {
 		if p.logger != nil {
-			p.logger.Info("Docker Sandboxes host-trust relay activation skipped because the Windows overlay relay is disabled", "provider", "docker-sandboxes", "instance", instance.Name)
+			p.logger.Debug("Docker Sandboxes host-trust relay activation skipped because the Windows overlay relay is disabled", "provider", "docker-sandboxes", "instance", instance.Name)
 		}
 		return nil
 	}
 	if p.logger != nil {
-		p.logger.Info(fmt.Sprintf("Docker Sandboxes host-trust relay activation started on controller port %d", p.hostTrustRelayPort), "provider", "docker-sandboxes", "instance", instance.Name)
+		p.logger.Debug(fmt.Sprintf("Docker Sandboxes host-trust relay activation started on controller port %d", p.hostTrustRelayPort), "provider", "docker-sandboxes", "instance", instance.Name)
 	}
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil {
@@ -104,7 +104,7 @@ func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provid
 		return fmt.Errorf("allow exact Docker Sandboxes host-trust relay endpoint: %w", err)
 	}
 	if p.logger != nil {
-		p.logger.Info("Docker Sandboxes host-trust relay policy is active", "provider", "docker-sandboxes", "instance", instance.Name)
+		p.logger.Debug("Docker Sandboxes host-trust relay policy is active", "provider", "docker-sandboxes", "instance", instance.Name)
 	}
 
 	configuration := guestRelayConfiguration{
@@ -126,20 +126,20 @@ func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provid
 		return fmt.Errorf("activate Docker Sandboxes host-trust relay: %w", err)
 	}
 	if p.logger != nil {
-		p.logger.Info("Docker Sandboxes guest host-trust relay is active", "provider", "docker-sandboxes", "instance", instance.Name)
+		p.logger.Debug("Docker Sandboxes guest host-trust relay is active", "provider", "docker-sandboxes", "instance", instance.Name)
 	}
 	if err := p.verifyHostTrustRelayPolicy(ctx, instance, relay.port, probeStarted); err != nil {
 		return err
 	}
 	if p.logger != nil {
-		p.logger.Info("Docker Sandboxes host-trust relay route is verified", "provider", "docker-sandboxes", "instance", instance.Name)
+		p.logger.Debug("Docker Sandboxes host-trust relay route is verified", "provider", "docker-sandboxes", "instance", instance.Name)
 	}
 	if err := p.finalizeGuestRelay(ctx, instance, "--commit"); err != nil {
 		return fmt.Errorf("commit Docker Sandboxes guest host-trust relay: %w", err)
 	}
 	configured = true
 	if p.logger != nil {
-		p.logger.Info("Docker Sandboxes host-trust relay activation complete", "provider", "docker-sandboxes", "instance", instance.Name)
+		p.logger.Debug("Docker Sandboxes host-trust relay activation complete", "provider", "docker-sandboxes", "instance", instance.Name)
 	}
 	return nil
 }

@@ -99,6 +99,7 @@ Without `--external-outage-retry`, GitHub `429` and `5xx` responses and transien
 | Property | Type and default | Required or applies when | Effect and caution |
 | --- | --- | --- | --- |
 | `directory` | string; `work/logs` | All providers. Non-empty. | Root for manager, instance, build, error, and benchmark logs. |
+| `level` | `debug`, `info`, `warn`, or `error`; `info` | Manager events. | Minimum manager-event severity written to configured sinks. `debug` includes periodic health and refresh details. |
 | `managerSinks` | non-empty list of `console`, `file`; `[console]` | Manager events. | Choose user-facing manager event destinations. |
 | `managerConsoleFormat` | `text` or `json`; `text` | Manager console sink. | Console encoding. |
 | `managerConsoleTextFormat` | one-line template; empty | Only when manager console format is `text`. | May use `{time}`, `{level}`, `{message}`, `{attributes}` and must contain `{message}`. |
