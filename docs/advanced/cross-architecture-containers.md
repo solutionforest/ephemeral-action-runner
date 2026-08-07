@@ -53,19 +53,19 @@ The setup helper is privileged. Use it only in trusted workflows and treat its p
 | --- | --- |
 | Docker Container | Run the setup action inside the disposable job before Docker or Compose uses a foreign image. No EPAR configuration key enables universal emulation. |
 | WSL | Run the setup action inside the WSL runner if its Linux Docker daemon needs a foreign image. An x64 WSL runner does not gain ARM64 execution merely by pulling an ARM64 image. |
-| Tart on Apple Silicon | The guest is ARM64. The optional Rosetta path is experimental and not equivalent to QEMU/binfmt. Use a distinct label and validate the exact image/workload. |
-| Docker Sandboxes | Keep `provider.platform` native. EPAR automatically runs the pinned `tonistiigi/binfmt --install all` equivalent inside every sandbox VM; no emulation configuration or workflow-level privileged installer is required. |
+| Tart on Apple Silicon (retired) | The guest is ARM64. The optional Rosetta path is retained for existing configurations and is not equivalent to QEMU/binfmt. Use a distinct label and validate the exact image/workload. |
+| Docker Sandboxes | Keep `provider.platform` native. The default `best-effort` mode tries the bundled QEMU/binfmt handlers and warns when only native execution is available. Set `required` only when foreign execution must be an admission requirement; `native-only` skips the attempt. |
 | GitHub-hosted Windows or macOS | These labels do not replace a Linux Docker daemon for container actions or service containers. Use a suitable Linux execution surface. |
 
 Keep architecture-specific jobs on a distinct `runs-on` label. Do not label an ARM64 runner as `ubuntu-latest`: GitHub's `ubuntu-latest` is a GitHub-managed environment, and x64 assumptions can fail on ARM64.
 
 ## Operational examples
 
-For an amd64-only service on an ARM64 host, first try a published ARM64 or multi-platform image. With Docker Sandboxes, use the native ARM64 template and request the AMD64 image through the service-level `platform` property when manifest selection needs to be explicit; do not set a project-wide `DOCKER_DEFAULT_PLATFORM`. EPAR verifies that generic QEMU handlers were registered but trusts the real service startup and health check as the compatibility proof. If the service is performance-sensitive or fails under emulation, route it to a native x64 runner instead.
+For an amd64-only service on an ARM64 host, first try a published ARM64 or multi-platform image. With Docker Sandboxes, use the native ARM64 template and request the AMD64 image through the service-level `platform` property when manifest selection needs to be explicit; do not set a project-wide `DOCKER_DEFAULT_PLATFORM`. Select `required` when the runner must be rejected unless QEMU handlers are active. EPAR still trusts the real service startup and health check as the compatibility proof. If the service is performance-sensitive or fails under emulation, route it to a native x64 runner instead.
 
 For an ARM64 image on an x64 Linux runner, follow the same process with `platforms: arm64` and `--platform linux/arm64`. Never treat a successful `docker pull` as the proof; run a container and check both the expected architecture output and the real workload.
 
-Docker Sandboxes has no fixed advertised target matrix. It installs every handler present in the immutable host-platform `tonistiigi/binfmt` artifact and lets QEMU handle the executable when a registered ELF signature matches. Unsupported images or workloads fail normally at execution time rather than preventing unrelated native and foreign services from sharing the runner.
+Docker Sandboxes has no fixed advertised target matrix. `best-effort` and `required` install every handler available from the immutable host-platform `tonistiigi/binfmt` artifact and let QEMU handle an executable when a registered ELF signature matches. In `best-effort`, missing sandbox-kernel support produces a controller warning and foreign images fail normally at execution time while native jobs continue. `native-only` deliberately makes no foreign-execution claim.
 
 ## References
 

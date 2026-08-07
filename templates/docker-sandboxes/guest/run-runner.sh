@@ -10,6 +10,7 @@ log_file="${EPAR_RUNNER_LOG_FILE:-/var/log/actions-runner/run.log}"
 startup_check_seconds="${EPAR_RUNNER_STARTUP_CHECK_SECONDS:-1}"
 agent_home="/home/agent"
 agent_runtime_dir="/run/user/1000"
+sandbox_forward_proxy="http://gateway.docker.internal:3128"
 
 process_start_time() {
   local pid="$1"
@@ -44,7 +45,9 @@ fi
 rm -f "${pid_file}" "${pid_start_file}"
 
 [[ -s /opt/epar/host-trust-generation.json ]]
+[[ -s /opt/epar/trust/ca-bundle.pem && ! -L /opt/epar/trust/ca-bundle.pem ]]
 [[ -x /opt/epar/check-host-trust-generation.sh ]]
+[[ -x /opt/epar/prepare-job-start.sh ]]
 if [[ ! -x /usr/bin/python3 ]]; then
   echo "EPAR runner trust policy: python3 is required" >&2
   exit 1
@@ -86,17 +89,34 @@ runner_environment=(
   "RUNNER_TOOL_CACHE=${tool_cache}"
   "AGENT_TOOLSDIRECTORY=${tool_cache}"
   "DOTNET_INSTALL_DIR=${tool_cache}/dotnet"
+  # The listener alone uses Docker Sandboxes' canonical forward proxy for
+  # GitHub control-plane traffic. The job-start hook clears these variables
+  # through GITHUB_ENV before workflow steps run.
+  "HTTP_PROXY=${sandbox_forward_proxy}"
+  "HTTPS_PROXY=${sandbox_forward_proxy}"
+  "ALL_PROXY=${sandbox_forward_proxy}"
+  "http_proxy=${sandbox_forward_proxy}"
+  "https_proxy=${sandbox_forward_proxy}"
+  "all_proxy=${sandbox_forward_proxy}"
+	"SSL_CERT_FILE=/opt/epar/trust/ca-bundle.pem"
+	"NODE_EXTRA_CA_CERTS=/opt/epar/trust/ca-bundle.pem"
+	"REQUESTS_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"
+	"PIP_CERT=/opt/epar/trust/ca-bundle.pem"
+	"CURL_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"
+	"GIT_SSL_CAINFO=/opt/epar/trust/ca-bundle.pem"
+	"AWS_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"
   "PATH=/opt/epar/hook-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   "LANG=C.UTF-8"
 )
-for environment_name in SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
+for environment_name in JAVA_TOOL_OPTIONS NODE_USE_ENV_PROXY; do
   if [[ -n "${!environment_name+x}" ]]; then
     runner_environment+=("${environment_name}=${!environment_name}")
   fi
 done
-if [[ "${trust_mode}" == "overlay" ]]; then
-  runner_environment+=("ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/check-host-trust-generation.sh")
-fi
+# Always install the preparation hook. It validates the host-trust lease when
+# overlay mode is enabled (and accepts the explicit disabled marker otherwise)
+# before clearing the listener proxy for workflow steps.
+runner_environment+=("ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/prepare-job-start.sh")
 sudo -u agent -H env -i "${runner_environment[@]}" /bin/bash -c 'cd "$1" || exit 1; nohup ./run.sh >>"$2" 2>&1 </dev/null & printf "%s\n" "$!"' bash "${runner_dir}" "${log_file}" >"${pid_file}"
 sleep "${startup_check_seconds}"
 pid="$(cat "${pid_file}" 2>/dev/null || true)"

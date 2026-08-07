@@ -10,12 +10,22 @@ FROM --platform=${TEMPLATE_PLATFORM} ${BINFMT_IMAGE} AS qemu-source
 FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS hook-builder
 ARG TARGETOS
 ARG TARGETARCH
-ARG HOOK_LAUNCHER_SHA256=7fe07f10f484fa6888481a4165e81570187c0aeff422738d3ea5add6b95dd9b7
+ARG HOOK_LAUNCHER_SHA256=75c25e1cb5c458840f35e1df5232550f32d90987d32ebc4f2c093ac7268ef799
 WORKDIR /src
 COPY hook-launcher/main.go /src/main.go
 RUN echo "${HOOK_LAUNCHER_SHA256}  /src/main.go" | sha256sum --check - \
     && install -d -m 0755 /out \
     && CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" GOTOOLCHAIN=local go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/epar-hook-bash /src/main.go
+
+FROM --platform=$BUILDPLATFORM ${GO_BUILDER_IMAGE} AS egress-bridge-builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG EGRESS_BRIDGE_SHA256=9b25461c671d8edef8abe046d167516c127e86d65046af6953507ae03bfd4918
+WORKDIR /src
+COPY egress-bridge/main.go /src/main.go
+RUN echo "${EGRESS_BRIDGE_SHA256}  /src/main.go" | sha256sum --check - \
+    && install -d -m 0755 /out \
+    && CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" GOTOOLCHAIN=local go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/epar-egress-bridge /src/main.go
 
 FROM --platform=${TEMPLATE_PLATFORM} ${SOURCE_IMAGE} AS runner-template
 
@@ -46,6 +56,7 @@ COPY host-trust-metadata/ /opt/epar/
 COPY helpers.sha256 /opt/epar/helpers.sha256
 COPY profiles/${COMPATIBILITY_FILE} /opt/epar/template-compatibility.json
 COPY --from=hook-builder --chmod=0555 /out/epar-hook-bash /opt/epar/hook-bin/bash
+COPY --from=egress-bridge-builder --chmod=0555 /out/epar-egress-bridge /opt/epar/epar-egress-bridge
 COPY --from=qemu-source /usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/
 COPY inputs/emulation-licenses/ /usr/share/licenses/epar-emulation/
 COPY --chmod=0755 inputs/tini /usr/local/bin/tini
@@ -61,6 +72,7 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && cd /opt/epar \
     && chmod 0555 ./*.sh \
     && install -m 0555 enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation \
+    && install -m 0555 verify-native-architecture.sh /opt/epar/verify-native-architecture \
     && chmod 0555 /opt/epar/emulation/binfmt /opt/epar/emulation/qemu-* \
     && chmod 0444 /usr/share/licenses/epar-emulation/*.txt \
     && /opt/epar/prepare-template.sh \
@@ -73,6 +85,7 @@ RUN [[ "${TARGETPLATFORM}" == "${TEMPLATE_PLATFORM}" ]] \
     && chown -R agent:agent /opt/actions-runner /var/log/actions-runner \
     && chmod 0555 /opt/epar/custom-install/run.sh \
     && /opt/epar/custom-install/run.sh \
+    && /opt/epar/install-trusted-ca-certificates.sh \
     && sudo -u agent -H /opt/actions-runner/bin/Runner.Listener --version | grep -Fx "${ACTIONS_RUNNER_VERSION}" \
     && /usr/local/bin/tini --version 2>&1 | grep -F 'version 0.19.0'
 

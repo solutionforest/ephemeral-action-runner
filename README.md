@@ -1,8 +1,8 @@
 # Ephemeral Action Runner
 
-![Ephemeral Action Runner banner](docs/assets/brand/epar-banner.jpg)
+EPAR keeps a warm pool of disposable GitHub Actions runners. Each runner handles one job inside a dedicated [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM with a private Docker daemon, then is replaced with a clean runner.
 
-Ephemeral Action Runner (EPAR) keeps a warm pool of disposable GitHub Actions self-hosted runners on a machine you control. A runner accepts one job, is removed, and is replaced with a clean runner so ordinary job files, containers, and caches do not become the next job's starting state.
+![Ephemeral Action Runner banner](docs/assets/brand/epar-banner.jpg)
 
 ```mermaid
 flowchart LR
@@ -15,64 +15,36 @@ flowchart LR
 ## Why EPAR
 
 - Keep private-repository CI ready without maintaining a long-lived runner workspace.
-- Protect the host with [Docker Sandboxes](docs/providers/docker-sandboxes.md): each runner gets a dedicated microVM and private Docker daemon, then is removed after one job.
-- Run Docker-friendly Linux jobs from a Windows, macOS, Linux, or other Docker-capable host.
+- Recycle the runner, its private daemon, and job state after every job.
+- Run Docker-based Linux jobs from Linux, macOS, or Windows hosts when Docker Sandboxes capability checks pass.
 
 ## Quick Start
 
-The normal path is a source archive plus Docker. EPAR's first run opens a guided setup wizard; it checks what the host supports and writes your ignored local configuration.
+This quick start uses Docker Sandboxes. Install Docker and the Docker Sandboxes `sbx` CLI, then confirm that `sbx diagnose --output json` reports at least one passing check and no failures. EPAR keeps the detailed helper, proxy, and build guidance in the linked deep guides.
 
-### 1. Install the host tools
+1. Download GitHub's **Source code (zip)** or **Source code (tar.gz)** for the release you want from the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), extract it, and open a terminal in the extracted folder.
+2. Create a GitHub App by following [GitHub App Setup](docs/github-app.md); have the App ID, organization name, and private-key file path ready.
+3. Start EPAR:
 
-- Install and start Docker.
-- For stronger isolation, also install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) to enable the Docker Sandboxes provider.
+   ```bash
+   ./start
+   ```
 
-On macOS or Linux, the first Docker Sandboxes runner may trigger operating-system or security-tool prompts for runtime helpers such as `mkfs.ext4`, `mkfs.erofs`, and `containerd-shim-nerdbox-v1`; macOS may say the helper “is an app downloaded from the Internet.” These are used to create the runner's private Docker filesystem, unpack its read-only template filesystem, and launch the sandbox VM. Confirm that each executable belongs to the installed Docker Sandboxes runtime and that any displayed file target is sandbox-owned before approving it. Denying a required helper prevents that sandbox from starting, and EPAR fails closed without registering it; preserve and clean any diagnostic runtime state through EPAR's exact cleanup path. See the [Docker Sandboxes provider guide](docs/providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) and [troubleshooting](docs/troubleshooting.md#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt).
-
-Docker Sandboxes has a host credential-injecting forward proxy. EPAR's Docker Sandboxes template keeps the private Docker daemon and Actions listener on Docker Sandboxes' policy-enforced transparent egress path by default, so a workflow's own `docker login` remains authoritative instead of being replaced by the host `sbx login` identity. Rebuild older templates after upgrading EPAR. See [Docker Hub Credentials and Transparent Egress](docs/providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
-
-### 2. Download EPAR
-
-From the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), download GitHub's **Source code (zip)** or **Source code (tar.gz)** for the release you want. Extract it and open a terminal in the extracted folder.
-
-### 3. Create a GitHub App
-
-EPAR uses a GitHub App to obtain short-lived runner registration tokens. Follow [GitHub App Setup](docs/github-app.md), then have the App ID, organization name, and private-key file path ready.
-
-### 4. Start EPAR
-
-```bash
-./start
-```
-
-Use `./start` in native Windows PowerShell too. PowerShell resolves it to EPAR's internal Windows wrapper; do not use bare `start`, which is PowerShell's `Start-Process` alias. The wrapper builds a project-local native controller with local Go when it works, otherwise with Docker, and then executes that controller directly. If no configuration exists, the interactive wizard asks for the GitHub App, a runner group, and an available provider. The first start can take longer while EPAR prepares the controller, the configured runner image, or the first runner.
-
-Keep the process open while runners should accept work. Press `Ctrl-C` once to stop, then wait for cleanup to finish before closing the terminal. For detailed commands, config selection, no-Go startup, verification, and cleanup, read [Usage](docs/usage.md).
-
-## Choose a provider
-
-Choose a provider based on your host OS, available prerequisites, and isolation needs. **Docker Sandboxes** is recommended when its capability checks pass as it provides the highest isolation level. EPAR never silently falls back to another provider.
-
-| Provider | Host OS | Prerequisites | Isolation and compatibility |
-| --- | --- | --- | --- |
-| [Docker Sandboxes](docs/providers/docker-sandboxes.md) | Linux, macOS, Windows | Docker, the `sbx` CLI, and healthy `sbx diagnose --output json` results | Highest isolation level — each runner uses a dedicated microVM with a private Docker daemon. Recommended when capability checks pass. |
-| [Docker Container](docs/providers/docker-container.md) | Linux, macOS, Windows | Docker | Standard isolation level — each disposable runner container has a private Docker daemon. |
-| [WSL](docs/providers/wsl.md) | Windows | WSL2 and Docker | Standard isolation level — each runner uses a disposable WSL2 Linux environment. |
-| [Tart](docs/providers/tart.md) | Apple Silicon macOS | Tart | Experimental — ARM64 Linux VM with limited compatibility for CI jobs that require non-ARM64 Docker images. |
+The first run opens a guided setup wizard for the GitHub App, runner group, Docker Sandboxes host checks, and runner image. Keep the process open while runners should accept work. Press `Ctrl-C` once to stop and wait for cleanup to finish before closing the terminal. See [Usage](docs/usage.md) for configuration, verification, no-Go startup, and cleanup details.
 
 ## Route a workflow to EPAR
 
-Every EPAR runner has GitHub's `self-hosted` label. Add one of the provider labels when a repository has several types of runner:
+Every EPAR runner has GitHub's `self-hosted` label. Add the EPAR Sandboxes label when a workflow should use this environment:
 
 ```yaml
 runs-on: [self-hosted, linux, epar-docker-sandboxes]
 ```
 
-Use labels that describe the environment your job actually needs. In particular, an ARM64 Tart runner is not a replacement for GitHub-hosted `ubuntu-latest` or an x64-only workload.
+Use labels that describe the environment your job needs and keep runner groups limited to the repositories and secrets that require access.
 
-## Security depends on the provider
+## Security
 
-Docker Sandboxes places each runner inside a dedicated microVM sandbox and provides EPAR's strongest host-isolation boundary. Docker Container and WSL remain trusted-workflow providers; Tart is VM-isolated but experimental. With every provider, restrict access with [runner groups](docs/runner-groups.md) and expose only the secrets and services each workflow needs. Read [Security](docs/security.md) before choosing a provider.
+Docker Sandboxes puts each runner and its private Docker daemon inside a dedicated microVM, then removes that runner after one job. This is a strong host-isolation boundary, not a universal safety guarantee: workflows still control their assigned guest and any secrets or services exposed to them. Read [Security](docs/security.md), use [runner groups](docs/runner-groups.md), and follow the [Docker Sandboxes provider guide](docs/providers/docker-sandboxes.md) before routing jobs.
 
 ## Find the right guide
 

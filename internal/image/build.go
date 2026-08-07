@@ -42,9 +42,11 @@ func (m *Coordinator) UpdateUpstream(ctx context.Context) error {
 	logPath := m.buildLogPath("runner-images.source.log")
 	defer m.releaseTranscript(logPath)
 	m.infof("updating runner-images checkout at %s\n", dir)
+	attemptCtx, cancelAttempt := boundedImageAttempt(ctx, runnerImagesAttemptTimeout)
+	defer cancelAttempt()
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		if err := m.runHostLogged(ctx, logPath, "git", "-C", dir, "fetch", "--depth", "1", "origin", "main"); err != nil {
-			return err
+		if err := m.runHostLogged(attemptCtx, logPath, "git", "-C", dir, "fetch", "--depth", "1", "origin", "main"); err != nil {
+			return classifyImageCommandFailure("github.com", "fetch runner-images", err, boundedRedactedLogTail(logPath, 16*1024), false)
 		}
 		if err := m.runHostLogged(ctx, logPath, "git", "-C", dir, "checkout", "FETCH_HEAD"); err != nil {
 			return err
@@ -53,8 +55,8 @@ func (m *Coordinator) UpdateUpstream(ctx context.Context) error {
 		if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
 			return err
 		}
-		if err := m.runHostLogged(ctx, logPath, "git", "clone", "--depth", "1", "https://github.com/actions/runner-images.git", dir); err != nil {
-			return err
+		if err := m.runHostLogged(attemptCtx, logPath, "git", "clone", "--depth", "1", "https://github.com/actions/runner-images.git", dir); err != nil {
+			return classifyImageCommandFailure("github.com", "clone runner-images", err, boundedRedactedLogTail(logPath, 16*1024), false)
 		}
 	}
 	commitBytes, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD").Output()
@@ -283,7 +285,7 @@ func (m *Coordinator) buildDockerContainerImageAttempt(ctx context.Context, upst
 		return nil
 	}
 	if err := m.runHostBuildxLogged(ctx, buildLogPath, "docker", args...); err != nil {
-		return err
+		return classifyImageCommandFailure("OCI registry", "Buildx remote image acquisition", err, boundedRedactedLogTail(buildLogPath, 32*1024), true)
 	}
 	if !m.hostTrustEnabled() {
 		m.infof("image build complete: %s is available in `docker image ls`\n", targetImage)

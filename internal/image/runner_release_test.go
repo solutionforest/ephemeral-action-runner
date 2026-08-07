@@ -125,6 +125,22 @@ func TestActionsRunnerReleaseUnauthorizedFailureDoesNotUseFallback(t *testing.T)
 	}
 }
 
+func TestActionsRunnerReleaseOrdinaryForbiddenFailureDoesNotUseFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	_, err := resolveActionsRunnerFromAPI(context.Background(), Manifest{}, "latest", "x64", server.Client(), server.URL+"/latest")
+	var failure *actionsRunnerReleaseFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("failure = %v, want classified HTTP failure", err)
+	}
+	if failure.fallbackEligible {
+		t.Fatalf("ordinary forbidden failure unexpectedly allows fallback: %+v", failure)
+	}
+}
+
 func writeTestActionsRunnerFallbackLock(t *testing.T, lockPath string) {
 	t.Helper()
 	content := `{"tag_name":"v2.336.0","assets":[{"name":"actions-runner-linux-x64-2.336.0.tar.gz","browser_download_url":"https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz","digest":"sha256:04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d"}]}`

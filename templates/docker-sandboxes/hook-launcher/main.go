@@ -11,7 +11,7 @@ import (
 
 const (
 	realBash = "/bin/bash"
-	hookPath = "/opt/epar/check-host-trust-generation.sh"
+	hookPath = "/opt/epar/prepare-job-start.sh"
 )
 
 func main() {
@@ -38,9 +38,10 @@ func isHostTrustHookInvocation(arguments []string) bool {
 
 func isolatedHookEnvironment(environment []string) []string {
 	allowed := map[string]bool{
-		"LANG":   true,
-		"LC_ALL": true,
-		"TZ":     true,
+		"LANG":       true,
+		"LC_ALL":     true,
+		"TZ":         true,
+		"GITHUB_ENV": true,
 	}
 	result := make([]string, 0, len(allowed)+2)
 	for _, entry := range environment {

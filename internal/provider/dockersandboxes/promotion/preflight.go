@@ -209,7 +209,8 @@ func sandboxCommandEnvironment() []string {
 	environment := make([]string, 0, len(os.Environ()))
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
-		if strings.HasPrefix(strings.ToUpper(key), "DOCKER_SANDBOXES_") {
+		upperKey := strings.ToUpper(key)
+		if strings.HasPrefix(upperKey, "DOCKER_SANDBOXES_") || upperKey == "SSH_AUTH_SOCK" || upperKey == "SSH_AUTH_SOCK_GATEWAY" || upperKey == "SSH_AGENT_PID" {
 			continue
 		}
 		environment = append(environment, item)

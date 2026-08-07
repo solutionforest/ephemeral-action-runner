@@ -371,7 +371,7 @@ func (m *Manager) installHostTrustRuntime(ctx context.Context, instanceName stri
 	if err != nil {
 		return fmt.Errorf("archive host trust certificates: %w", err)
 	}
-	script := fmt.Sprintf("sudo install -d -m 0755 %s && sudo find %s -maxdepth 1 -type f -name 'epar-*.crt' -delete && sudo tar -x -f - --no-same-owner --no-same-permissions -C %s && sudo update-ca-certificates", shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir))
+	script := fmt.Sprintf("sudo install -d -m 0755 %s && sudo find %s -maxdepth 1 -type f -name 'epar-*.crt' -delete && sudo tar -x -f - --no-same-owner --no-same-permissions -C %s && sudo update-ca-certificates && sudo install -d -m 0755 -o root -g root /opt/epar/trust && sudo install -m 0444 -o root -g root /etc/ssl/certs/ca-certificates.crt /opt/epar/trust/ca-bundle.pem.tmp && sudo mv -f /opt/epar/trust/ca-bundle.pem.tmp /opt/epar/trust/ca-bundle.pem && sudo test -s /opt/epar/trust/ca-bundle.pem && sudo test ! -L /opt/epar/trust/ca-bundle.pem", shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir), shellQuote(hostTrustGuestDir))
 	if _, err := m.execGuest(ctx, instanceName, provider.ShellCommand(script), provider.ExecOptions{Stdin: archive}); err != nil {
 		return fmt.Errorf("install host trust certificates in runtime: %w", err)
 	}
@@ -418,14 +418,23 @@ func (m *Manager) issueHostTrustLeaseWithLifetime(ctx context.Context, instanceN
 	writeCtx, cancel := context.WithTimeout(ctx, hostTrustWriteTimeout)
 	defer cancel()
 	staging := hostTrustLeaseGuest + ".tmp"
-	script := fmt.Sprintf("cat > /tmp/epar-host-trust-lease && if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar && sudo install -m 0644 /tmp/epar-host-trust-lease %s && sudo mv -f %s %s; else install -d -m 0755 /run/epar && install -m 0644 /tmp/epar-host-trust-lease %s && mv -f %s %s; fi && rm -f /tmp/epar-host-trust-lease", shellQuote(staging), shellQuote(staging), shellQuote(hostTrustLeaseGuest), shellQuote(staging), shellQuote(staging), shellQuote(hostTrustLeaseGuest))
+	script := fmt.Sprintf("if command -v sudo >/dev/null 2>&1; then sudo rm -f %s %s; else rm -f %s %s; fi && cat > /tmp/epar-host-trust-lease && if command -v sudo >/dev/null 2>&1; then sudo install -d -m 0755 /run/epar && sudo install -m 0644 /tmp/epar-host-trust-lease %s && sudo mv -f %s %s; else install -d -m 0755 /run/epar && install -m 0644 /tmp/epar-host-trust-lease %s && mv -f %s %s; fi && rm -f /tmp/epar-host-trust-lease", shellQuote(hostTrustLeaseGuest), shellQuote(staging), shellQuote(hostTrustLeaseGuest), shellQuote(staging), shellQuote(staging), shellQuote(staging), shellQuote(hostTrustLeaseGuest), shellQuote(staging), shellQuote(staging), shellQuote(hostTrustLeaseGuest))
 	if _, err := m.execGuest(writeCtx, instanceName, provider.ShellCommand(script), provider.ExecOptions{Stdin: string(content) + "\n"}); err != nil {
+		revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
+		revokeErr := m.revokeHostTrustLease(revokeCtx, instanceName)
+		revokeCancel()
 		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("host trust lease write exceeded %s: %w", hostTrustWriteTimeout, err)
+			return errors.Join(fmt.Errorf("host trust lease write exceeded %s: %w", hostTrustWriteTimeout, err), revokeErr)
 		}
-		return err
+		return errors.Join(err, revokeErr)
 	}
 	return nil
+}
+
+func (m *Manager) revokeHostTrustLease(ctx context.Context, instanceName string) error {
+	script := fmt.Sprintf("if command -v sudo >/dev/null 2>&1; then sudo rm -f %s %s; else rm -f %s %s; fi", shellQuote(hostTrustLeaseGuest), shellQuote(hostTrustLeaseGuest+".tmp"), shellQuote(hostTrustLeaseGuest), shellQuote(hostTrustLeaseGuest+".tmp"))
+	_, err := m.execGuest(ctx, instanceName, provider.ShellCommand(script), provider.ExecOptions{})
+	return err
 }
 
 func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot, busyHandoff map[string]bool) int {
@@ -439,6 +448,32 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 	}
 	retired := 0
 	for name, instance := range active {
+		if !instance.ProviderOwned || (instance.Phase != LifecycleReady && instance.Phase != LifecycleDraining) {
+			continue
+		}
+		if _, requiresTransport := m.providerLifecycle().(provider.HostTrustRuntimeActivator); requiresTransport {
+			providerInstance, providerErr := m.providerInstance(ctx, name)
+			if providerErr != nil {
+				revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
+				revokeErr := m.revokeHostTrustLease(revokeCtx, name)
+				cancel()
+				m.warnf("[%s] host trust transport identity warning; lease not refreshed: %v\n", name, providerErr)
+				if revokeErr != nil {
+					m.warnf("[%s] host trust transport identity fencing warning: %v\n", name, revokeErr)
+				}
+				continue
+			}
+			if err := m.activateProviderHostTrustRuntime(ctx, providerInstance); err != nil {
+				revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
+				revokeErr := m.revokeHostTrustLease(revokeCtx, name)
+				cancel()
+				m.warnf("[%s] host trust transport refresh warning; lease not refreshed: %v\n", name, err)
+				if revokeErr != nil {
+					m.warnf("[%s] host trust transport refresh fencing warning: %v\n", name, revokeErr)
+				}
+				continue
+			}
+		}
 		if instance.HostTrustGeneration != current.Generation {
 			// Revoke the old generation before any remote status query. This is
 			// safe for an already-running job (its hook already ran) and closes

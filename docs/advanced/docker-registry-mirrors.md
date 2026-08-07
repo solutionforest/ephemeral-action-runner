@@ -48,7 +48,7 @@ The generated daemon config is equivalent to:
 }
 ```
 
-The same config surface works for Docker Container, Tart, and WSL when Docker is installed in the runner instance.
+The same config surface remains available to Docker Container and WSL compatibility runners and to existing Tart configurations when Docker is installed in the runner instance.
 
 ## What EPAR Does Not Run
 
@@ -109,7 +109,7 @@ docker:
 
 For Docker Container, EPAR adds Docker's `host.docker.internal:host-gateway` alias when any configured mirror uses `host.docker.internal`. Some host runtimes already provide this name; others support Docker's `host-gateway` token and can use the added alias. If the host runtime supports neither behavior, use a LAN address or DNS name reachable from the runner instead.
 
-For Tart and WSL, `host.docker.internal` may not resolve the way it does in Docker containers. Use a LAN address, DNS name, or other route that is reachable from the guest.
+For existing Tart and WSL configurations, `host.docker.internal` may not resolve the way it does in Docker containers. Use a LAN address, DNS name, or other route that is reachable from the guest.
 
 ## Provider Addressing
 
@@ -118,8 +118,8 @@ The mirror URL must be valid from the runner instance's point of view:
 | Provider | Same-host mirror URL guidance |
 | --- | --- |
 | Docker Container | `http://host.docker.internal:5050` is a good one-machine choice when the local cache publishes host port `5050`. EPAR adds Docker's `host-gateway` alias for this name when needed. |
-| Tart | Use an IP address or DNS name reachable from inside the VM, such as the host's LAN IP or an intranet DNS name. `host.docker.internal` is not guaranteed. |
-| WSL | Use an address reachable from inside the WSL distro. Depending on Windows and WSL networking, this may be the Windows host address, a LAN IP, or an intranet DNS name. `host.docker.internal` is not guaranteed. |
+| Tart (retired) | Existing configurations should use an IP address or DNS name reachable from inside the VM, such as the host's LAN IP or an intranet DNS name. `host.docker.internal` is not guaranteed. |
+| WSL (compatibility) | Use an address reachable from inside the WSL distro. Depending on Windows and WSL networking, this may be the Windows host address, a LAN IP, or an intranet DNS name. `host.docker.internal` is not guaranteed. |
 
 For a shared office cache, prefer a stable LAN DNS name:
 
@@ -141,7 +141,7 @@ docker:
 
 A mirror cannot bypass registry authorization.
 
-For Docker Hub private images, keep doing `docker login` inside the GitHub Actions job with repository or organization secrets. Host-side `docker login` is not copied into EPAR runners, and EPAR does not bake Docker credentials into images. EPAR's current Docker Sandboxes template routes its private Docker daemon transparently so the host forward proxy cannot replace the job's registry authorization during normal operation; see [Docker Hub Credentials and Transparent Egress](../providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
+For Docker Hub private images, keep doing `docker login` inside the GitHub Actions job with repository or organization secrets. Host-side `docker login` is not copied into EPAR runners, and EPAR does not bake Docker credentials into images. EPAR gives the Docker Sandboxes gateway proxy only to runner registration and the Actions listener. On Windows overlay runners, host-level workflow HTTPS clients use EPAR's raw authenticated local relay listener and the private daemon uses a separate root-only TLS-terminating listener; both reach the credential-free controller-host relay. Other configurations retain the transparent daemon route. The hook, relay token, local authority, and runtime scrub are scoped to the current runner and do not mutate unrelated sandboxes or global secrets; see [Docker Hub Credentials and Transparent Egress](../providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
 Private pulls can use a mirror in two common ways:
 
@@ -175,7 +175,7 @@ docker exec <epar-instance> docker info
 docker exec <epar-instance> cat /etc/docker/daemon.json
 ```
 
-For Tart or WSL, inspect the guest with the provider's normal shell/exec workflow and check:
+For existing Tart or WSL configurations, inspect the guest with the provider's normal shell/exec workflow and check:
 
 ```bash
 docker info

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -34,7 +35,7 @@ const (
 var (
 	testWorkspace  = providerTestWorkspace()
 	readyListJSON  = `{"sandboxes":[{"id":"9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b","name":"epar-sandbox-1","status":"running","workspaces":[` + strconv.Quote(testWorkspace) + `],"agent":"shell","additive_field":true}]}`
-	inspectionJSON = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":` + strconv.Quote(testWorkspace) + `,"network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","mcp_gateway":false,"sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
+	inspectionJSON = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":` + strconv.Quote(testWorkspace) + `,"network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
 	testInstance   = provider.Instance{Name: testName, ProviderID: testID, Source: "shell", State: "running"}
 )
 
@@ -144,7 +145,7 @@ func (writer *cancellationSignalWriter) Write(data []byte) (int, error) {
 func scriptedProvider(t *testing.T, steps ...commandStep) (*Provider, func()) {
 	t.Helper()
 	p := New("sbx-test-double")
-	p.architectureEmulation = &fakeArchitectureEmulationEnabler{result: architectureEmulationResult{Backend: "qemu", HandlerCount: 1}}
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{result: architectureEmulationResult{Mode: architectureEmulationRequired, Backend: "qemu", HandlerCount: 1}}
 	index := 0
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 		t.Helper()
@@ -196,7 +197,6 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	}
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{
@@ -240,6 +240,107 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	done()
 }
 
+func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T) {
+	const daemonFailure = "500 Internal Server Error: failed to run sandbox container"
+	cause := errors.New("exit status 1")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: daemonFailure}, err: cause},
+	)
+	_, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil {
+		t.Fatal("Create unexpectedly succeeded after the known sandbox-container failure")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("Create error = %v, want original command error to remain wrapped", err)
+	}
+	for _, expected := range []string{
+		sandboxContainerFailureSignature,
+		"EPAR removes SSH-agent variables when its commands start a stopped daemon",
+		"EPAR will not stop or restart a running shared daemon",
+		"Coordinate with every process using that daemon",
+		"sbx daemon stop",
+		"env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach",
+	} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("Create error = %q, want remediation text %q", err, expected)
+		}
+	}
+	done()
+}
+
+func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
+	cause := errors.New("permission denied")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, err: cause},
+	)
+	_, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || !errors.Is(err, cause) {
+		t.Fatalf("Create error = %v, want original unrelated command error", err)
+	}
+	for _, misleading := range []string{sandboxContainerFailureSignature, "SSH-agent", "sbx daemon stop", "SSH_AUTH_SOCK"} {
+		if strings.Contains(err.Error(), misleading) {
+			t.Fatalf("unrelated Create error = %q, unexpectedly contains %q", err, misleading)
+		}
+	}
+	done()
+}
+
+func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`}},
+	)
+	p.architectureEmulation = bestEffortArchitectureEnabler{platform: "linux/amd64"}
+	var logOutput bytes.Buffer
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("instance = %#v, want exact receipted identity", instance)
+	}
+	if !strings.Contains(logOutput.String(), "QEMU/binfmt unavailable; continuing with verified native") {
+		t.Fatalf("best-effort create log = %q, want native fallback warning", logOutput.String())
+	}
+	done()
+}
+
+func TestNewWithArchitectureModeMapsEveryValidatedMode(t *testing.T) {
+	for _, test := range []struct {
+		mode string
+		want any
+	}{
+		{mode: architectureEmulationBestEffort, want: bestEffortArchitectureEnabler{}},
+		{mode: architectureEmulationRequired, want: qemuBinfmtEnabler{}},
+		{mode: architectureEmulationNativeOnly, want: nativeArchitectureEnabler{}},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			p := NewWithArchitectureMode("sbx", false, test.mode, "linux/amd64")
+			if reflect.TypeOf(p.architectureEmulation) != reflect.TypeOf(test.want) {
+				t.Fatalf("architecture enabler type = %T, want %T", p.architectureEmulation, test.want)
+			}
+		})
+	}
+	if p := NewWithArchitectureMode("sbx", false, "invalid", "linux/amd64"); p.architectureEmulation != nil {
+		t.Fatalf("invalid mode enabler = %T, want nil fail-closed enabler", p.architectureEmulation)
+	}
+}
+
 func TestExperimentalV2ReceiptRemainsReadableForCleanup(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{
 		"schemaVersion":   2,
@@ -274,10 +375,164 @@ func TestQEMUBinfmtEnablerUsesExactGuestHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Backend != "qemu" || result.HandlerCount != 9 {
+	if result.Mode != architectureEmulationRequired || result.Backend != "qemu" || result.HandlerCount != 9 {
 		t.Fatalf("architecture emulation result = %#v", result)
 	}
 	done()
+}
+
+func TestNativeArchitectureEnablerUsesExactGuestHelper(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{
+			args:   []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"},
+			result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`},
+		},
+	)
+	result, err := (nativeArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Mode != architectureEmulationNativeOnly || result.Backend != "native" || result.HandlerCount != 0 || result.Platform != "linux/amd64" {
+		t.Fatalf("native-only architecture result = %#v", result)
+	}
+	done()
+}
+
+func TestNativeArchitectureEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
+	for _, output := range []string{
+		`{"backend":"native","handlerCount":1,"platform":"linux/amd64"}`,
+		`{"backend":"native","handlerCount":0,"platform":"linux/arm64"}`,
+		`{"backend":"qemu","handlerCount":1,"platform":"linux/amd64"}`,
+		`not-json`,
+	} {
+		t.Run(output, func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: output}},
+			)
+			if _, err := (nativeArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance); err == nil || !strings.Contains(err.Error(), "unsupported evidence") {
+				t.Fatalf("Enable() error = %v", err)
+			}
+			done()
+		})
+	}
+}
+
+func TestBestEffortArchitectureUsesQEMUWhenAvailable(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{
+			args:   []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper},
+			result: provider.ExecResult{Stdout: `{"backend":"qemu","handlerCount":9}`},
+		},
+	)
+	result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Mode != architectureEmulationBestEffort || result.Backend != "qemu" || result.HandlerCount != 9 || result.Warning != "" {
+		t.Fatalf("best-effort QEMU result = %#v", result)
+	}
+	done()
+}
+
+func TestBestEffortArchitectureFallsBackToVerifiedNative(t *testing.T) {
+	for _, handlerCount := range []int{0, 2} {
+		t.Run(strconv.Itoa(handlerCount), func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+				commandStep{
+					args:   []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"},
+					result: provider.ExecResult{Stdout: fmt.Sprintf(`{"backend":"native","handlerCount":%d,"platform":"linux/amd64"}`, handlerCount)},
+				},
+			)
+			result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Mode != architectureEmulationBestEffort || result.Backend != "native" || result.HandlerCount != handlerCount || result.Platform != "linux/amd64" || !strings.Contains(result.Warning, "binfmt_misc is unavailable") {
+				t.Fatalf("best-effort native result = %#v", result)
+			}
+			done()
+		})
+	}
+}
+
+func TestBestEffortArchitectureBoundsFallbackWarning(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New(strings.Repeat("x", architectureWarningLimit+100))},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`}},
+	)
+	result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warning) != architectureWarningLimit {
+		t.Fatalf("warning length = %d, want %d", len(result.Warning), architectureWarningLimit)
+	}
+	done()
+}
+
+func TestBestEffortArchitectureFailsWhenNativeVerificationFails(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/arm64"}`}},
+	)
+	if _, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(context.Background(), p, testInstance); err == nil || !strings.Contains(err.Error(), "QEMU/binfmt activation failed") || !strings.Contains(err.Error(), "native architecture verification also failed") {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	done()
+}
+
+func TestNativeOnlyArchitectureCapabilityLogsVisibleWarning(t *testing.T) {
+	var logOutput bytes.Buffer
+	p := New("sbx-test-double")
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	p.logArchitectureCapability(testName, architectureEmulationResult{
+		Mode: architectureEmulationNativeOnly, Backend: "native", HandlerCount: 0, Platform: "linux/amd64",
+	})
+	for _, expected := range []string{
+		`"level":"WARN"`,
+		`"msg":"Docker Sandboxes native-only architecture verified: platform=linux/amd64; foreign-architecture containers are unsupported"`,
+		`"architectureEmulation":"native-only"`,
+		`"backend":"native"`,
+		`"platform":"linux/amd64"`,
+		`"registeredHandlers":0`,
+	} {
+		if !strings.Contains(logOutput.String(), expected) {
+			t.Fatalf("native-only architecture warning %q does not contain %q", logOutput.String(), expected)
+		}
+	}
+}
+
+func TestBestEffortNativeFallbackLogsVisibleWarning(t *testing.T) {
+	var logOutput bytes.Buffer
+	p := New("sbx-test-double")
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	p.logArchitectureCapability(testName, architectureEmulationResult{
+		Mode: architectureEmulationBestEffort, Backend: "native", HandlerCount: 0, Platform: "linux/amd64", Warning: "binfmt_misc is unavailable",
+	})
+	for _, expected := range []string{
+		`"level":"WARN"`,
+		`"msg":"Docker Sandboxes QEMU/binfmt unavailable; continuing with verified native platform=linux/amd64; foreign-architecture containers may fail"`,
+		`"architectureEmulation":"best-effort"`,
+		`"backend":"native"`,
+		`"qemuError":"binfmt_misc is unavailable"`,
+	} {
+		if !strings.Contains(logOutput.String(), expected) {
+			t.Fatalf("best-effort architecture warning %q does not contain %q", logOutput.String(), expected)
+		}
+	}
+}
+
+func TestArchitectureCapabilityLogIsEmittedOncePerLiveInstance(t *testing.T) {
+	var logOutput bytes.Buffer
+	p := New("sbx-test-double")
+	p.SetLogger(slog.New(slog.NewJSONHandler(&logOutput, nil)))
+	evidence := architectureEmulationResult{Mode: architectureEmulationBestEffort, Backend: "native", Platform: "linux/amd64", Warning: "binfmt_misc is unavailable"}
+	p.logArchitectureCapability(testName, evidence)
+	p.logArchitectureCapability(testName, evidence)
+	if got := strings.Count(logOutput.String(), "QEMU/binfmt unavailable; continuing with verified native"); got != 1 {
+		t.Fatalf("fallback warning count = %d, want 1: %s", got, logOutput.String())
+	}
 }
 
 func TestQEMUBinfmtEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
@@ -301,7 +556,6 @@ func TestQEMUBinfmtEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
 func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -330,7 +584,6 @@ func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) 
 func TestCreateReturnsExactReceiptWhenArchitectureEmulationSetupFails(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -376,7 +629,6 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 	mismatch := strings.Replace(templateListJSON, "39cf20eca861", "aaaaaaaaaaaa", 1)
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}},
 	)
 	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "does not match") {
@@ -388,7 +640,6 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -399,19 +650,6 @@ func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T)
 	)
 	if _, err := p.Create(context.Background(), validCreateRequest()); err != nil {
 		t.Fatal(err)
-	}
-	done()
-}
-
-func TestCreateFailsClosedWithoutEchoingGlobalSecretMetadata(t *testing.T) {
-	const listedMetadata = "github registry masked-prefix masked-suffix"
-	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: listedMetadata}},
-	)
-	_, err := p.Create(context.Background(), validCreateRequest())
-	if err == nil || !strings.Contains(err.Error(), "global secrets are configured") || strings.Contains(err.Error(), listedMetadata) {
-		t.Fatalf("global-secret preflight error = %v", err)
 	}
 	done()
 }
@@ -433,25 +671,80 @@ func TestInstanceAdmissionUsesExactInspectionAndRejectsAttachedCapabilities(t *t
 		done()
 	})
 	for _, mutation := range []struct {
-		name string
-		old  string
-		new  string
+		name     string
+		old      string
+		new      string
+		metadata string
 	}{
-		{name: "kit", old: `"kits":[]`, new: `"kits":[{"name":"docker-auth"}]`},
-		{name: "mcp", old: `"mcp_gateway":false`, new: `"mcp_gateway":true`},
-		{name: "secret", old: `"state":"running"`, new: `"state":"running","secrets":["registry"]`},
-		{name: "port", old: `"state":"running"`, new: `"state":"running","published_ports":["8080:80"]`},
-		{name: "auth", old: `"state":"running"`, new: `"state":"running","auth_mode":"docker-login"`},
+		{name: "kit", old: `"kits":[]`, new: `"kits":[{"name":"docker-auth","token":"kit-token-metadata"}]`, metadata: "kit-token-metadata"},
+		{name: "published_ports", old: `"state":"running"`, new: `"state":"running","published_ports":["8080:80"]`, metadata: "8080:80"},
+		{name: "ports", old: `"state":"running"`, new: `"state":"running","ports":[{"host_port":8080}]`, metadata: "8080"},
+		{name: "auth", old: `"state":"running"`, new: `"state":"running","auth":{"provider":"registry-auth-metadata"}`, metadata: "registry-auth-metadata"},
+		{name: "auth_mode", old: `"state":"running"`, new: `"state":"running","auth_mode":"docker-login-metadata"`, metadata: "docker-login-metadata"},
+		{name: "docker_auth", old: `"state":"running"`, new: `"state":"running","docker_auth":{"registry":"registry-token-metadata"}`, metadata: "registry-token-metadata"},
 	} {
 		t.Run(mutation.name, func(t *testing.T) {
 			fixture := strings.Replace(inspectionJSON, mutation.old, mutation.new, 1)
 			p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
-			if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err == nil {
+			err := p.VerifyInstanceAdmission(context.Background(), testInstance)
+			if err == nil {
 				t.Fatal("attached capability was accepted")
+			}
+			if mutation.metadata != "" && strings.Contains(err.Error(), mutation.metadata) {
+				t.Fatalf("attached capability metadata leaked in error: %v", err)
 			}
 			done()
 		})
 	}
+}
+
+func TestInstanceAdmissionIgnoresProviderSecretsMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "missing", value: ""},
+		{name: "string", value: `"registry-secret-metadata"`},
+		{name: "number", value: `42`},
+		{name: "boolean", value: `true`},
+		{name: "object", value: `{"token":"registry-secret-metadata"}`},
+		{name: "array", value: `["registry-secret-metadata",{"kind":"service"}]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := inspectionJSON
+			if test.value != "" {
+				fixture = strings.Replace(inspectionJSON, `"state":"running"`, `"state":"running","secrets":`+test.value, 1)
+			}
+			p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
+			if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err != nil {
+				t.Fatalf("provider secrets metadata affected admission: %v", err)
+			}
+			done()
+		})
+	}
+}
+
+func TestInstanceAdmissionRejectsCredentialMetadataWithoutEchoingIt(t *testing.T) {
+	const metadata = "registry-token-metadata"
+	fixture := strings.Replace(inspectionJSON, `"state":"running"`, `"state":"running","docker_auth":{"registry":"`+metadata+`"}`, 1)
+	p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
+	err := p.VerifyInstanceAdmission(context.Background(), testInstance)
+	if err == nil || !strings.Contains(err.Error(), "forbidden attached capability") || strings.Contains(err.Error(), metadata) {
+		t.Fatalf("credential capability error = %v", err)
+	}
+	done()
+}
+
+func TestInstanceAdmissionRechecksConfiguredArchitectureCapability(t *testing.T) {
+	p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}})
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{err: errors.New("required QEMU handlers are unavailable")}
+	if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err == nil || !strings.Contains(err.Error(), "required QEMU handlers are unavailable") {
+		t.Fatalf("VerifyInstanceAdmission() error = %v, want configured architecture rejection", err)
+	}
+	if calls := p.architectureEmulation.(*fakeArchitectureEmulationEnabler).calls; calls != 1 {
+		t.Fatalf("architecture admission calls = %d, want 1", calls)
+	}
+	done()
 }
 
 func TestInstanceAdmissionRejectsPublishedPortInventory(t *testing.T) {
@@ -607,10 +900,9 @@ func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {
 	done()
 }
 
-func TestAdmissionUsesDiagnosticsWithoutReadingVersion(t *testing.T) {
+func TestAdmissionUsesDiagnosticsWithoutReadingGlobalSecrets(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
 		t.Fatal(err)
@@ -621,7 +913,6 @@ func TestAdmissionUsesDiagnosticsWithoutReadingVersion(t *testing.T) {
 func TestAdmissionRechecksDiagnostics(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"secret", "ls", "-g"}, result: provider.ExecResult{Stdout: `No secrets found for scope "(global)".`}},
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
@@ -655,6 +946,43 @@ func TestInventoryParsesWrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
 			t.Fatalf("schema drift was accepted: %s", fixture)
 		}
 	}
+}
+
+func TestInventoryRetriesOneInvalidMachineReadableResponse(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: "Starting sandboxd daemon..."}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+	)
+	items, err := p.Inventory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Instance.ProviderID != testID {
+		t.Fatalf("retried inventory = %#v, want exact fixture identity", items)
+	}
+	done()
+}
+
+func TestInventoryFailsClosedAfterSecondInvalidMachineReadableResponse(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: "Starting sandboxd daemon..."}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"items":[]}`}},
+	)
+	if _, err := p.Inventory(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported json schema") {
+		t.Fatalf("persistent invalid inventory output was accepted: %v", err)
+	}
+	done()
+}
+
+func TestInventoryDoesNotRetryCommandFailure(t *testing.T) {
+	expected := errors.New("sandboxd unavailable")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, err: expected},
+	)
+	if _, err := p.Inventory(context.Background()); !errors.Is(err, expected) {
+		t.Fatalf("Inventory() error = %v, want command failure", err)
+	}
+	done()
 }
 
 func TestLifecycleCommandsUseExactIdentityAndArgv(t *testing.T) {
@@ -1158,7 +1486,7 @@ func TestCommandBoundaryRejectsInteractiveAndDestructiveGlobalCommands(t *testin
 			t.Fatalf("non-exact Docker Sandboxes published-port inspection was accepted: %q", arguments)
 		}
 	}
-	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
+	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop"}, {"daemon", "stop", "--detach"}, {"daemon", "restart"}, {"daemon", "restart", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
 		if err := validateCommandRequest(commandRequest{args: arguments, operation: "test forbidden daemon command"}); err == nil {
 			t.Fatalf("non-exact Docker Sandboxes daemon command was accepted: %q", arguments)
 		}

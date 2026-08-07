@@ -4,9 +4,11 @@ set -euo pipefail
 if [[ "$#" -eq 0 ]]; then
   marker="/opt/epar/host-trust-generation.json"
   lease="/run/epar/host-trust-lease.json"
+  production_paths=true
 elif [[ "$#" -eq 2 ]]; then
   marker="$1"
   lease="$2"
+  production_paths=false
 else
   echo "EPAR host-trust gate: invalid invocation" >&2
   exit 1
@@ -16,12 +18,40 @@ if [[ ! -s "${marker}" ]]; then
   echo "EPAR host-trust gate: image generation marker is missing" >&2
   exit 1
 fi
-if [[ ! -s "${lease}" ]]; then
-  echo "EPAR host-trust gate: controller lease is missing" >&2
-  exit 1
-fi
 if [[ ! -x /usr/bin/python3 ]]; then
   echo "EPAR host-trust gate: python3 is required" >&2
+  exit 1
+fi
+if [[ "${production_paths}" == "true" ]]; then
+  canonical_bundle="/opt/epar/trust/ca-bundle.pem"
+  if [[ ! -s "${canonical_bundle}" || -L "${canonical_bundle}" || "$(stat -c '%U:%G:%a' "${canonical_bundle}" 2>/dev/null || true)" != "root:root:444" ]]; then
+    echo "EPAR host-trust gate: canonical CA bundle is missing or invalid" >&2
+    exit 1
+  fi
+fi
+if [[ ! -s "${lease}" ]]; then
+  # A disabled policy is explicit image metadata and intentionally has no
+  # controller lease. Keep the job-start hook unconditional while still
+  # failing closed for an overlay image whose lease disappeared or expired.
+  if /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3 -I -S - "${marker}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        marker = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(marker, dict) or marker.get("schemaVersion") != 1:
+    raise SystemExit(1)
+if marker.get("mode") != "disabled" or marker.get("generation") != "disabled" or marker.get("hostOS") not in ("", None) or marker.get("scopes") != [] or marker.get("certificateCount") != 0:
+    raise SystemExit(1)
+PY
+  then
+    echo "EPAR host-trust gate: host-trust policy is explicitly disabled"
+    exit 0
+  fi
+  echo "EPAR host-trust gate: controller lease is missing" >&2
   exit 1
 fi
 

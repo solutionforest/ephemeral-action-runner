@@ -344,7 +344,7 @@ func TestValidateRunnerGroupSecurityRejectsInvalidValues(t *testing.T) {
 
 func TestLoggingDefaults(t *testing.T) {
 	got := Default().Logging
-	if got.Directory != "work/logs" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
+	if got.Directory != "work/logs" || got.Level != "info" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
 		t.Fatalf("unexpected logging destination defaults: %+v", got)
 	}
 	if got.MaxFileSizeMiB != 100 || got.MaxBackups != 3 || !got.CompressBackups || !got.RetentionEnabled || got.RetentionMaxTotalMiB != 1024 {
@@ -356,29 +356,44 @@ func TestLoggingDefaults(t *testing.T) {
 }
 
 func TestCheckedInExampleConfigurationsValidate(t *testing.T) {
-	patterns := []string{
-		filepath.Join("..", "..", "configs", "*.yml"),
-		filepath.Join("..", "..", "examples", "observability", "*.yml"),
+	paths, err := filepath.Glob(filepath.Join("..", "..", "configs", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, pattern := range patterns {
-		paths, err := filepath.Glob(pattern)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(paths) == 0 {
-			t.Fatalf("no examples matched %s", pattern)
-		}
-		for _, path := range paths {
-			t.Run(filepath.Base(path), func(t *testing.T) {
-				cfg, err := Load(path)
-				if err != nil {
-					t.Fatalf("Load(%s): %v", path, err)
-				}
-				if err := Validate(cfg); err != nil {
-					t.Fatalf("Validate(%s): %v", path, err)
-				}
-			})
-		}
+	if len(paths) == 0 {
+		t.Fatal("no configuration examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%s): %v", path, err)
+			}
+			if err := Validate(cfg); err != nil {
+				t.Fatalf("Validate(%s): %v", path, err)
+			}
+		})
+	}
+}
+
+func TestObservabilityExamplesRequireAnExplicitProviderType(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "observability", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no observability examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%s): %v", path, err)
+			}
+			if err := Validate(cfg); err == nil || err.Error() != "provider.type is required" {
+				t.Fatalf("Validate(%s) error = %v, want provider.type is required", path, err)
+			}
+		})
 	}
 }
 
@@ -388,6 +403,7 @@ func TestLoadLoggingConfiguration(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 logging:
   directory: custom/logs
+  level: DEBUG
   managerSinks:
     - console
     - file
@@ -406,6 +422,8 @@ logging:
   errorMaxAgeDays: 10
   benchmarkMaxAgeDays: 11
   retentionIntervalMinutes: 12
+provider:
+  type: tart
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +432,7 @@ logging:
 		t.Fatal(err)
 	}
 	got := cfg.Logging
-	if got.Directory != "custom/logs" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
+	if got.Directory != "custom/logs" || got.Level != "debug" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
 		t.Fatalf("unexpected logging config: %+v", got)
 	}
 	if err := Validate(cfg); err != nil {
@@ -425,7 +443,7 @@ logging:
 func TestLoadCustomConsoleTextFormats(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\n"
+	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\nprovider:\n  type: tart\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +465,7 @@ func TestLoadCustomConsoleTextFormats(t *testing.T) {
 func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\nprovider:\n  type: tart\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
@@ -508,6 +526,7 @@ func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
 func TestValidateLoggingRejectsInvalidValues(t *testing.T) {
 	for _, mutate := range []func(*LoggingConfig){
 		func(logging *LoggingConfig) { logging.Directory = " " },
+		func(logging *LoggingConfig) { logging.Level = "trace" },
 		func(logging *LoggingConfig) { logging.ManagerSinks = nil },
 		func(logging *LoggingConfig) { logging.TranscriptSinks = []string{"syslog"} },
 		func(logging *LoggingConfig) { logging.ManagerSinks = []string{"Console"} },
@@ -543,7 +562,7 @@ func TestTrustedCACertificatePathsDefaultToEmpty(t *testing.T) {
 }
 
 func TestValidateRejectsEmptyTrustedCACertificatePath(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Image.TrustedCACertificatePaths = []string{" "}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "image.trustedCaCertificatePaths") {
 		t.Fatalf("Validate() error = %v, want trusted CA path error", err)
@@ -625,10 +644,8 @@ func TestValidateHostTrustAllowsDockerSandboxesOverlay(t *testing.T) {
 }
 
 func TestValidateHostTrustAllowsWSLOverlay(t *testing.T) {
-	cfg := Default()
-	cfg.Provider.Type = "wsl"
+	cfg := defaultWSLConfig()
 	cfg.Provider.SourceImage = "runner-image.tar"
-	cfg.Provider.InstallRoot = "work/wsl"
 	cfg.Runner.Ephemeral = true
 	cfg.Image.HostTrustMode = HostTrustModeOverlay
 	cfg.Image.HostTrustScopes = []string{HostTrustScopeSystem}
@@ -853,6 +870,63 @@ runner:
 	}
 }
 
+func TestProviderTypeIsRequiredAndDoesNotApplyProviderDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  includeHostLabel: false\npool:\n  instances: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider, (ProviderConfig{}); got != want {
+		t.Fatalf("provider defaults = %+v, want %+v", got, want)
+	}
+	if got, want := cfg.Image.SourceImage, ""; got != want {
+		t.Fatalf("image.sourceImage = %q, want empty without provider.type", got)
+	}
+	if got, want := cfg.Image.OutputImage, ""; got != want {
+		t.Fatalf("image.outputImage = %q, want empty without provider.type", got)
+	}
+	if got := cfg.Runner.Labels; len(got) != 0 {
+		t.Fatalf("runner.labels = %#v, want no provider-specific defaults", got)
+	}
+	if err := Validate(cfg); err == nil || err.Error() != "provider.type is required" {
+		t.Fatalf("Validate() error = %v, want provider.type is required", err)
+	}
+}
+
+func TestProviderDefaultsForMinimalTartConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  includeHostLabel: false\nprovider:\n  type: tart\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceImage, "ghcr.io/cirruslabs/ubuntu:latest"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "epar-ubuntu-24-arm64"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
+		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.Network, "default"; got != want {
+		t.Fatalf("provider.network = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels, []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}; !slices.Equal(got, want) {
+		t.Fatalf("runner.labels = %#v, want %#v", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProviderDefaultsForMinimalWSLConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -880,6 +954,9 @@ provider:
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
 		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.InstallRoot, "work/wsl"; got != want {
+		t.Fatalf("provider.installRoot = %q, want %q", got, want)
 	}
 	if got, want := cfg.Pool.NamePrefix, "epar-wsl"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
@@ -1020,22 +1097,21 @@ func TestExampleConfigsLoadAndValidate(t *testing.T) {
 }
 
 func TestValidateRosettaTag(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid rosetta tag rejected: %v", err)
 	}
 
 	for _, tag := range []string{"bad tag", "bad/tag", "../rosetta", "-bad"} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Provider.RosettaTag = tag
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("provider.rosettaTag %q accepted", tag)
 		}
 	}
 
-	cfg = Default()
-	cfg.Provider.Type = "wsl"
+	cfg = defaultWSLConfig()
 	cfg.Provider.SourceImage = "image.tar"
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err == nil {
@@ -1044,8 +1120,7 @@ func TestValidateRosettaTag(t *testing.T) {
 }
 
 func TestValidateDockerPlatform(t *testing.T) {
-	cfg := Default()
-	cfg.Provider.Type = "docker-container"
+	cfg := defaultDockerContainerConfig()
 	cfg.Provider.SourceImage = "runner-image"
 	cfg.Provider.Platform = "linux/amd64"
 	if err := Validate(cfg); err != nil {
@@ -1053,8 +1128,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 	}
 
 	for _, platform := range []string{"bad platform", "-linux/amd64", "linux/$bad"} {
-		cfg := Default()
-		cfg.Provider.Type = "docker-container"
+		cfg := defaultDockerContainerConfig()
 		cfg.Provider.SourceImage = "runner-image"
 		cfg.Provider.Platform = platform
 		if err := Validate(cfg); err == nil {
@@ -1062,8 +1136,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 		}
 	}
 
-	cfg = Default()
-	cfg.Provider.Type = "tart"
+	cfg = defaultTartConfig()
 	cfg.Provider.Platform = "linux/arm64"
 	if err := Validate(cfg); err == nil {
 		t.Fatal("provider.platform accepted for Tart")
@@ -1071,7 +1144,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 }
 
 func TestValidateDockerRegistryMirror(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Docker.RegistryMirrors = []string{"https://mirror.example.test", "http://host.docker.internal:5000/"}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid registry mirrors rejected: %v", err)
@@ -1086,7 +1159,7 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 		"https://mirror example.test",
 		" https://mirror.example.test",
 	} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.RegistryMirrors = []string{mirror}
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.registryMirrors %q accepted", mirror)
@@ -1095,7 +1168,7 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 }
 
 func TestValidateDockerDaemonProxy(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Docker.HTTPProxy = "http://proxy.example.test:3128"
 	cfg.Docker.HTTPSProxy = "https://proxy.example.test:8443"
 	cfg.Docker.NoProxy = "localhost,127.0.0.1,.example.test,10.0.0.0/8,*"
@@ -1111,7 +1184,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 		"http://proxy.example.test?x=1",
 		" http://proxy.example.test",
 	} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.HTTPProxy = proxyURL
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.httpProxy %q accepted", proxyURL)
@@ -1119,7 +1192,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 	}
 
 	for _, noProxy := range []string{"localhost,,example.test", " localhost", "http://example.test", "user@example.test", "10.0.0.0/not-a-prefix"} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.NoProxy = noProxy
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.noProxy %q accepted", noProxy)
@@ -1150,7 +1223,7 @@ func TestValidateRejectsDockerSocketProvider(t *testing.T) {
 }
 
 func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1160,7 +1233,7 @@ func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
 }
 
 func TestValidateRejectsInvalidPoolInstances(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Pool.Instances = 0
 	if err := Validate(cfg); err == nil {
 		t.Fatal("pool.instances=0 accepted")
@@ -1176,6 +1249,8 @@ pool:
   replacementRetryMaxSeconds: 720
   replacementRetryMultiplier: 1.5
   replacementRetryJitterPercent: 0
+provider:
+  type: tart
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1232,7 +1307,7 @@ func TestValidateRejectsInvalidPoolReplacementRetryConfiguration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cfg := Default()
+			cfg := defaultTartConfig()
 			test.mutate(&cfg)
 			if err := Validate(cfg); err == nil {
 				t.Fatal("Validate accepted invalid replacement retry configuration")
@@ -1369,6 +1444,9 @@ dockerSandboxes:
 	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
 		t.Fatalf("dockerSandboxes.memory = %q, want %q", got, want)
 	}
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, DockerSandboxesArchitectureEmulationBestEffort; got != want {
+		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want omitted configuration to default to %q", got, want)
+	}
 	if got, want := cfg.DockerSandboxes.AdditionalAllow, []string{"api.github.com", "*.githubusercontent.com:443"}; !slices.Equal(got, want) {
 		t.Fatalf("dockerSandboxes.additionalAllow = %#v, want %#v", got, want)
 	}
@@ -1389,15 +1467,39 @@ func TestLoadDockerSandboxesRejectsRemovedHostReserve(t *testing.T) {
 	}
 }
 
-func TestLoadDockerSandboxesRejectsArchitectureEmulationConfiguration(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "docker-sandboxes.yml")
-	if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  architectureEmulation: disabled\n"), 0644); err != nil {
-		t.Fatal(err)
+func TestLoadDockerSandboxesArchitectureEmulation(t *testing.T) {
+	for _, value := range []string{DockerSandboxesArchitectureEmulationBestEffort, DockerSandboxesArchitectureEmulationRequired, DockerSandboxesArchitectureEmulationNativeOnly} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "docker-sandboxes.yml")
+			if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  architectureEmulation: "+value+"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.DockerSandboxes.ArchitectureEmulation; got != value {
+				t.Fatalf("dockerSandboxes.architectureEmulation = %q, want %q", got, value)
+			}
+			cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+			if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err != nil {
+				t.Fatalf("ValidateDockerSandboxes() rejected %q: %v", value, err)
+			}
+		})
 	}
-	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "unknown key dockerSandboxes.architectureEmulation") {
-		t.Fatalf("Load() error = %v, want removed emulation-setting rejection", err)
+}
+
+func TestValidateDockerSandboxesRejectsInvalidArchitectureEmulation(t *testing.T) {
+	for _, value := range []string{"", "disabled", "Required", "native"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := Default()
+			cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+			cfg.DockerSandboxes.ArchitectureEmulation = value
+			if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err == nil || !strings.Contains(err.Error(), "supported values are best-effort, required, and native-only") {
+				t.Fatalf("ValidateDockerSandboxes() error = %v, want unsupported architecture-emulation rejection", err)
+			}
+		})
 	}
 }
 
@@ -1508,6 +1610,7 @@ func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T)
 func TestValidateDockerSandboxesAcceptsARM64Configuration(t *testing.T) {
 	cfg := validDockerSandboxesConfig()
 	cfg.Provider.Platform = "linux/arm64"
+	cfg.Image.SourcePlatform = cfg.Provider.Platform
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate() rejected linux/arm64 Docker Sandboxes configuration: %v", err)
 	}
@@ -1605,13 +1708,35 @@ func TestEffectiveMinimumFreeBytesKeepsStricterCommonReserve(t *testing.T) {
 func validDockerSandboxesConfig() Config {
 	cfg := Default()
 	cfg.Provider.Type = "docker-sandboxes"
-	cfg.Provider.SourceImage = ""
 	cfg.Provider.Platform = "linux/amd64"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true, "provider.platform": true})
+	cfg.Provider.SourceImage = ""
 	cfg.Runner.Ephemeral = true
 	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
 	cfg.DockerSandboxes.PolicyGeneration = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	cfg.DockerSandboxes.AdditionalAllow = []string{"api.github.com"}
 	cfg.DockerSandboxes.RootDisk = "120GiB"
 	cfg.DockerSandboxes.DockerDisk = "50GiB"
+	return cfg
+}
+
+func defaultTartConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "tart"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
+}
+
+func defaultWSLConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "wsl"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
+}
+
+func defaultDockerContainerConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "docker-container"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
 	return cfg
 }

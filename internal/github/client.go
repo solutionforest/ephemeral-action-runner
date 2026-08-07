@@ -9,11 +9,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/dependency"
 )
 
 type Client struct {
@@ -173,7 +175,36 @@ func (c *Client) installationRequest(ctx context.Context, method, path string, b
 	if err != nil {
 		return err
 	}
-	return c.request(ctx, method, path, "Bearer "+token, body, out)
+	err = c.request(ctx, method, path, "Bearer "+token, body, out)
+	if !isUnauthorizedHTTPError(err) || ctx.Err() != nil {
+		return err
+	}
+
+	// A cached GitHub App installation token can be revoked or rejected before
+	// its advertised expiry. Refresh it once in place instead of terminating a
+	// healthy pool. The rejected-token comparison prevents concurrent requests
+	// from invalidating a newer token that another request already minted.
+	c.invalidateInstallationToken(token)
+	refreshedToken, refreshErr := c.installationToken(ctx)
+	if refreshErr != nil {
+		return fmt.Errorf("refresh GitHub App installation token after HTTP 401: %w", refreshErr)
+	}
+	return c.request(ctx, method, path, "Bearer "+refreshedToken, body, out)
+}
+
+func isUnauthorizedHTTPError(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized
+}
+
+func (c *Client) invalidateInstallationToken(rejectedToken string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if rejectedToken == "" || c.token != rejectedToken {
+		return
+	}
+	c.token = ""
+	c.tokenExpires = time.Time{}
 }
 
 func (c *Client) installationToken(ctx context.Context) (string, error) {
@@ -210,13 +241,13 @@ func (c *Client) request(ctx context.Context, method, path, auth string, body, o
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return dependency.NewFailure("github", requestOperation(method, path), err)
 		}
 		reader = bytes.NewReader(data)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.cfg.APIBaseURL+path, reader)
 	if err != nil {
-		return err
+		return dependency.NewFailure("github", requestOperation(method, path), err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -228,38 +259,174 @@ func (c *Client) request(ctx context.Context, method, path, auth string, body, o
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		// GitHub calls deliberately make one HTTP attempt.  The lifecycle
+		// supervisor owns retry timing and can therefore coordinate retries
+		// across providers without nested pagination/readiness retries.
+		return dependency.NewFailure("github", requestOperation(method, path), err,
+			dependency.WithRetryable(retryableTransportFailure(ctx, err)))
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return dependency.NewFailure("github", requestOperation(method, path), err,
+			dependency.WithRetryable(retryableTransportFailure(ctx, err)),
+			dependency.WithRequestID(headerValue(resp.Header, "X-GitHub-Request-Id")))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &HTTPError{
-			Method:     method,
-			Path:       path,
-			StatusCode: resp.StatusCode,
-			Body:       strings.TrimSpace(string(respBody)),
-			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		httpError := &HTTPError{
+			Method:         method,
+			Path:           path,
+			StatusCode:     resp.StatusCode,
+			Body:           strings.TrimSpace(string(respBody)),
+			RetryAfter:     parseRetryAfter(headerValue(resp.Header, "Retry-After"), time.Now()),
+			RateLimitReset: parseRateLimitReset(headerValue(resp.Header, "X-RateLimit-Reset")),
+			RequestID:      dependency.SanitizeRequestID(headerValue(resp.Header, "X-GitHub-Request-Id")),
+			Cause:          errors.New(strings.TrimSpace(string(respBody))),
 		}
+		httpError.RateLimitRemaining, httpError.RateLimitKnown = parseRateLimitRemaining(headerValue(resp.Header, "X-RateLimit-Remaining"))
+		return httpError
 	}
 	if out == nil || len(respBody) == 0 {
 		return nil
 	}
-	return json.Unmarshal(respBody, out)
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return dependency.NewFailure("github", requestOperation(method, path), err,
+			dependency.WithRequestID(headerValue(resp.Header, "X-GitHub-Request-Id")))
+	}
+	return nil
+}
+
+func retryableTransportFailure(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		// http.Client.Timeout and transport-level deadlines wrap
+		// context.DeadlineExceeded even though the caller's context remains
+		// usable.  Treat those bounded request timeouts as transient.
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return dependency.IsRetryable(err)
 }
 
 type HTTPError struct {
-	Method     string
-	Path       string
-	StatusCode int
-	Body       string
-	RetryAfter time.Duration
+	Method             string
+	Path               string
+	StatusCode         int
+	Body               string
+	RetryAfter         time.Duration
+	RateLimitReset     time.Time
+	RateLimitRemaining int
+	RateLimitKnown     bool
+	RateLimited        bool
+	RequestID          string
+	Cause              error
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("github %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+	if e == nil {
+		return "<nil>"
+	}
+	message := fmt.Sprintf("github %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+	metadata := make([]string, 0, 3)
+	if requestID := dependency.SanitizeRequestID(e.RequestID); requestID != "" {
+		metadata = append(metadata, "request-id="+requestID)
+	}
+	if e.RetryAfter > 0 {
+		metadata = append(metadata, "retry-after="+e.RetryAfter.String())
+	}
+	if !e.RateLimitReset.IsZero() {
+		metadata = append(metadata, "rate-limit-reset="+e.RateLimitReset.UTC().Format(time.RFC3339))
+	}
+	if len(metadata) > 0 {
+		message += " (" + strings.Join(metadata, ", ") + ")"
+	}
+	return message
+}
+
+// Unwrap exposes the provider-neutral failure while retaining the response
+// cause through Failure.Unwrap.  This lets errors.As discover structured
+// metadata even after runner-group policy methods add contextual wrapping.
+func (e *HTTPError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.DependencyFailure()
+}
+
+// DependencyFailure adapts HTTPError to the provider-neutral failure model.
+// It intentionally computes the classification lazily so HTTPError values
+// constructed in tests or by callers with struct literals retain the same
+// status/rate-limit semantics as responses created by request.
+func (e *HTTPError) DependencyFailure() *dependency.Failure {
+	if e == nil {
+		return nil
+	}
+	return dependency.NewHTTPFailure("github", requestOperation(e.Method, e.Path), dependency.HTTPMetadata{
+		StatusCode:      e.StatusCode,
+		RetryAfter:      e.RetryAfter,
+		RateLimitReset:  e.RateLimitReset,
+		RateLimitRemain: e.RateLimitRemaining,
+		RateLimitKnown:  e.RateLimitKnown || e.RateLimited,
+		RequestID:       e.RequestID,
+		Body:            e.Body,
+	}, e.Cause)
+}
+
+// IsRetryable exposes the shared classification for callers that already
+// hold an HTTPError value rather than its wrapped error interface.
+func (e *HTTPError) IsRetryable() bool {
+	failure := e.DependencyFailure()
+	return failure != nil && failure.Retryable
+}
+
+func requestOperation(method, path string) string {
+	method = strings.TrimSpace(method)
+	path = strings.TrimSpace(path)
+	if method == "" {
+		return path
+	}
+	if path == "" {
+		return method
+	}
+	return method + " " + path
+}
+
+func parseRateLimitReset(value string) time.Time {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || seconds <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(seconds, 0).UTC()
+}
+
+func parseRateLimitRemaining(value string) (int, bool) {
+	if strings.TrimSpace(value) == "" {
+		return 0, false
+	}
+	remaining, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, false
+	}
+	return remaining, true
+}
+
+func headerValue(headers http.Header, name string) string {
+	if value := headers.Get(name); value != "" {
+		return value
+	}
+	for key, values := range headers {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

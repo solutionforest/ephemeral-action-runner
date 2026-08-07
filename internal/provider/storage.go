@@ -20,15 +20,16 @@ type filesystemStorage struct {
 }
 
 type StorageRoot struct {
-	ID           string
-	Role         storage.StorageRole
-	Kind         storage.SurfaceKind
-	Path         string
-	CapacityPath string
-	Provenance   string
-	Confidence   string
-	Warnings     []string
-	ReportOnly   bool
+	ID                        string
+	Role                      storage.StorageRole
+	Kind                      storage.SurfaceKind
+	Path                      string
+	CapacityPath              string
+	CapacityUnavailableReason string
+	Provenance                string
+	Confidence                string
+	Warnings                  []string
+	ReportOnly                bool
 }
 
 // StorageRootDiscovery performs read-only provider backing-path discovery at
@@ -92,6 +93,8 @@ func (contribution *filesystemStorage) StorageSnapshot(ctx context.Context, requ
 	seen := make(map[string]struct{}, len(specifications))
 	seenRoles := make(map[storage.StorageRole]string, len(specifications))
 	domainByIdentity := make(map[string]storage.CapacityDomain, len(specifications))
+	domainByID := make(map[string]storage.CapacityDomain, len(specifications))
+	unknownDomainByLocator := make(map[string]storage.CapacityDomain, len(specifications))
 	for _, specification := range specifications {
 		if strings.TrimSpace(specification.ID) == "" || strings.TrimSpace(specification.Path) == "" {
 			return StorageSnapshot{}, fmt.Errorf("provider %s has an incomplete storage root", contribution.providerType)
@@ -110,34 +113,77 @@ func (contribution *filesystemStorage) StorageSnapshot(ctx context.Context, requ
 		if capacityPath == "" {
 			capacityPath = specification.Path
 		}
-		root, err := nearestExistingDirectory(capacityPath)
-		if err != nil {
-			return StorageSnapshot{}, fmt.Errorf("resolve %s storage root %s: %w", contribution.providerType, specification.ID, err)
-		}
-		probedDomain, err := contribution.domainProbe(root, request.Now)
-		if err != nil {
-			return StorageSnapshot{}, err
-		}
-		if strings.TrimSpace(probedDomain.ID) == "" || strings.TrimSpace(probedDomain.Identity) == "" {
-			return StorageSnapshot{}, fmt.Errorf("provider %s storage root %s has an incomplete capacity domain", contribution.providerType, specification.ID)
-		}
 		kind := specification.Kind
 		if kind == "" {
 			kind = storage.SurfaceHostFilesystem
-		}
-		domain, exists := domainByIdentity[probedDomain.Identity]
-		if !exists {
-			domain = probedDomain
-			domainByIdentity[probedDomain.Identity] = domain
-		} else if domain.ID != probedDomain.ID {
-			return StorageSnapshot{}, fmt.Errorf("provider %s capacity domain identity %q resolved to conflicting IDs %q and %q", contribution.providerType, probedDomain.Identity, domain.ID, probedDomain.ID)
 		}
 		provenance := specification.Provenance
 		if provenance == "" {
 			provenance = "provider-root"
 		}
 		confidence := specification.Confidence
-		if confidence == "" {
+		root := capacityPath
+		unavailableReason := strings.TrimSpace(specification.CapacityUnavailableReason)
+		if unavailableReason == "" {
+			resolvedRoot, resolveErr := nearestExistingDirectory(capacityPath)
+			if resolveErr != nil {
+				unavailableReason = fmt.Sprintf("resolve %s storage root %s: %v", contribution.providerType, specification.ID, resolveErr)
+			} else {
+				root = resolvedRoot
+			}
+		}
+
+		var domain storage.CapacityDomain
+		if unavailableReason == "" {
+			probedDomain, probeErr := contribution.domainProbe(root, request.Now)
+			if probeErr != nil {
+				unavailableReason = fmt.Sprintf("measure %s storage root %s: %v", contribution.providerType, specification.ID, probeErr)
+			} else if strings.TrimSpace(probedDomain.ID) == "" || strings.TrimSpace(probedDomain.Identity) == "" {
+				return StorageSnapshot{}, fmt.Errorf("provider %s storage root %s has an incomplete capacity domain", contribution.providerType, specification.ID)
+			} else {
+				var exists bool
+				domain, exists = domainByIdentity[probedDomain.Identity]
+				if !exists {
+					if previous, duplicateID := domainByID[probedDomain.ID]; duplicateID && previous.Identity != probedDomain.Identity {
+						return StorageSnapshot{}, fmt.Errorf("provider %s capacity domain ID %q maps conflicting identities %q and %q", contribution.providerType, probedDomain.ID, previous.Identity, probedDomain.Identity)
+					}
+					domain = probedDomain
+					domainByIdentity[probedDomain.Identity] = domain
+					domainByID[domain.ID] = domain
+				} else if domain.ID != probedDomain.ID {
+					return StorageSnapshot{}, fmt.Errorf("provider %s capacity domain identity %q resolved to conflicting IDs %q and %q", contribution.providerType, probedDomain.Identity, domain.ID, probedDomain.ID)
+				}
+			}
+		}
+		if unavailableReason != "" {
+			if confidence == "" {
+				confidence = "unavailable"
+			}
+			locator := filepath.Clean(capacityPath)
+			var exists bool
+			domain, exists = unknownDomainByLocator[locator]
+			if !exists {
+				domain = storage.CapacityDomain{
+					ID:                        contribution.providerType + "-" + specification.ID + "-unmeasured",
+					Kind:                      kind,
+					Path:                      capacityPath,
+					Provenance:                provenance,
+					Confidence:                confidence,
+					CapacityUnavailableReason: unavailableReason,
+					Capacity:                  storage.Capacity{ObservedAt: request.Now},
+				}
+				if previous, duplicateID := domainByID[domain.ID]; duplicateID {
+					return StorageSnapshot{}, fmt.Errorf("provider %s capacity domain ID %q conflicts between measured path %q and unavailable path %q", contribution.providerType, domain.ID, previous.Path, capacityPath)
+				}
+				unknownDomainByLocator[locator] = domain
+				domainByID[domain.ID] = domain
+			} else if !strings.Contains(domain.CapacityUnavailableReason, unavailableReason) {
+				domain.CapacityUnavailableReason += "; " + unavailableReason
+				unknownDomainByLocator[locator] = domain
+				domainByID[domain.ID] = domain
+			}
+			snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("provider %s storage capacity is unavailable for surface %s at %s: %s", contribution.providerType, specification.ID, capacityPath, unavailableReason))
+		} else if confidence == "" {
 			confidence = "authoritative-filesystem-probe"
 		}
 		snapshot.Surfaces = append(snapshot.Surfaces, storage.Surface{
@@ -156,7 +202,7 @@ func (contribution *filesystemStorage) StorageSnapshot(ctx context.Context, requ
 		})
 		snapshot.Warnings = append(snapshot.Warnings, specification.Warnings...)
 	}
-	for _, domain := range domainByIdentity {
+	for _, domain := range domainByID {
 		snapshot.Domains = append(snapshot.Domains, domain)
 	}
 	sort.Slice(snapshot.Surfaces, func(i, j int) bool { return snapshot.Surfaces[i].ID < snapshot.Surfaces[j].ID })

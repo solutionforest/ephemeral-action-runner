@@ -84,7 +84,7 @@ func PullDockerImage(ctx context.Context, opts DockerPullOptions) (DockerPullRes
 	}
 	result := DockerPullResult{Platform: platform}
 	if opts.QueryRemoteSize {
-		result.RemoteCompressedSize, result.RemoteCompressedError = RemoteCompressedLayerSize(opts.Image, platform)
+		result.RemoteCompressedSize, result.RemoteCompressedError = RemoteCompressedLayerSize(ctx, opts.Image, platform)
 	}
 
 	registryAuth, err := DockerRegistryAuth(opts.Image)
@@ -184,12 +184,14 @@ func normalizeDockerArchitecture(architecture string) string {
 }
 
 // RemoteCompressedLayerSize returns the total compressed size of the selected remote image layers.
-func RemoteCompressedLayerSize(image string, platform ocispec.Platform) (int64, error) {
+func RemoteCompressedLayerSize(ctx context.Context, image string, platform ocispec.Platform) (int64, error) {
 	ref, authenticator, err := DockerImageReferenceAndAuth(image)
 	if err != nil {
 		return 0, err
 	}
-	remoteImage, err := remote.Image(ref, remote.WithAuth(authenticator), remote.WithPlatform(gcrv1.Platform{
+	metadataCtx, cancel := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	defer cancel()
+	remoteImage, err := remote.Image(ref, remote.WithContext(metadataCtx), remote.WithAuth(authenticator), remote.WithPlatform(gcrv1.Platform{
 		OS:           platform.OS,
 		Architecture: platform.Architecture,
 		Variant:      platform.Variant,

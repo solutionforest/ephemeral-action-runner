@@ -100,6 +100,7 @@ const (
 
 type LoggingConfig struct {
 	Directory                   string
+	Level                       string
 	ManagerSinks                []string
 	ManagerConsoleFormat        string
 	ManagerConsoleTextFormat    string
@@ -170,21 +171,25 @@ type DockerConfig struct {
 // the exact imported template identity is stored in EPAR's local artifact
 // receipt rather than user configuration.
 type DockerSandboxesConfig struct {
-	PolicyGeneration     string
-	NetworkBaseline      string
-	AdditionalAllow      []string
-	AdditionalDeny       []string
-	StagingRoot          string
-	CPUs                 int
-	Memory               string
-	RootDisk             string
-	DockerDisk           string
-	MaxConcurrentCreates int
+	PolicyGeneration      string
+	NetworkBaseline       string
+	ArchitectureEmulation string
+	AdditionalAllow       []string
+	AdditionalDeny        []string
+	StagingRoot           string
+	CPUs                  int
+	Memory                string
+	RootDisk              string
+	DockerDisk            string
+	MaxConcurrentCreates  int
 }
 
 const (
-	DockerSandboxesNetworkBaselineOpen     = "open"
-	DockerSandboxesNetworkBaselineBalanced = "balanced"
+	DockerSandboxesNetworkBaselineOpen             = "open"
+	DockerSandboxesNetworkBaselineBalanced         = "balanced"
+	DockerSandboxesArchitectureEmulationBestEffort = "best-effort"
+	DockerSandboxesArchitectureEmulationRequired   = "required"
+	DockerSandboxesArchitectureEmulationNativeOnly = "native-only"
 )
 
 var dockerSandboxesOpenDefaultDenyResources = []string{
@@ -229,8 +234,6 @@ func Default() Config {
 			WebBaseURL: "https://github.com",
 		},
 		Image: ImageConfig{
-			SourceImage:     "ghcr.io/cirruslabs/ubuntu:latest",
-			OutputImage:     "epar-ubuntu-24-arm64",
 			UpstreamDir:     "third_party/runner-images",
 			UpstreamLock:    "third_party/runner-images.lock",
 			RunnerVersion:   "latest",
@@ -259,6 +262,7 @@ func Default() Config {
 		},
 		Logging: LoggingConfig{
 			Directory:                "work/logs",
+			Level:                    "info",
 			ManagerSinks:             []string{"console"},
 			ManagerConsoleFormat:     "text",
 			ManagerFileFormat:        "json",
@@ -277,7 +281,6 @@ func Default() Config {
 			RetentionIntervalMinutes: 60,
 		},
 		Runner: RunnerConfig{
-			Labels:           []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
 			IncludeHostLabel: true,
 			Ephemeral:        true,
 		},
@@ -290,20 +293,15 @@ func Default() Config {
 				RequirePublicRepositoriesDisabled: true,
 			},
 		},
-		Provider: ProviderConfig{
-			Type:        "tart",
-			SourceImage: "epar-ubuntu-24-arm64",
-			Network:     "default",
-			InstallRoot: "work/wsl",
-		},
 		DockerSandboxes: DockerSandboxesConfig{
-			NetworkBaseline:      DockerSandboxesNetworkBaselineOpen,
-			StagingRoot:          ".local/docker-sandboxes-staging",
-			CPUs:                 4,
-			Memory:               "8GiB",
-			RootDisk:             DockerSandboxesAutomaticRootDisk,
-			DockerDisk:           DockerSandboxesDefaultDockerDisk,
-			MaxConcurrentCreates: 2,
+			NetworkBaseline:       DockerSandboxesNetworkBaselineOpen,
+			ArchitectureEmulation: DockerSandboxesArchitectureEmulationBestEffort,
+			StagingRoot:           ".local/docker-sandboxes-staging",
+			CPUs:                  4,
+			Memory:                "8GiB",
+			RootDisk:              DockerSandboxesAutomaticRootDisk,
+			DockerDisk:            DockerSandboxesDefaultDockerDisk,
+			MaxConcurrentCreates:  2,
 		},
 		Timeouts: TimeoutConfig{
 			BootSeconds:         180,
@@ -546,6 +544,8 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "directory":
 			cfg.Logging.Directory = value
+		case "level":
+			cfg.Logging.Level = strings.ToLower(value)
 		case "managerSinks", "transcriptSinks":
 			return setListValue(cfg, section, key, parseList(value))
 		case "managerConsoleFormat":
@@ -725,6 +725,8 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.DockerSandboxes.PolicyGeneration = value
 		case "networkBaseline":
 			cfg.DockerSandboxes.NetworkBaseline = strings.ToLower(value)
+		case "architectureEmulation":
+			cfg.DockerSandboxes.ArchitectureEmulation = value
 		case "additionalAllow", "additionalDeny":
 			return setListValue(cfg, section, key, parseList(value))
 		case "stagingRoot":
@@ -791,7 +793,26 @@ func isKnownSection(section string) bool {
 
 func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 	switch cfg.Provider.Type {
+	case "tart":
+		if !explicit["image.sourceImage"] {
+			cfg.Image.SourceImage = "ghcr.io/cirruslabs/ubuntu:latest"
+		}
+		if !explicit["image.outputImage"] {
+			cfg.Image.OutputImage = "epar-ubuntu-24-arm64"
+		}
+		if !explicit["provider.sourceImage"] {
+			cfg.Provider.SourceImage = cfg.Image.OutputImage
+		}
+		if !explicit["provider.network"] {
+			cfg.Provider.Network = "default"
+		}
+		if !explicit["runner.labels"] {
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}
+		}
 	case "wsl":
+		if !explicit["provider.installRoot"] {
+			cfg.Provider.InstallRoot = "work/wsl"
+		}
 		sourceType := cfg.Image.SourceType
 		if !explicit["image.sourceType"] {
 			sourceType = ImageSourceDockerImage
@@ -1283,6 +1304,9 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 	if sandboxes.NetworkBaseline != DockerSandboxesNetworkBaselineOpen && sandboxes.NetworkBaseline != DockerSandboxesNetworkBaselineBalanced {
 		return fmt.Errorf("unsupported dockerSandboxes.networkBaseline %q; supported values are open and balanced", sandboxes.NetworkBaseline)
 	}
+	if sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationBestEffort && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationRequired && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationNativeOnly {
+		return fmt.Errorf("unsupported dockerSandboxes.architectureEmulation %q; supported values are best-effort, required, and native-only", sandboxes.ArchitectureEmulation)
+	}
 	if err := validateDockerSandboxHostnameList("additionalAllow", sandboxes.AdditionalAllow); err != nil {
 		return err
 	}
@@ -1505,6 +1529,11 @@ func ValidateRunnerGroupSecurity(policy RunnerGroupSecurityConfig) error {
 func ValidateLogging(logging LoggingConfig) error {
 	if strings.TrimSpace(logging.Directory) == "" {
 		return fmt.Errorf("logging.directory is required")
+	}
+	switch logging.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("unsupported logging.level %q; supported values are debug, info, warn, and error", logging.Level)
 	}
 	if err := validateLoggingSinks("managerSinks", logging.ManagerSinks); err != nil {
 		return err

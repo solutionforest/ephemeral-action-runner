@@ -87,6 +87,9 @@ assert_last_call 'default start' start
 (cd "$project" && ./start --config .local/custom-config.yml --instances 2)
 assert_last_call 'start flag' start --config .local/custom-config.yml --instances 2
 
+(cd "$project" && ./start --config .local/custom-config.yml --external-outage-retry=continuous)
+assert_last_call 'external outage retry flag' start --config .local/custom-config.yml --external-outage-retry=continuous
+
 (cd "$project" && ./start --config '.local/config with spaces.yml' --label 'value "with quotes"')
 assert_last_call 'quoted start' start --config '.local/config with spaces.yml' --label 'value "with quotes"'
 

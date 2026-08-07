@@ -18,7 +18,7 @@ func TestEvaluateCapacity(t *testing.T) {
 		wantDeficit  uint64
 	}{
 		{
-			name:         "unknown fails closed",
+			name:         "unknown is distinct from insufficiency",
 			capacity:     Capacity{},
 			requirement:  Requirement{ID: "full-build", SurfaceID: "host", PeakBytes: 30 * GiB},
 			wantStatus:   CapacityUnknown,

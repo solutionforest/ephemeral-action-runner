@@ -1,14 +1,14 @@
 # WSL2 Provider
 
-WSL2 runs each disposable GitHub Actions runner in an imported Ubuntu WSL distribution on a native Windows host. EPAR uses the shared pool lifecycle, including strict capacity, registration, replacement, and cleanup.
+WSL2 is a compatibility provider that runs each disposable GitHub Actions runner in an imported Ubuntu WSL distribution on a native Windows host. EPAR uses the shared pool lifecycle, including strict capacity, registration, replacement, and cleanup. The first-run wizard keeps it behind `C. Show compatibility providers`; existing configurations continue to use the documented runtime and cleanup path.
 
 ## When To Use It
 
-Choose WSL2 for Windows-hosted Linux runners when you want native x64 Linux execution and a WSL distribution per runner. It is often the clearest choice for workflows that need native amd64 Docker execution on Windows.
+Choose WSL2 for an existing Windows-hosted Linux deployment when you want native x64 Linux execution and a WSL distribution per runner. It is often the clearest compatibility choice for workflows that need native amd64 Docker execution on Windows; new setup should start with Docker Sandboxes when its capability checks pass.
 
 ## Support Status
 
-WSL2 is supported only on native Windows with WSL default version 2. It is not equivalent to one full VM per job: distros share the WSL kernel and host integration surface, so use it for trusted jobs.
+WSL2 compatibility is supported only on native Windows with WSL default version 2. It is not equivalent to one full VM per job: distros share the WSL kernel and host integration surface, so use it for trusted jobs.
 
 ## Prerequisites
 

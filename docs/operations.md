@@ -2,6 +2,8 @@
 
 EPAR is a foreground supervisor. Keep it running while the pool should accept jobs; it creates, monitors, retires, and replaces disposable runners within the configured capacity.
 
+Docker Sandboxes is the primary provider on Linux, macOS, and Windows hosts when its admission checks pass. Docker Container and WSL remain compatibility providers, and Tart runtime/cleanup support is retained only for existing configurations; startup never silently changes a configured provider.
+
 ```mermaid
 flowchart LR
   Start["Start or resume pool"] --> Ready["Maintain ready runners"]
@@ -18,6 +20,10 @@ flowchart LR
 ## Start and stop deliberately
 
 Use `./start` for normal operation because it verifies the configured image or sandbox template before starting the pool. Press `Ctrl-C` once to request a clean stop, then wait for cleanup to finish before closing the terminal. `--keep-on-exit` is a debugging option that deliberately leaves owned runner resources running after the supervisor exits.
+
+Unattended hosts can add `--external-outage-retry=continuous` or a positive duration such as `--external-outage-retry=4h`. Only typed transient failures from GitHub, configured registries and mirrors, source-image or runner-image fetches, and required Actions runner metadata or downloads enter this supervision. Authentication, authorization without rate-limit evidence, TLS trust, missing manifests, local runtime, storage, ownership, configuration, platform, and custom-script failures remain terminal. EPAR does not consult GitHub Status or change providers, images, credentials, or trust policy.
+
+One incident clock follows consecutive blocking external failures across startup, initial capacity, and steady-state replacement. A bounded incident keeps its original start and deadline across controller restarts and is cleared only after desired capacity is healthy, or after a mandatory reconciliation succeeds while capacity was already healthy. Server `Retry-After` and rate-limit reset times take precedence over the configured delay cap; if the next permitted request is beyond the deadline, EPAR waits only to that deadline, performs normal exact cleanup, and exits nonzero. Scheduled image checks that can safely retain the current verified artifact do not activate this incident clock.
 
 The supervisor reports when GitHub assigns a job and when the ephemeral runner finishes or is released. GitHub Actions remains the source of truth for whether the job succeeded or failed.
 
@@ -44,6 +50,8 @@ For transient GitHub or network failures during replacement, including `429` and
 ```
 
 Add `--no-github` to `status` when you need a local-only view. By default, host logs live under `work/logs`; manager events are console-first and instance/build transcripts are file artifacts. A failed launch or readiness check appends bounded guest diagnostics to the relevant instance log. See [Logging](logging.md) for locations, formats, retention, and shipping.
+
+`status` prints the local external-outage supervision record before provider and GitHub inventory, so `status --no-github` remains useful during an outage. The record includes the current stage, dependency, attempt, next retry, deadline, controller PID/update time, sanitized request ID, and recovery or exhaustion outcome without credentials or registration tokens.
 
 When multiple configs run concurrently, give each one a distinct `logging.directory` as well as a distinct prefix and workflow-routing label. Config-specific lifecycle state and build workspaces remain isolated, while the host resource catalog retains exact shared-artifact references.
 

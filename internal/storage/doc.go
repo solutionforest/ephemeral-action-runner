@@ -1,5 +1,5 @@
-// Package storage defines provider-neutral, fail-closed storage inventory,
-// capacity, retention-planning, and exact-execution contracts.
+// Package storage defines provider-neutral storage inventory, best-effort
+// capacity measurement, retention-planning, and exact-execution contracts.
 //
 // The package does not delete host resources and does not implement Docker,
 // Docker Sandboxes, or filesystem cleanup. Adapters inventory exact artifacts,

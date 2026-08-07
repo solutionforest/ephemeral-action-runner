@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"go/parser"
 	"go/token"
 	"path/filepath"
@@ -204,6 +206,68 @@ func TestDockerStorageMapsInactiveContainerdRoleToEngineDomain(t *testing.T) {
 	imageStore := byRole[storage.StorageRoleContainerdStore]
 	if engine.CapacityPath != imageStore.CapacityPath || engine.Path != imageStore.Path {
 		t.Fatalf("inactive containerd alias paths differ: engine=%#v image-store=%#v", engine, imageStore)
+	}
+}
+
+func TestDockerStoragePreservesUnavailableReasonAndAlias(t *testing.T) {
+	previous := discoverCurrentDockerStorage
+	t.Cleanup(func() { discoverCurrentDockerStorage = previous })
+	discoverCurrentDockerStorage = func(context.Context) (storagepath.DockerStorage, error) {
+		return storagepath.DockerStorage{Roots: []storagepath.Resolution{{
+			ID: "engine", Path: "/var/lib/docker", CapacityUnavailableReason: "host cannot stat guest path", Provenance: storagepath.ProvenanceDockerInfo, Confidence: storagepath.ConfidenceUnavailable,
+		}}}, nil
+	}
+	roots, err := dockerStorageRoots(context.Background(), provider.StorageRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 2 {
+		t.Fatalf("roots = %#v, want engine and containerd alias", roots)
+	}
+	for _, root := range roots {
+		if root.CapacityUnavailableReason != "host cannot stat guest path" || root.Confidence != string(storagepath.ConfidenceUnavailable) {
+			t.Fatalf("unavailable root = %#v", root)
+		}
+	}
+}
+
+func TestDockerStorageDiscoveryFailurePublishesUnknownRoots(t *testing.T) {
+	previous := discoverCurrentDockerStorage
+	t.Cleanup(func() { discoverCurrentDockerStorage = previous })
+	discoverCurrentDockerStorage = func(context.Context) (storagepath.DockerStorage, error) {
+		return storagepath.DockerStorage{}, fmt.Errorf("%w: docker info temporarily unavailable", storagepath.ErrDockerCapacityUnavailable)
+	}
+	roots, err := dockerStorageRoots(context.Background(), provider.StorageRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 2 {
+		t.Fatalf("roots = %#v, want two unknown role roots", roots)
+	}
+	for _, root := range roots {
+		if root.CapacityUnavailableReason == "" || root.Confidence != string(storagepath.ConfidenceUnavailable) {
+			t.Fatalf("fallback root = %#v", root)
+		}
+	}
+}
+
+func TestDockerStorageRejectsUnsupportedEndpointAndMalformedObservation(t *testing.T) {
+	previous := discoverCurrentDockerStorage
+	t.Cleanup(func() { discoverCurrentDockerStorage = previous })
+	for name, discoveryErr := range map[string]error{
+		"remote":       storagepath.ErrRemoteDockerEndpoint,
+		"unsupported":  storagepath.ErrUnsupportedDockerTransport,
+		"invalid":      storagepath.ErrInvalidDockerStorage,
+		"unclassified": errors.New("unclassified Docker discovery failure"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			discoverCurrentDockerStorage = func(context.Context) (storagepath.DockerStorage, error) {
+				return storagepath.DockerStorage{}, discoveryErr
+			}
+			if _, err := dockerStorageRoots(context.Background(), provider.StorageRequest{}); err == nil || !errors.Is(err, discoveryErr) {
+				t.Fatalf("dockerStorageRoots() error = %v, want %v", err, discoveryErr)
+			}
+		})
 	}
 }
 

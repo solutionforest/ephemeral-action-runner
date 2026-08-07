@@ -169,10 +169,10 @@ copy_page "docs/logging.md" "Logging"
 copy_page "docs/storage.md" "Storage"
 copy_page "docs/troubleshooting.md" "Troubleshooting"
 copy_page "docs/security.md" "Security"
-copy_page "docs/providers/tart.md" "Tart-Provider"
-copy_page "docs/providers/wsl.md" "WSL-Provider"
-copy_page "docs/providers/docker-container.md" "Docker-Container-Provider"
 copy_page "docs/providers/docker-sandboxes.md" "Docker-Sandboxes-Provider"
+copy_page "docs/providers/docker-container.md" "Docker-Container-Provider"
+copy_page "docs/providers/wsl.md" "WSL-Provider"
+copy_page "docs/providers/tart.md" "Tart-Provider"
 copy_page "docs/development/adding-provider.md" "Adding-A-Provider"
 copy_page "docs/advanced/docker-registry-mirrors.md" "Docker-Registry-Mirrors"
 copy_page "docs/advanced/docker-sandboxes-template.md" "Docker-Sandboxes-Template"
@@ -204,10 +204,13 @@ cat > "$out_dir/_Sidebar.md" <<'SIDEBAR'
 
 ## Providers
 
-- [Docker Container](Docker-Container-Provider)
 - [Docker Sandboxes](Docker-Sandboxes-Provider)
-- [Tart](Tart-Provider)
-- [WSL](WSL-Provider)
+
+## Compatibility providers
+
+- [Docker Container](Docker-Container-Provider)
+- [WSL2](WSL-Provider)
+- [Tart (retired)](Tart-Provider)
 - [Adding A Provider](Adding-A-Provider)
 
 ## Operations

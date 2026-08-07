@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/dependency"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
@@ -59,6 +59,8 @@ type Manager struct {
 	imageEnsured          bool
 	now                   func() time.Time
 	randomFloat64         func() float64
+	externalOutageMu      sync.Mutex
+	externalOutage        *externalOutageRuntime
 }
 
 func (m *Manager) ConfigureStorageAdmissionOverride(allow bool, command string) {
@@ -85,13 +87,14 @@ type VerifyOptions struct {
 }
 
 type RunOptions struct {
-	Instances         int
-	Register          bool
-	KeepOnExit        bool
-	ReplaceCompleted  bool
-	MonitorInterval   time.Duration
-	HostTrustLockHeld bool
-	PoolLockHeld      bool
+	Instances           int
+	Register            bool
+	KeepOnExit          bool
+	ReplaceCompleted    bool
+	MonitorInterval     time.Duration
+	HostTrustLockHeld   bool
+	PoolLockHeld        bool
+	ExternalOutageRetry ExternalOutageRetryPolicy
 }
 
 type LifecyclePhase string
@@ -225,9 +228,22 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
-	if opts.Register {
-		if err := m.PreflightRunnerGroup(ctx); err != nil {
+	if !opts.ExternalOutageRetry.IsOff() {
+		if err := m.ConfigureExternalOutageRetry(opts.ExternalOutageRetry); err != nil {
 			return err
+		}
+		if !opts.PoolLockHeld {
+			controllerLock, err := m.AcquirePoolControllerLock()
+			if err != nil {
+				return err
+			}
+			defer controllerLock.Close()
+			opts.PoolLockHeld = true
+		}
+	}
+	if opts.Register {
+		if err := m.RunExternalOutageStage(ctx, "registration-security-preflight", m.PreflightRunnerGroup); err != nil {
+			return m.withOutageExhaustionCleanup(err, nil, opts.KeepOnExit)
 		}
 	}
 	if !opts.PoolLockHeld {
@@ -255,8 +271,8 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	defer stopStorageLease()
 	if m.AutomaticImageLifecycle {
-		if err := m.EnsureImage(ctx); err != nil {
-			return fmt.Errorf("ensure current provider artifact before pool startup: %w", err)
+		if err := m.RunExternalOutageStage(ctx, "required-image-assurance", m.EnsureImage); err != nil {
+			return m.withOutageExhaustionCleanup(fmt.Errorf("ensure current provider artifact before pool startup: %w", err), nil, opts.KeepOnExit)
 		}
 	}
 	opts.Instances = m.requestedInstances(opts.Instances)
@@ -270,16 +286,33 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		}
 		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
-	active, err := m.reconcilePhysicalPool(ctx, nil, opts.Register)
+	var active map[string]ProvisionedInstance
+	err = m.RunExternalOutageStage(ctx, "initial-pool-reconciliation", func(attemptCtx context.Context) error {
+		var reconcileErr error
+		active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+		return reconcileErr
+	})
 	if err != nil {
-		return fmt.Errorf("initial pool reconciliation: %w", err)
+		return m.withOutageExhaustionCleanup(fmt.Errorf("initial pool reconciliation: %w", err), active, opts.KeepOnExit)
 	}
-	active, err = m.reduceOverCapacity(ctx, active, opts.Instances, opts.Register)
+	err = m.RunExternalOutageStage(ctx, "initial-over-capacity-reconciliation", func(attemptCtx context.Context) error {
+		var reconcileErr error
+		active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
+		return reconcileErr
+	})
 	if err != nil {
-		return fmt.Errorf("initial over-capacity reconciliation: %w", err)
+		return m.withOutageExhaustionCleanup(fmt.Errorf("initial over-capacity reconciliation: %w", err), active, opts.KeepOnExit)
+	}
+	var poolTrustGeneration string
+	err = m.RunExternalOutageStage(ctx, "initial-host-trust-preparation", func(attemptCtx context.Context) error {
+		var prepareErr error
+		poolTrustGeneration, prepareErr = m.prepareExistingHostTrustRuntimes(attemptCtx, active, opts.Register)
+		return prepareErr
+	})
+	if err != nil {
+		return m.withOutageExhaustionCleanup(fmt.Errorf("initial host-trust runtime preparation: %w", err), active, opts.KeepOnExit)
 	}
 	sequence := 1
-	poolTrustGeneration := ""
 	cleanup := func() error {
 		if opts.KeepOnExit {
 			m.infof("Stopping EPAR pool. --keep-on-exit is enabled, so owned runner resources will remain running.\n")
@@ -289,25 +322,32 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for len(active) < opts.Instances {
-		active, err = m.reconcilePhysicalPool(ctx, active, opts.Register)
-		if err != nil {
-			stopLeaseKeeper()
-			return fmt.Errorf("initial pool reconciliation before allocation: %w", err)
-		}
-		if len(active) >= opts.Instances {
-			break
-		}
-		vm, err := m.provisionOne(ctx, RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now()), opts.Register, opts.Register && opts.ReplaceCompleted)
-		sequence++
-		if isPhysicalPhase(vm.Phase) {
-			active[vm.Name] = vm
-		}
+		var vm ProvisionedInstance
+		err = m.RunExternalOutageStage(ctx, "initial-capacity-provisioning", func(attemptCtx context.Context) error {
+			vm = ProvisionedInstance{}
+			var reconcileErr error
+			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			if reconcileErr != nil || len(active) >= opts.Instances {
+				return reconcileErr
+			}
+			name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
+			sequence++
+			var provisionErr error
+			vm, provisionErr = m.provisionOne(attemptCtx, name, opts.Register, opts.Register && opts.ReplaceCompleted)
+			if isPhysicalPhase(vm.Phase) {
+				active[vm.Name] = vm
+			}
+			return provisionErr
+		})
 		if err != nil {
 			stopLeaseKeeper()
 			if ctx.Err() != nil {
 				return cleanup()
 			}
-			return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+			return m.cleanupAfterPoolFailure(err, active, opts.KeepOnExit)
+		}
+		if len(active) >= opts.Instances && vm.Name == "" {
+			break
 		}
 		leaseAdd(vm)
 		if vm.HostTrustGeneration != "" {
@@ -316,6 +356,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 	}
 	stopLeaseKeeper()
+	if readyPoolCapacity(active) >= opts.Instances {
+		if err := m.markExternalOutageRecovered(); err != nil {
+			return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+		}
+	}
 	if !opts.Register || (!opts.ReplaceCompleted && !m.hostTrustEnabled()) {
 		m.logPoolRunning("EPAR pool")
 		if !m.Config.Logging.RetentionEnabled {
@@ -344,6 +389,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	nextLivenessCheck := time.Now().Add(opts.MonitorInterval)
 	nextRetention := time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 	nextHostTrustCollection := time.Time{}
+	nextHostTrustReconciliation := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
 	hostTrustBusyHandoff := make(map[string]bool)
 	confirmedInactiveChecks := make(map[string]int)
@@ -357,11 +403,26 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		case <-ticker.C:
 			now := m.currentTime()
 			dependencyCooldown := retry.active(now)
+			if m.externalOutageEnabled() {
+				_, dependencyCooldown, err = m.externalOutageCooldown(now)
+				if err != nil {
+					return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				if !dependencyCooldown {
+					if err := m.externalOutageReady(ctx); err != nil {
+						if ctx.Err() != nil {
+							return cleanup()
+						}
+						m.logExternalOutageExhaustion(err)
+						return m.cleanupAfterPoolFailure(err, active, opts.KeepOnExit)
+					}
+				}
+			}
 			if m.Config.Logging.RetentionEnabled && !time.Now().Before(nextRetention) {
 				m.pruneLogsBestEffort()
 				nextRetention = time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 			}
-			if m.AutomaticImageLifecycle && !imageMaintenancePending && m.Config.Image.UpdateFrequency != config.ImageUpdateFrequencyManual {
+			if !dependencyCooldown && m.AutomaticImageLifecycle && !imageMaintenancePending && m.Config.Image.UpdateFrequency != config.ImageUpdateFrequencyManual {
 				check, checkErr := m.CheckRemoteImageUpdate(ctx, now)
 				if checkErr != nil {
 					m.warnf("scheduled image update check failed; the current verified pool remains available: %v\n", checkErr)
@@ -395,8 +456,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			trustRetired := 0
 			trustCapacityReady := true
+			hostTrustReconciled := false
 			if m.hostTrustEnabled() {
-				now := time.Now()
+				now := m.currentTime()
 				if currentHostTrust.Generation == "" || !now.Before(nextHostTrustCollection) {
 					current, err := m.resolveHostTrust(ctx)
 					nextHostTrustCollection = now.Add(m.hostTrustCollectionInterval())
@@ -412,13 +474,27 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							currentHostTrust = current
 							if !dependencyCooldown {
 								trustRetired += m.reconcileHostTrustRunners(ctx, active, current, hostTrustBusyHandoff)
+								hostTrustReconciled = true
+								nextHostTrustReconciliation = m.currentTime().Add(hostTrustRefreshInterval)
 							}
 							m.infof("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
 							ready = false
 							for attempt := 1; attempt <= 3; attempt++ {
 								generationBeforeEnsure := current.Generation
-								if err := m.ensureHostTrustImage(ctx); err != nil {
-									m.warnf("host trust replacement image warning: %v\n", err)
+								attemptCtx, cancelAttempt, attemptErr := m.externalOutageAttemptContext(ctx)
+								if attemptErr != nil {
+									return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+								}
+								ensureErr := m.ensureHostTrustImage(attemptCtx)
+								cancelAttempt()
+								if ensureErr != nil {
+									if handled, outageErr := m.deferExternalOutage("host-trust-replacement-image", ensureErr); handled {
+										if outageErr != nil {
+											return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
+										}
+										dependencyCooldown = true
+									}
+									m.warnf("host trust replacement image warning: %v\n", ensureErr)
 									nextHostTrustCollection = time.Now()
 									break
 								}
@@ -446,8 +522,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 					}
 				}
-				if currentHostTrust.Generation != "" && !dependencyCooldown {
+				if currentHostTrust.Generation != "" && !dependencyCooldown && !hostTrustReconciled && (nextHostTrustReconciliation.IsZero() || !m.currentTime().Before(nextHostTrustReconciliation)) {
 					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust, hostTrustBusyHandoff)
+					nextHostTrustReconciliation = m.currentTime().Add(hostTrustRefreshInterval)
 				}
 			}
 			if dependencyCooldown {
@@ -463,6 +540,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				for name, vm := range active {
 					alive, reason, err := m.runnerAlive(ctx, vm)
 					if err != nil {
+						if ctx.Err() != nil {
+							return cleanup()
+						}
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
 						m.warnf("[%s] runner health is temporarily unknown; keeping the runner and retrying: %v\n", name, err)
 						continue
@@ -490,12 +570,23 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			var reconcileErr error
 			beforeReconcile := active
-			active, reconcileErr = m.reconcilePhysicalPool(ctx, active, opts.Register)
+			attemptCtx, cancelAttempt, attemptErr := m.externalOutageAttemptContext(ctx)
+			if attemptErr != nil {
+				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+			}
+			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			cancelAttempt()
 			if reconcileErr != nil {
 				if ctx.Err() != nil {
 					return cleanup()
 				}
-				if !isTransientDependencyError(reconcileErr) {
+				if handled, outageErr := m.deferExternalOutage("steady-state-pool-reconciliation", reconcileErr); handled {
+					if outageErr != nil {
+						return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
+					}
+					continue
+				}
+				if m.externalOutageEnabled() || !isTransientDependencyError(reconcileErr) {
 					return errors.Join(fmt.Errorf("pool reconciliation: %w", reconcileErr), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
 				retry.schedule(m, now, reconcileErr)
@@ -503,9 +594,20 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				continue
 			}
 			retry.resetAfterAdoption(beforeReconcile, active)
-			active, reconcileErr = m.reduceOverCapacity(ctx, active, opts.Instances, opts.Register)
+			attemptCtx, cancelAttempt, attemptErr = m.externalOutageAttemptContext(ctx)
+			if attemptErr != nil {
+				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+			}
+			active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
+			cancelAttempt()
 			if reconcileErr != nil {
-				if !isTransientDependencyError(reconcileErr) {
+				if handled, outageErr := m.deferExternalOutage("steady-state-over-capacity-reconciliation", reconcileErr); handled {
+					if outageErr != nil {
+						return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
+					}
+					continue
+				}
+				if m.externalOutageEnabled() || !isTransientDependencyError(reconcileErr) {
 					return errors.Join(fmt.Errorf("reduce over-capacity pool: %w", reconcileErr), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
 				retry.schedule(m, now, reconcileErr)
@@ -513,6 +615,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			if m.hostTrustEnabled() && currentHostTrust.Generation != "" && currentHostTrust.Generation != poolTrustGeneration {
 				trustCapacityReady = false
+			}
+			if readyPoolCapacity(active) >= opts.Instances {
+				if err := m.markExternalOutageRecovered(); err != nil {
+					return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
 			}
 			replacementCapacity := len(active)
 			needsTrustCapacity := false
@@ -533,9 +640,21 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
-				active, err = m.reconcilePhysicalPool(ctx, active, opts.Register)
+				attemptCtx, cancelAttempt, attemptErr := m.externalOutageAttemptContext(ctx)
+				if attemptErr != nil {
+					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				active, err = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+				cancelAttempt()
 				if err != nil {
-					if !isTransientDependencyError(err) {
+					if handled, outageErr := m.deferExternalOutage("replacement-preallocation-reconciliation", err); handled {
+						if outageErr != nil {
+							return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
+						}
+						m.warnf("[%s] replacement deferred during external outage: %v\n", name, err)
+						break
+					}
+					if m.externalOutageEnabled() || !isTransientDependencyError(err) {
 						return errors.Join(fmt.Errorf("pool reconciliation before replacement allocation: %w", err), m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 					}
 					retry.schedule(m, m.currentTime(), err)
@@ -547,7 +666,12 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					break
 				}
 				m.infof("[%s] creating replacement runner\n", name)
-				vm, err := m.provisionOne(ctx, name, opts.Register, true)
+				attemptCtx, cancelAttempt, attemptErr = m.externalOutageAttemptContext(ctx)
+				if attemptErr != nil {
+					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+				}
+				vm, err := m.provisionOne(attemptCtx, name, opts.Register, true)
+				cancelAttempt()
 				if isPhysicalPhase(vm.Phase) {
 					active[vm.Name] = vm
 				}
@@ -556,7 +680,13 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						return cleanup()
 					}
 					m.warnf("[%s] replacement failed: %v\n", name, err)
-					if !isTransientDependencyError(err) {
+					if handled, outageErr := m.deferExternalOutage("replacement-provisioning", err); handled {
+						if outageErr != nil {
+							return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
+						}
+						break
+					}
+					if m.externalOutageEnabled() || !isTransientDependencyError(err) {
 						return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 					}
 					retry.schedule(m, m.currentTime(), err)
@@ -570,6 +700,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 				m.logReplacementReady("EPAR pool", vm.Name)
+				if readyPoolCapacity(active) >= opts.Instances {
+					if err := m.markExternalOutageRecovered(); err != nil {
+						return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
+					}
+				}
 			}
 		}
 	}
@@ -622,6 +757,16 @@ func currentHostTrustCapacity(active map[string]ProvisionedInstance, generation 
 		}
 	}
 	return capacity
+}
+
+func readyPoolCapacity(active map[string]ProvisionedInstance) int {
+	ready := 0
+	for _, vm := range active {
+		if vm.Phase == LifecycleReady || vm.Phase == "" {
+			ready++
+		}
+	}
+	return ready
 }
 
 func isPhysicalPhase(phase LifecyclePhase) bool {
@@ -949,24 +1094,8 @@ func (s *replacementRetryState) remaining(now time.Time) time.Duration {
 
 func (s *replacementRetryState) schedule(m *Manager, now time.Time, err error) {
 	initial, maximum, multiplier, jitter := m.replacementRetrySettings()
-	nominal := float64(initial) * math.Pow(multiplier, float64(s.attempt))
-	if nominal > float64(maximum) {
-		nominal = float64(maximum)
-	}
-	factor := 1.0
-	if jitter > 0 {
-		factor += ((m.randomValue() * 2) - 1) * jitter
-	}
-	delay := time.Duration(nominal * factor)
-	if delay < time.Second {
-		delay = time.Second
-	}
-	if delay > maximum {
-		delay = maximum
-	}
-	if retryAfter := retryAfterDuration(err); retryAfter > delay {
-		delay = retryAfter
-	}
+	settings := dependency.BackoffSettings{Initial: initial, Maximum: maximum, Multiplier: multiplier, Jitter: jitter, Minimum: time.Second, Random: m.randomValue}
+	delay := dependency.CalculateDelay(settings, s.attempt, dependency.HintFromFailure(err), now)
 	s.attempt++
 	s.next = now.Add(delay)
 }
@@ -1014,14 +1143,6 @@ func (m *Manager) randomValue() float64 {
 		return m.randomFloat64()
 	}
 	return rand.Float64()
-}
-
-func retryAfterDuration(err error) time.Duration {
-	var httpErr *gh.HTTPError
-	if errors.As(err, &httpErr) {
-		return httpErr.RetryAfter
-	}
-	return 0
 }
 
 func isTransientDependencyError(err error) bool {
@@ -1235,6 +1356,7 @@ func (m *Manager) cleanupLegacyTestProvider(ctx context.Context) error {
 
 func (m *Manager) Status(ctx context.Context) (string, error) {
 	var b strings.Builder
+	b.WriteString(m.externalOutageStatus())
 	updateStatus, updateErr := m.ImageUpdatePolicyStatus()
 	if updateErr != nil {
 		if m.Config.Image.UpdateFrequency == config.ImageUpdateFrequencyManual {
@@ -1270,7 +1392,7 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 	}
 	items, err := m.inventoryProvider(ctx)
 	if err != nil {
-		return "", err
+		return b.String(), err
 	}
 	b.WriteString("Instances:\n")
 	for _, item := range items {
@@ -1524,6 +1646,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if err := m.configureDockerRegistryMirrors(ctx, name); err != nil {
 			return err
 		}
+		if err := m.activateProviderHostTrustRuntime(ctx, created); err != nil {
+			return err
+		}
 		return m.verifyProviderRuntimeWithRetry(ctx, created, guestLogPath)
 	}); err != nil {
 		return vm, err
@@ -1541,6 +1666,12 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if err := validateHostTrustMarkerAgainstSnapshot(marker, currentTrust); err != nil {
 			if installErr := m.installHostTrustRuntime(ctx, name, currentTrust); installErr != nil {
 				return vm, fmt.Errorf("%w: %v; runtime refresh failed: %v", errHostTrustImageMismatch, err, installErr)
+			}
+			if activateErr := m.activateProviderHostTrustRuntime(ctx, created); activateErr != nil {
+				return vm, fmt.Errorf("%w: %v; provider trust transport refresh failed: %v", errHostTrustImageMismatch, err, activateErr)
+			}
+			if runtimeErr := m.verifyProviderRuntimeWithRetry(ctx, created, guestLogPath); runtimeErr != nil {
+				return vm, fmt.Errorf("%w: %v; refreshed runtime validation failed: %v", errHostTrustImageMismatch, err, runtimeErr)
 			}
 			marker, err = m.readInstanceHostTrustMarker(ctx, name)
 			if err != nil {
@@ -1646,7 +1777,7 @@ func (m *Manager) PreflightRunnerGroup(ctx context.Context) error {
 			m.warnf("warning: %s; continuing because security.runnerGroup.enforcement is warn\n", message)
 			return nil
 		}
-		return fmt.Errorf("%s", message)
+		return fmt.Errorf("runner-group security preflight could not read GitHub policy: %w", err)
 	}
 	for _, advisory := range result.Advisories {
 		m.warnf("warning: runner-group security advisory: %s\n", advisory)

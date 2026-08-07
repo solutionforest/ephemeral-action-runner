@@ -93,6 +93,9 @@ type dockerSandboxesSourceLock struct {
 	HookLauncher struct {
 		SHA256 string `json:"sha256"`
 	} `json:"hookLauncher"`
+	EgressBridge struct {
+		SHA256 string `json:"sha256"`
+	} `json:"egressBridge"`
 	Tini struct {
 		Version string `json:"version"`
 	} `json:"tini"`
@@ -203,9 +206,12 @@ func ResolveCatthehackerSource(ctx context.Context, input, platform string) (Res
 	if err != nil {
 		return ResolvedDockerSource{}, err
 	}
-	indexRaw, err := exec.CommandContext(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", reference).Output()
+	indexCtx, cancelIndex := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	indexRaw, err := exec.CommandContext(indexCtx, "docker", "buildx", "imagetools", "inspect", "--raw", reference).CombinedOutput()
+	cancelIndex()
 	if err != nil {
-		return ResolvedDockerSource{}, fmt.Errorf("resolve source image %s: %w", reference, err)
+		cause := fmt.Errorf("resolve source image %s: %w: %s", reference, err, strings.TrimSpace(string(indexRaw)))
+		return ResolvedDockerSource{}, classifyImageCommandFailure("OCI registry", "resolve source image index", cause, "", false)
 	}
 	var index dockerManifestDocument
 	if err := json.Unmarshal(indexRaw, &index); err != nil {
@@ -230,9 +236,12 @@ func ResolveCatthehackerSource(ctx context.Context, input, platform string) (Res
 	if tagSeparator < 0 {
 		return ResolvedDockerSource{}, fmt.Errorf("source image %s has no tag", reference)
 	}
-	platformRaw, err := exec.CommandContext(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", reference[:tagSeparator]+"@"+platformDigest).Output()
+	platformCtx, cancelPlatform := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	platformRaw, err := exec.CommandContext(platformCtx, "docker", "buildx", "imagetools", "inspect", "--raw", reference[:tagSeparator]+"@"+platformDigest).CombinedOutput()
+	cancelPlatform()
 	if err != nil {
-		return ResolvedDockerSource{}, fmt.Errorf("resolve source image %s for %s: %w", reference, platform, err)
+		cause := fmt.Errorf("resolve source image %s for %s: %w: %s", reference, platform, err, strings.TrimSpace(string(platformRaw)))
+		return ResolvedDockerSource{}, classifyImageCommandFailure("OCI registry", "resolve source platform manifest", cause, "", false)
 	}
 	return parseResolvedDockerSource(reference, platform, indexRaw, platformRaw)
 }
@@ -330,10 +339,13 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 		}
 		platform = "linux/" + architecture
 	}
-	indexRaw, err := m.runHostOutput(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", reference)
+	indexCtx, cancelIndex := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	indexRaw, err := m.runHostOutput(indexCtx, "docker", "buildx", "imagetools", "inspect", "--raw", reference)
+	cancelIndex()
 	if err != nil {
 		err = m.explainBuiltInCatthehackerAuthFailure(ctx, reference, err)
-		return ResolvedDockerSource{}, fmt.Errorf("resolve source image %s: %w", reference, err)
+		cause := fmt.Errorf("resolve source image %s: %w", reference, err)
+		return ResolvedDockerSource{}, classifyImageCommandFailure("OCI registry", "resolve source image index", cause, "", false)
 	}
 	var index dockerManifestDocument
 	if err := json.Unmarshal([]byte(indexRaw), &index); err != nil {
@@ -358,11 +370,14 @@ func (m *Coordinator) resolveDockerSandboxesSource(ctx context.Context) (Resolve
 	if err != nil {
 		return ResolvedDockerSource{}, err
 	}
-	platformRaw, err := m.runHostOutput(ctx, "docker", "buildx", "imagetools", "inspect", "--raw", repository+"@"+platformDigest)
+	platformCtx, cancelPlatform := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	platformRaw, err := m.runHostOutput(platformCtx, "docker", "buildx", "imagetools", "inspect", "--raw", repository+"@"+platformDigest)
+	cancelPlatform()
 	if err != nil {
 		platformReference := repository + "@" + platformDigest
 		err = m.explainBuiltInCatthehackerAuthFailure(ctx, platformReference, err)
-		return ResolvedDockerSource{}, fmt.Errorf("resolve source platform manifest %s: %w", platform, err)
+		cause := fmt.Errorf("resolve source platform manifest %s: %w", platform, err)
+		return ResolvedDockerSource{}, classifyImageCommandFailure("OCI registry", "resolve source platform manifest", cause, "", false)
 	}
 	return parseResolvedDockerSource(reference, platform, []byte(indexRaw), []byte(platformRaw))
 }
@@ -943,7 +958,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"expectedDockerDaemonCount": 1,
 			"architectureEmulation": map[string]any{
 				"backend":              lock.Emulation.Backend,
-				"policy":               "automatic-binfmt-install-all",
+				"policy":               "configured-best-effort-required-or-native-only",
 				"release":              lock.Emulation.Source.Release,
 				"sourceIndexDigest":    lock.Emulation.Source.IndexDigest,
 				"sourceManifestDigest": emulationPlatformLock.ManifestDigest,
@@ -1004,6 +1019,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"GO_BUILDER_IMAGE=" + platformLock.GoBuilderReference,
 			"BINFMT_IMAGE=" + emulationPlatformLock.SourceReference,
 			"HOOK_LAUNCHER_SHA256=" + lock.HookLauncher.SHA256,
+			"EGRESS_BRIDGE_SHA256=" + lock.EgressBridge.SHA256,
 			"SOURCE_PROFILE=" + profile,
 			"SOURCE_INDEX_DIGEST=" + source.IndexDigest,
 			"SOURCE_MANIFEST_DIGEST=" + source.PlatformDigest,
@@ -1026,7 +1042,9 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		m.infof("building Docker Sandboxes runner template from %s for %s\n", source.Reference, source.Platform)
 		m.infof("full Docker Sandboxes Buildx progress: %s\n", buildLogPath)
 		if err := m.runHostBuildxLogged(ctx, buildLogPath, "docker", args...); err != nil {
-			return fmt.Errorf("build Docker Sandboxes runner template: %w%s", err, boundedRedactedLogTail(buildLogPath, 32*1024))
+			tail := boundedRedactedLogTail(buildLogPath, 32*1024)
+			cause := fmt.Errorf("build Docker Sandboxes runner template: %w%s", err, tail)
+			return classifyImageCommandFailure("OCI registry", "Buildx remote image acquisition", cause, tail, true)
 		}
 		if err := readJSONFile(buildMetadataPath, &buildMetadata); err != nil {
 			return fmt.Errorf("read Docker Sandboxes Buildx metadata: %w", err)
@@ -1075,7 +1093,8 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	m.infof("full Docker Sandboxes provenance, SBOM, and software-inventory progress: %s\n", attestationLogPath)
 	builderNeedsStop = !m.DryRun
 	if err := m.runHostBuildxLogged(ctx, attestationLogPath, "docker", attestationArgs...); err != nil {
-		return dockerSandboxesEvidenceBuildError(err, attestationLogPath)
+		cause := dockerSandboxesEvidenceBuildError(err, attestationLogPath)
+		return classifyImageCommandFailure("OCI registry", "Buildx remote evidence acquisition", cause, boundedRedactedLogTail(attestationLogPath, 32*1024), true)
 	}
 	var attestationMetadata dockerSandboxesBuildMetadata
 	if err := readJSONFile(attestationMetadataPath, &attestationMetadata); err != nil {
@@ -1150,7 +1169,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
 	metadata.Compatibility.EmulationBackend = lock.Emulation.Backend
-	metadata.Compatibility.EmulationPolicy = "automatic-binfmt-install-all"
+	metadata.Compatibility.EmulationPolicy = "configured-best-effort-required-or-native-only"
 	metadata.Compatibility.EmulationRelease = lock.Emulation.Source.Release
 	metadata.Compatibility.EmulationSourceDigest = lock.Emulation.Source.IndexDigest
 	metadata.Compatibility.EmulationManifestDigest = emulationPlatformLock.ManifestDigest
@@ -1678,7 +1697,7 @@ func verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePat
 	if !validSHA256(metadata.Template.Digest) || metadata.Template.CacheID != strings.TrimPrefix(metadata.Template.Digest, "sha256:")[:12] || metadata.Template.Tag == "" || metadata.Template.RootDisk == "" || metadata.Template.Archive != filepath.Base(archivePath) {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
-	if metadata.Compatibility.TemplateSchemaVersion != 2 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 || metadata.Compatibility.EmulationBackend != "qemu" || metadata.Compatibility.EmulationPolicy != "automatic-binfmt-install-all" || metadata.Compatibility.EmulationRelease == "" || !validSHA256(metadata.Compatibility.EmulationSourceDigest) || !validSHA256(metadata.Compatibility.EmulationManifestDigest) || metadata.Compatibility.QEMUVersion == "" {
+	if metadata.Compatibility.TemplateSchemaVersion != 2 || metadata.Compatibility.RunnerExecution != "direct-actions-listener" || metadata.Compatibility.DockerDaemonOwner != "docker-sandboxes-runtime" || metadata.Compatibility.ExpectedDockerDaemonCount != 1 || metadata.Compatibility.EmulationBackend != "qemu" || metadata.Compatibility.EmulationPolicy != "configured-best-effort-required-or-native-only" || metadata.Compatibility.EmulationRelease == "" || !validSHA256(metadata.Compatibility.EmulationSourceDigest) || !validSHA256(metadata.Compatibility.EmulationManifestDigest) || metadata.Compatibility.QEMUVersion == "" {
 		return metadata, provider.TemplateArtifact{}, "", "", false, nil
 	}
 	archiveInfo, err := os.Lstat(archivePath)

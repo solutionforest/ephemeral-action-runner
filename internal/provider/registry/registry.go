@@ -2,7 +2,10 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path/filepath"
+	"runtime"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
@@ -37,6 +40,7 @@ var entries = []entry{
 			Type:                   "docker-sandboxes",
 			DisplayName:            "Docker Sandboxes",
 			WizardSupported:        true,
+			WizardTier:             provider.WizardTierPrimary,
 			WizardNumber:           "1",
 			WizardLabel:            "Docker Sandboxes — recommended",
 			WizardAliases:          []string{"docker-sandboxes", "sandboxes"},
@@ -54,12 +58,13 @@ var entries = []entry{
 			WizardReview:           provider.WizardReviewDockerImage,
 		},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
-			sandboxes := dockersandboxes.NewWithDryRun("", dryRun)
+			sandboxes := dockersandboxes.NewWithArchitectureMode("", dryRun, cfg.DockerSandboxes.ArchitectureEmulation, cfg.Provider.Platform)
+			sandboxes.ConfigureHostTrustRelay(runtime.GOOS == "windows" && cfg.Image.HostTrustMode == config.HostTrustModeOverlay, filepath.Clean(projectRoot)+"\x00"+cfg.Pool.NamePrefix)
 			return Runtime{Lifecycle: sandboxes, PolicyManager: sandboxes, Storage: providerStorage(cfg, projectRoot)}
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardNumber: "2", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
+		descriptor: provider.Descriptor{Type: "docker-container", DisplayName: "Docker Container", WizardSupported: true, WizardTier: provider.WizardTierCompatibility, WizardNumber: "2", WizardLabel: "Docker Container — private daemon", WizardAliases: []string{"docker", "docker-container"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteDocker, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustOverlay, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
 			environment := map[string]string{
@@ -71,14 +76,14 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
+		descriptor: provider.Descriptor{Type: "wsl", DisplayName: "WSL2", WizardSupported: true, WizardTier: provider.WizardTierCompatibility, WizardNumber: "3", WizardLabel: "WSL2", WizardAliases: []string{"wsl", "wsl2"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeDocker, GuidedArtifacts: true, WizardImageProfiles: catthehackerProfiles(), WizardCustomImageTags: true, WizardPrerequisite: provider.WizardPrerequisiteWSL2, WizardOnboarding: provider.WizardOnboardingCatthehackerDocker, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewDockerImage},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			installRoot := config.ProjectPath(projectRoot, cfg.Provider.InstallRoot)
 			return adaptLegacy(wsl.New("", installRoot, projectRoot, dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (experimental)", WizardSupported: true, WizardNumber: "4", WizardLabel: "Tart (experimental)", WizardAliases: []string{"tart"}, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative, WizardPrerequisite: provider.WizardPrerequisiteTart, WizardOnboarding: provider.WizardOnboardingNone, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewNativeImage, WizardReviewSource: "ghcr.io/cirruslabs/ubuntu:latest", WizardReviewOutput: "epar-ubuntu-24-arm64"},
+		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (retired)", WizardSupported: false, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
 			return adaptLegacy(tart.New("", dryRun), providerStorage(cfg, projectRoot), dryRun)
 		},
@@ -190,6 +195,29 @@ func dockerStorageRoots(ctx context.Context, request provider.StorageRequest) ([
 	}
 	discovered, err := discoverCurrentDockerStorage(ctx)
 	if err != nil {
+		if errors.Is(err, storagepath.ErrDockerCapacityUnavailable) {
+			reason := fmt.Sprintf("discover Docker Engine host capacity: %v", err)
+			return []provider.StorageRoot{
+				{
+					ID:                        "docker-engine-backing",
+					Role:                      storage.StorageRoleDockerEngine,
+					Kind:                      storage.SurfaceDockerEngine,
+					Path:                      "docker-engine",
+					CapacityUnavailableReason: reason,
+					Provenance:                "docker-discovery",
+					Confidence:                string(storagepath.ConfidenceUnavailable),
+				},
+				{
+					ID:                        "containerd-store-backing",
+					Role:                      storage.StorageRoleContainerdStore,
+					Kind:                      storage.SurfaceDockerEngine,
+					Path:                      "containerd-store",
+					CapacityUnavailableReason: reason,
+					Provenance:                "docker-discovery",
+					Confidence:                string(storagepath.ConfidenceUnavailable),
+				},
+			}, nil
+		}
 		return nil, err
 	}
 	roots := make([]provider.StorageRoot, 0, len(discovered.Roots)+1)
@@ -204,14 +232,15 @@ func dockerStorageRoots(ctx context.Context, request provider.StorageRequest) ([
 			id = "containerd-store-backing"
 		}
 		mapped := provider.StorageRoot{
-			ID:           id,
-			Role:         role,
-			Kind:         storage.SurfaceDockerEngine,
-			Path:         root.Path,
-			CapacityPath: root.CapacityPath,
-			Provenance:   string(root.Provenance),
-			Confidence:   string(root.Confidence),
-			Warnings:     append([]string(nil), root.Warnings...),
+			ID:                        id,
+			Role:                      role,
+			Kind:                      storage.SurfaceDockerEngine,
+			Path:                      root.Path,
+			CapacityPath:              root.CapacityPath,
+			CapacityUnavailableReason: root.CapacityUnavailableReason,
+			Provenance:                string(root.Provenance),
+			Confidence:                string(root.Confidence),
+			Warnings:                  append([]string(nil), root.Warnings...),
 		}
 		roots = append(roots, mapped)
 		if root.ID == "engine" {

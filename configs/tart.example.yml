@@ -1,4 +1,4 @@
-# Experimental: this default is a basic Ubuntu ARM64 Tart VM, not a GitHub-hosted runner image.
+# Retired compatibility provider: this basic Ubuntu ARM64 Tart VM example is retained for existing configurations and exact cleanup.
 # It does not include the broad dependency set from https://github.com/actions/runner-images.
 github:
   appId: 123456
@@ -37,6 +37,7 @@ storage:
 
 logging:
   directory: work/logs
+  level: info
   managerSinks: [console]
   managerConsoleFormat: text
   managerConsoleTextFormat: "{time} [{level}] {message}"

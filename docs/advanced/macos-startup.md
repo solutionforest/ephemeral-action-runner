@@ -48,6 +48,7 @@ export EPAR_USE_DOCKER_RUN="auto"
 export EPAR_MIRROR_CONTAINER="epar-dockerhub-cache"
 export EPAR_WAIT_FOR_DOCKER=1
 export EPAR_DOCKER_WAIT_ATTEMPTS=120
+export EPAR_EXTERNAL_OUTAGE_RETRY="continuous"
 ```
 
 Set `EPAR_WAIT_FOR_DOCKER=0` only when the selected provider does not need Docker at startup.
@@ -122,6 +123,7 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.example.epar.plist
 
 ## Operational Notes
 
+- The example script defaults `EPAR_EXTERNAL_OUTAGE_RETRY` to `continuous`, which passes `--external-outage-retry=continuous` to `./start`. Set it to a positive duration such as `4h` for a bounded outage window. Do not combine bounded mode with unconditional `launchd` restart behavior: allow the nonzero exhausted result to remain visible. EPAR persists the original bounded incident deadline for the selected config.
 - `start` cleans up prefixed instances when it exits. Use `--keep-on-exit` only for debugging.
 - The first run can take a while because `start` may build or refresh the configured image before starting runners.
 - If Docker cannot start, the script exits before EPAR starts.

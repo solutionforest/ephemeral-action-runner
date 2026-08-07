@@ -17,6 +17,8 @@ import (
 )
 
 func verifiedDownload(ctx context.Context, client *http.Client, sourceURL, destination, expectedSHA256 string, mode os.FileMode) error {
+	attemptCtx, cancel := boundedImageAttempt(ctx, verifiedAssetAttemptTimeout)
+	defer cancel()
 	expectedSHA256 = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(expectedSHA256), "sha256:"))
 	if len(expectedSHA256) != sha256.Size*2 {
 		return fmt.Errorf("invalid locked SHA-256 for %s", sourceURL)
@@ -39,7 +41,7 @@ func verifiedDownload(ctx context.Context, client *http.Client, sourceURL, desti
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	request, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, sourceURL, nil)
 	if err != nil {
 		return err
 	}
@@ -48,7 +50,8 @@ func verifiedDownload(ctx context.Context, client *http.Client, sourceURL, desti
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("download %s: %w", sourceURL, err)
+		cause := fmt.Errorf("download %s: %w", sourceURL, err)
+		return classifyImageDependencyFailure(request.URL.Host, "download verified image asset", cause)
 	}
 	defer response.Body.Close()
 	flags := os.O_CREATE | os.O_WRONLY
@@ -59,7 +62,8 @@ func verifiedDownload(ctx context.Context, client *http.Client, sourceURL, desti
 		flags |= os.O_TRUNC
 	}
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("download %s: HTTP %s", sourceURL, response.Status)
+		cause := fmt.Errorf("download %s: HTTP %s", sourceURL, response.Status)
+		return classifyImageHTTPFailure(request.URL.Host, "download verified image asset", response, cause)
 	}
 	file, err := os.OpenFile(partial, flags, 0o600)
 	if err != nil {
@@ -69,7 +73,8 @@ func verifiedDownload(ctx context.Context, client *http.Client, sourceURL, desti
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if copyErr != nil {
-		return fmt.Errorf("download %s after %d bytes: %w", sourceURL, offset, copyErr)
+		cause := fmt.Errorf("download %s after %d bytes: %w", sourceURL, offset, copyErr)
+		return classifyImageDependencyFailure(request.URL.Host, "download verified image asset", cause)
 	}
 	if syncErr != nil {
 		return syncErr

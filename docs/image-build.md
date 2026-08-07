@@ -1,6 +1,6 @@
 # Image Customization
 
-EPAR prepares a reusable runner artifact before it creates disposable instances. The artifact differs by provider: Docker Container uses a Docker image, WSL2 uses a rootfs tar, Tart uses a Tart VM image, and Docker Sandboxes uses a built, imported, and read-back runner template.
+EPAR prepares a reusable runner artifact before it creates disposable instances. Docker Sandboxes is the primary artifact path on Linux, macOS, and Windows hosts; compatibility providers retain their existing artifact forms, and Tart's image path is retained only for existing configurations.
 
 ```mermaid
 flowchart LR
@@ -16,12 +16,12 @@ flowchart LR
 
 | Provider | Default source | Reusable artifact | Build command |
 | --- | --- | --- | --- |
-| Docker Container | `ghcr.io/catthehacker/ubuntu:full-latest` | Docker image tag | `image build --replace` |
-| WSL2 | Catthehacker Docker image converted to rootfs | Rootfs tar | `image build --replace` |
-| Tart | `ghcr.io/cirruslabs/ubuntu:latest` | Tart VM image | `image build --replace` |
-| Docker Sandboxes | Selected Catthehacker source | Verified imported runner template | `image build` |
+| Docker Sandboxes (primary) | Selected Catthehacker source | Verified imported runner template | `image build` |
+| Docker Container (compatibility) | `ghcr.io/catthehacker/ubuntu:full-latest` | Docker image tag | `image build --replace` |
+| WSL2 (compatibility) | Catthehacker Docker image converted to rootfs | Rootfs tar | `image build --replace` |
+| Tart (retired) | `ghcr.io/cirruslabs/ubuntu:latest` | Tart VM image for existing configurations | `image build --replace` |
 
-The first-run wizard gives Docker Container and WSL the ordered Catthehacker choices `full-latest`, `act-latest`, or another validated tag. Docker Sandboxes offers only `full-latest` and `act-latest` because its reusable template must already contain the private Docker daemon and runtime closure; specialized upstream tags are not interchangeable merely because they publish the requested OCI platform. Every path includes platform resolution and a storage estimate. The generated config uses no custom scripts and schedules updates weekly at 07:00 local time; edit the config after initialization to change those advanced settings. `./start` always verifies local inputs and the active artifact, but checks mutable source tags and `runnerVersion: latest` only when the configured schedule is due. Docker Sandboxes imports a replacement into its template cache and activates it only after exact readback succeeds.
+The first-run wizard initially offers Docker Sandboxes and its ordered Catthehacker choices `full-latest` and `act-latest`; choose `C. Show compatibility providers` to reach Docker Container and WSL, which retain another validated Catthehacker tag. Tart is retired from onboarding, although existing Tart configurations continue to build and clean up their VM image. Docker Sandboxes offers only `full-latest` and `act-latest` because its reusable template must already contain the private Docker daemon and runtime closure; specialized upstream tags are not interchangeable merely because they publish the requested OCI platform. Every path includes platform resolution and a storage estimate. The generated config uses no custom scripts and schedules updates weekly at 07:00 local time; edit the config after initialization to change those advanced settings. `./start` always verifies local inputs and the active artifact, but checks mutable source tags and `runnerVersion: latest` only when the configured schedule is due. Docker Sandboxes imports a replacement into its template cache and activates it only after exact readback succeeds.
 
 Use `./start image update` for an immediate remote check that rebuilds only when an immutable source or Actions runner identity changed. Use `./start image build` to force a build. Actions runner packages are selected by exact platform, downloaded into a content-addressed cache by the native controller, and SHA-256 verified before entering any provider build; guests do not resolve `latest`.
 
@@ -45,7 +45,7 @@ The built-in `install-web-e2e.sh` adds browser/E2E tooling. It needs EPAR's pinn
 ./start image build --replace
 ```
 
-The default Catthehacker sources and runner-only Tart builds do not require that checkout. Use the exact configuration and provider guide to decide whether a selected script needs it.
+The default Catthehacker sources and runner-only Tart builds for existing configurations do not require that checkout. Use the exact configuration and provider guide to decide whether a selected script needs it.
 
 ## Trust And Enterprise CAs
 
@@ -61,7 +61,7 @@ EPAR validates PEM or DER CA certificates and incorporates their hashes into art
 
 EPAR's project-owned BuildKit builder always receives current host system roots so image acquisition can operate behind authorized HTTPS inspection. This operational trust is independent of `image.hostTrustMode` and is not copied into runners. If runner overlay explicitly includes the `user` scope, those user roots are also available to the builder for the same invocation.
 
-The first-run wizard generates `image.hostTrustMode: overlay` for Docker Container and Docker Sandboxes so runners inherit the host root anchors needed by services trusted on that machine. Omitted or `disabled` mode creates a Docker Sandboxes template with an explicit disabled-policy marker and no job-start trust hook; edit the generated config only when intentionally testing without runner inheritance. Overlay mode is additive to Ubuntu roots and explicit CA paths, not an emulation of every Windows or macOS trust policy. The wizard uses `[system, user]` on Windows/macOS and `[system]` on Linux. See [Configuration](configuration.md) and [Security](security.md) before changing it.
+The first-run wizard generates `image.hostTrustMode: overlay` for Docker Container and Docker Sandboxes so runners inherit the host root anchors needed by services trusted on that machine. EPAR atomically publishes the resulting Ubuntu bundle at `/opt/epar/trust/ca-bundle.pem` for its owned clients. On Windows Docker Sandboxes, overlay also activates a credential-free authenticated controller-host public-TLS relay and verifies its bridge, daemon readback, Registry TLS proof, and route evidence before registration. Omitted or `disabled` mode creates an explicit disabled-policy marker; the unconditional job-start preparation hook accepts that marker while still applying workflow egress isolation. Overlay remains additive rather than a complete emulation of every Windows or macOS trust-policy constraint, and arbitrary nested images require their own CA installation. The wizard uses `[system, user]` on Windows/macOS and `[system]` on Linux. See [Configuration](configuration.md) and [Security](security.md) before changing it.
 
 ## Provider Differences
 
@@ -73,9 +73,9 @@ The output is a Docker image named by `image.outputImage`; `provider.sourceImage
 
 The default source is converted from a Docker image to an intermediate rootfs tar, then EPAR produces `image.outputImage` as the reusable WSL tar. Docker is required during this conversion. For `image.sourceType: rootfs-tar`, export a clean Ubuntu WSL distribution once and use that tar as `image.sourceImage`; see [WSL2 Provider](providers/wsl.md).
 
-### Tart
+### Tart (retired compatibility)
 
-The output is a local Tart VM image. The default is intentionally lean; use a custom bootable Ubuntu source image or focused install scripts when a workflow needs more tooling. EPAR builds and verifies a content-named candidate, keeps a rollback clone until the configured output passes immutable identity readback, and disables Tart's unrelated automatic cache pruning for its clone operations. `provider.rosettaTag` is an opt-in, experimental Tart-only layer for selected Linux amd64 user-space workloads.
+Tart has no onboarding path, but existing configurations continue to use a local Tart VM image. The default is intentionally lean; use a custom bootable Ubuntu source image or focused install scripts when a workflow needs more tooling. EPAR builds and verifies a content-named candidate, keeps a rollback clone until the configured output passes immutable identity readback, and disables Tart's unrelated automatic cache pruning for its clone operations. `provider.rosettaTag` remains an opt-in Tart-only layer for selected Linux amd64 user-space workloads.
 
 ### Docker Sandboxes
 

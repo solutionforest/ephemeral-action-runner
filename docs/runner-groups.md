@@ -12,7 +12,7 @@ GitHub decides which repositories can route jobs to a self-hosted runner through
 
 See GitHub’s [runner-group access documentation](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access) for the organization and enterprise controls.
 
-Any repository with access to the group can route a matching job to its runners. Broad access also applies to repositories created later, and public repositories can expose self-hosted runners to untrusted pull request or fork workflows. Provider isolation does not replace this authorization boundary: Docker Sandboxes isolates each runner inside a dedicated microVM, but a job can still access its assigned secrets and reachable services; Docker Container and WSL should remain limited to trusted workflows.
+Any repository with access to the group can route a matching job to its runners. Broad access also applies to repositories created later, and public repositories can expose self-hosted runners to untrusted pull request or fork workflows. Provider isolation does not replace this authorization boundary: Docker Sandboxes isolates each runner inside a dedicated microVM, but a job can still access its assigned secrets and reachable services; Docker Container and WSL compatibility providers should remain limited to trusted workflows, and retired Tart configurations need the same explicit group controls.
 
 ## Wizard Decisions
 

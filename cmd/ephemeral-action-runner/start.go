@@ -43,6 +43,15 @@ type storageAdmissionConfiguringStarterManager interface {
 	ConfigureStorageAdmissionOverride(bool, string)
 }
 
+type externalOutageConfiguringStarterManager interface {
+	ConfigureExternalOutageRetry(pool.ExternalOutageRetryPolicy) error
+	RunExternalOutageStage(context.Context, string, func(context.Context) error) error
+}
+
+type externalOutageCleanupStarterManager interface {
+	CleanupAfterExternalOutageExhaustion(error, bool) error
+}
+
 type starterManagerFactory func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error)
 
 var newStarterManager starterManagerFactory = func(configPath, projectRoot string, dryRun bool, githubEnabled bool) (starterManager, error) {
@@ -61,6 +70,7 @@ type startOptions struct {
 	MonitorInterval          time.Duration
 	AllowInsufficientStorage bool
 	StorageOverrideCommand   string
+	ExternalOutageRetry      string
 	In                       io.Reader
 	Out                      io.Writer
 	ManagerFactory           starterManagerFactory
@@ -74,7 +84,8 @@ func runStart(args []string) error {
 	keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 	replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 	monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
-	allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+	allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
+	externalOutageRetry := fs.String("external-outage-retry", "off", "retry transient external outages: off, continuous, or a positive duration")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -93,6 +104,7 @@ func runStart(args []string) error {
 		MonitorInterval:          *monitorInterval,
 		AllowInsufficientStorage: *allowInsufficientStorage,
 		StorageOverrideCommand:   matchingStartCommand(appendStorageOverride(args)),
+		ExternalOutageRetry:      *externalOutageRetry,
 		In:                       os.Stdin,
 		Out:                      os.Stdout,
 		ManagerFactory:           newStarterManager,
@@ -100,6 +112,10 @@ func runStart(args []string) error {
 }
 
 func runStartWithOptions(opts startOptions) (err error) {
+	externalOutagePolicy, err := pool.ParseExternalOutageRetryPolicy(opts.ExternalOutageRetry)
+	if err != nil {
+		return err
+	}
 	if opts.Context == nil {
 		opts.Context = context.Background()
 	}
@@ -146,6 +162,15 @@ func runStartWithOptions(opts startOptions) (err error) {
 		}
 		configuringManager.ConfigureStorageAdmissionOverride(opts.AllowInsufficientStorage, overrideCommand)
 	}
+	externalOutageManager, supportsExternalOutageRetry := manager.(externalOutageConfiguringStarterManager)
+	if !externalOutagePolicy.IsOff() && !supportsExternalOutageRetry {
+		return fmt.Errorf("start manager does not support --external-outage-retry")
+	}
+	if supportsExternalOutageRetry {
+		if err := externalOutageManager.ConfigureExternalOutageRetry(externalOutagePolicy); err != nil {
+			return fmt.Errorf("configure external outage retry: %w", err)
+		}
+	}
 	if timingManager, ok := manager.(startupTimingStarterManager); ok {
 		if _, err := timingManager.StartStartupTiming(); err != nil {
 			return fmt.Errorf("start startup timing log: %w", err)
@@ -154,22 +179,58 @@ func runStartWithOptions(opts startOptions) (err error) {
 			timingManager.FinishStartupTiming(err)
 		}()
 	}
+	poolLockHeld := false
+	var poolControllerLock io.Closer
+	acquirePoolLock := func() error {
+		if poolLockHeld {
+			return nil
+		}
+		if lockingManager, ok := manager.(poolLockingStarterManager); ok {
+			controllerLock, lockErr := lockingManager.AcquirePoolControllerLock()
+			if lockErr != nil {
+				return lockErr
+			}
+			if controllerLock != nil {
+				poolControllerLock = controllerLock
+				poolLockHeld = true
+			}
+		}
+		return nil
+	}
+	if !externalOutagePolicy.IsOff() {
+		if _, ok := manager.(poolLockingStarterManager); !ok {
+			return fmt.Errorf("start manager does not support the pool-controller lock required by --external-outage-retry")
+		}
+		if err := acquirePoolLock(); err != nil {
+			return err
+		}
+		if !poolLockHeld {
+			return fmt.Errorf("start manager did not acquire the pool-controller lock required by --external-outage-retry")
+		}
+	}
+	defer func() {
+		if poolControllerLock != nil {
+			_ = poolControllerLock.Close()
+		}
+	}()
+	runExternalStage := func(stage string, operation func(context.Context) error) error {
+		if externalOutagePolicy.IsOff() {
+			return operation(opts.Context)
+		}
+		stageErr := externalOutageManager.RunExternalOutageStage(opts.Context, stage, operation)
+		if cleanupManager, ok := manager.(externalOutageCleanupStarterManager); ok {
+			return cleanupManager.CleanupAfterExternalOutageExhaustion(stageErr, opts.KeepOnExit)
+		}
+		return stageErr
+	}
 	if opts.Register {
 		fmt.Fprintf(opts.Out, "Checking GitHub runner-group security policy for %s\n", configPath)
-		if err = manager.PreflightRunnerGroup(opts.Context); err != nil {
+		if err = runExternalStage("runner-group-security-preflight", manager.PreflightRunnerGroup); err != nil {
 			return err
 		}
 	}
-	poolLockHeld := false
-	if lockingManager, ok := manager.(poolLockingStarterManager); ok {
-		controllerLock, err := lockingManager.AcquirePoolControllerLock()
-		if err != nil {
-			return err
-		}
-		if controllerLock != nil {
-			defer controllerLock.Close()
-			poolLockHeld = true
-		}
+	if err := acquirePoolLock(); err != nil {
+		return err
 	}
 	hostTrustLockHeld := false
 	if lockingManager, ok := manager.(hostTrustLockingStarterManager); ok {
@@ -183,7 +244,7 @@ func runStartWithOptions(opts startOptions) (err error) {
 		}
 	}
 	fmt.Fprintf(opts.Out, "Ensuring the runner image or sandbox template is current for %s\n", configPath)
-	if err = manager.EnsureImage(opts.Context); err != nil {
+	if err = runExternalStage("required-image-assurance", manager.EnsureImage); err != nil {
 		return err
 	}
 	stopGuidance := "Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window."
@@ -196,13 +257,14 @@ func runStartWithOptions(opts startOptions) (err error) {
 		fmt.Fprintf(opts.Out, "Starting EPAR pool using pool.instances from config. %s\n", stopGuidance)
 	}
 	err = manager.RunPool(opts.Context, pool.RunOptions{
-		Instances:         opts.Instances,
-		Register:          opts.Register,
-		KeepOnExit:        opts.KeepOnExit,
-		ReplaceCompleted:  opts.ReplaceCompleted,
-		MonitorInterval:   opts.MonitorInterval,
-		PoolLockHeld:      poolLockHeld,
-		HostTrustLockHeld: hostTrustLockHeld,
+		Instances:           opts.Instances,
+		Register:            opts.Register,
+		KeepOnExit:          opts.KeepOnExit,
+		ReplaceCompleted:    opts.ReplaceCompleted,
+		MonitorInterval:     opts.MonitorInterval,
+		PoolLockHeld:        poolLockHeld,
+		HostTrustLockHeld:   hostTrustLockHeld,
+		ExternalOutageRetry: externalOutagePolicy,
 	})
 	return err
 }

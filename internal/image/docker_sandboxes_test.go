@@ -87,6 +87,14 @@ func TestDockerSandboxesDockerfileUsesVerifiedLocalDownloadsAndInstallsTrustBefo
 	if trustInstall < 0 || customInstall < 0 || trustInstall >= customInstall {
 		t.Fatalf("runner trust must be installed before custom scripts:\n%s", text)
 	}
+	if strings.Count(text, "/opt/epar/install-trusted-ca-certificates.sh") != 2 || strings.LastIndex(text, "/opt/epar/install-trusted-ca-certificates.sh") <= customInstall {
+		t.Fatal("runner trust bundle must be refreshed after custom scripts")
+	}
+	for _, required := range []string{"AS egress-bridge-builder", "ARG EGRESS_BRIDGE_SHA256=", "COPY egress-bridge/main.go /src/main.go", "/out/epar-egress-bridge /opt/epar/epar-egress-bridge"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("Docker Sandboxes Dockerfile omitted egress bridge build contract %q", required)
+		}
+	}
 	runnerScript, err := os.ReadFile(filepath.Join("..", "..", "templates", "docker-sandboxes", "guest", "run-runner.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -148,22 +156,49 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			`"XDG_STATE_HOME=${agent_home}/.local/state"`,
 			`"XDG_RUNTIME_DIR=${agent_runtime_dir}"`,
 			`"DOCKER_CONFIG=${agent_home}/.docker"`,
+			`sandbox_forward_proxy="http://gateway.docker.internal:3128"`,
+			`"HTTP_PROXY=${sandbox_forward_proxy}"`,
+			`"HTTPS_PROXY=${sandbox_forward_proxy}"`,
+			`"ALL_PROXY=${sandbox_forward_proxy}"`,
+			`"http_proxy=${sandbox_forward_proxy}"`,
+			`"https_proxy=${sandbox_forward_proxy}"`,
+			`"all_proxy=${sandbox_forward_proxy}"`,
+			`"SSL_CERT_FILE=/opt/epar/trust/ca-bundle.pem"`,
+			`"NODE_EXTRA_CA_CERTS=/opt/epar/trust/ca-bundle.pem"`,
+			`"REQUESTS_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"`,
+			`"PIP_CERT=/opt/epar/trust/ca-bundle.pem"`,
+			`"CURL_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"`,
+			`"GIT_SSL_CAINFO=/opt/epar/trust/ca-bundle.pem"`,
+			`"AWS_CA_BUNDLE=/opt/epar/trust/ca-bundle.pem"`,
+			`ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/prepare-job-start.sh`,
 		} {
 			if !strings.Contains(runner, required) {
 				t.Fatalf("Docker Sandboxes listener environment omitted %q", required)
 			}
 		}
-		for _, forbidden := range []string{"http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
-			if strings.Contains(runner, forbidden) {
-				t.Fatalf("Docker Sandboxes listener still inherits host forward-proxy variables via %q", forbidden)
-			}
+		if strings.Contains(runner, `"NO_PROXY=`) || strings.Contains(runner, `"no_proxy=`) {
+			t.Fatal("Docker Sandboxes listener must not bypass its canonical forward proxy with NO_PROXY")
 		}
 
 		configure := readTemplateFile(t, filepath.Join("guest", "configure-runner.sh"))
-		for _, forbidden := range []string{"http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
-			if strings.Contains(configure, forbidden) {
-				t.Fatalf("Docker Sandboxes registration still inherits host forward-proxy variables via %q", forbidden)
+		for _, required := range []string{
+			`sandbox_forward_proxy="http://gateway.docker.internal:3128"`,
+			`"HTTP_PROXY=${sandbox_forward_proxy}"`,
+			`"HTTPS_PROXY=${sandbox_forward_proxy}"`,
+			`"ALL_PROXY=${sandbox_forward_proxy}"`,
+			`"http_proxy=${sandbox_forward_proxy}"`,
+			`"https_proxy=${sandbox_forward_proxy}"`,
+			`"all_proxy=${sandbox_forward_proxy}"`,
+			`/opt/epar/scrub-docker-auth.sh --runtime`,
+			`"SSL_CERT_FILE=/opt/epar/trust/ca-bundle.pem"`,
+			`"NODE_EXTRA_CA_CERTS=/opt/epar/trust/ca-bundle.pem"`,
+		} {
+			if !strings.Contains(configure, required) {
+				t.Fatalf("Docker Sandboxes registration omitted split-egress or runtime scrub contract %q", required)
 			}
+		}
+		if strings.Contains(configure, `"NO_PROXY=`) || strings.Contains(configure, `"no_proxy=`) {
+			t.Fatal("Docker Sandboxes registration must not bypass its canonical forward proxy with NO_PROXY")
 		}
 
 		entrypoint := readTemplateFile(t, filepath.Join("guest", "template-entrypoint.sh"))
@@ -175,6 +210,10 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			"unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY",
 			`docker info --format '{{.NoProxy}}'`,
 			"policy-enforced transparent egress",
+			"/opt/epar/epar-egress-bridge",
+			"/run/epar/egress-bridge.pid",
+			"cleanup_bridge_on_failure",
+			`sudo -n kill -TERM "${cleanup_bridge_pids[0]}"`,
 		} {
 			if !strings.Contains(entrypoint, required) {
 				t.Fatalf("Docker Sandboxes entrypoint omitted SSH-agent isolation contract %q", required)
@@ -220,6 +259,10 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 
 	t.Run("source credential scrubbing", func(t *testing.T) {
 		prepare := readTemplateFile(t, filepath.Join("guest", "prepare-template.sh"))
+		scrubber := readTemplateFile(t, filepath.Join("guest", "scrub-docker-auth.sh"))
+		if !strings.Contains(prepare, `/opt/epar/scrub-docker-auth.sh --build`) {
+			t.Fatal("Docker Sandboxes template preparation does not invoke the shared build-time credential scrub")
+		}
 		for _, required := range []string{
 			`passwd_entries="$(getent passwd)"`,
 			`[[ -z "${passwd_entries}" ]]`,
@@ -227,15 +270,31 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			"for root_home_docker_config in /.docker /.dockercfg",
 			`rm -rf -- "${credential_home}/.docker"`,
 			`rm -f -- "${credential_home}/.dockercfg"`,
-			"failed to scrub source Docker client configuration",
+			"failed to scrub Docker client authentication",
 		} {
-			if !strings.Contains(prepare, required) {
+			if !strings.Contains(scrubber, required) {
 				t.Fatalf("Docker Sandboxes template preparation omitted credential-scrubbing contract %q", required)
 			}
 		}
 		for _, forbidden := range []string{"cat /root/.docker", "cat /home/runner/.docker", "cat /home/agent/.docker", "cp /root/.docker", "cp /home/runner/.docker"} {
-			if strings.Contains(prepare, forbidden) {
+			if strings.Contains(scrubber, forbidden) {
 				t.Fatalf("Docker Sandboxes credential hygiene exposes or copies source credential material via %q", forbidden)
+			}
+		}
+		configure := readTemplateFile(t, filepath.Join("guest", "configure-runner.sh"))
+		if !strings.Contains(configure, `/opt/epar/scrub-docker-auth.sh --runtime`) {
+			t.Fatal("Docker Sandboxes registration does not invoke the narrow runtime credential scrub")
+		}
+		for _, required := range []string{
+			`docker_config_dir="${credential_home}/.docker"`,
+			`[[ -L "${docker_config_dir}" ]]`,
+			`rm -f -- /.docker/config.json /.dockercfg`,
+			`runtime_config="${credential_home}/.docker/config.json"`,
+			`rm -f -- "${runtime_config}"`,
+			`preserve .docker/sandbox/locks`,
+		} {
+			if !strings.Contains(scrubber+configure, required) {
+				t.Fatalf("Docker Sandboxes runtime credential scrub omitted %q", required)
 			}
 		}
 		verify := readTemplateFile(t, filepath.Join("guest", "verify-template.sh"))
@@ -263,9 +322,47 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			}
 		}
 	})
+
+	t.Run("job-start split-egress boundary", func(t *testing.T) {
+		hook := readTemplateFile(t, filepath.Join("guest", "prepare-job-start.sh"))
+		for _, required := range []string{
+			`/opt/epar/check-host-trust-generation.sh`,
+			`GITHUB_ENV`,
+			`_runner_file_commands`,
+			`readlink -f -- "${GITHUB_ENV}"`,
+			`[[ -L "${GITHUB_ENV}" || ! -f "${GITHUB_ENV}" ]]`,
+			`stat -c '%u:%g'`,
+			`printf 'HTTP_PROXY=\n'`,
+			`printf 'HTTPS_PROXY=%s\n' "${workflow_https_proxy}"`,
+			`printf 'ALL_PROXY=\n'`,
+			`printf 'http_proxy=\n'`,
+			`printf 'https_proxy=%s\n' "${workflow_https_proxy}"`,
+			`printf 'all_proxy=\n'`,
+			`printf 'NO_PROXY=%s\n' "${workflow_no_proxy}"`,
+			`printf 'no_proxy=%s\n' "${workflow_no_proxy}"`,
+			`workflow_https_proxy="http://127.0.0.1:3130"`,
+			`/run/epar/egress-relay-active`,
+			`if sudo -n test -e /run/epar/egress-relay-active`,
+			`sudo -n stat -c '%U:%G:%a' /run/epar/egress-relay-active`,
+			`http://127.0.0.1:3129/health`,
+			`marker_mode="$(jq -er '.mode | strings' /opt/epar/host-trust-generation.json)"`,
+			`relay_required=true`,
+			`Windows host-trust overlay requires the authenticated relay`,
+		} {
+			if !strings.Contains(hook, required) {
+				t.Fatalf("Docker Sandboxes job-start hook omitted %q", required)
+			}
+		}
+		launcher := readTemplateFile(t, filepath.Join("hook-launcher", "main.go"))
+		for _, required := range []string{`hookPath = "/opt/epar/prepare-job-start.sh"`, `"GITHUB_ENV": true`, `"LANG":`} {
+			if !strings.Contains(launcher, required) {
+				t.Fatalf("Docker Sandboxes hook launcher omitted %q", required)
+			}
+		}
+	})
 }
 
-func TestDockerSandboxesDockerDaemonUsesPolicyEnforcedTransparentRegistryPath(t *testing.T) {
+func TestDockerSandboxesDockerDaemonBootstrapsThenUsesAuthenticatedHostTrustRelay(t *testing.T) {
 	templateRoot := filepath.Join("..", "..", "templates", "docker-sandboxes")
 	content, err := os.ReadFile(filepath.Join(templateRoot, "guest", "docker-daemon.json"))
 	if err != nil {
@@ -282,7 +379,7 @@ func TestDockerSandboxesDockerDaemonUsesPolicyEnforcedTransparentRegistryPath(t 
 		t.Fatalf("parse Docker daemon proxy configuration: %v", err)
 	}
 	if configuration.Proxies.HTTPProxy != "http://gateway.docker.internal:3128" || configuration.Proxies.HTTPSProxy != "http://gateway.docker.internal:3128" || configuration.Proxies.NoProxy != "*" {
-		t.Fatalf("Docker daemon proxy configuration = %#v, want Sandbox forward proxy with daemon-wide transparent routing", configuration.Proxies)
+		t.Fatalf("Docker daemon proxy configuration = %#v, want the bootstrap Sandbox proxy isolated by daemon-wide no-proxy", configuration.Proxies)
 	}
 	prepareContent, err := os.ReadFile(filepath.Join(templateRoot, "guest", "prepare-template.sh"))
 	if err != nil {
@@ -312,9 +409,49 @@ func TestDockerSandboxesDockerDaemonUsesPolicyEnforcedTransparentRegistryPath(t 
 		`(keys - ["proxies", "registry-mirrors"])`,
 		`has("registry-mirrors")`,
 		`docker info --format '{{.NoProxy}}'`,
+		`http://127.0.0.1:3129`,
+		`/run/epar/egress-relay.json`,
+		`/run/epar/egress-relay-active`,
+		`if sudo -n test -e /run/epar/egress-relay-active`,
+		`marker_host_os="$(jq -er '.hostOS | strings | ascii_downcase' /opt/epar/host-trust-generation.json)"`,
+		`Windows host-trust overlay requires the authenticated relay`,
 	} {
 		if !strings.Contains(verify, required) {
 			t.Fatalf("Docker Sandboxes template verification omitted daemon proxy contract %q", required)
+		}
+	}
+	activationContent, err := os.ReadFile(filepath.Join(templateRoot, "guest", "configure-egress-relay.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation := string(activationContent)
+	for _, required := range []string{
+		`bridge_proxy="http://127.0.0.1:3129"`,
+		`install -d -m 0755 -o root -g root "${config_dir}"`,
+		`relay_ca_source="${config_dir}/egress-relay-ca.crt"`,
+		`relay_ca_key="${config_dir}/egress-relay-ca.key"`,
+		`relay_ca_trust="/usr/local/share/ca-certificates/epar/epar-egress-relay.crt"`,
+		`GODEBUG=tlsmlkem=0,tlssecpmlkem=0`,
+		`remove_relay_ca_trust()`,
+		`set(value) != {"schemaVersion", "relayAddress", "token"}`,
+		`daemon_already_configured=false`,
+		`if [[ "${daemon_already_configured}" != "true" ]]`,
+		`((keys - ["proxies", "registry-mirrors"]) | length) == 0 and .proxies == {"https-proxy": $proxy, "no-proxy": $no_proxy}`,
+		`daemon_backup="${config_dir}/docker-daemon.pre-relay.json"`,
+		`rollback_daemon()`,
+		`if [[ "${mode}" == "--commit" ]]`,
+		`if [[ "${mode}" == "--rollback" ]]`,
+		`mv -f "${daemon_config}.rollback.new" "${daemon_config}"`,
+		`if [[ "${status}" != "0" ]]`,
+		`[[ "${#dockerd_pids[@]}" != "1" ]]`,
+		`if [[ -n "$(docker ps -aq)" ]]`,
+		`kill -TERM "${dockerd_pid}"`,
+		`env -i HOME=/root`,
+		`--proxy "${bridge_proxy}" --noproxy '' --cacert "${relay_ca_trust}"`,
+		`if [[ "${registry_status}" != "401" ]]`,
+	} {
+		if !strings.Contains(activation, required) {
+			t.Fatalf("Docker Sandboxes runtime relay activation omitted %q", required)
 		}
 	}
 }
@@ -534,7 +671,7 @@ func TestVerifiedDockerSandboxesBuildArtifactAcceptsOnlyCompleteExactEvidence(t 
 	metadata.Compatibility.DockerDaemonOwner = "docker-sandboxes-runtime"
 	metadata.Compatibility.ExpectedDockerDaemonCount = 1
 	metadata.Compatibility.EmulationBackend = "qemu"
-	metadata.Compatibility.EmulationPolicy = "automatic-binfmt-install-all"
+	metadata.Compatibility.EmulationPolicy = "configured-best-effort-required-or-native-only"
 	metadata.Compatibility.EmulationRelease = "qemu-v10.2.3-68"
 	metadata.Compatibility.EmulationSourceDigest = "sha256:" + strings.Repeat("d", 64)
 	metadata.Compatibility.EmulationManifestDigest = "sha256:" + strings.Repeat("e", 64)
@@ -612,7 +749,7 @@ func TestDockerSandboxesEmulationLockAndTemplateAssetsAreExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"/usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/", "enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation"} {
+	for _, required := range []string{"/usr/bin/binfmt /usr/bin/qemu-* /opt/epar/emulation/", "enable-architecture-emulation.sh /opt/epar/enable-architecture-emulation", "verify-native-architecture.sh /opt/epar/verify-native-architecture"} {
 		if !strings.Contains(string(dockerfile), required) {
 			t.Fatalf("Dockerfile omits %q", required)
 		}
@@ -626,8 +763,17 @@ func TestDockerSandboxesEmulationLockAndTemplateAssetsAreExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(helper), "--install all") || !strings.Contains(string(helper), "/proc/sys/fs/binfmt_misc") {
+	if !strings.Contains(string(helper), "--install all") || !strings.Contains(string(helper), "modprobe binfmt_misc") || !strings.Contains(string(helper), "/proc/sys/fs/binfmt_misc") || !strings.Contains(string(helper), "sandbox kernel/module set does not provide usable binfmt_misc support") {
 		t.Fatal("architecture emulation helper does not install and structurally verify binfmt handlers")
+	}
+	nativeHelper, err := os.ReadFile(filepath.Join(templateRoot, "guest", "verify-native-architecture.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"linux/amd64", "linux/arm64", "docker info --format", "/opt/epar/emulation/qemu-", `"backend":"native"`, `"handlerCount":%d`, "epar_handler_count"} {
+		if !strings.Contains(string(nativeHelper), required) {
+			t.Fatalf("native architecture helper omits %q", required)
+		}
 	}
 }
 

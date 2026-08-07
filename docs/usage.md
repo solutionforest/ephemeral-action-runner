@@ -1,6 +1,6 @@
 # Usage
 
-Use this page for normal EPAR tasks. Start with the host and provider you already have; the [documentation hub](README.md) links to the provider-specific guides.
+Use this page for normal EPAR tasks. Docker Sandboxes is the primary provider on Linux, macOS, and Windows hosts when its capability checks pass; the [documentation hub](README.md) links to compatibility and provider-specific guides.
 
 ## Prerequisites
 
@@ -8,18 +8,18 @@ Use this page for normal EPAR tasks. Start with the host and provider you alread
 | --- | --- |
 | Run a source archive | Go 1.25 or newer, or Docker for the no-Go controller builder |
 | Register or inspect GitHub runners | A GitHub App with organization self-hosted runner read/write permission |
-| Docker Container | Docker with privileged Linux-container support |
-| Docker Sandboxes | Docker and the `sbx` CLI with at least one diagnostic pass and zero failures; the wizard builds and imports the selected EPAR template |
-| WSL | Native Windows, WSL2, and Docker when preparing the default WSL image |
-| Tart | Native Apple Silicon macOS and Tart |
+| Docker Sandboxes (primary) | Docker and the `sbx` CLI with at least one diagnostic pass and zero failures; the wizard builds and imports the selected EPAR template |
+| Docker Container (compatibility) | Docker with privileged Linux-container support; reveal it in the wizard with `C. Show compatibility providers` |
+| WSL2 (compatibility) | Native Windows, WSL2, and Docker when preparing the default WSL image; reveal it in the wizard with `C. Show compatibility providers` |
+| Tart (retired) | Existing configurations only; runtime and exact cleanup compatibility remain available without onboarding |
 
 Get the source from the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), extract the source archive, and work from that folder. You do not need Packer, GitHub CLI, or `sshpass`.
 
-EPAR works with any Docker installation that supports the selected provider.
+EPAR works with a Docker installation that supports the selected provider. Docker Sandboxes is the default path; compatibility providers are explicit choices and EPAR never silently changes a configured provider.
 
 ## Start a pool
 
-On macOS, Linux, WSL, Git Bash, or native Windows PowerShell, run:
+On macOS, Linux, Git Bash, or native Windows PowerShell, run:
 
 ```text
 ./start
@@ -27,7 +27,7 @@ On macOS, Linux, WSL, Git Bash, or native Windows PowerShell, run:
 
 PowerShell resolves `./start` to EPAR's internal Windows wrapper. Do not use bare `start` in PowerShell because that name is the `Start-Process` alias. The wrapper uses local Go when available, otherwise it uses Docker, to build a native controller under `.local/bin/<os>-<arch>/`; it then executes that project-local controller directly. See [Running EPAR Without Installing Go](advanced/no-go-install.md) for the fallback details.
 
-When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group. The runner-group list orders GitHub's Default group first, hides blocked groups and policy details initially, and lets you reveal either from the menu. The provider list always has the fixed order `1. Docker Sandboxes — recommended`, `2. Docker Container`, `3. WSL2`, and `4. Tart`; Docker Sandboxes remains the default even when its prerequisite status is unavailable. Pressing Enter or choosing `1` while it is unavailable displays its status and remediation, then keeps the menu open so you can make an explicit available choice. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share the Catthehacker image-selection and estimate flow, and all three present `full-latest` and `act-latest` as the built-in choices. Docker Container and WSL additionally offer another validated Catthehacker tag, while Docker Sandboxes limits source selection to the two built-in profiles proven to include its required private Docker daemon and runtime closure. The wizard writes empty custom-install scripts, weekly updates at 07:00 local time, and host-trust overlay for applicable providers; edit the generated config afterward to change those advanced settings. Later option lists use `0` to go back, text prompts use `/back`, and a final provider-neutral review shows the applicable artifact estimate before one creation decision. Running `./start init` exits after writing, while an embedded first run continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
+When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group. The runner-group list orders GitHub's Default group first, hides blocked groups and policy details initially, and lets you reveal either from the menu. Four provider identities remain accepted at runtime, while three are onboarding-capable: `1. Docker Sandboxes — recommended (default)` is visible first; choose `C. Show compatibility providers` to reveal `2. Docker Container` and `3. WSL2`; Tart remains a retired runtime/configuration identity with no onboarding option. Docker Sandboxes remains the default even when its prerequisite status is unavailable. Pressing Enter or choosing `1` while it is unavailable displays its status and remediation, then keeps the menu open so you can make an explicit available choice; choose `R` to refresh prerequisites. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share the Catthehacker image-selection and estimate flow, and all three present `full-latest` and `act-latest` as the built-in choices. Docker Container and WSL additionally offer another validated Catthehacker tag, while Docker Sandboxes limits source selection to the two built-in profiles proven to include its required private Docker daemon and runtime closure. The wizard writes empty custom-install scripts, weekly updates at 07:00 local time, and host-trust overlay for applicable providers; edit the generated config afterward to change those advanced settings. Later option lists use `0` to go back, text prompts use `/back`, and a final provider-neutral review shows the applicable artifact estimate before one creation decision. Running `./start init` exits after writing, while an embedded first run continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
 
 See [Docker Sandboxes](providers/docker-sandboxes.md) for source profiles, capacity, local receipts, and platform validation status.
 
@@ -45,6 +45,15 @@ Pass a config path and an instance count through the wrapper:
 ./start --config .local/ci.yml --instances 2
 ```
 
+For an unattended controller that should remain alive through transient external-service outages, opt in explicitly:
+
+```bash
+./start --config .local/ci.yml --external-outage-retry=continuous
+./start --config .local/ci.yml --external-outage-retry=4h
+```
+
+The accepted values are `off`, `continuous`, or a positive Go duration. Omission is `off`, so ordinary interactive starts keep their existing fail-fast startup behavior. The flag applies only to the configured `start` lifecycle; it does not retry the first-run wizard, wrapper controller builds, `pool up`, or maintenance commands.
+
 On Windows PowerShell, backslash paths may be clearer while the command remains the same:
 
 ```powershell
@@ -55,7 +64,7 @@ If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.ins
 
 Multiple configs from the same checkout may run concurrently when they use different canonical config paths, unique `pool.namePrefix` values, unique workflow-routing labels, and preferably separate log directories. EPAR rejects a second controller for the same config path or prefix before provisioning or cleanup can mutate provider state. Config-scoped BuildKit builders and transient workspaces keep divergent registry, trust, and cache settings isolated.
 
-Storage-consuming commands fail before their provider side effects when any authoritative capacity domain cannot retain `storage.minimumFree` after the operation's largest phase-overlapping allocation. The checkout filesystem is not assumed to contain Docker, Docker Sandboxes, WSL, or Tart storage. Inspect the same calculation with `./start storage status --operation <name>`; preserve `--config` and `--project-root` for non-default configurations. The one-invocation `--allow-insufficient-storage` option keeps all probes and warnings but permits only storage admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, and cleanup protections remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image update`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
+Storage-consuming commands fail before their provider side effects when a measured capacity domain cannot retain `storage.minimumFree` after the operation's largest phase-overlapping allocation. An unavailable capacity measurement is reported as a warning and does not block the command; the checkout filesystem is not assumed to contain provider runtime storage. Inspect the same calculation, including unknown domains and their causes, with `./start storage status --operation <name>`; preserve `--config` and `--project-root` for non-default configurations. The one-invocation `--allow-insufficient-storage` option permits only confirmed insufficient-capacity admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, cleanup protections, remote Docker-context rejection, and malformed storage topology remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image update`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
 
 Each normal start also reconciles interrupted exact-owned work and retires unreferenced superseded artifacts after replacement readback. Use `./start storage status` to inspect the result. `./start storage prune --legacy` previews prefix-era resources, which remain manual and require the displayed plan hash before execution.
 
@@ -87,7 +96,7 @@ Verify registration and online/idle state:
 ./start pool verify --instances 2 --register-only --cleanup
 ```
 
-`--cleanup` removes verification resources after the check. Docker Sandboxes uses its exact ownership records; legacy providers use the configured pool-name boundary. Use [Operations](operations.md) for the distinction and recovery guidance.
+`--cleanup` removes verification resources after the check. Docker Sandboxes uses its exact ownership records; compatibility providers use the configured pool-name boundary, and retired Tart configurations keep their existing exact runtime/cleanup behavior. Use [Operations](operations.md) for the distinction and recovery guidance.
 
 ## Run, inspect, and clean up
 

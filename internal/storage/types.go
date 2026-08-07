@@ -39,7 +39,7 @@ const (
 )
 
 // Capacity is one capacity observation. Unknown capacity is a first-class
-// fail-closed state, not zero available bytes.
+// state, not zero available bytes.
 type Capacity struct {
 	Known          bool      `json:"known"`
 	AvailableBytes uint64    `json:"availableBytes,omitempty"`
@@ -71,13 +71,14 @@ type Surface struct {
 // logical surfaces may resolve to the same domain and must then share one
 // capacity check and one free-space reserve.
 type CapacityDomain struct {
-	ID         string      `json:"id"`
-	Kind       SurfaceKind `json:"kind"`
-	Identity   string      `json:"identity,omitempty"`
-	Path       string      `json:"path,omitempty"`
-	Provenance string      `json:"provenance,omitempty"`
-	Confidence string      `json:"confidence,omitempty"`
-	Capacity   Capacity    `json:"capacity"`
+	ID                        string      `json:"id"`
+	Kind                      SurfaceKind `json:"kind"`
+	Identity                  string      `json:"identity,omitempty"`
+	Path                      string      `json:"path,omitempty"`
+	Provenance                string      `json:"provenance,omitempty"`
+	Confidence                string      `json:"confidence,omitempty"`
+	CapacityUnavailableReason string      `json:"capacityUnavailableReason,omitempty"`
+	Capacity                  Capacity    `json:"capacity"`
 }
 
 // OperationPlan describes storage growth as overlapping phases. The reserve
@@ -136,7 +137,7 @@ type ResolvedOperationPlan struct {
 	Requirements []DomainRequirement  `json:"requirements,omitempty"`
 }
 
-// OperationEvaluation adds fail-closed capacity checks to a resolved plan.
+// OperationEvaluation adds capacity checks to a resolved plan.
 type OperationEvaluation struct {
 	ResolvedOperationPlan
 	CapacityChecks []CapacityCheck `json:"capacityChecks,omitempty"`

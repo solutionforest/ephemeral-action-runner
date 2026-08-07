@@ -480,12 +480,11 @@ func TestDockerSandboxesRunnerRequiresExplicitDisabledOrOverlayTrustPolicy(t *te
 	text := string(content)
 	for _, required := range []string{
 		"[[ -s /opt/epar/host-trust-generation.json ]]",
-		"ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/check-host-trust-generation.sh",
+		"ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/epar/prepare-job-start.sh",
 		"PATH=/opt/epar/hook-bin:",
 		`if mode == "disabled":`,
 		`elif mode == "overlay":`,
 		`raise SystemExit(f"EPAR runner trust policy: unknown mode {mode!r}")`,
-		`if [[ "${trust_mode}" == "overlay" ]]; then`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("Docker Sandboxes runner omitted trust-policy invariant %q", required)
@@ -493,6 +492,9 @@ func TestDockerSandboxesRunnerRequiresExplicitDisabledOrOverlayTrustPolicy(t *te
 	}
 	if strings.Contains(text, `if [[ -s /opt/epar/host-trust-generation.json ]]`) {
 		t.Fatal("Docker Sandboxes runner accepts a missing policy marker")
+	}
+	if strings.Contains(text, `if [[ "${trust_mode}" == "overlay" ]]`) {
+		t.Fatal("Docker Sandboxes runner conditionally omits the job-start preparation hook")
 	}
 }
 

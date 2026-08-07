@@ -1,3 +1,4 @@
+# Retired compatibility provider: this Rosetta-oriented Tart example is retained for existing configurations and exact cleanup.
 github:
   appId: 123456
   organization: your-org
@@ -35,6 +36,7 @@ storage:
 
 logging:
   directory: work/logs
+  level: info
   managerSinks: [console]
   managerConsoleFormat: text
   managerConsoleTextFormat: "{time} [{level}] {message}"

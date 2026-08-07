@@ -33,8 +33,8 @@ func FormatBytes(value uint64) string {
 	return fmt.Sprintf("%d bytes", value)
 }
 
-// CapacityAdmissionError renders a fail-closed capacity decision in terms an
-// operator can act on without translating byte counts or policy arithmetic.
+// CapacityAdmissionError renders a confirmed insufficient-capacity decision
+// in terms an operator can act on without translating byte counts or policy arithmetic.
 func CapacityAdmissionError(action string, surface Surface, requirement Requirement, check CapacityCheck, cleanupCommand string) error {
 	available := "unknown"
 	if surface.Capacity.Known {

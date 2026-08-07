@@ -17,9 +17,10 @@ import (
 type Confidence string
 
 const (
-	ConfidenceObserved Confidence = "observed"
-	ConfidenceDerived  Confidence = "derived"
-	ConfidenceAssumed  Confidence = "assumed"
+	ConfidenceObserved    Confidence = "observed"
+	ConfidenceDerived     Confidence = "derived"
+	ConfidenceAssumed     Confidence = "assumed"
+	ConfidenceUnavailable Confidence = "unavailable"
 )
 
 type Provenance string
@@ -38,12 +39,13 @@ const (
 // for capacity measurement. CapacityPath may be a redirected canonical target.
 // Neither field is cleanup ownership evidence.
 type Resolution struct {
-	ID           string
-	Path         string
-	CapacityPath string
-	Provenance   Provenance
-	Confidence   Confidence
-	Warnings     []string
+	ID                        string
+	Path                      string
+	CapacityPath              string
+	CapacityUnavailableReason string
+	Provenance                Provenance
+	Confidence                Confidence
+	Warnings                  []string
 }
 
 type Environment struct {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,10 @@ const (
 	commandWaitDelay      = 5 * time.Second
 	keepaliveStartupDelay = 500 * time.Millisecond
 )
+
+const sandboxContainerFailureSignature = "failed to run sandbox container"
+
+const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. EPAR will not stop or restart a running shared daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
 
 const directWorkspaceVerificationScript = `set -euo pipefail
 if test -n "${SSH_AUTH_SOCK:-}" || test -n "${SSH_AUTH_SOCK_GATEWAY:-}" || test -n "${SSH_AGENT_PID:-}" || test -e /run/ssh-agent.sock || test -L /run/ssh-agent.sock; then
@@ -61,7 +66,14 @@ type Provider struct {
 	activeTemplate        provider.TemplateArtifact
 	dryRun                bool
 	architectureEmulation architectureEmulationEnabler
+	architectureLogged    sync.Map
 	logger                *slog.Logger
+	relayMu               sync.Mutex
+	relay                 *egressRelay
+	relayTokens           map[string]string
+	relayConnections      map[string]map[net.Conn]struct{}
+	hostTrustRelayEnabled bool
+	hostTrustRelayPort    int
 }
 
 type instanceReceipt struct {
@@ -111,11 +123,35 @@ func NewWithDryRun(binary string, dryRun bool) *Provider {
 	return newWithArchitectureEmulation(binary, dryRun, qemuBinfmtEnabler{})
 }
 
+func NewWithArchitectureMode(binary string, dryRun bool, mode, platform string) *Provider {
+	var enabler architectureEmulationEnabler
+	switch mode {
+	case architectureEmulationBestEffort:
+		enabler = bestEffortArchitectureEnabler{platform: platform}
+	case architectureEmulationRequired:
+		enabler = qemuBinfmtEnabler{}
+	case architectureEmulationNativeOnly:
+		enabler = nativeArchitectureEnabler{platform: platform}
+	}
+	return newWithArchitectureEmulation(binary, dryRun, enabler)
+}
+
 func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectureEmulationEnabler) *Provider {
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary, dryRun: dryRun, architectureEmulation: enabler}
+	return &Provider{Binary: binary, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]string), relayConnections: make(map[string]map[net.Conn]struct{})}
+}
+
+// ConfigureHostTrustRelay enables the Windows-host trust transport used by
+// Docker Sandboxes overlay mode. It is configured once by the provider
+// registry before lifecycle operations begin.
+func (p *Provider) ConfigureHostTrustRelay(enabled bool, stableIdentity ...string) {
+	p.hostTrustRelayEnabled = enabled
+	p.hostTrustRelayPort = 0
+	if enabled && len(stableIdentity) != 0 && stableIdentity[0] != "" {
+		p.hostTrustRelayPort = stableRelayPort(stableIdentity[0])
+	}
 }
 
 // SetLogger attaches the controller's structured logger before any concurrent
@@ -218,7 +254,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		environment["DOCKER_SANDBOXES_DOCKER_SIZE"] = request.DockerDisk
 	}
 	if _, err := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox"}); err != nil {
-		return provider.Instance{}, err
+		return provider.Instance{}, withSandboxContainerFailureRemediation(err)
 	}
 	items, err = p.inventoryVerified(ctx)
 	if err != nil {
@@ -261,14 +297,39 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			if err != nil {
 				return instance, err
 			}
-			if p.logger != nil {
-				message := fmt.Sprintf("Docker Sandboxes architecture emulation enabled: backend=%s registeredHandlers=%d", emulation.Backend, emulation.HandlerCount)
-				p.logger.Info(message, "provider", "docker-sandboxes", "instance", item.Instance.Name, "backend", emulation.Backend, "registeredHandlers", emulation.HandlerCount)
-			}
+			p.logArchitectureCapability(item.Instance.Name, emulation)
 			return instance, nil
 		}
 	}
 	return provider.Instance{}, fmt.Errorf("docker sandbox was not present in inventory after create")
+}
+
+func withSandboxContainerFailureRemediation(err error) error {
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), sandboxContainerFailureSignature) {
+		return err
+	}
+	return fmt.Errorf("%w; %s", err, sandboxContainerFailureRemediation)
+}
+
+func (p *Provider) logArchitectureCapability(instanceName string, emulation architectureEmulationResult) {
+	if p.logger == nil {
+		return
+	}
+	if _, alreadyLogged := p.architectureLogged.LoadOrStore(instanceName, struct{}{}); alreadyLogged {
+		return
+	}
+	if emulation.Mode == architectureEmulationNativeOnly {
+		message := fmt.Sprintf("Docker Sandboxes native-only architecture verified: platform=%s; foreign-architecture containers are unsupported", emulation.Platform)
+		p.logger.Warn(message, "provider", "docker-sandboxes", "instance", instanceName, "architectureEmulation", emulation.Mode, "backend", emulation.Backend, "platform", emulation.Platform, "registeredHandlers", emulation.HandlerCount)
+		return
+	}
+	if emulation.Mode == architectureEmulationBestEffort && emulation.Backend == "native" {
+		message := fmt.Sprintf("Docker Sandboxes QEMU/binfmt unavailable; continuing with verified native platform=%s; foreign-architecture containers may fail", emulation.Platform)
+		p.logger.Warn(message, "provider", "docker-sandboxes", "instance", instanceName, "architectureEmulation", emulation.Mode, "backend", emulation.Backend, "platform", emulation.Platform, "registeredHandlers", emulation.HandlerCount, "qemuError", emulation.Warning)
+		return
+	}
+	message := fmt.Sprintf("Docker Sandboxes architecture emulation enabled: backend=%s registeredHandlers=%d", emulation.Backend, emulation.HandlerCount)
+	p.logger.Info(message, "provider", "docker-sandboxes", "instance", instanceName, "architectureEmulation", emulation.Mode, "backend", emulation.Backend, "registeredHandlers", emulation.HandlerCount)
 }
 
 // ImportTemplate performs the one exact provider mutation required after the
@@ -396,14 +457,12 @@ func (p *Provider) ObserveTemplate(ctx context.Context, artifact provider.Templa
 	return false, nil
 }
 
-// VerifyAdmission fail-closes on provider-wide channels Docker Sandboxes can
-// inject into every sandbox. EPAR deliberately does not consume global secrets;
-// repository and workflow input can never opt out of this check.
+// VerifyAdmission checks only host-level Docker Sandboxes readiness. Capability
+// checks that are specific to an EPAR-managed sandbox are performed by
+// VerifyInstanceAdmission after that exact sandbox has been created.
 func (p *Provider) VerifyAdmission(ctx context.Context) error {
-	if _, err := p.VerifyHostReadiness(ctx); err != nil {
-		return err
-	}
-	return p.verifyNoGlobalSecrets(ctx)
+	_, err := p.VerifyHostReadiness(ctx)
+	return err
 }
 
 func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provider.Instance) error {
@@ -417,7 +476,18 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	if err := p.verifyNoPublishedPorts(ctx, instance); err != nil {
 		return err
 	}
-	return p.verifyInspection(ctx, instance, nil)
+	if err := p.verifyInspection(ctx, instance, nil); err != nil {
+		return err
+	}
+	if p.architectureEmulation == nil {
+		return fmt.Errorf("Docker Sandboxes architecture emulation enabler is unavailable")
+	}
+	emulation, err := p.architectureEmulation.Enable(ctx, p, instance)
+	if err != nil {
+		return err
+	}
+	p.logArchitectureCapability(instance.Name, emulation)
+	return nil
 }
 
 func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest) error {
@@ -436,14 +506,10 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
-	var mcpGateway bool
-	if raw, ok := inspection["mcp_gateway"]; !ok || json.Unmarshal(raw, &mcpGateway) != nil || mcpGateway {
-		return fmt.Errorf("docker sandbox inspection reported an enabled MCP gateway")
-	}
 	if expected != nil && (stringValue(inspection["image"]) != expected.Template || stringValue(inspection["image_digest"]) != expected.TemplateDigest || stringValue(inspection["workspace"]) != expected.StagingPath) {
 		return fmt.Errorf("docker sandbox inspection did not bind the exact template identity and staging path")
 	}
-	for _, field := range []string{"kits", "secrets", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
+	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
 		value, ok := inspection[field]
 		if field == "kits" && !ok {
 			return fmt.Errorf("docker sandbox inspection omitted required attached-capability field %q", field)
@@ -504,21 +570,6 @@ func (p *Provider) verifyNoPublishedPorts(ctx context.Context, instance provider
 	}
 	if len(ports) != 0 {
 		return fmt.Errorf("docker sandbox reported a forbidden published port")
-	}
-	return nil
-}
-
-func (p *Provider) verifyNoGlobalSecrets(ctx context.Context) error {
-	result, err := p.run(ctx, commandRequest{
-		args:        []string{"secret", "ls", "-g"},
-		operation:   "verify docker sandboxes global secret isolation",
-		outputLimit: 64 << 10,
-	})
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(strings.ReplaceAll(result.Stdout, "\r\n", "\n")) != `No secrets found for scope "(global)".` {
-		return fmt.Errorf("docker sandboxes global secrets are configured; EPAR refuses to expose shared registry or service credentials to workflow sandboxes")
 	}
 	return nil
 }
@@ -724,6 +775,10 @@ func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error)
 }
 
 func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
+	if err := validateInstance(instance, true); err != nil {
+		return err
+	}
+	defer p.releaseRelayToken(instance.Name)
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		return err
@@ -736,6 +791,10 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 }
 
 func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error {
+	if err := validateInstance(instance, true); err != nil {
+		return err
+	}
+	defer p.releaseRelayToken(instance.Name)
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		return err
@@ -764,6 +823,7 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 	if err != nil {
 		return err
 	}
+	p.architectureLogged.Delete(instance.Name)
 	if p.runCommand == nil {
 		stagingRoot, openErr := staging.Open(filepath.Dir(receipt.StagingPath))
 		if openErr != nil {
@@ -784,11 +844,24 @@ func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, err
 }
 
 func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryItem, error) {
-	result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes"})
-	if err != nil {
-		return nil, err
+	for attempt := 1; attempt <= 2; attempt++ {
+		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes"})
+		if err != nil {
+			return nil, err
+		}
+		items, parseErr := parseInventory([]byte(result.Stdout))
+		if parseErr == nil {
+			p.reconcileRelayTokens(items)
+			return items, nil
+		}
+		if attempt == 2 {
+			return nil, parseErr
+		}
+		if p.logger != nil {
+			p.logger.Debug("Docker Sandboxes inventory returned invalid machine-readable output; retrying once", "provider", "docker-sandboxes", "stdoutBytes", len(result.Stdout))
+		}
 	}
-	return parseInventory([]byte(result.Stdout))
+	return nil, fmt.Errorf("inventory docker sandboxes did not complete")
 }
 
 // CachedTemplates returns the strictly parsed, host-level Docker Sandboxes
@@ -958,10 +1031,6 @@ func validateCommandRequest(request commandRequest) error {
 	}
 	switch request.args[0] {
 	case "version", "create", "exec", "daemon", "diagnose", "stop", "rm", "ls", "template", "policy", "inspect", "ports":
-	case "secret":
-		if len(request.args) != 3 || request.args[1] != "ls" || request.args[2] != "-g" {
-			return fmt.Errorf("only exact global-secret absence verification is permitted")
-		}
 	default:
 		return fmt.Errorf("docker sandboxes command %q is not permitted", request.args[0])
 	}
@@ -970,6 +1039,11 @@ func validateCommandRequest(request commandRequest) error {
 	}
 	if request.args[0] == "ports" && (len(request.args) != 3 || !sandboxNamePattern.MatchString(request.args[1]) || request.args[2] != "--json") {
 		return fmt.Errorf("only exact machine-readable published-port absence verification is permitted")
+	}
+	if request.args[0] == "policy" {
+		if err := validatePolicyCommand(request.args); err != nil {
+			return err
+		}
 	}
 	if request.args[0] == "daemon" && (len(request.args) != 3 || !((request.args[1] == "status" && request.args[2] == "--json") || (request.args[1] == "start" && request.args[2] == "--detach"))) {
 		return fmt.Errorf("only exact daemon status or detached-start operations are permitted")

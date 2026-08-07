@@ -9,11 +9,20 @@ fi
 emulation_root=/opt/epar/emulation
 binfmt_root=/proc/sys/fs/binfmt_misc
 install_output=""
+module_output=""
 
 if [[ "$(findmnt -T "${binfmt_root}" -n -o FSTYPE)" != "binfmt_misc" ]]; then
+  if ! grep -qw binfmt_misc /proc/filesystems && command -v modprobe >/dev/null 2>&1; then
+    if ! module_output="$(modprobe binfmt_misc 2>&1)"; then
+      [[ -z "${module_output}" ]] || printf '%s\n' "${module_output}" >&2
+      echo "failed to load the sandbox kernel binfmt_misc module for QEMU handler registration" >&2
+      exit 1
+    fi
+  fi
   if ! mount_output="$(mount -t binfmt_misc binfmt_misc "${binfmt_root}" 2>&1)"; then
+    [[ -z "${module_output}" ]] || printf '%s\n' "${module_output}" >&2
     [[ -z "${mount_output}" ]] || printf '%s\n' "${mount_output}" >&2
-    echo "failed to mount binfmt_misc for QEMU handler registration" >&2
+    echo "failed to mount binfmt_misc for QEMU handler registration; the sandbox kernel/module set does not provide usable binfmt_misc support" >&2
     exit 1
   fi
 fi

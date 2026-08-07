@@ -10,18 +10,28 @@ import (
 )
 
 const architectureEmulationHelper = "/opt/epar/enable-architecture-emulation"
+const nativeArchitectureHelper = "/opt/epar/verify-native-architecture"
+const architectureWarningLimit = 4 << 10
+
+const (
+	architectureEmulationBestEffort = "best-effort"
+	architectureEmulationRequired   = "required"
+	architectureEmulationNativeOnly = "native-only"
+)
 
 // architectureEmulationEnabler is deliberately target-agnostic. The current
-// implementation enables every handler bundled by the locked QEMU artifact;
-// a future implementation can compose an authoritative accelerator with QEMU
-// without adding provider configuration or changing the sandbox lifecycle.
+// implementation can require QEMU, attempt it before a verified native
+// fallback, or verify an explicitly configured native-only capability.
 type architectureEmulationEnabler interface {
 	Enable(context.Context, *Provider, provider.Instance) (architectureEmulationResult, error)
 }
 
 type architectureEmulationResult struct {
+	Mode         string `json:"mode,omitempty"`
 	Backend      string `json:"backend"`
 	HandlerCount int    `json:"handlerCount"`
+	Platform     string `json:"platform,omitempty"`
+	Warning      string `json:"-"`
 }
 
 type qemuBinfmtEnabler struct{}
@@ -39,6 +49,48 @@ func (qemuBinfmtEnabler) Enable(ctx context.Context, sandboxProvider *Provider, 
 	if err := decodeStrictJSON([]byte(strings.TrimSpace(result.Stdout)), &evidence); err != nil || evidence.Backend != "qemu" || evidence.HandlerCount < 1 {
 		return architectureEmulationResult{}, fmt.Errorf("Docker Sandboxes architecture emulation helper returned unsupported evidence")
 	}
+	evidence.Mode = architectureEmulationRequired
+	return evidence, nil
+}
+
+type nativeArchitectureEnabler struct {
+	platform      string
+	allowHandlers bool
+}
+
+func (enabler nativeArchitectureEnabler) Enable(ctx context.Context, sandboxProvider *Provider, instance provider.Instance) (architectureEmulationResult, error) {
+	result, err := sandboxProvider.run(ctx, commandRequest{
+		args:        []string{"exec", instance.Name, "--", "sudo", "-n", nativeArchitectureHelper, enabler.platform},
+		operation:   "verify Docker Sandboxes native architecture",
+		outputLimit: diagnosticOutputLimit,
+	})
+	if err != nil {
+		return architectureEmulationResult{}, err
+	}
+	var evidence architectureEmulationResult
+	if err := decodeStrictJSON([]byte(strings.TrimSpace(result.Stdout)), &evidence); err != nil || evidence.Backend != "native" || evidence.HandlerCount < 0 || (!enabler.allowHandlers && evidence.HandlerCount != 0) || evidence.Platform != enabler.platform {
+		return architectureEmulationResult{}, fmt.Errorf("Docker Sandboxes native architecture helper returned unsupported evidence")
+	}
+	evidence.Mode = architectureEmulationNativeOnly
+	return evidence, nil
+}
+
+type bestEffortArchitectureEnabler struct {
+	platform string
+}
+
+func (enabler bestEffortArchitectureEnabler) Enable(ctx context.Context, sandboxProvider *Provider, instance provider.Instance) (architectureEmulationResult, error) {
+	evidence, qemuErr := (qemuBinfmtEnabler{}).Enable(ctx, sandboxProvider, instance)
+	if qemuErr == nil {
+		evidence.Mode = architectureEmulationBestEffort
+		return evidence, nil
+	}
+	evidence, nativeErr := (nativeArchitectureEnabler{platform: enabler.platform, allowHandlers: true}).Enable(ctx, sandboxProvider, instance)
+	if nativeErr != nil {
+		return architectureEmulationResult{}, fmt.Errorf("Docker Sandboxes QEMU/binfmt activation failed (%v), and native architecture verification also failed: %w", qemuErr, nativeErr)
+	}
+	evidence.Mode = architectureEmulationBestEffort
+	evidence.Warning = truncate(qemuErr.Error(), architectureWarningLimit)
 	return evidence, nil
 }
 

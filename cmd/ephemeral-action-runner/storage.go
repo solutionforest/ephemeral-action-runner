@@ -543,11 +543,15 @@ func printStorageReport(subcommand string, report storageCommandReport) {
 		fmt.Fprintf(os.Stdout, "Allocation %s\toperation=%s\tphase=%s\trole=%s\tsurface=%s\tdomain=%s\tbytes=%s\n", allocation.AllocationID, allocation.OperationID, allocation.PhaseID, valueOrDash(string(allocation.Role)), allocation.SurfaceID, allocation.DomainID, formatStorageBytes(allocation.Bytes))
 	}
 	for _, check := range report.Plan.CapacityChecks {
+		available := "unknown"
+		if check.Capacity.Known {
+			available = formatStorageBytes(check.Capacity.AvailableBytes)
+		}
 		if check.DomainRequirement != nil {
-			fmt.Fprintf(os.Stdout, "Capacity %s\toperation=%s\tdomain=%s\tstatus=%s\tavailable=%s\tphasePeak=%s\treserve=%s\trequired=%s\n", check.Requirement.ID, check.DomainRequirement.OperationID, check.DomainRequirement.DomainID, check.Status, formatStorageBytes(check.Capacity.AvailableBytes), formatStorageBytes(check.DomainRequirement.PeakBytes), formatStorageBytes(check.DomainRequirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes))
+			fmt.Fprintf(os.Stdout, "Capacity %s\toperation=%s\tdomain=%s\tstatus=%s\tavailable=%s\tphasePeak=%s\treserve=%s\trequired=%s\treason=%s\n", check.Requirement.ID, check.DomainRequirement.OperationID, check.DomainRequirement.DomainID, check.Status, available, formatStorageBytes(check.DomainRequirement.PeakBytes), formatStorageBytes(check.DomainRequirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes), check.Reason)
 			continue
 		}
-		fmt.Fprintf(os.Stdout, "Capacity %s\tstatus=%s\tavailable=%s\testimated=%s\treserve=%s\trequired=%s\n", check.Requirement.ID, check.Status, formatStorageBytes(check.Capacity.AvailableBytes), formatStorageBytes(check.Requirement.PeakBytes), formatStorageBytes(check.Requirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes))
+		fmt.Fprintf(os.Stdout, "Capacity %s\tstatus=%s\tavailable=%s\testimated=%s\treserve=%s\trequired=%s\treason=%s\n", check.Requirement.ID, check.Status, available, formatStorageBytes(check.Requirement.PeakBytes), formatStorageBytes(check.Requirement.MinimumFreeBytes), formatStorageBytes(check.RequiredAvailableBytes), check.Reason)
 	}
 	for _, decision := range report.Plan.Decisions {
 		fmt.Fprintf(os.Stdout, "Artifact %s\taction=%s\tprovider=%s\tkind=%s\tbytes=%s\tidentity=%s\ttarget=%s\treason=%s\n", decision.Artifact.ID, decision.Action, valueOrDash(decision.Artifact.Provider), decision.Artifact.Kind, formatStorageBytes(decision.Artifact.SizeBytes), valueOrDash(decision.Artifact.Target.Identity), decision.Artifact.Target.Locator, strings.Join(decision.Reasons, ","))

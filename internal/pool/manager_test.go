@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -542,6 +544,101 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&imageEnsures); got == 0 {
 		t.Fatal("G2 replacement image was not ensured")
+	}
+}
+
+func TestRunPoolRefreshesHostTrustTransportOnLeaseCadence(t *testing.T) {
+	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	marker, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Join(command, " ") == "cat "+hostTrustMarkerGuest {
+			return provider.ExecResult{Stdout: string(marker)}, nil
+		}
+		if strings.Contains(strings.Join(command, " "), runnerProcessRunningSentinel) {
+			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+	github := &fakeGitHub{
+		runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+		found:      true,
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+	}
+	activation := make(chan struct{}, 4)
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false), onActivate: func(provider.Instance) { activation <- struct{}{} }}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+	manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true})
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-activation:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatalf("host trust activation %d did not occur", i+1)
+		}
+	}
+	select {
+	case <-activation:
+		cancel()
+		t.Fatal("host trust transport was refreshed again before the lease refresh cadence elapsed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunPoolCancellationDuringLivenessSkipsTransientWarningAndCleansUp(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{
+		runner: gh.Runner{ID: 123, Status: "online"},
+		found:  true,
+	}
+	github.waitFunc = func(_ context.Context, name string, _ time.Duration) (gh.Runner, error) {
+		return gh.Runner{Name: name, ID: 123, Status: "online"}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+		if atomic.LoadInt32(&github.runnerByNameCalls) == 1 {
+			cancel()
+			return gh.Runner{}, false, context.Canceled
+		}
+		return gh.Runner{Name: name, ID: 123, Status: "online"}, true, nil
+	}
+	manager := newRegisteredTestManager(t, provider, github)
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{Directory: manager.Config.Logging.Directory, ManagerSinks: logging.SinkConsole, Stdout: &console, Stderr: &console})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	manager.Logging = runtime
+
+	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, PoolLockHeld: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(console.String(), "runner health is temporarily unknown") {
+		t.Fatalf("shutdown cancellation emitted a transient health warning: %q", console.String())
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got != 1 {
+		t.Fatalf("provider cleanup calls = %d, want 1", got)
+	}
+	if !strings.Contains(console.String(), "Cleanup complete. EPAR can now exit safely") {
+		t.Fatalf("shutdown cancellation did not complete exact cleanup: %q", console.String())
 	}
 }
 
@@ -1087,6 +1184,190 @@ func TestProvisioningRecordsPartialCreateIdentityBeforeExactRollback(t *testing.
 	if record.ProviderID != partial.ProviderID || record.Phase != poolstate.PhaseTombstoned {
 		t.Fatalf("lifecycle record = %#v, want exact provider identity tombstoned", record)
 	}
+}
+
+func TestHostTrustRuntimeActivationFailsBeforeRegistrationAndRollsBack(t *testing.T) {
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{}
+	activator := &activatingLifecycle{
+		Lifecycle: provider.AdaptLegacy(fake, false),
+		err:       errors.New("relay proof failed"),
+	}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Lifecycle = activator
+	manager.AllowInsufficientStorage = true
+
+	if _, err := manager.provisionOne(context.Background(), "epar-test-activation", true, false); err == nil || !strings.Contains(err.Error(), "relay proof failed") {
+		t.Fatalf("provisionOne() error = %v, want relay proof failure", err)
+	}
+	if activator.calls != 1 {
+		t.Fatalf("activation calls = %d, want 1", activator.calls)
+	}
+	if got := atomic.LoadInt32(&github.registrationCalls); got != 0 {
+		t.Fatalf("registration token calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("exact rollback delete calls = %d, want 1", got)
+	}
+}
+
+func TestControllerRestartReactivatesExistingHostTrustRuntimesBeforeUse(t *testing.T) {
+	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	marker, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{
+		{Name: "runner-b", ProviderID: "fake:runner-b", State: "running"},
+		{Name: "runner-a", ProviderID: "fake:runner-a", State: "running"},
+	}}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Join(command, " ") == "cat "+hostTrustMarkerGuest {
+			return provider.ExecResult{Stdout: string(marker)}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
+	manager := newRegisteredTestManager(t, fake, &fakeGitHub{})
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+	active := map[string]ProvisionedInstance{
+		"runner-b": {Name: "runner-b", HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady},
+		"runner-a": {Name: "runner-a", HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady},
+	}
+
+	if _, err := manager.prepareExistingHostTrustRuntimes(context.Background(), active, false); err != nil {
+		t.Fatal(err)
+	}
+	if activator.calls != 2 {
+		t.Fatalf("activation calls = %d, want one per kept instance", activator.calls)
+	}
+	if got := []string{activator.instances[0].ProviderID, activator.instances[1].ProviderID}; !reflect.DeepEqual(got, []string{"fake:runner-a", "fake:runner-b"}) {
+		t.Fatalf("reactivated provider identities = %v, want deterministic exact instances", got)
+	}
+	if active["runner-a"].HostTrustGeneration != "g1" || active["runner-b"].HostTrustGeneration != "g1" {
+		t.Fatalf("restored generations = %q/%q, want g1/g1", active["runner-a"].HostTrustGeneration, active["runner-b"].HostTrustGeneration)
+	}
+}
+
+func TestControllerRestartFailsClosedWhenExistingHostTrustRuntimeCannotReactivate(t *testing.T) {
+	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	marker, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-a", ProviderID: "fake:runner-a", State: "running"}}}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Join(command, " ") == "cat "+hostTrustMarkerGuest {
+			return provider.ExecResult{Stdout: string(marker)}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false), err: errors.New("relay unavailable")}
+	manager := newRegisteredTestManager(t, fake, &fakeGitHub{})
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+
+	_, err = manager.prepareExistingHostTrustRuntimes(context.Background(), map[string]ProvisionedInstance{"runner-a": {Name: "runner-a", HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}, false)
+	if err == nil || !strings.Contains(err.Error(), "relay unavailable") {
+		t.Fatalf("reactivation error = %v, want relay failure", err)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("existing instance delete calls = %d, want fail-closed preservation", got)
+	}
+}
+
+func TestControllerRestartDoesNotTouchUnownedOrQuarantinedSandbox(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-unowned", ProviderID: "foreign", State: "running"}}}
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
+	manager := newRegisteredTestManager(t, fake, &fakeGitHub{})
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
+		t.Fatal("host trust was resolved for an ineligible sandbox")
+		return hosttrust.Snapshot{}, nil
+	}
+
+	if generation, err := manager.prepareExistingHostTrustRuntimes(context.Background(), map[string]ProvisionedInstance{
+		"epar-test-unowned": {Name: "epar-test-unowned", ProviderID: "foreign", ProviderOwned: false, Phase: LifecycleQuarantined},
+	}, true); err != nil || generation != "" {
+		t.Fatalf("prepareExistingHostTrustRuntimes() = %q, %v; want no-op", generation, err)
+	}
+	if activator.calls != 0 || atomic.LoadInt32(&fake.execCalls) != 0 {
+		t.Fatalf("unowned sandbox mutations = activations %d guest execs %d, want zero", activator.calls, fake.execCalls)
+	}
+}
+
+func TestRunPoolControllerRestartFencesRebindsAndLeasesExistingRunner(t *testing.T) {
+	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	marker, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "epar-test-existing"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var order []string
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "fake:" + name, State: "running"}}}
+	fake.execFunc = func(_ context.Context, _ string, command []string, options provider.ExecOptions) (provider.ExecResult, error) {
+		text := strings.Join(command, " ")
+		switch {
+		case text == "cat "+hostTrustMarkerGuest:
+			order = append(order, "marker")
+			return provider.ExecResult{Stdout: string(marker)}, nil
+		case strings.Contains(text, "rm -f") && strings.Contains(text, hostTrustLeaseGuest) && options.Stdin == "":
+			order = append(order, "fence")
+		case strings.Contains(options.Stdin, `"expiresAt"`):
+			order = append(order, "lease")
+			cancel()
+		case strings.Contains(text, "/opt/epar/validate-runtime.sh"):
+			order = append(order, "verify")
+		}
+		return provider.ExecResult{}, nil
+	}
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false), onActivate: func(provider.Instance) { order = append(order, "activate") }}
+	github := &fakeGitHub{
+		runner:      gh.Runner{Name: name, ID: 42, Status: "online"},
+		found:       true,
+		listRunners: []gh.Runner{{Name: name, ID: 42, Status: "online"}},
+	}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+
+	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, PoolLockHeld: true, HostTrustLockHeld: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := order, []string{"fence", "marker", "activate", "verify", "marker", "lease"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("restart preparation order = %v, want %v", got, want)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("existing runner delete calls = %d, want zero", got)
+	}
+}
+
+type activatingLifecycle struct {
+	provider.Lifecycle
+	calls      int
+	err        error
+	instances  []provider.Instance
+	onActivate func(provider.Instance)
+}
+
+func (l *activatingLifecycle) ActivateHostTrustRuntime(_ context.Context, instance provider.Instance) error {
+	l.calls++
+	l.instances = append(l.instances, instance)
+	if l.onActivate != nil {
+		l.onActivate(instance)
+	}
+	return l.err
 }
 
 type partialCreateLifecycle struct {
@@ -1653,9 +1934,11 @@ type fakeGitHub struct {
 	listErr             error
 	listFunc            func(context.Context) ([]gh.Runner, error)
 	registrationErr     error
+	registrationFunc    func(context.Context) (gh.RegistrationToken, error)
 	registrationToken   string
 	policyResult        gh.RunnerGroupPolicyResult
 	policyErr           error
+	policyFunc          func(context.Context, string, config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error)
 	policyCalls         int32
 	registrationCalls   int32
 	deleteCalls         int32
@@ -1669,13 +1952,19 @@ func (g *fakeGitHub) OrganizationURL() string {
 	return "https://github.test/example"
 }
 
-func (g *fakeGitHub) EvaluateRunnerGroupPolicy(context.Context, string, config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error) {
+func (g *fakeGitHub) EvaluateRunnerGroupPolicy(ctx context.Context, group string, policy config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error) {
 	atomic.AddInt32(&g.policyCalls, 1)
+	if g.policyFunc != nil {
+		return g.policyFunc(ctx, group, policy)
+	}
 	return g.policyResult, g.policyErr
 }
 
-func (g *fakeGitHub) RegistrationToken(context.Context) (gh.RegistrationToken, error) {
+func (g *fakeGitHub) RegistrationToken(ctx context.Context) (gh.RegistrationToken, error) {
 	atomic.AddInt32(&g.registrationCalls, 1)
+	if g.registrationFunc != nil {
+		return g.registrationFunc(ctx)
+	}
 	token := g.registrationToken
 	if token == "" {
 		token = "token"
