@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,13 +151,14 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 		return hosttrust.Snapshot{}, nil
 	}
 
-	fake := &fakeStarterManager{}
+	fake := &lockingFakeStarterManager{fakeStarterManager: &fakeStarterManager{}}
 	var out bytes.Buffer
 	err := runStartWithOptions(startOptions{
-		Context:     context.Background(),
-		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\n\n\n"),
-		Out:         &out,
+		Context:             context.Background(),
+		ProjectRoot:         dir,
+		ExternalOutageRetry: "continuous",
+		In:                  strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\n\n\n"),
+		Out:                 &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
 				t.Fatalf("config path = %q", path)
@@ -178,6 +180,9 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
+	}
+	if fake.externalOutagePolicy.IsOff() {
+		t.Fatal("external outage retry was not activated after the wizard created the config")
 	}
 }
 
@@ -367,6 +372,58 @@ func TestStartRejectsNonPositiveInstancesOverride(t *testing.T) {
 	}
 }
 
+func TestStartRejectsInvalidExternalOutageRetryBeforeManager(t *testing.T) {
+	for _, value := range []string{"0", "0s", "-1s", "bounded", "later"} {
+		t.Run(value, func(t *testing.T) {
+			err := runStartWithOptions(startOptions{
+				Context:             context.Background(),
+				ProjectRoot:         t.TempDir(),
+				ExternalOutageRetry: value,
+				Out:                 &bytes.Buffer{},
+				ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+					t.Fatal("manager factory ran for an invalid external outage retry policy")
+					return nil, nil
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "external-outage-retry") {
+				t.Fatalf("error = %v, want external-outage-retry validation error", err)
+			}
+		})
+	}
+}
+
+func TestStartConfiguresExternalOutageRetryAfterConfigResolution(t *testing.T) {
+	for _, value := range []string{"continuous", "4h"} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yml")
+			if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			fake := &lockingFakeStarterManager{fakeStarterManager: &fakeStarterManager{}}
+			err := runStartWithOptions(startOptions{
+				Context:             context.Background(),
+				ProjectRoot:         dir,
+				ConfigPath:          configPath,
+				ExternalOutageRetry: value,
+				Out:                 &bytes.Buffer{},
+				ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+					return fake, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fake.externalOutagePolicy.IsOff() {
+				t.Fatalf("policy for %q was not enabled", value)
+			}
+			if got := strings.Join(fake.externalStages, ","); got != "required-image-assurance" {
+				t.Fatalf("external stages = %q, want required-image-assurance", got)
+			}
+		})
+	}
+}
+
 func TestStartPreflightsBeforeImageAndPool(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")
@@ -414,19 +471,80 @@ func TestStartPreflightsBeforeImageAndPool(t *testing.T) {
 	}
 }
 
+func TestExternalOutageRetryAcquiresPoolLockBeforeDurableSupervision(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		policy string
+		want   string
+	}{
+		{policy: "off", want: "preflight,pool-lock,image,pool"},
+		{policy: "continuous", want: "pool-lock,preflight,image,pool"},
+	} {
+		t.Run(test.policy, func(t *testing.T) {
+			fake := &lockingFakeStarterManager{fakeStarterManager: &fakeStarterManager{}}
+			err := runStartWithOptions(startOptions{
+				Context:             context.Background(),
+				ProjectRoot:         dir,
+				ConfigPath:          configPath,
+				Register:            true,
+				ExternalOutageRetry: test.policy,
+				Out:                 &bytes.Buffer{},
+				ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+					return fake, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(fake.calls, ","); got != test.want {
+				t.Fatalf("call order = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 type fakeStarterManager struct {
-	preflightErr error
-	ensureCalls  int
-	runCalls     int
-	runOptions   pool.RunOptions
-	calls        []string
-	allowStorage bool
-	overrideHint string
+	preflightErr         error
+	ensureCalls          int
+	runCalls             int
+	runOptions           pool.RunOptions
+	calls                []string
+	allowStorage         bool
+	overrideHint         string
+	externalOutagePolicy pool.ExternalOutageRetryPolicy
+	externalStages       []string
+}
+
+type lockingFakeStarterManager struct {
+	*fakeStarterManager
+}
+
+type fakeStarterCloser struct{}
+
+func (fakeStarterCloser) Close() error { return nil }
+
+func (m *lockingFakeStarterManager) AcquirePoolControllerLock() (io.Closer, error) {
+	m.calls = append(m.calls, "pool-lock")
+	return fakeStarterCloser{}, nil
 }
 
 func (m *fakeStarterManager) ConfigureStorageAdmissionOverride(allow bool, command string) {
 	m.allowStorage = allow
 	m.overrideHint = command
+}
+
+func (m *fakeStarterManager) ConfigureExternalOutageRetry(policy pool.ExternalOutageRetryPolicy) error {
+	m.externalOutagePolicy = policy
+	return nil
+}
+
+func (m *fakeStarterManager) RunExternalOutageStage(ctx context.Context, stage string, operation func(context.Context) error) error {
+	m.externalStages = append(m.externalStages, stage)
+	return operation(ctx)
 }
 
 func (m *fakeStarterManager) PreflightRunnerGroup(context.Context) error {

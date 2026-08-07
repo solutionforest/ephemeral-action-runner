@@ -6,9 +6,12 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -17,6 +20,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/dependency"
 )
 
 func TestJWTShape(t *testing.T) {
@@ -48,6 +52,146 @@ func TestParseRetryAfter(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPErrorDependencyFailureClassification(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name      string
+		err       *HTTPError
+		retryable bool
+	}{
+		{name: "request timeout", err: &HTTPError{StatusCode: http.StatusRequestTimeout}, retryable: true},
+		{name: "rate limit", err: &HTTPError{StatusCode: http.StatusTooManyRequests}, retryable: true},
+		{name: "server error", err: &HTTPError{StatusCode: http.StatusBadGateway}, retryable: true},
+		{name: "unauthorized", err: &HTTPError{StatusCode: http.StatusUnauthorized}, retryable: false},
+		{name: "ordinary forbidden", err: &HTTPError{StatusCode: http.StatusForbidden}, retryable: false},
+		{name: "rate limited forbidden", err: &HTTPError{StatusCode: http.StatusForbidden, RateLimitKnown: true, RateLimitRemaining: 0}, retryable: true},
+		{name: "reset hinted forbidden", err: &HTTPError{StatusCode: http.StatusForbidden, RateLimitReset: now.Add(time.Minute)}, retryable: true},
+		{name: "retry-after hinted forbidden", err: &HTTPError{StatusCode: http.StatusForbidden, RetryAfter: time.Minute}, retryable: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := test.err.DependencyFailure()
+			if failure == nil || failure.Retryable != test.retryable {
+				t.Fatalf("failure = %+v, retryable = %t, want %t", failure, failure != nil && failure.Retryable, test.retryable)
+			}
+			if got := dependency.IsRetryable(test.err); got != test.retryable {
+				t.Fatalf("dependency.IsRetryable() = %t, want %t", got, test.retryable)
+			}
+		})
+	}
+}
+
+func TestHTTPErrorCarriesStructuredMetadataThroughWrapping(t *testing.T) {
+	client := New(config.GitHubConfig{APIBaseURL: "https://api.github.test"})
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		response := &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header: http.Header{
+				"Retry-After":           []string{"120"},
+				"X-RateLimit-Reset":     []string{fmt.Sprintf("%d", time.Now().Add(5*time.Minute).Unix())},
+				"X-RateLimit-Remaining": []string{"0"},
+				"X-Github-Request-Id":   []string{"req-123"},
+			},
+			Body: io.NopCloser(strings.NewReader(`{"message":"rate limit exceeded"}`)),
+		}
+		return response, nil
+	})}
+	err := client.request(context.Background(), http.MethodGet, "/orgs/example/actions/runners", "", nil, nil)
+	if err == nil {
+		t.Fatal("request() error = nil, want HTTP failure")
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("errors.As(HTTPError) failed: %v", err)
+	}
+	if httpErr.RequestID != "req-123" || httpErr.RateLimitRemaining != 0 || !httpErr.RateLimitKnown || httpErr.RetryAfter != 2*time.Minute {
+		t.Fatalf("HTTP metadata: request=%q remaining=%d known=%t retry=%s reset=%s", httpErr.RequestID, httpErr.RateLimitRemaining, httpErr.RateLimitKnown, httpErr.RetryAfter, httpErr.RateLimitReset)
+	}
+	var failure *dependency.Failure
+	if !errors.As(err, &failure) {
+		t.Fatalf("errors.As(dependency.Failure) failed: %v", err)
+	}
+	if failure.Service != "github" || !strings.Contains(failure.Operation, "GET /orgs/example/actions/runners") || !failure.Retryable || failure.RequestID != "req-123" {
+		t.Fatalf("dependency failure = %+v", failure)
+	}
+	wrapped := fmt.Errorf("list runner groups: %w", err)
+	if !errors.As(wrapped, &failure) || failure.RequestID != "req-123" || !failure.Retryable {
+		t.Fatalf("wrapped dependency failure = %+v", failure)
+	}
+}
+
+func TestGitHubTransportFailureIsTypedAndSingleAttempt(t *testing.T) {
+	client := New(config.GitHubConfig{APIBaseURL: "https://api.github.test"})
+	var calls int
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, &net.DNSError{Err: "temporary DNS failure", IsTemporary: true}
+	})}
+	err := client.request(context.Background(), http.MethodGet, "/orgs/example/actions/runners", "", nil, nil)
+	if calls != 1 {
+		t.Fatalf("transport calls = %d, want one attempt", calls)
+	}
+	var failure *dependency.Failure
+	if !errors.As(err, &failure) || !failure.Retryable || failure.Service != "github" {
+		t.Fatalf("typed transport failure = %+v (err=%v)", failure, err)
+	}
+}
+
+func TestGitHubClientTimeoutIsRetryableButCallerDeadlineIsTerminal(t *testing.T) {
+	client := New(config.GitHubConfig{APIBaseURL: "https://api.github.test"})
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: http.MethodGet, URL: "https://api.github.test", Err: context.DeadlineExceeded}
+	})}
+	err := client.request(context.Background(), http.MethodGet, "/timeout", "", nil, nil)
+	var failure *dependency.Failure
+	if !errors.As(err, &failure) || !failure.Retryable {
+		t.Fatalf("client timeout failure = %+v (err=%v), want retryable", failure, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	defer cancel()
+	err = client.request(ctx, http.MethodGet, "/timeout", "", nil, nil)
+	failure = nil
+	if errors.As(err, &failure) && failure.Retryable {
+		t.Fatalf("caller deadline failure = %+v, want terminal", failure)
+	}
+}
+
+func TestListRunnersAbortsPaginationOnFirstTransientFailure(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{AppID: 123, Organization: "example", PrivateKeyPath: keyPath, APIBaseURL: "https://api.github.test"})
+	var listCalls int
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			return response(http.StatusOK, `{"id":42}`), nil
+		case "/app/installations/42/access_tokens":
+			return response(http.StatusOK, `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`), nil
+		case "/orgs/example/actions/runners":
+			listCalls++
+			return response(http.StatusServiceUnavailable, `{"message":"temporarily unavailable"}`), nil
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+	_, err := client.ListRunners(context.Background())
+	if err == nil || listCalls != 1 {
+		t.Fatalf("ListRunners() err=%v listCalls=%d, want one transient attempt", err, listCalls)
+	}
+	var failure *dependency.Failure
+	if !errors.As(err, &failure) || !failure.Retryable {
+		t.Fatalf("ListRunners() failure = %+v", failure)
+	}
+	_, err = client.WaitRunnerOnline(context.Background(), "epar-test-1", time.Second)
+	if err == nil || listCalls != 2 {
+		t.Fatalf("WaitRunnerOnline() err=%v listCalls=%d, want one list attempt", err, listCalls)
+	}
+}
+
+func response(status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 }
 
 func TestListRunnersUsesInstallationToken(t *testing.T) {

@@ -20,7 +20,7 @@ Create a shortcut that launches the wrapper through Windows PowerShell:
 
 ```text
 Target: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
-Arguments: -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& './start' --config .local\config.yml"
+Arguments: -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& './start' --config .local\config.yml --external-outage-retry=continuous"
 Start in: D:\path\to\ephemeral-action-runner
 ```
 
@@ -35,7 +35,7 @@ $startup = [Environment]::GetFolderPath("Startup")
 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("$startup\EPAR.lnk")
 $shortcut.TargetPath = $powershell
 $shortcut.WorkingDirectory = $root
-$shortcut.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& ''./start'' --config .local\config.yml"'
+$shortcut.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& ''./start'' --config .local\config.yml --external-outage-retry=continuous"'
 $shortcut.Save()
 ```
 
@@ -48,7 +48,7 @@ Create a user logon task:
 3. On **Triggers**, add **At log on**. Add a short delay if Docker needs time to start.
 4. On **Actions**, choose **Start a program**.
 5. Set **Program/script** to `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`.
-6. Set **Add arguments** to `-NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& './start' --config .local\config.yml"`.
+6. Set **Add arguments** to `-NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& './start' --config .local\config.yml --external-outage-retry=continuous"`.
 7. Set **Start in** to `D:\path\to\ephemeral-action-runner`.
 
 If the host runtime is tied to the user session, keep the task as a user logon task. A boot-time system task may start too early or without the expected Docker context.
@@ -58,7 +58,7 @@ PowerShell equivalent:
 ```powershell
 $root = "D:\path\to\ephemeral-action-runner"
 $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& ''./start'' --config .local\config.yml"'
+$arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -Command "& ''./start'' --config .local\config.yml --external-outage-retry=continuous"'
 $action = New-ScheduledTaskAction `
   -Execute $powershell `
   -Argument $arguments `
@@ -83,6 +83,7 @@ Unregister-ScheduledTask -TaskName "EPAR" -Confirm:$false
 
 ## Notes
 
+- The autorun examples use `--external-outage-retry=continuous` so a transient GitHub, registry, or runner-download outage pauses the existing controller instead of ending the task. Use a positive duration such as `--external-outage-retry=4h` when the task should eventually fail, but do not combine bounded mode with an unconditional task restart policy because each restart can otherwise obscure the exhausted result. EPAR persists the original bounded incident deadline for the selected config.
 - Stop the foreground EPAR process or scheduled task to trigger normal cleanup.
 - For Docker Container, the host Docker runtime must support privileged Linux containers.
 - For WSL, make sure WSL2 is installed and the configured WSL image has been built or can be built by `start`.

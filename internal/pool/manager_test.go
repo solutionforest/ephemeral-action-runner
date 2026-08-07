@@ -1838,9 +1838,11 @@ type fakeGitHub struct {
 	listErr             error
 	listFunc            func(context.Context) ([]gh.Runner, error)
 	registrationErr     error
+	registrationFunc    func(context.Context) (gh.RegistrationToken, error)
 	registrationToken   string
 	policyResult        gh.RunnerGroupPolicyResult
 	policyErr           error
+	policyFunc          func(context.Context, string, config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error)
 	policyCalls         int32
 	registrationCalls   int32
 	deleteCalls         int32
@@ -1854,13 +1856,19 @@ func (g *fakeGitHub) OrganizationURL() string {
 	return "https://github.test/example"
 }
 
-func (g *fakeGitHub) EvaluateRunnerGroupPolicy(context.Context, string, config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error) {
+func (g *fakeGitHub) EvaluateRunnerGroupPolicy(ctx context.Context, group string, policy config.RunnerGroupSecurityConfig) (gh.RunnerGroupPolicyResult, error) {
 	atomic.AddInt32(&g.policyCalls, 1)
+	if g.policyFunc != nil {
+		return g.policyFunc(ctx, group, policy)
+	}
 	return g.policyResult, g.policyErr
 }
 
-func (g *fakeGitHub) RegistrationToken(context.Context) (gh.RegistrationToken, error) {
+func (g *fakeGitHub) RegistrationToken(ctx context.Context) (gh.RegistrationToken, error) {
 	atomic.AddInt32(&g.registrationCalls, 1)
+	if g.registrationFunc != nil {
+		return g.registrationFunc(ctx)
+	}
 	token := g.registrationToken
 	if token == "" {
 		token = "token"

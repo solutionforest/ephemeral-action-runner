@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/solutionforest/ephemeral-action-runner/internal/dependency"
 )
 
 func TestVerifiedDownloadResumesAndPublishesOnlyLockedContent(t *testing.T) {
@@ -57,6 +59,21 @@ func TestVerifiedDownloadResumesAndPublishesOnlyLockedContent(t *testing.T) {
 	}
 	if _, err := os.Stat(destination + ".partial"); !os.IsNotExist(err) {
 		t.Fatalf("partial download still exists after publication: %v", err)
+	}
+}
+
+func TestVerifiedDownloadReturnsTypedTransientHTTPFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	destination := filepath.Join(t.TempDir(), "asset")
+	err := verifiedDownload(context.Background(), server.Client(), server.URL, destination, strings.Repeat("0", 64), 0o600)
+	if !dependency.IsRetryable(err) {
+		t.Fatalf("HTTP 503 download error was not a typed retryable failure: %v", err)
+	}
+	if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
+		t.Fatalf("failed download published a destination: %v", statErr)
 	}
 }
 

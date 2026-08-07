@@ -30,9 +30,12 @@ func (m *Coordinator) resolveTartOCIReference(ctx context.Context, reference str
 	if err != nil {
 		return "", err
 	}
-	descriptor, err := remote.Get(ref, remote.WithContext(ctx), remote.WithAuth(authenticator), remote.WithTransport(client.Transport))
+	attemptCtx, cancel := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	defer cancel()
+	descriptor, err := remote.Get(ref, remote.WithContext(attemptCtx), remote.WithAuth(authenticator), remote.WithTransport(client.Transport))
 	if err != nil {
-		return "", fmt.Errorf("resolve Tart OCI source %s: %w", reference, err)
+		cause := fmt.Errorf("resolve Tart OCI source %s: %w", reference, err)
+		return "", classifyImageDependencyFailure(ref.Context().RegistryStr(), "resolve Tart OCI source", cause)
 	}
 	digest := descriptor.Digest.String()
 	if !validSHA256(digest) {

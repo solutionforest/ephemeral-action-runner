@@ -21,6 +21,8 @@ The canonical config path owns its lifecycle-state namespace and may have only o
 
 `pool.logDir` is a deprecated compatibility input. If `logging.directory` is absent, EPAR uses it and emits a warning; using both is rejected. `pool.vmPrefix` is an accepted alias for `pool.namePrefix`. `image.profile` and the old `docker-socket` provider are rejected rather than silently migrated.
 
+External-outage supervision is an invocation policy, not YAML. Pass `--external-outage-retry=off`, `--external-outage-retry=continuous`, or a positive Go duration to `start`. EPAR reuses `pool.replacementRetryInitialSeconds`, `pool.replacementRetryMaxSeconds`, `pool.replacementRetryMultiplier`, and `pool.replacementRetryJitterPercent` for its delay curve; no configuration migration or duplicate retry settings are required.
+
 ## Provider matrix
 
 | Provider | Host and artifact model | Image defaults | Provider-only configuration |
@@ -79,7 +81,7 @@ The default update policy checks remotely mutable inputs weekly at 07:00 local t
 | `replacementRetryMultiplier` | number; `2` | All providers. At least `1`. | Backoff multiplier. |
 | `replacementRetryJitterPercent` | integer; `20` | All providers. `0` through `100`. | Randomizes retry delay to avoid synchronized retries. |
 
-GitHub `429` and `5xx` responses and transient network failures back off replacement allocation; a longer `Retry-After` wins. Invalid configuration, authentication failures, and initial startup remain fail-fast after compensating rollback.
+Without `--external-outage-retry`, GitHub `429` and `5xx` responses and transient network failures back off steady-state replacement allocation, while initial startup remains fail-fast after compensating rollback. With the flag enabled, the same delay settings supervise typed transient external failures across startup and replacement; a longer `Retry-After` or rate-limit reset wins in either path. Invalid configuration, authentication, ordinary authorization, and local failures remain terminal.
 
 ### `storage`
 

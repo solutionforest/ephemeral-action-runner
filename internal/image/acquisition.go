@@ -22,7 +22,9 @@ type DockerSourcePullOptions struct {
 }
 
 func (m *Coordinator) PullDockerSource(ctx context.Context, opts DockerSourcePullOptions) error {
-	result, err := PullDockerImage(ctx, DockerPullOptions{
+	attemptCtx, cancelAttempt := boundedImageAttempt(ctx, dockerPullAttemptTimeout)
+	defer cancelAttempt()
+	result, err := PullDockerImage(attemptCtx, DockerPullOptions{
 		Image:            opts.Image,
 		Platform:         opts.Platform,
 		FallbackPlatform: m.Config.Provider.Platform,
@@ -30,7 +32,7 @@ func (m *Coordinator) PullDockerSource(ctx context.Context, opts DockerSourcePul
 	})
 	var enginePullErr *DockerEnginePullError
 	if err != nil && !errors.As(err, &enginePullErr) {
-		return m.pullDockerSourceWithCLI(ctx, opts, err)
+		return m.pullDockerSourceWithCLI(attemptCtx, opts, err)
 	}
 	if opts.AnnounceRemoteSize {
 		if result.RemoteCompressedError != nil {
@@ -43,10 +45,11 @@ func (m *Coordinator) PullDockerSource(ctx context.Context, opts DockerSourcePul
 		m.WriteDockerPullNotice(opts.LogPath, "warning: could not load Docker registry credentials; continuing without explicit credentials: "+sanitizeImageError(result.RegistryAuthError))
 	}
 	if err != nil {
-		return err
+		return classifyImageDependencyFailure("OCI registry", "pull Docker source image", err)
 	}
-	if err := m.renderDockerPullProgress(ctx, result.Response, opts.LogPath); err != nil {
-		return fmt.Errorf("Docker Engine pull %s: %w", opts.Image, err)
+	if err := m.renderDockerPullProgress(attemptCtx, result.Response, opts.LogPath); err != nil {
+		cause := fmt.Errorf("Docker Engine pull %s: %w", opts.Image, err)
+		return classifyImageDependencyFailure("OCI registry", "stream Docker source image", cause)
 	}
 	m.WriteDockerPullNotice(opts.LogPath, "Docker source pull complete: "+opts.Image)
 	return nil
@@ -59,7 +62,8 @@ func (m *Coordinator) pullDockerSourceWithCLI(ctx context.Context, opts DockerSo
 		args = append(args, "--platform", opts.Platform)
 	}
 	args = append(args, opts.Image)
-	return m.runHostLogged(ctx, opts.LogPath, "docker", args...)
+	err := m.runHostLogged(ctx, opts.LogPath, "docker", args...)
+	return classifyImageCommandFailure("OCI registry", "pull Docker source image", err, boundedRedactedLogTail(opts.LogPath, 16*1024), false)
 }
 
 func (m *Coordinator) renderDockerPullProgress(ctx context.Context, response client.ImagePullResponse, logPath string) error {

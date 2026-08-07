@@ -230,8 +230,12 @@ func (m *Coordinator) ensureBuildxBuilder(ctx context.Context, registryReference
 		if journalErr := m.beginDockerRoleAcquisition(backendID, "buildkit-image", buildkitImageReference, previousBuildKitImageID, time.Now().UTC()); journalErr != nil {
 			return fmt.Errorf("journal EPAR BuildKit image acquisition: %w", journalErr)
 		}
-		if pullErr := m.runHost(ctx, "docker", "pull", buildkitImageReference); pullErr != nil {
-			return fmt.Errorf("resolve EPAR BuildKit image %s: %w", buildkitImageReference, pullErr)
+		pullCtx, cancelPull := boundedImageAttempt(ctx, dockerPullAttemptTimeout)
+		pullErr := m.runHost(pullCtx, "docker", "pull", buildkitImageReference)
+		cancelPull()
+		if pullErr != nil {
+			cause := fmt.Errorf("resolve EPAR BuildKit image %s: %w", buildkitImageReference, pullErr)
+			return classifyImageCommandFailure("docker.io", "pull EPAR BuildKit image", cause, "", false)
 		}
 		output, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", buildkitImageReference)
 		if inspectErr != nil {

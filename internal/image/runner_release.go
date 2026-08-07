@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/dependency"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -103,7 +103,9 @@ func actionsRunnerReleaseEndpoint(selector string) string {
 }
 
 func resolveActionsRunnerFromAPI(ctx context.Context, manifest Manifest, selector, architecture string, client *http.Client, endpoint string) (Manifest, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	attemptCtx, cancel := boundedImageAttempt(ctx, imageMetadataAttemptTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return manifest, err
 	}
@@ -126,9 +128,10 @@ func resolveActionsRunnerFromAPI(ctx context.Context, manifest Manifest, selecto
 }
 
 func actionsRunnerReleaseRequestError(selector string, err error) error {
-	failure := &actionsRunnerReleaseFailure{err: fmt.Errorf("resolve GitHub Actions runner %s: %w", selector, err), diagnostic: "request failed"}
-	var networkErr net.Error
-	if errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary()) {
+	cause := fmt.Errorf("resolve GitHub Actions runner %s: %w", selector, err)
+	classified := classifyImageDependencyFailure("github.com", "resolve Actions runner release", cause)
+	failure := &actionsRunnerReleaseFailure{err: classified, diagnostic: "request failed"}
+	if dependency.IsRetryable(classified) {
 		failure.fallbackEligible = true
 		failure.diagnostic = "transient request failure"
 	}
@@ -136,10 +139,11 @@ func actionsRunnerReleaseRequestError(selector string, err error) error {
 }
 
 func actionsRunnerReleaseHTTPError(selector string, response *http.Response) error {
-	fallbackEligible := response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusRequestTimeout || response.StatusCode >= http.StatusInternalServerError
+	cause := fmt.Errorf("resolve GitHub Actions runner %s: GitHub returned HTTP %d", selector, response.StatusCode)
+	classified := classifyImageHTTPFailure("api.github.com", "resolve Actions runner release", response, cause)
 	return &actionsRunnerReleaseFailure{
-		err:              fmt.Errorf("resolve GitHub Actions runner %s: GitHub returned HTTP %d", selector, response.StatusCode),
-		fallbackEligible: fallbackEligible,
+		err:              classified,
+		fallbackEligible: dependency.IsRetryable(classified),
 		diagnostic:       actionsRunnerReleaseHTTPDiagnostic(response),
 	}
 }

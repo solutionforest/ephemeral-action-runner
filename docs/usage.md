@@ -45,6 +45,15 @@ Pass a config path and an instance count through the wrapper:
 ./start --config .local/ci.yml --instances 2
 ```
 
+For an unattended controller that should remain alive through transient external-service outages, opt in explicitly:
+
+```bash
+./start --config .local/ci.yml --external-outage-retry=continuous
+./start --config .local/ci.yml --external-outage-retry=4h
+```
+
+The accepted values are `off`, `continuous`, or a positive Go duration. Omission is `off`, so ordinary interactive starts keep their existing fail-fast startup behavior. The flag applies only to the configured `start` lifecycle; it does not retry the first-run wizard, wrapper controller builds, `pool up`, or maintenance commands.
+
 On Windows PowerShell, backslash paths may be clearer while the command remains the same:
 
 ```powershell

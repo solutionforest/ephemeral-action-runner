@@ -186,6 +186,12 @@ A GitHub 429/5xx response or an `sbx` command timeout makes runner health tempor
 
 `networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
 
+## EPAR exits during a GitHub or registry incident
+
+Plain `./start` intentionally keeps fail-fast startup behavior for a human-attended invocation. For an unattended host, start the configured controller with `--external-outage-retry=continuous` or a bounded duration such as `--external-outage-retry=4h`. Use `./start status --no-github` to inspect the local incident stage, attempt, next retry, and deadline even while GitHub is unavailable.
+
+Only typed transient failures such as HTTP 408, 429, 5xx, rate-limited 403 responses, DNS failures, connection resets/refusals, and timeouts are retried. Correct authentication, ordinary authorization, certificate trust, missing image manifests, storage, local Docker or Sandbox readiness, ownership, configuration, platform, and custom-script failures instead of expecting outage supervision to mask them. EPAR never queries GitHub Status and never silently changes a provider, source image, registry, credential, or trust policy.
+
 ## GitHub Actions runner release resolution reports HTTP 403 or 429
 
 The public `actions/runner` Releases API has a separate unauthenticated rate limit. An EPAR GitHub App installation token is not used for that public repository because it may not have permission to read it. On a 403, 429, timeout, or transient server response, EPAR prints the HTTP status and any safe rate-limit, retry, and request-ID headers, then uses the reviewed exact release in `third_party/actions-runner-release.lock.json`. This is an explicit metadata-only fallback: the selected version must match `image.runnerVersion` when that value is pinned, the expected asset name and canonical GitHub URL are checked, and the downloaded package must still match the lock's SHA-256 before it is installed.

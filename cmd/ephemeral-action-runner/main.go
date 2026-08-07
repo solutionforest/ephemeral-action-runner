@@ -425,10 +425,12 @@ func runStatus(args []string) error {
 	}
 	defer m.Close()
 	status, err := m.Status(context.Background())
+	if status != "" {
+		fmt.Print(status)
+	}
 	if err != nil {
 		return err
 	}
-	fmt.Print(status)
 	return nil
 }
 
