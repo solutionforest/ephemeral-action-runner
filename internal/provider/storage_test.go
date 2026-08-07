@@ -220,12 +220,16 @@ func TestFilesystemStoragePublishesUnknownCapacityAndGroupsOnlyMatchingLocators(
 func TestFilesystemStorageRetainsKnownDomainWhenAnotherProbeFails(t *testing.T) {
 	knownRoot := t.TempDir()
 	unknownRoot := t.TempDir()
+	canonicalUnknownRoot, err := nearestExistingDirectory(unknownRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	contribution := NewMultiFilesystemStorage("example", []StorageRoot{
 		{ID: "known", Role: storage.StorageRoleProject, Path: knownRoot},
 		{ID: "unknown", Role: storage.StorageRoleDockerEngine, Path: unknownRoot},
 	}).(*filesystemStorage)
 	contribution.domainProbe = func(path string, now time.Time) (storage.CapacityDomain, error) {
-		if path == unknownRoot {
+		if path == canonicalUnknownRoot {
 			return storage.CapacityDomain{}, errors.New("statfs denied")
 		}
 		return storage.CapacityDomain{ID: "known-domain", Kind: storage.SurfaceHostFilesystem, Identity: "known-domain", Path: path, Capacity: storage.Capacity{Known: true, TotalBytes: 100 * storage.GiB, AvailableBytes: 80 * storage.GiB, ObservedAt: now}}, nil
