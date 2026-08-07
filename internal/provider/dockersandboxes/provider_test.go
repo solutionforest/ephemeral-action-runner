@@ -873,6 +873,43 @@ func TestInventoryParsesWrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
 	}
 }
 
+func TestInventoryRetriesOneInvalidMachineReadableResponse(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: "Starting sandboxd daemon..."}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+	)
+	items, err := p.Inventory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Instance.ProviderID != testID {
+		t.Fatalf("retried inventory = %#v, want exact fixture identity", items)
+	}
+	done()
+}
+
+func TestInventoryFailsClosedAfterSecondInvalidMachineReadableResponse(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: "Starting sandboxd daemon..."}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"items":[]}`}},
+	)
+	if _, err := p.Inventory(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported json schema") {
+		t.Fatalf("persistent invalid inventory output was accepted: %v", err)
+	}
+	done()
+}
+
+func TestInventoryDoesNotRetryCommandFailure(t *testing.T) {
+	expected := errors.New("sandboxd unavailable")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, err: expected},
+	)
+	if _, err := p.Inventory(context.Background()); !errors.Is(err, expected) {
+		t.Fatalf("Inventory() error = %v, want command failure", err)
+	}
+	done()
+}
+
 func TestLifecycleCommandsUseExactIdentityAndArgv(t *testing.T) {
 	t.Run("start", func(t *testing.T) {
 		p, done := identityScript(t, commandStep{args: []string{"exec", "-i", testName, "--", "/bin/sleep", "infinity"}})

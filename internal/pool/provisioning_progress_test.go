@@ -69,6 +69,9 @@ func TestDockerSandboxesCreateProgressUsesOneInteractiveLine(t *testing.T) {
 	if !strings.Contains(output, "Docker Sandboxes instance preparation complete") {
 		t.Fatalf("interactive progress omitted completion: %q", output)
 	}
+	if !strings.Contains(output, "\r\033[2K\n") {
+		t.Fatalf("interactive progress did not terminate the cleared heartbeat line before completion: %q", output)
+	}
 }
 
 func TestDockerSandboxesCreateProgressUsesOneInteractiveLineWhenTranscriptsUseConsole(t *testing.T) {

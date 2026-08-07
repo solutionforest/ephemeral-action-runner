@@ -837,16 +837,24 @@ func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, err
 }
 
 func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryItem, error) {
-	result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes"})
-	if err != nil {
-		return nil, err
+	for attempt := 1; attempt <= 2; attempt++ {
+		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes"})
+		if err != nil {
+			return nil, err
+		}
+		items, parseErr := parseInventory([]byte(result.Stdout))
+		if parseErr == nil {
+			p.reconcileRelayTokens(items)
+			return items, nil
+		}
+		if attempt == 2 {
+			return nil, parseErr
+		}
+		if p.logger != nil {
+			p.logger.Debug("Docker Sandboxes inventory returned invalid machine-readable output; retrying once", "provider", "docker-sandboxes", "stdoutBytes", len(result.Stdout))
+		}
 	}
-	items, err := parseInventory([]byte(result.Stdout))
-	if err != nil {
-		return nil, err
-	}
-	p.reconcileRelayTokens(items)
-	return items, nil
+	return nil, fmt.Errorf("inventory docker sandboxes did not complete")
 }
 
 // CachedTemplates returns the strictly parsed, host-level Docker Sandboxes

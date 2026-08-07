@@ -56,7 +56,7 @@ func (m *Manager) runDockerSandboxesCreateProgress(instance string, operation fu
 	heartbeat.Wait()
 	elapsed := time.Since(startedAt).Round(time.Second)
 	if interactive && interactiveRendered {
-		_, _ = fmt.Fprint(dockerPullProgressConsole, "\r\033[2K")
+		_, _ = fmt.Fprint(dockerPullProgressConsole, "\r\033[2K\n")
 	}
 	if err != nil {
 		m.logger().Warn(label+" failed", append(attributes, "elapsed", elapsed)...)

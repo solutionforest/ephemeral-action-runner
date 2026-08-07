@@ -389,6 +389,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	nextLivenessCheck := time.Now().Add(opts.MonitorInterval)
 	nextRetention := time.Now().Add(time.Duration(m.Config.Logging.RetentionIntervalMinutes) * time.Minute)
 	nextHostTrustCollection := time.Time{}
+	nextHostTrustReconciliation := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
 	hostTrustBusyHandoff := make(map[string]bool)
 	confirmedInactiveChecks := make(map[string]int)
@@ -455,8 +456,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			trustRetired := 0
 			trustCapacityReady := true
+			hostTrustReconciled := false
 			if m.hostTrustEnabled() {
-				now := time.Now()
+				now := m.currentTime()
 				if currentHostTrust.Generation == "" || !now.Before(nextHostTrustCollection) {
 					current, err := m.resolveHostTrust(ctx)
 					nextHostTrustCollection = now.Add(m.hostTrustCollectionInterval())
@@ -472,6 +474,8 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							currentHostTrust = current
 							if !dependencyCooldown {
 								trustRetired += m.reconcileHostTrustRunners(ctx, active, current, hostTrustBusyHandoff)
+								hostTrustReconciled = true
+								nextHostTrustReconciliation = m.currentTime().Add(hostTrustRefreshInterval)
 							}
 							m.infof("host trust generation changed (%s -> %s); building replacement image\n", emptyDash(poolTrustGeneration), current.Generation)
 							ready = false
@@ -518,8 +522,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 					}
 				}
-				if currentHostTrust.Generation != "" && !dependencyCooldown {
+				if currentHostTrust.Generation != "" && !dependencyCooldown && !hostTrustReconciled && (nextHostTrustReconciliation.IsZero() || !m.currentTime().Before(nextHostTrustReconciliation)) {
 					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust, hostTrustBusyHandoff)
+					nextHostTrustReconciliation = m.currentTime().Add(hostTrustRefreshInterval)
 				}
 			}
 			if dependencyCooldown {
@@ -535,6 +540,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				for name, vm := range active {
 					alive, reason, err := m.runnerAlive(ctx, vm)
 					if err != nil {
+						if ctx.Err() != nil {
+							return cleanup()
+						}
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
 						m.warnf("[%s] runner health is temporarily unknown; keeping the runner and retrying: %v\n", name, err)
 						continue

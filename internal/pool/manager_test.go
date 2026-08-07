@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -543,6 +544,101 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&imageEnsures); got == 0 {
 		t.Fatal("G2 replacement image was not ensured")
+	}
+}
+
+func TestRunPoolRefreshesHostTrustTransportOnLeaseCadence(t *testing.T) {
+	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	marker, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Join(command, " ") == "cat "+hostTrustMarkerGuest {
+			return provider.ExecResult{Stdout: string(marker)}, nil
+		}
+		if strings.Contains(strings.Join(command, " "), runnerProcessRunningSentinel) {
+			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+	github := &fakeGitHub{
+		runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+		found:      true,
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+	}
+	activation := make(chan struct{}, 4)
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false), onActivate: func(provider.Instance) { activation <- struct{}{} }}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+	manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true})
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-activation:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatalf("host trust activation %d did not occur", i+1)
+		}
+	}
+	select {
+	case <-activation:
+		cancel()
+		t.Fatal("host trust transport was refreshed again before the lease refresh cadence elapsed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunPoolCancellationDuringLivenessSkipsTransientWarningAndCleansUp(t *testing.T) {
+	provider := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{
+		runner: gh.Runner{ID: 123, Status: "online"},
+		found:  true,
+	}
+	github.waitFunc = func(_ context.Context, name string, _ time.Duration) (gh.Runner, error) {
+		return gh.Runner{Name: name, ID: 123, Status: "online"}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+		if atomic.LoadInt32(&github.runnerByNameCalls) == 1 {
+			cancel()
+			return gh.Runner{}, false, context.Canceled
+		}
+		return gh.Runner{Name: name, ID: 123, Status: "online"}, true, nil
+	}
+	manager := newRegisteredTestManager(t, provider, github)
+	var console bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{Directory: manager.Config.Logging.Directory, ManagerSinks: logging.SinkConsole, Stdout: &console, Stderr: &console})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	manager.Logging = runtime
+
+	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, PoolLockHeld: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(console.String(), "runner health is temporarily unknown") {
+		t.Fatalf("shutdown cancellation emitted a transient health warning: %q", console.String())
+	}
+	if got := atomic.LoadInt32(&provider.deleteCalls); got != 1 {
+		t.Fatalf("provider cleanup calls = %d, want 1", got)
+	}
+	if !strings.Contains(console.String(), "Cleanup complete. EPAR can now exit safely") {
+		t.Fatalf("shutdown cancellation did not complete exact cleanup: %q", console.String())
 	}
 }
 
