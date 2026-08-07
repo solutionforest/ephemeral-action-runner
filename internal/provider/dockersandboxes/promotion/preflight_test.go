@@ -12,6 +12,28 @@ import (
 	sandboxpolicy "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/policy"
 )
 
+func TestSandboxCommandEnvironmentStripsHostSSHAgentAndSandboxOverrides(t *testing.T) {
+	t.Setenv("DOCKER_SANDBOXES_TEST_OVERRIDE", "should-not-reach-sbx")
+	t.Setenv("ssh_auth_sock", "/tmp/host-agent.sock")
+	t.Setenv("SSH_AUTH_SOCK_GATEWAY", "gateway.example.test:3129")
+	t.Setenv("SSH_AGENT_PID", "4242")
+	t.Setenv("EPAR_TEST_SANDBOX_ENV", "retained")
+
+	seen := make(map[string]string)
+	for _, item := range sandboxCommandEnvironment() {
+		key, value, _ := strings.Cut(item, "=")
+		seen[strings.ToUpper(key)] = value
+	}
+	for _, key := range []string{"DOCKER_SANDBOXES_TEST_OVERRIDE", "SSH_AUTH_SOCK", "SSH_AUTH_SOCK_GATEWAY", "SSH_AGENT_PID"} {
+		if _, ok := seen[key]; ok {
+			t.Fatalf("sandbox command environment retained %s", key)
+		}
+	}
+	if seen["EPAR_TEST_SANDBOX_ENV"] != "retained" {
+		t.Fatalf("sandbox command environment dropped unrelated environment: %#v", seen)
+	}
+}
+
 func TestRunPreflightPassesEveryIndependentGateWithExactReadOnlyArgv(t *testing.T) {
 	record, outputs := validPreflightFixture(t)
 	var commands [][]string

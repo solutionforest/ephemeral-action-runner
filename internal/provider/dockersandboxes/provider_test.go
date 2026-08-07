@@ -240,6 +240,57 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 	done()
 }
 
+func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T) {
+	const daemonFailure = "500 Internal Server Error: failed to run sandbox container"
+	cause := errors.New("exit status 1")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: daemonFailure}, err: cause},
+	)
+	_, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil {
+		t.Fatal("Create unexpectedly succeeded after the known sandbox-container failure")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("Create error = %v, want original command error to remain wrapped", err)
+	}
+	for _, expected := range []string{
+		sandboxContainerFailureSignature,
+		"EPAR removes SSH-agent variables when its commands start a stopped daemon",
+		"EPAR will not stop or restart a running shared daemon",
+		"Coordinate with every process using that daemon",
+		"sbx daemon stop",
+		"env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach",
+	} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("Create error = %q, want remediation text %q", err, expected)
+		}
+	}
+	done()
+}
+
+func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
+	cause := errors.New("permission denied")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, err: cause},
+	)
+	_, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || !errors.Is(err, cause) {
+		t.Fatalf("Create error = %v, want original unrelated command error", err)
+	}
+	for _, misleading := range []string{sandboxContainerFailureSignature, "SSH-agent", "sbx daemon stop", "SSH_AUTH_SOCK"} {
+		if strings.Contains(err.Error(), misleading) {
+			t.Fatalf("unrelated Create error = %q, unexpectedly contains %q", err, misleading)
+		}
+	}
+	done()
+}
+
 func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
@@ -1411,7 +1462,7 @@ func TestCommandBoundaryRejectsInteractiveAndDestructiveGlobalCommands(t *testin
 			t.Fatalf("non-exact Docker Sandboxes published-port inspection was accepted: %q", arguments)
 		}
 	}
-	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
+	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop"}, {"daemon", "stop", "--detach"}, {"daemon", "restart"}, {"daemon", "restart", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
 		if err := validateCommandRequest(commandRequest{args: arguments, operation: "test forbidden daemon command"}); err == nil {
 			t.Fatalf("non-exact Docker Sandboxes daemon command was accepted: %q", arguments)
 		}

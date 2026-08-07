@@ -129,7 +129,7 @@ Capacity admission accounts for phase-overlapping physical growth on each resolv
 
 ### Symptom
 
-On macOS or Linux, host security asks whether to allow a Docker Sandboxes helper such as `mkfs.ext4`, `mkfs.erofs`, or `containerd-shim-nerdbox-v1`; macOS may say that the helper “is an app downloaded from the Internet.” After a required prompt is denied or blocked, EPAR reports `create docker sandbox failed`, and `sbx` may report `500 Internal Server Error: failed to run sandbox container`. The runner is neither registered nor marked ready.
+On macOS or Linux, host security asks whether to allow a Docker Sandboxes helper such as `mkfs.ext4`, `mkfs.erofs`, or `containerd-shim-nerdbox-v1`; macOS may say that the helper “is an app downloaded from the Internet.” After a required prompt is denied or blocked, EPAR reports `create docker sandbox failed`, and `sbx` may report `500 Internal Server Error: failed to run sandbox container`. The runner is neither registered nor marked ready. That exact signature also causes EPAR to append a conditional SSH-agent daemon hint while preserving the original command error; unrelated create failures are returned without that hint.
 
 ### Diagnosis and remediation
 
@@ -149,14 +149,14 @@ Sandbox creation reaches `verify dedicated docker sandbox staging workspace` and
 
 Docker Sandboxes may forward the host SSH agent when its shared daemon inherits the host's agent environment. EPAR rejects the resulting sandbox because the forwarded socket or gateway could let a workflow use host SSH credentials. This is not evidence that the staging mount is missing or read-only, and deleting only `/run/ssh-agent.sock` is insufficient when the forwarding gateway remains configured.
 
-Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then restart it with all forwarding variables removed and retry EPAR:
+EPAR never stops or restarts a running shared daemon automatically. Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then stop it and restart it with all forwarding variables removed before retrying EPAR:
 
 ```sh
 sbx daemon stop
 env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
 ```
 
-EPAR strips these variables from Docker Sandboxes commands it launches, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
+EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. A stopped daemon can also be started explicitly from the sanitized environment above; EPAR does not mutate a running shared daemon as a recovery action. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
 
 ## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
 

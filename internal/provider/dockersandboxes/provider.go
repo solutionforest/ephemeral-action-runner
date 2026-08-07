@@ -29,6 +29,10 @@ const (
 	keepaliveStartupDelay = 500 * time.Millisecond
 )
 
+const sandboxContainerFailureSignature = "failed to run sandbox container"
+
+const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. EPAR will not stop or restart a running shared daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
+
 const directWorkspaceVerificationScript = `set -euo pipefail
 if test -n "${SSH_AUTH_SOCK:-}" || test -n "${SSH_AUTH_SOCK_GATEWAY:-}" || test -n "${SSH_AGENT_PID:-}" || test -e /run/ssh-agent.sock || test -L /run/ssh-agent.sock; then
   echo "Docker Sandboxes exposed host SSH-agent forwarding; stop the daemon and restart it with SSH_AUTH_SOCK, SSH_AUTH_SOCK_GATEWAY, and SSH_AGENT_PID unset" >&2
@@ -250,7 +254,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		environment["DOCKER_SANDBOXES_DOCKER_SIZE"] = request.DockerDisk
 	}
 	if _, err := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox"}); err != nil {
-		return provider.Instance{}, err
+		return provider.Instance{}, withSandboxContainerFailureRemediation(err)
 	}
 	items, err = p.inventoryVerified(ctx)
 	if err != nil {
@@ -298,6 +302,13 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		}
 	}
 	return provider.Instance{}, fmt.Errorf("docker sandbox was not present in inventory after create")
+}
+
+func withSandboxContainerFailureRemediation(err error) error {
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), sandboxContainerFailureSignature) {
+		return err
+	}
+	return fmt.Errorf("%w; %s", err, sandboxContainerFailureRemediation)
 }
 
 func (p *Provider) logArchitectureCapability(instanceName string, emulation architectureEmulationResult) {
