@@ -230,7 +230,7 @@ func runImage(args []string) error {
 	case "update":
 		fs := flag.NewFlagSet("image update", flag.ExitOnError)
 		common := addCommonFlags(fs)
-		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -257,7 +257,7 @@ func runImage(args []string) error {
 	case "update-upstream":
 		fs := flag.NewFlagSet("image update-upstream", flag.ExitOnError)
 		common := addCommonFlags(fs)
-		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -282,7 +282,7 @@ func runImage(args []string) error {
 		replace := fs.Bool("replace", false, "delete an existing output image before building")
 		update := fs.Bool("update-upstream", false, "refresh runner-images before building")
 		skipUpstream := fs.Bool("skip-upstream-check", false, "skip checking the runner-images checkout")
-		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -347,7 +347,7 @@ func runPool(args []string) error {
 		instances := fs.Int("instances", 0, "number of concurrent instances to verify; overrides pool.instances")
 		registerOnly := fs.Bool("register-only", false, "register runners and verify online/idle without dispatching a job")
 		cleanup := fs.Bool("cleanup", false, "clean up verification resources; legacy providers use the configured pool prefix, while Docker Sandboxes uses exact owned records")
-		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -369,7 +369,7 @@ func runPool(args []string) error {
 		keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 		replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 		monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
-		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -579,22 +579,31 @@ func preflightControllerStorage(configPath, projectRoot string, cfg config.Confi
 			Now:           time.Now(),
 		})
 		if err != nil {
-			return fmt.Errorf("provider storage capacity domains cannot be measured before controller bootstrap: %w\n\nInspect the same operation with:\n  %s", err, statusCommand)
+			return fmt.Errorf("resolve provider storage topology before controller bootstrap: %w\n\nInspect the same operation with:\n  %s", err, statusCommand)
 		}
 		evaluation, err := storage.EvaluateOperationPlan(operationPlan, snapshot.Surfaces, snapshot.Domains)
 		if err != nil {
 			return fmt.Errorf("resolve controller bootstrap storage: %w", err)
 		}
 		for _, check := range evaluation.CapacityChecks {
-			if check.Status != storage.CapacityReady {
+			switch check.Status {
+			case storage.CapacityReady:
+				continue
+			case storage.CapacityUnknown:
+				warnControllerUnknownStorage(operationPlan.ID, check, evaluation.Allocations, statusCommand)
+				continue
+			case storage.CapacityInsufficient:
 				return operationCapacityAdmissionError("initialize the EPAR controller", snapshot.Domains, check, cfg.Provider.Type, pruneCommand)
+			default:
+				return fmt.Errorf("controller storage capacity check returned unsupported status %q", check.Status)
 			}
 		}
 		return nil
 	}
 	domain, err := storage.ProbeFilesystemCapacityDomain(projectRoot, time.Now())
 	if err != nil {
-		return fmt.Errorf("controller storage capacity domain %q cannot be measured before bootstrap: %w\n\nInspect the same operation with:\n  %s", projectRoot, err, statusCommand)
+		fmt.Fprintf(os.Stderr, "\n*** STORAGE CAPACITY UNKNOWN ***\noperation=%s domain=project roles=%s estimatedBytes=0 requiredBytes=%d reason=%v\nEPAR will continue because capacity could not be measured. Confirmed insufficient capacity remains enforced.\n\nInspect the same operation with:\n  %s\n\n", operationPlan.ID, storage.StorageRoleProject, operationPlan.MinimumFreeBytes, err, statusCommand)
+		return nil
 	}
 	domain.ID = "project-domain"
 	surface := storage.Surface{ID: "project", Provider: cfg.Provider.Type, Role: storage.StorageRoleProject, Kind: storage.SurfaceHostFilesystem, DomainID: domain.ID, Path: projectRoot, Location: projectRoot, Provenance: domain.Provenance, Confidence: domain.Confidence, AdmissionAuthoritative: true, Capacity: domain.Capacity}
@@ -603,11 +612,46 @@ func preflightControllerStorage(configPath, projectRoot string, cfg config.Confi
 		return fmt.Errorf("evaluate controller storage capacity: %w", err)
 	}
 	for _, check := range evaluation.CapacityChecks {
-		if check.Status != storage.CapacityReady {
+		switch check.Status {
+		case storage.CapacityReady:
+			continue
+		case storage.CapacityUnknown:
+			warnControllerUnknownStorage(operationPlan.ID, check, evaluation.Allocations, statusCommand)
+			continue
+		case storage.CapacityInsufficient:
 			return operationCapacityAdmissionError("initialize the EPAR controller", []storage.CapacityDomain{domain}, check, cfg.Provider.Type, pruneCommand)
+		default:
+			return fmt.Errorf("controller storage capacity check returned unsupported status %q", check.Status)
 		}
 	}
 	return nil
+}
+
+func warnControllerUnknownStorage(operation string, check storage.CapacityCheck, allocations []storage.ResolvedAllocation, statusCommand string) {
+	domainID := check.Requirement.SurfaceID
+	if check.DomainRequirement != nil {
+		domainID = check.DomainRequirement.DomainID
+	}
+	roles := make([]string, 0)
+	seen := make(map[storage.StorageRole]struct{})
+	for _, allocation := range allocations {
+		if allocation.DomainID != domainID || allocation.Role == "" {
+			continue
+		}
+		if _, exists := seen[allocation.Role]; exists {
+			continue
+		}
+		seen[allocation.Role] = struct{}{}
+		roles = append(roles, string(allocation.Role))
+	}
+	if len(roles) == 0 {
+		roles = append(roles, "unknown")
+	}
+	estimatedBytes := check.Requirement.PeakBytes
+	if check.DomainRequirement != nil {
+		estimatedBytes = check.DomainRequirement.PeakBytes
+	}
+	fmt.Fprintf(os.Stderr, "\n*** STORAGE CAPACITY UNKNOWN ***\noperation=%s domain=%s roles=%s estimatedBytes=%d requiredBytes=%d reason=%s\nEPAR will continue because capacity could not be measured. Confirmed insufficient capacity remains enforced.\n\nInspect the same operation with:\n  %s\n\n", operation, domainID, strings.Join(roles, ","), estimatedBytes, check.RequiredAvailableBytes, check.Reason, statusCommand)
 }
 
 func operationCapacityAdmissionError(action string, domains []storage.CapacityDomain, check storage.CapacityCheck, providerType, pruneCommand string) error {

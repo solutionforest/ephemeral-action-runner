@@ -84,7 +84,7 @@ func runStart(args []string) error {
 	keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 	replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 	monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
-	allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation after storage-only admission warnings")
+	allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 	externalOutageRetry := fs.String("external-outage-retry", "off", "retry transient external outages: off, continuous, or a positive duration")
 	if err := fs.Parse(args); err != nil {
 		return err

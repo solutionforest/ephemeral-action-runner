@@ -19,6 +19,13 @@ const (
 	DockerEndpointRemote DockerEndpointClass = "remote"
 )
 
+var (
+	ErrRemoteDockerEndpoint       = errors.New("remote Docker endpoint")
+	ErrUnsupportedDockerTransport = errors.New("unsupported Docker transport")
+	ErrInvalidDockerStorage       = errors.New("invalid Docker storage observation")
+	ErrDockerCapacityUnavailable  = errors.New("Docker capacity path is unavailable")
+)
+
 type DockerInfo struct {
 	DockerRootDir   string     `json:"DockerRootDir"`
 	OperatingSystem string     `json:"OperatingSystem"`
@@ -45,7 +52,7 @@ type DockerDiscoveryOptions struct {
 func ClassifyDockerEndpoint(endpoint string) (DockerEndpointClass, error) {
 	endpoint = strings.TrimSpace(strings.Trim(endpoint, "\""))
 	if endpoint == "" {
-		return "", errors.New("Docker endpoint is unavailable")
+		return "", fmt.Errorf("%w: Docker endpoint is unavailable", ErrInvalidDockerStorage)
 	}
 	lower := strings.ToLower(endpoint)
 	for _, prefix := range []string{"unix://", "npipe://", "fd://"} {
@@ -58,7 +65,7 @@ func ClassifyDockerEndpoint(endpoint string) (DockerEndpointClass, error) {
 			return DockerEndpointRemote, nil
 		}
 	}
-	return "", fmt.Errorf("Docker endpoint %q uses an unsupported transport", endpoint)
+	return "", fmt.Errorf("%w: Docker endpoint %q", ErrUnsupportedDockerTransport, endpoint)
 }
 
 // DiscoverDockerStorage resolves the host-visible backing store for one Docker
@@ -70,29 +77,46 @@ func DiscoverDockerStorage(options DockerDiscoveryOptions) (DockerStorage, error
 		return DockerStorage{}, err
 	}
 	if class == DockerEndpointRemote {
-		return DockerStorage{}, fmt.Errorf("remote Docker endpoint %q has no host-local authoritative capacity path", options.Endpoint)
+		return DockerStorage{}, fmt.Errorf("%w %q has no host-local authoritative capacity path", ErrRemoteDockerEndpoint, options.Endpoint)
 	}
 	result := DockerStorage{Endpoint: options.Endpoint, EndpointClass: class, Desktop: isDockerDesktop(options.Info)}
 	if result.Desktop {
 		root, discoverErr := discoverDesktopRoot(options)
 		if discoverErr != nil {
-			return DockerStorage{}, discoverErr
+			if errors.Is(discoverErr, ErrDockerCapacityUnavailable) {
+				result.Roots = []Resolution{unavailableResolution("engine", root.Path, root.Provenance, discoverErr)}
+				return result, nil
+			}
+			return DockerStorage{}, fmt.Errorf("%w: %v", ErrInvalidDockerStorage, discoverErr)
 		}
 		result.Roots = []Resolution{root}
 		return result, nil
 	}
 	if !isAbs(options.Environment.GOOS, options.Info.DockerRootDir) {
-		return DockerStorage{}, fmt.Errorf("Docker info root %q is not an absolute host path", options.Info.DockerRootDir)
+		return DockerStorage{}, fmt.Errorf("%w: Docker info root %q is not an absolute host path", ErrInvalidDockerStorage, options.Info.DockerRootDir)
+	} else {
+		resolved, resolveErr := resolveObservedDirectory(options, options.Info.DockerRootDir)
+		if resolveErr != nil {
+			result.Roots = append(result.Roots, unavailableResolution("engine", clean(options.Environment.GOOS, options.Info.DockerRootDir), ProvenanceDockerInfo, fmt.Errorf("resolve Docker Engine capacity path: %w", resolveErr)))
+		} else {
+			result.Roots = append(result.Roots, Resolution{ID: "engine", Path: clean(options.Environment.GOOS, options.Info.DockerRootDir), CapacityPath: resolved, Provenance: ProvenanceDockerInfo, Confidence: ConfidenceObserved})
+		}
 	}
-	resolved, err := resolveObservedDirectory(options, options.Info.DockerRootDir)
-	if err != nil {
-		return DockerStorage{}, fmt.Errorf("resolve Docker Engine capacity path: %w", err)
-	}
-	result.Roots = append(result.Roots, Resolution{ID: "engine", Path: clean(options.Environment.GOOS, options.Info.DockerRootDir), CapacityPath: resolved, Provenance: ProvenanceDockerInfo, Confidence: ConfidenceObserved})
 	if containerdImageStoreActive(options.Info) {
 		containerdRoot, rootErr := nativeContainerdRoot(options)
 		if rootErr != nil {
-			return DockerStorage{}, rootErr
+			if errors.Is(rootErr, ErrInvalidDockerStorage) {
+				return DockerStorage{}, rootErr
+			}
+			path := containerdRoot.Path
+			if path == "" {
+				path = "/var/lib/containerd"
+			}
+			provenance := containerdRoot.Provenance
+			if provenance == "" {
+				provenance = ProvenancePlatformDefault
+			}
+			containerdRoot = unavailableResolution("containerd", path, provenance, rootErr)
 		}
 		result.Roots = append(result.Roots, containerdRoot)
 	}
@@ -102,7 +126,7 @@ func DiscoverDockerStorage(options DockerDiscoveryOptions) (DockerStorage, error
 func DiscoverCurrentDockerStorage(ctx context.Context) (DockerStorage, error) {
 	environment, err := CurrentEnvironment()
 	if err != nil {
-		return DockerStorage{}, err
+		return DockerStorage{}, fmt.Errorf("%w: discover local storage environment: %v", ErrInvalidDockerStorage, err)
 	}
 	endpoint := strings.TrimSpace(os.Getenv("DOCKER_HOST"))
 	if endpoint == "" {
@@ -111,7 +135,7 @@ func DiscoverCurrentDockerStorage(ctx context.Context) (DockerStorage, error) {
 			return DockerStorage{}, fmt.Errorf("inspect Docker context endpoint: %w", err)
 		}
 		if err := json.Unmarshal(bytes.TrimSpace(endpointBytes), &endpoint); err != nil {
-			return DockerStorage{}, fmt.Errorf("decode Docker context endpoint: %w", err)
+			return DockerStorage{}, fmt.Errorf("%w: decode Docker context endpoint: %v", ErrInvalidDockerStorage, err)
 		}
 	}
 	classification, err := ClassifyDockerEndpoint(endpoint)
@@ -119,17 +143,31 @@ func DiscoverCurrentDockerStorage(ctx context.Context) (DockerStorage, error) {
 		return DockerStorage{}, err
 	}
 	if classification == DockerEndpointRemote {
-		return DockerStorage{}, fmt.Errorf("remote Docker endpoint %q has no host-local authoritative capacity path", endpoint)
+		return DockerStorage{}, fmt.Errorf("%w %q has no host-local authoritative capacity path", ErrRemoteDockerEndpoint, endpoint)
 	}
 	infoBytes, err := runDocker(ctx, "info", "--format", "{{json .}}")
 	if err != nil {
-		return DockerStorage{}, fmt.Errorf("inspect Docker Engine storage: %w", err)
+		return DockerStorage{}, fmt.Errorf("%w: inspect Docker Engine storage: %v", ErrDockerCapacityUnavailable, err)
 	}
 	var info DockerInfo
 	if err := json.Unmarshal(infoBytes, &info); err != nil {
-		return DockerStorage{}, fmt.Errorf("decode Docker Engine storage: %w", err)
+		return DockerStorage{}, fmt.Errorf("%w: decode Docker Engine storage: %v", ErrInvalidDockerStorage, err)
 	}
 	return DiscoverDockerStorage(DockerDiscoveryOptions{Environment: environment, Endpoint: endpoint, Info: info})
+}
+
+func unavailableResolution(id, path string, provenance Provenance, cause error) Resolution {
+	reason := "capacity path is unavailable"
+	if cause != nil {
+		reason = cause.Error()
+	}
+	return Resolution{
+		ID:                        id,
+		Path:                      path,
+		CapacityUnavailableReason: reason,
+		Provenance:                provenance,
+		Confidence:                ConfidenceUnavailable,
+	}
 }
 
 func runDocker(ctx context.Context, arguments ...string) ([]byte, error) {
@@ -163,11 +201,14 @@ func containerdImageStoreActive(info DockerInfo) bool {
 }
 
 func nativeContainerdRoot(options DockerDiscoveryOptions) (Resolution, error) {
-	if options.Environment.GOOS != "linux" {
-		return Resolution{}, fmt.Errorf("active containerd image store root discovery is unsupported on native %s Docker Engine", options.Environment.GOOS)
-	}
 	root := "/var/lib/containerd"
 	provenance := ProvenancePlatformDefault
+	candidate := func() Resolution {
+		return Resolution{ID: "containerd", Path: root, Provenance: provenance}
+	}
+	if options.Environment.GOOS != "linux" {
+		return candidate(), fmt.Errorf("active containerd image store root discovery is unsupported on native %s Docker Engine", options.Environment.GOOS)
+	}
 	readFile := options.ReadFile
 	if readFile == nil {
 		readFile = os.ReadFile
@@ -175,18 +216,18 @@ func nativeContainerdRoot(options DockerDiscoveryOptions) (Resolution, error) {
 	data, err := readFile("/etc/containerd/config.toml")
 	if err == nil {
 		if configured := parseContainerdRoot(data); configured != "" {
-			if !isAbs("linux", configured) {
-				return Resolution{}, fmt.Errorf("containerd root %q is not absolute", configured)
-			}
 			root = clean("linux", configured)
 			provenance = ProvenanceContainerdConfig
+			if !isAbs("linux", configured) {
+				return candidate(), fmt.Errorf("%w: containerd root %q is not absolute", ErrInvalidDockerStorage, configured)
+			}
 		}
 	} else if !os.IsNotExist(err) {
-		return Resolution{}, fmt.Errorf("read containerd configuration: %w", err)
+		return candidate(), fmt.Errorf("read containerd configuration: %w", err)
 	}
 	resolved, err := resolveObservedDirectory(options, root)
 	if err != nil {
-		return Resolution{}, fmt.Errorf("resolve containerd capacity path: %w", err)
+		return candidate(), fmt.Errorf("resolve containerd capacity path: %w", err)
 	}
 	return Resolution{ID: "containerd", Path: root, CapacityPath: resolved, Provenance: provenance, Confidence: ConfidenceDerived}, nil
 }
@@ -259,7 +300,7 @@ func discoverDesktopRoot(options DockerDiscoveryOptions) (Resolution, error) {
 				if os.IsNotExist(statErr) {
 					continue
 				}
-				return Resolution{}, fmt.Errorf("inspect Docker Desktop settings path %s: %w", value, statErr)
+				return Resolution{ID: "engine", Path: clean(options.Environment.GOOS, value), Provenance: ProvenanceDocumentedSettings}, fmt.Errorf("%w: inspect Docker Desktop settings path %s: %v", ErrDockerCapacityUnavailable, value, statErr)
 			}
 			if !info.IsDir() {
 				if isDesktopDisk(options.Environment.GOOS, value) {
@@ -273,7 +314,7 @@ func discoverDesktopRoot(options DockerDiscoveryOptions) (Resolution, error) {
 					if os.IsNotExist(candidateErr) {
 						continue
 					}
-					return Resolution{}, fmt.Errorf("inspect Docker Desktop settings disk %s: %w", candidate, candidateErr)
+					return Resolution{ID: "engine", Path: clean(options.Environment.GOOS, candidate), Provenance: ProvenanceDocumentedSettings}, fmt.Errorf("%w: inspect Docker Desktop settings disk %s: %v", ErrDockerCapacityUnavailable, candidate, candidateErr)
 				}
 				if !candidateInfo.IsDir() {
 					addDesktopDiskCandidate(candidates, options.Environment.GOOS, candidate)
@@ -281,7 +322,7 @@ func discoverDesktopRoot(options DockerDiscoveryOptions) (Resolution, error) {
 			}
 		}
 	} else if !os.IsNotExist(readErr) {
-		return Resolution{}, fmt.Errorf("read Docker Desktop settings store %s: %w", settingsPath, readErr)
+		return Resolution{ID: "engine", Path: defaultDisk, Provenance: ProvenanceDocumentedDefaultAssumed}, fmt.Errorf("%w: read Docker Desktop settings store %s: %v", ErrDockerCapacityUnavailable, settingsPath, readErr)
 	}
 	if len(candidates) > 1 {
 		paths := make([]string, 0, len(candidates))
@@ -298,22 +339,22 @@ func discoverDesktopRoot(options DockerDiscoveryOptions) (Resolution, error) {
 	for _, candidate := range candidates {
 		resolved, err := capacityPath(candidate)
 		if err != nil {
-			return Resolution{}, fmt.Errorf("resolve Docker Desktop settings backing disk: %w", err)
+			return Resolution{ID: "engine", Path: candidate, Provenance: ProvenanceDocumentedSettings}, fmt.Errorf("%w: resolve Docker Desktop settings backing disk: %v", ErrDockerCapacityUnavailable, err)
 		}
 		return Resolution{ID: "engine", Path: candidate, CapacityPath: resolved, Provenance: ProvenanceDocumentedSettings, Confidence: ConfidenceObserved}, nil
 	}
 	if info, err := stat(defaultDisk); err == nil && !info.IsDir() {
 		resolved, resolveErr := capacityPath(defaultDisk)
 		if resolveErr != nil {
-			return Resolution{}, fmt.Errorf("resolve Docker Desktop default backing disk: %w", resolveErr)
+			return Resolution{ID: "engine", Path: defaultDisk, Provenance: ProvenanceDocumentedDefaultObserved}, fmt.Errorf("%w: resolve Docker Desktop default backing disk: %v", ErrDockerCapacityUnavailable, resolveErr)
 		}
 		return Resolution{ID: "engine", Path: defaultDisk, CapacityPath: resolved, Provenance: ProvenanceDocumentedDefaultObserved, Confidence: ConfidenceObserved}, nil
 	} else if err != nil && !os.IsNotExist(err) {
-		return Resolution{}, fmt.Errorf("inspect Docker Desktop default backing disk: %w", err)
+		return Resolution{ID: "engine", Path: defaultDisk, Provenance: ProvenanceDocumentedDefaultAssumed}, fmt.Errorf("%w: inspect Docker Desktop default backing disk: %v", ErrDockerCapacityUnavailable, err)
 	}
 	resolved, err := capacityPath(defaultDisk)
 	if err != nil {
-		return Resolution{}, fmt.Errorf("resolve Docker Desktop assumed backing disk ancestor: %w", err)
+		return Resolution{ID: "engine", Path: defaultDisk, Provenance: ProvenanceDocumentedDefaultAssumed}, fmt.Errorf("%w: resolve Docker Desktop assumed backing disk ancestor: %v", ErrDockerCapacityUnavailable, err)
 	}
 	warning := fmt.Sprintf("Docker Desktop backing disk was not observed; capacity is measured at nearest existing ancestor %s of documented default %s", resolved, defaultDisk)
 	return Resolution{ID: "engine", Path: defaultDisk, CapacityPath: resolved, Provenance: ProvenanceDocumentedDefaultAssumed, Confidence: ConfidenceAssumed, Warnings: []string{warning}}, nil

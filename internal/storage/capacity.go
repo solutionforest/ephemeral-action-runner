@@ -141,7 +141,10 @@ func evaluateDomainCapacity(domain CapacityDomain, requirement DomainRequirement
 	}
 	if !domain.Capacity.Known {
 		check.Status = CapacityUnknown
-		check.Reason = "capacity domain observation is unavailable"
+		check.Reason = strings.TrimSpace(domain.CapacityUnavailableReason)
+		if check.Reason == "" {
+			check.Reason = "capacity domain observation is unavailable"
+		}
 		return check, nil
 	}
 	if domain.Capacity.AvailableBytes < requirement.RequiredAvailableBytes {

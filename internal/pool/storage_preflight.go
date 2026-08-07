@@ -38,15 +38,19 @@ func (m *Manager) preflightStorageAttempt(plan storage.OperationPlan, housekeepi
 	if plan.Provider == "" || plan.Provider == "shared" {
 		plan.Provider = m.Config.Provider.Type
 	}
+	projectPlan := plan
+	projectPlan.Phases = append([]storage.OperationPhase(nil), plan.Phases...)
+	for phaseIndex := range projectPlan.Phases {
+		projectPlan.Phases[phaseIndex].Allocations = append([]storage.Allocation(nil), projectPlan.Phases[phaseIndex].Allocations...)
+		for allocationIndex := range projectPlan.Phases[phaseIndex].Allocations {
+			projectPlan.Phases[phaseIndex].Allocations[allocationIndex].Role = ""
+			projectPlan.Phases[phaseIndex].Allocations[allocationIndex].SurfaceID = "project"
+		}
+	}
 	if m.Storage != nil {
 		snapshot, err := m.Storage.StorageSnapshot(context.Background(), provider.StorageRequest{OperationPlan: plan, Now: m.currentTime()})
 		if err != nil {
-			measurementErr := fmt.Errorf("provider storage capacity domains cannot be measured before %s: %w\n\nInspect the same operation with:\n  %s", operation, err, m.storageStatusCommand(operation))
-			if m.AllowInsufficientStorage {
-				m.warnStorageOverride(operation, measurementErr)
-				return nil
-			}
-			return measurementErr
+			return fmt.Errorf("resolve provider storage topology before %s: %w\n\nInspect the same operation with:\n  %s", operation, err, m.storageStatusCommand(operation))
 		}
 		m.warnStorageDiscovery(snapshot.Warnings)
 		if len(snapshot.Surfaces) == 0 || len(snapshot.Domains) == 0 {
@@ -57,8 +61,15 @@ func (m *Manager) preflightStorageAttempt(plan storage.OperationPlan, housekeepi
 			return fmt.Errorf("resolve storage operation %s: %w", operation, err)
 		}
 		for _, check := range evaluation.CapacityChecks {
-			if check.Status == storage.CapacityReady {
+			switch check.Status {
+			case storage.CapacityReady:
 				continue
+			case storage.CapacityUnknown:
+				m.warnUnknownStorage(operation, check, evaluation.Allocations)
+				continue
+			case storage.CapacityInsufficient:
+			default:
+				return fmt.Errorf("storage capacity check for %s returned unsupported status %q", operation, check.Status)
 			}
 			if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
 				if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
@@ -78,23 +89,21 @@ func (m *Manager) preflightStorageAttempt(plan storage.OperationPlan, housekeepi
 
 	domain, err := storage.ProbeFilesystemCapacityDomain(m.ProjectRoot, m.currentTime())
 	if err != nil {
-		measurementErr := fmt.Errorf("project storage capacity domain %q cannot be measured before %s: %w\n\nInspect the same operation with:\n  %s", m.ProjectRoot, operation, err, m.storageStatusCommand(operation))
-		if m.AllowInsufficientStorage {
-			m.warnStorageOverride(operation, measurementErr)
-			return nil
+		unknownDomain := storage.CapacityDomain{ID: "project-domain", Kind: storage.SurfaceHostFilesystem, Path: m.ProjectRoot, CapacityUnavailableReason: err.Error(), Capacity: storage.Capacity{ObservedAt: m.currentTime()}}
+		unknownSurface := storage.Surface{ID: "project", Provider: m.Config.Provider.Type, Role: storage.StorageRoleProject, Kind: storage.SurfaceHostFilesystem, DomainID: unknownDomain.ID, Path: m.ProjectRoot, Location: m.ProjectRoot, Classification: "physical", AdmissionAuthoritative: true, Capacity: unknownDomain.Capacity}
+		evaluation, evaluationErr := storage.EvaluateOperationPlan(projectPlan, []storage.Surface{unknownSurface}, []storage.CapacityDomain{unknownDomain})
+		if evaluationErr != nil {
+			return fmt.Errorf("resolve project storage operation %s after capacity probe failure: %w", operation, evaluationErr)
 		}
-		return measurementErr
+		for _, check := range evaluation.CapacityChecks {
+			if check.Status != storage.CapacityUnknown {
+				return fmt.Errorf("project storage capacity check for %s returned unexpected status %q after probe failure", operation, check.Status)
+			}
+			m.warnUnknownStorage(operation, check, evaluation.Allocations)
+		}
+		return nil
 	}
 	domain.ID = "project-domain"
-	projectPlan := plan
-	projectPlan.Phases = append([]storage.OperationPhase(nil), plan.Phases...)
-	for phaseIndex := range projectPlan.Phases {
-		projectPlan.Phases[phaseIndex].Allocations = append([]storage.Allocation(nil), projectPlan.Phases[phaseIndex].Allocations...)
-		for allocationIndex := range projectPlan.Phases[phaseIndex].Allocations {
-			projectPlan.Phases[phaseIndex].Allocations[allocationIndex].Role = ""
-			projectPlan.Phases[phaseIndex].Allocations[allocationIndex].SurfaceID = "project"
-		}
-	}
 	surface := storage.Surface{
 		ID:                     "project",
 		Provider:               m.Config.Provider.Type,
@@ -114,8 +123,15 @@ func (m *Manager) preflightStorageAttempt(plan storage.OperationPlan, housekeepi
 		return fmt.Errorf("resolve project storage operation %s: %w", operation, err)
 	}
 	for _, check := range evaluation.CapacityChecks {
-		if check.Status == storage.CapacityReady {
+		switch check.Status {
+		case storage.CapacityReady:
 			continue
+		case storage.CapacityUnknown:
+			m.warnUnknownStorage(operation, check, evaluation.Allocations)
+			continue
+		case storage.CapacityInsufficient:
+		default:
+			return fmt.Errorf("storage capacity check for %s returned unsupported status %q", operation, check.Status)
 		}
 		if !housekeepingRetried && m.AutomaticImageLifecycle && operation == "instance-create" {
 			if cleanupErr := m.imageCoordinator().HousekeepStorage(context.Background()); cleanupErr != nil {
@@ -202,8 +218,35 @@ func (m *Manager) warnStorageOverride(operation string, err error) {
 	m.warnf("\n*** STORAGE SAFETY OVERRIDE ACTIVE ***\n%s\nContinuing %s because --allow-insufficient-storage was explicitly supplied for this invocation.\n\n", err, strings.ReplaceAll(operation, "-", " "))
 }
 
+func (m *Manager) warnUnknownStorage(operation string, check storage.CapacityCheck, allocations []storage.ResolvedAllocation) {
+	domainID := check.Requirement.SurfaceID
+	if check.DomainRequirement != nil {
+		domainID = check.DomainRequirement.DomainID
+	}
+	roles := make([]string, 0)
+	seen := make(map[storage.StorageRole]struct{})
+	for _, allocation := range allocations {
+		if allocation.DomainID != domainID || allocation.Role == "" {
+			continue
+		}
+		if _, exists := seen[allocation.Role]; exists {
+			continue
+		}
+		seen[allocation.Role] = struct{}{}
+		roles = append(roles, string(allocation.Role))
+	}
+	if len(roles) == 0 {
+		roles = append(roles, "unknown")
+	}
+	estimatedBytes := check.Requirement.PeakBytes
+	if check.DomainRequirement != nil {
+		estimatedBytes = check.DomainRequirement.PeakBytes
+	}
+	m.warnf("\n*** STORAGE CAPACITY UNKNOWN ***\noperation=%s domain=%s roles=%s estimatedBytes=%d requiredBytes=%d reason=%s\nEPAR will continue because capacity could not be measured. Confirmed insufficient capacity remains enforced.\n\nInspect the same operation with:\n  %s\n\n", operation, domainID, strings.Join(roles, ","), estimatedBytes, check.RequiredAvailableBytes, check.Reason, m.storageStatusCommand(operation))
+}
+
 // PreflightProviderStorage lets provider-side controllers apply the same
-// fail-closed domain evaluator to an exact operation before provider side effects.
+// domain evaluator to an exact operation before provider side effects.
 func (m *Manager) PreflightProviderStorage(plan storage.OperationPlan) error {
 	return m.preflightStorage(plan)
 }

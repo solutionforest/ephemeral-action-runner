@@ -25,7 +25,7 @@ flowchart TB
 
 ## When To Use It
 
-Choose Docker Sandboxes when its local checks pass and you want a microVM boundary around the runner and its Docker workload. The first-run wizard recommends it when the supported-platform, Docker, and machine-readable `sbx` readiness checks pass. Startup then performs the remaining storage, template, policy-rule, runtime, and registration admission checks and fails closed. A configured Docker Sandboxes pool never silently falls back to Docker Container or another provider.
+Choose Docker Sandboxes when its local checks pass and you want a microVM boundary around the runner and its Docker workload. The first-run wizard recommends it when the supported-platform, Docker, and machine-readable `sbx` readiness checks pass. Startup then performs the remaining storage, template, policy-rule, runtime, and registration admission checks. Measured insufficient storage blocks admission, while an unmeasurable local capacity domain warns and leaves the measurable-domain checks in force; other admission failures remain blocking. A configured Docker Sandboxes pool never silently falls back to Docker Container or another provider.
 
 ## Support Status
 
@@ -37,7 +37,7 @@ EPAR recommends this provider in the wizard by capability, not by an operating-s
 - Docker Sandboxes CLI whose `sbx diagnose --output json` result reports at least one passing check and no failed checks. Before the first-run provider assessment, the wizard runs `sbx daemon start --detach` when the `sbx` executable is installed, then runs diagnostics. Warnings and skipped checks do not make the provider unavailable.
 - A native `amd64` or `arm64` controller with matching `linux/amd64` or `linux/arm64` image support. EPAR does not use emulation to admit a mismatched template.
 - Enough capacity to resolve, build, export, import, and retain the selected runner template.
-- Enough physical backing storage in every resolved Engine, project, Sandbox cache, and Sandbox state capacity domain for the phase-overlapping template and sandbox bootstrap work while retaining `storage.minimumFree` once per domain. Use `./start storage status --operation template-build --provider docker-sandboxes --config <path> --project-root <path>` to inspect the same plan. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
+- Enough physical backing storage in every measurable Engine, project, Sandbox cache, and Sandbox state capacity domain for the phase-overlapping template and sandbox bootstrap work while retaining `storage.minimumFree` once per domain. Use `./start storage status --operation template-build --provider docker-sandboxes --config <path> --project-root <path>` to inspect the same plan; an unmeasurable local domain is shown as unknown with its reason and warns without blocking the operation. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
 - A GitHub runner group that meets enforced policy. Docker Sandboxes requires `security.runnerGroup.enforcement: enforce` and `runner.ephemeral: true`.
 
 The wizard builds and imports the template. The recipes in `templates/docker-sandboxes` are build inputs, not prebuilt images.
@@ -96,7 +96,7 @@ The provider keeps architecture admission behind an internal target-agnostic bou
 ## Normal Workflow
 
 1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the Catthehacker `full-latest` or `act-latest` profile, then review the non-blocking physical-growth estimate, sparse logical limits, and reserve. The generated config uses no custom install scripts; add them afterward when needed. The wizard's initial screen keeps compatibility providers behind `C. Show compatibility providers`; their specialized and custom tags do not change Docker Sandboxes' requirement for a private Docker daemon and runtime closure.
-2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, performs authoritative storage admission, builds and imports the template, and activates it only after exact readback. On macOS or Linux, review the narrowly scoped helper prompts described in [Private Filesystem and VM Helper Approval](#private-filesystem-and-vm-helper-approval) if the host presents them.
+2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, enforces measured storage capacity while warning about any unmeasurable local domain, builds and imports the template, and activates it only after exact readback. On macOS or Linux, review the narrowly scoped helper prompts described in [Private Filesystem and VM Helper Approval](#private-filesystem-and-vm-helper-approval) if the host presents them.
 3. Prewarm the selected template without GitHub registration:
 
    ```powershell

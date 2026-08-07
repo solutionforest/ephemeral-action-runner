@@ -80,8 +80,15 @@ func TestClassifyDockerEndpoint(t *testing.T) {
 
 func TestDiscoverDockerStorageRejectsRemoteContext(t *testing.T) {
 	_, err := DiscoverDockerStorage(DockerDiscoveryOptions{Endpoint: "ssh://builder.example"})
-	if err == nil || !strings.Contains(err.Error(), "remote Docker endpoint") {
+	if err == nil || !errors.Is(err, ErrRemoteDockerEndpoint) {
 		t.Fatalf("remote discovery error = %v", err)
+	}
+}
+
+func TestClassifyDockerEndpointRejectsUnsupportedTransport(t *testing.T) {
+	_, err := ClassifyDockerEndpoint("orb://local")
+	if err == nil || !errors.Is(err, ErrUnsupportedDockerTransport) {
+		t.Fatalf("unsupported transport error = %v", err)
 	}
 }
 
@@ -133,8 +140,20 @@ func TestDiscoverDockerDesktopRejectsAmbiguousObservedDisks(t *testing.T) {
 		},
 		Stat: func(path string) (os.FileInfo, error) { return fakeFileInfo{name: base("linux", path)}, nil },
 	})
-	if err == nil || !strings.Contains(err.Error(), "multiple existing backing disks") {
+	if err == nil || !errors.Is(err, ErrInvalidDockerStorage) || !strings.Contains(err.Error(), "multiple existing backing disks") {
 		t.Fatalf("ambiguous settings error = %v", err)
+	}
+}
+
+func TestDiscoverDockerDesktopRejectsMalformedSettings(t *testing.T) {
+	_, err := DiscoverDockerStorage(DockerDiscoveryOptions{
+		Environment: Environment{GOOS: "linux", HomeDir: "/home/runner"},
+		Endpoint:    "unix:///home/runner/.docker/desktop/docker.sock",
+		Info:        DockerInfo{OperatingSystem: "Docker Desktop"},
+		ReadFile:    func(string) ([]byte, error) { return []byte(`{"unterminated":`), nil },
+	})
+	if err == nil || !errors.Is(err, ErrInvalidDockerStorage) || !strings.Contains(err.Error(), "decode Docker Desktop settings store") {
+		t.Fatalf("malformed settings error = %v", err)
 	}
 }
 
@@ -239,14 +258,107 @@ func TestDiscoverNativeDockerUsesDockerInfoAndActiveContainerdRoot(t *testing.T)
 	}
 }
 
-func TestDiscoverNativeDockerRejectsGuestOnlyDockerRoot(t *testing.T) {
-	_, err := DiscoverDockerStorage(DockerDiscoveryOptions{
+func TestDiscoverNativeDockerKeepsGuestOnlyDockerRootAsUnavailable(t *testing.T) {
+	discovered, err := DiscoverDockerStorage(DockerDiscoveryOptions{
 		Environment: Environment{GOOS: "linux", HomeDir: "/home/runner"},
 		Endpoint:    "unix:///var/run/docker.sock",
 		Info:        DockerInfo{DockerRootDir: "/var/lib/docker"},
 		Stat:        func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
 	})
-	if err == nil || !strings.Contains(err.Error(), "resolve Docker Engine capacity path") {
-		t.Fatalf("guest-only Docker root error = %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovered.Roots) != 1 {
+		t.Fatalf("roots = %#v, want one unknown engine root", discovered.Roots)
+	}
+	root := discovered.Roots[0]
+	if root.ID != "engine" || root.Path != "/var/lib/docker" || root.CapacityPath != "" || root.Confidence != ConfidenceUnavailable {
+		t.Fatalf("unknown engine root = %#v", root)
+	}
+	if !strings.Contains(root.CapacityUnavailableReason, "resolve Docker Engine capacity path") {
+		t.Fatalf("unavailable reason = %q", root.CapacityUnavailableReason)
+	}
+}
+
+func TestDiscoverNativeDockerPreservesKnownEngineWhenContainerdCapacityIsUnavailable(t *testing.T) {
+	discovered, err := DiscoverDockerStorage(DockerDiscoveryOptions{
+		Environment: Environment{GOOS: "linux", HomeDir: "/home/runner"},
+		Endpoint:    "unix:///var/run/docker.sock",
+		Info: DockerInfo{
+			DockerRootDir: "/mnt/docker",
+			DriverStatus:  [][]string{{"driver-type", "io.containerd.snapshotter.v1"}},
+		},
+		ReadFile: func(string) ([]byte, error) {
+			return []byte("root = \"/mnt/containerd\"\n"), nil
+		},
+		CapacityPath: func(path string) (string, error) {
+			if path == "/mnt/docker" {
+				return "/physical/docker", nil
+			}
+			return "", errors.New("statfs denied")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovered.Roots) != 2 {
+		t.Fatalf("roots = %#v, want engine and containerd", discovered.Roots)
+	}
+	if engine := discovered.Roots[0]; engine.CapacityPath != "/physical/docker" || engine.CapacityUnavailableReason != "" {
+		t.Fatalf("engine root = %#v", engine)
+	}
+	containerd := discovered.Roots[1]
+	if containerd.Path != "/mnt/containerd" || containerd.CapacityPath != "" || containerd.Provenance != ProvenanceContainerdConfig || containerd.Confidence != ConfidenceUnavailable {
+		t.Fatalf("containerd root = %#v", containerd)
+	}
+	if !strings.Contains(containerd.CapacityUnavailableReason, "statfs denied") {
+		t.Fatalf("containerd unavailable reason = %q", containerd.CapacityUnavailableReason)
+	}
+}
+
+func TestDiscoverDockerDesktopKeepsBackingDiskWhenCapacityResolutionFails(t *testing.T) {
+	environment := Environment{GOOS: "darwin", HomeDir: "/Users/runner"}
+	settings, disk, err := desktopPaths(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovered, err := DiscoverDockerStorage(DockerDiscoveryOptions{
+		Environment: environment,
+		Endpoint:    "unix:///Users/runner/.docker/run/docker.sock",
+		Info:        DockerInfo{Name: "docker-desktop"},
+		ReadFile: func(path string) ([]byte, error) {
+			if path != settings {
+				t.Fatalf("settings path = %q", path)
+			}
+			return nil, os.ErrNotExist
+		},
+		Stat: func(path string) (os.FileInfo, error) {
+			if path == disk {
+				return fakeFileInfo{name: "Docker.raw"}, nil
+			}
+			return nil, os.ErrNotExist
+		},
+		CapacityPath: func(string) (string, error) { return "", errors.New("statfs denied") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := discovered.Roots[0]
+	if root.Path != disk || root.CapacityPath != "" || root.Provenance != ProvenanceDocumentedDefaultObserved || root.Confidence != ConfidenceUnavailable {
+		t.Fatalf("Docker Desktop root = %#v", root)
+	}
+	if !strings.Contains(root.CapacityUnavailableReason, "statfs denied") {
+		t.Fatalf("unavailable reason = %q", root.CapacityUnavailableReason)
+	}
+}
+
+func TestDiscoverNativeDockerRejectsInvalidRelativeRoot(t *testing.T) {
+	_, err := DiscoverDockerStorage(DockerDiscoveryOptions{
+		Environment: Environment{GOOS: "linux"},
+		Endpoint:    "unix:///var/run/docker.sock",
+		Info:        DockerInfo{DockerRootDir: "var/lib/docker"},
+	})
+	if err == nil || !errors.Is(err, ErrInvalidDockerStorage) {
+		t.Fatalf("invalid root error = %v", err)
 	}
 }

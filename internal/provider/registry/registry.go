@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -194,6 +195,29 @@ func dockerStorageRoots(ctx context.Context, request provider.StorageRequest) ([
 	}
 	discovered, err := discoverCurrentDockerStorage(ctx)
 	if err != nil {
+		if errors.Is(err, storagepath.ErrDockerCapacityUnavailable) {
+			reason := fmt.Sprintf("discover Docker Engine host capacity: %v", err)
+			return []provider.StorageRoot{
+				{
+					ID:                        "docker-engine-backing",
+					Role:                      storage.StorageRoleDockerEngine,
+					Kind:                      storage.SurfaceDockerEngine,
+					Path:                      "docker-engine",
+					CapacityUnavailableReason: reason,
+					Provenance:                "docker-discovery",
+					Confidence:                string(storagepath.ConfidenceUnavailable),
+				},
+				{
+					ID:                        "containerd-store-backing",
+					Role:                      storage.StorageRoleContainerdStore,
+					Kind:                      storage.SurfaceDockerEngine,
+					Path:                      "containerd-store",
+					CapacityUnavailableReason: reason,
+					Provenance:                "docker-discovery",
+					Confidence:                string(storagepath.ConfidenceUnavailable),
+				},
+			}, nil
+		}
 		return nil, err
 	}
 	roots := make([]provider.StorageRoot, 0, len(discovered.Roots)+1)
@@ -208,14 +232,15 @@ func dockerStorageRoots(ctx context.Context, request provider.StorageRequest) ([
 			id = "containerd-store-backing"
 		}
 		mapped := provider.StorageRoot{
-			ID:           id,
-			Role:         role,
-			Kind:         storage.SurfaceDockerEngine,
-			Path:         root.Path,
-			CapacityPath: root.CapacityPath,
-			Provenance:   string(root.Provenance),
-			Confidence:   string(root.Confidence),
-			Warnings:     append([]string(nil), root.Warnings...),
+			ID:                        id,
+			Role:                      role,
+			Kind:                      storage.SurfaceDockerEngine,
+			Path:                      root.Path,
+			CapacityPath:              root.CapacityPath,
+			CapacityUnavailableReason: root.CapacityUnavailableReason,
+			Provenance:                string(root.Provenance),
+			Confidence:                string(root.Confidence),
+			Warnings:                  append([]string(nil), root.Warnings...),
 		}
 		roots = append(roots, mapped)
 		if root.ID == "engine" {
