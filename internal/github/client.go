@@ -175,7 +175,36 @@ func (c *Client) installationRequest(ctx context.Context, method, path string, b
 	if err != nil {
 		return err
 	}
-	return c.request(ctx, method, path, "Bearer "+token, body, out)
+	err = c.request(ctx, method, path, "Bearer "+token, body, out)
+	if !isUnauthorizedHTTPError(err) || ctx.Err() != nil {
+		return err
+	}
+
+	// A cached GitHub App installation token can be revoked or rejected before
+	// its advertised expiry. Refresh it once in place instead of terminating a
+	// healthy pool. The rejected-token comparison prevents concurrent requests
+	// from invalidating a newer token that another request already minted.
+	c.invalidateInstallationToken(token)
+	refreshedToken, refreshErr := c.installationToken(ctx)
+	if refreshErr != nil {
+		return fmt.Errorf("refresh GitHub App installation token after HTTP 401: %w", refreshErr)
+	}
+	return c.request(ctx, method, path, "Bearer "+refreshedToken, body, out)
+}
+
+func isUnauthorizedHTTPError(err error) bool {
+	var httpErr *HTTPError
+	return errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized
+}
+
+func (c *Client) invalidateInstallationToken(rejectedToken string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	if rejectedToken == "" || c.token != rejectedToken {
+		return
+	}
+	c.token = ""
+	c.tokenExpires = time.Time{}
 }
 
 func (c *Client) installationToken(ctx context.Context) (string, error) {

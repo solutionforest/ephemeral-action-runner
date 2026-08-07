@@ -235,6 +235,177 @@ func TestListRunnersUsesInstallationToken(t *testing.T) {
 	}
 }
 
+func TestInstallationRequestRefreshesRejectedCachedTokenOnce(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{AppID: 123, Organization: "example", PrivateKeyPath: keyPath, APIBaseURL: "https://api.github.test"})
+	var tokenRequests int
+	var runnerRequests int
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			return response(http.StatusOK, `{"id":42}`), nil
+		case "/app/installations/42/access_tokens":
+			tokenRequests++
+			return response(http.StatusOK, fmt.Sprintf(`{"token":"installation-token-%d","expires_at":"2099-01-01T00:00:00Z"}`, tokenRequests)), nil
+		case "/orgs/example/actions/runners":
+			runnerRequests++
+			if runnerRequests == 1 {
+				if got := r.Header.Get("Authorization"); got != "Bearer installation-token-1" {
+					t.Fatalf("first authorization = %q", got)
+				}
+				return response(http.StatusUnauthorized, `{"message":"Bad credentials"}`), nil
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer installation-token-2" {
+				t.Fatalf("refreshed authorization = %q", got)
+			}
+			return response(http.StatusOK, `{"total_count":1,"runners":[{"id":1,"name":"epar-test-1","status":"online"}]}`), nil
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	runners, err := client.ListRunners(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runners) != 1 || runners[0].ID != 1 {
+		t.Fatalf("runners = %+v", runners)
+	}
+	if tokenRequests != 2 || runnerRequests != 2 {
+		t.Fatalf("token requests=%d runner requests=%d, want 2/2", tokenRequests, runnerRequests)
+	}
+}
+
+func TestConcurrentUnauthorizedRequestsShareOneRefreshedToken(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{AppID: 123, Organization: "example", PrivateKeyPath: keyPath, APIBaseURL: "https://api.github.test"})
+	const callers = 16
+	var tokenRequests atomic.Int32
+	var rejectedRequests atomic.Int32
+	var recoveredRequests atomic.Int32
+	allRejectedStarted := make(chan struct{})
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			return response(http.StatusOK, `{"id":42}`), nil
+		case "/app/installations/42/access_tokens":
+			request := tokenRequests.Add(1)
+			return response(http.StatusOK, fmt.Sprintf(`{"token":"installation-token-%d","expires_at":"2099-01-01T00:00:00Z"}`, request)), nil
+		case "/orgs/example/actions/runners":
+			switch r.Header.Get("Authorization") {
+			case "Bearer installation-token-1":
+				if rejectedRequests.Add(1) == callers {
+					close(allRejectedStarted)
+				}
+				<-allRejectedStarted
+				return response(http.StatusUnauthorized, `{"message":"Bad credentials"}`), nil
+			case "Bearer installation-token-2":
+				recoveredRequests.Add(1)
+				return response(http.StatusOK, `{"total_count":0,"runners":[]}`), nil
+			default:
+				t.Fatalf("unexpected authorization %q", r.Header.Get("Authorization"))
+				return nil, nil
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+	if _, err := client.installationToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	errorsCh := make(chan error, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			_, err := client.ListRunners(context.Background())
+			errorsCh <- err
+		}()
+	}
+	wait.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := tokenRequests.Load(); got != 2 {
+		t.Fatalf("installation token requests = %d, want initial plus one shared refresh", got)
+	}
+	if rejectedRequests.Load() != callers || recoveredRequests.Load() != callers {
+		t.Fatalf("rejected=%d recovered=%d, want %d/%d", rejectedRequests.Load(), recoveredRequests.Load(), callers, callers)
+	}
+}
+
+func TestInstallationRequestKeepsSecondUnauthorizedTerminal(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{AppID: 123, Organization: "example", PrivateKeyPath: keyPath, APIBaseURL: "https://api.github.test"})
+	var tokenRequests int
+	var runnerRequests int
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			return response(http.StatusOK, `{"id":42}`), nil
+		case "/app/installations/42/access_tokens":
+			tokenRequests++
+			return response(http.StatusOK, fmt.Sprintf(`{"token":"installation-token-%d","expires_at":"2099-01-01T00:00:00Z"}`, tokenRequests)), nil
+		case "/orgs/example/actions/runners":
+			runnerRequests++
+			return response(http.StatusUnauthorized, `{"message":"Bad credentials"}`), nil
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	_, err := client.ListRunners(context.Background())
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusUnauthorized || dependency.IsRetryable(err) {
+		t.Fatalf("error = %v, want terminal second HTTP 401", err)
+	}
+	if tokenRequests != 2 || runnerRequests != 2 {
+		t.Fatalf("token requests=%d runner requests=%d, want exactly 2/2", tokenRequests, runnerRequests)
+	}
+}
+
+func TestInstallationRequestPropagatesTransientRefreshFailure(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{AppID: 123, Organization: "example", PrivateKeyPath: keyPath, APIBaseURL: "https://api.github.test"})
+	var tokenRequests int
+	var runnerRequests int
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			return response(http.StatusOK, `{"id":42}`), nil
+		case "/app/installations/42/access_tokens":
+			tokenRequests++
+			if tokenRequests == 1 {
+				return response(http.StatusOK, `{"token":"installation-token-1","expires_at":"2099-01-01T00:00:00Z"}`), nil
+			}
+			return response(http.StatusServiceUnavailable, `{"message":"temporarily unavailable"}`), nil
+		case "/orgs/example/actions/runners":
+			runnerRequests++
+			return response(http.StatusUnauthorized, `{"message":"Bad credentials"}`), nil
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	_, err := client.ListRunners(context.Background())
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusServiceUnavailable || !dependency.IsTypedRetryable(err) {
+		t.Fatalf("error = %v, want typed transient token-refresh failure", err)
+	}
+	if tokenRequests != 2 || runnerRequests != 1 {
+		t.Fatalf("token requests=%d runner requests=%d, want 2/1", tokenRequests, runnerRequests)
+	}
+}
+
 func TestInstallationTokenCacheIsConcurrentAndSingleFlight(t *testing.T) {
 	keyPath := writeKey(t)
 	client := New(config.GitHubConfig{
