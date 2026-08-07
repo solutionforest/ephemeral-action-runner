@@ -506,14 +506,10 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
-	var mcpGateway bool
-	if raw, ok := inspection["mcp_gateway"]; !ok || json.Unmarshal(raw, &mcpGateway) != nil || mcpGateway {
-		return fmt.Errorf("docker sandbox inspection reported an enabled MCP gateway")
-	}
 	if expected != nil && (stringValue(inspection["image"]) != expected.Template || stringValue(inspection["image_digest"]) != expected.TemplateDigest || stringValue(inspection["workspace"]) != expected.StagingPath) {
 		return fmt.Errorf("docker sandbox inspection did not bind the exact template identity and staging path")
 	}
-	for _, field := range []string{"kits", "secrets", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
+	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
 		value, ok := inspection[field]
 		if field == "kits" && !ok {
 			return fmt.Errorf("docker sandbox inspection omitted required attached-capability field %q", field)

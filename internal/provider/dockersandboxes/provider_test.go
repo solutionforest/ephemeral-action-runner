@@ -35,7 +35,7 @@ const (
 var (
 	testWorkspace  = providerTestWorkspace()
 	readyListJSON  = `{"sandboxes":[{"id":"9b6dbdf3-2ef4-47cb-8f55-55b26a790c8b","name":"epar-sandbox-1","status":"running","workspaces":[` + strconv.Quote(testWorkspace) + `],"agent":"shell","additive_field":true}]}`
-	inspectionJSON = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":` + strconv.Quote(testWorkspace) + `,"network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","mcp_gateway":false,"sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
+	inspectionJSON = `{"name":"epar-sandbox-1","agent":"shell","kits":[],"state":"running","image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"sha256:39cf20eca8610000000000000000000000000000000000000000000000000000","workspace":` + strconv.Quote(testWorkspace) + `,"network":"epar-sandbox-1","network_policy":{"scope":"global"},"proxy":"172.17.0.1:3128","sessions":0,"daemon_version":"fixture-current","daemon_uptime":"1h"}`
 	testInstance   = provider.Instance{Name: testName, ProviderID: testID, Source: "shell", State: "running"}
 )
 
@@ -677,8 +677,6 @@ func TestInstanceAdmissionUsesExactInspectionAndRejectsAttachedCapabilities(t *t
 		metadata string
 	}{
 		{name: "kit", old: `"kits":[]`, new: `"kits":[{"name":"docker-auth","token":"kit-token-metadata"}]`, metadata: "kit-token-metadata"},
-		{name: "mcp", old: `"mcp_gateway":false`, new: `"mcp_gateway":true`},
-		{name: "secrets", old: `"state":"running"`, new: `"state":"running","secrets":["registry-secret-metadata"]`, metadata: "registry-secret-metadata"},
 		{name: "published_ports", old: `"state":"running"`, new: `"state":"running","published_ports":["8080:80"]`, metadata: "8080:80"},
 		{name: "ports", old: `"state":"running"`, new: `"state":"running","ports":[{"host_port":8080}]`, metadata: "8080"},
 		{name: "auth", old: `"state":"running"`, new: `"state":"running","auth":{"provider":"registry-auth-metadata"}`, metadata: "registry-auth-metadata"},
@@ -694,6 +692,32 @@ func TestInstanceAdmissionUsesExactInspectionAndRejectsAttachedCapabilities(t *t
 			}
 			if mutation.metadata != "" && strings.Contains(err.Error(), mutation.metadata) {
 				t.Fatalf("attached capability metadata leaked in error: %v", err)
+			}
+			done()
+		})
+	}
+}
+
+func TestInstanceAdmissionIgnoresProviderSecretsMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "missing", value: ""},
+		{name: "string", value: `"registry-secret-metadata"`},
+		{name: "number", value: `42`},
+		{name: "boolean", value: `true`},
+		{name: "object", value: `{"token":"registry-secret-metadata"}`},
+		{name: "array", value: `["registry-secret-metadata",{"kind":"service"}]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := inspectionJSON
+			if test.value != "" {
+				fixture = strings.Replace(inspectionJSON, `"state":"running"`, `"state":"running","secrets":`+test.value, 1)
+			}
+			p, done := identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}})
+			if err := p.VerifyInstanceAdmission(context.Background(), testInstance); err != nil {
+				t.Fatalf("provider secrets metadata affected admission: %v", err)
 			}
 			done()
 		})

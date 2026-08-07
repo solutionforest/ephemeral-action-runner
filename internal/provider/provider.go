@@ -180,8 +180,8 @@ type AdmissionVerifier interface {
 }
 
 // InstanceAdmissionVerifier rechecks mutable provider state attached to one
-// exact runtime, including kits, injected authentication, secrets, published
-// ports, and management gateways. It is deliberately separate from general
+// exact runtime, including kits, injected authentication, and published
+// ports. It is deliberately separate from general
 // runtime health because any violation must stop job admission immediately.
 type InstanceAdmissionVerifier interface {
 	VerifyInstanceAdmission(ctx context.Context, instance Instance) error
