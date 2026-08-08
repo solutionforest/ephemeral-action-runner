@@ -380,16 +380,20 @@ func TestBuildxInspectRecognizesOnlyMissingBuilderDiagnostics(t *testing.T) {
 }
 
 func TestBuildxRecreateReasonDetectsBackendMismatchAndNodeError(t *testing.T) {
+	projectRoot := t.TempDir()
 	expected := BuildxMetadata{
 		SchemaVersion:     buildxMetadataSchemaVersion,
 		Builder:           "epar-test",
 		Driver:            "docker-container",
-		ProjectRoot:       "/project",
+		ProjectRoot:       projectRoot,
 		ConfigID:          "test",
-		EPARConfigPath:    "/project/config.yml",
+		EPARConfigPath:    filepath.Join(projectRoot, "config.yml"),
 		BackendID:         "docker:current",
-		ConfigPath:        "/project/buildkitd.toml",
-		CertificateBundle: "/project/ca.pem",
+		ConfigPath:        filepath.Join(projectRoot, "buildkitd.toml"),
+		CertificateBundle: filepath.Join(projectRoot, "ca.pem"),
+	}
+	if !buildxOperationalMetadataMatches(expected, expected) {
+		t.Fatal("platform-native healthy metadata fixture does not match itself")
 	}
 	actual := expected
 	actual.BackendID = "docker:previous"
