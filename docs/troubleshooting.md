@@ -268,6 +268,18 @@ Inspect the exact classification before removing anything manually:
 
 Use normal `storage prune --execute` only for exact catalog-owned resources. Legacy prefix-era entries require the plan hash printed by `storage prune --legacy`; they are not removed automatically. Do not use broad Docker prune/reset commands or VHDX compaction as a substitute for this review.
 
+## EPAR Buildx builder points to a previous Docker daemon
+
+### Symptom
+
+After switching between Docker Desktop, OrbStack, or another local Docker daemon, Buildx output names the previous context or socket, reports a node-level connection error despite a successful `docker buildx inspect` exit status, or reports that the expected `buildx_buildkit_epar-...` control container does not exist on the current daemon.
+
+### Diagnosis and remediation
+
+Current EPAR controllers record the Docker Engine identity with each config-scoped Buildx receipt. When valid ownership metadata proves that the stale definition belongs to the current project and configuration, EPAR automatically removes only that exact client-side definition while preserving daemon-local BuildKit state, recreates it against the active backend, bootstraps it, and verifies its image, configuration, registry trust, and CA bundle before continuing. Missing control containers and node errors embedded in otherwise successful Buildx output receive the same bounded recovery. No manual `docker rm`, `docker buildx rm`, or broad prune is normally required.
+
+EPAR never adopts or removes a same-name builder without valid exact ownership metadata. If automatic recovery reports that the definition remained present, or the recreated builder fails verification twice, preserve the error report and inspect `.local/storage/buildx/<config-id>/metadata.json` together with `docker context show`, `docker info`, and `docker buildx inspect <builder>`; repair the real daemon or ownership problem rather than deleting shared Docker state. A context that changes repeatedly during one reconciliation is detected and retried once, but the Docker target must remain stable for the image build itself. An unavailable daemon, failed registry access, or failure to produce a required verified artifact can still block startup.
+
 ## Docker image build fails with TLS certificate errors
 
 ### Symptom
@@ -288,7 +300,7 @@ Get-ChildItem .local/storage/buildx -Recurse -Filter metadata.json | Get-Content
 Get-ChildItem .local/storage/buildkit -Recurse -Filter buildkitd.toml | Get-Content
 ```
 
-The owned metadata records the exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in the host daemon because builder trust cannot repair host-daemon trust.
+The owned metadata records the Docker backend identity, exact registry set, configuration digest, certificate bundle, and trust generation. Rerunning the same command reconciles that exact builder and preserves its daemon-local BuildKit state; EPAR never changes Docker's shared/default builder. If the source-image `docker pull` itself fails before Buildx starts, configure the authorized CA in the host daemon because builder trust cannot repair host-daemon trust.
 
 Configure runner overlay only when jobs inside an ephemeral runner must inherit host roots:
 

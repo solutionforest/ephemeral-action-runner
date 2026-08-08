@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +43,89 @@ func TestBeginDockerAcquisitionPersistsPreexistingIdentityBeforePull(t *testing.
 	}
 	if len(value.Configs) != 1 || value.Configs[0].InstallationID == "" {
 		t.Fatalf("acquisition journal did not register its exact EPAR installation: %#v", value.Configs)
+	}
+}
+
+func TestInterruptedDockerAcquisitionWaitsForItsRecordedBackend(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", filepath.Join(t.TempDir(), "host-state"))
+	projectRoot := t.TempDir()
+	configPath := filepath.Join(projectRoot, "config.yml")
+	if err := os.WriteFile(configPath, []byte("provider:\n  type: docker-container\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	environment := &buildxCommandEnvironment{backendIDs: []string{"daemon-two"}}
+	coordinator := Coordinator{Config: config.Default(), ProjectRoot: projectRoot, ConfigPath: configPath, environment: environment}
+	now := time.Date(2026, 8, 8, 1, 2, 3, 0, time.UTC)
+	if err := coordinator.beginDockerRoleAcquisition("docker:daemon-one", "buildkit-image", buildkitImageReference, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.reconcileInterruptedDockerAcquisitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if environment.imageInspectCalls != 0 {
+		t.Fatalf("inactive-backend acquisition inspected the current daemon %d times", environment.imageInspectCalls)
+	}
+	store, err := storagecatalog.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := store.Load(now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(value.Journals) != 1 || value.Journals[0].Phase != "acquiring" {
+		t.Fatalf("inactive-backend acquisition journal was completed or replaced: %#v", value.Journals)
+	}
+}
+
+func TestDockerCatalogObservationAndCleanupRefuseAnotherBackend(t *testing.T) {
+	resource := storagecatalog.Resource{BackendID: "docker:daemon-one", Kind: catalogDockerImageKind, Identity: "sha256:buildkit", Locator: buildkitImageReference}
+	for _, operation := range []string{"observe", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			environment := &buildxCommandEnvironment{backendIDs: []string{"daemon-two"}}
+			coordinator := Coordinator{environment: environment}
+			switch operation {
+			case "observe":
+				exists, err := coordinator.catalogResourceExists(context.Background(), resource)
+				if err != nil || !exists {
+					t.Fatalf("inactive-backend observation = exists %t, err %v", exists, err)
+				}
+			case "remove":
+				err := coordinator.removeCatalogResource(context.Background(), resource)
+				if err == nil || !strings.Contains(err.Error(), "inactive backend") {
+					t.Fatalf("inactive-backend cleanup error = %v", err)
+				}
+			}
+			if environment.imageInspectCalls != 0 {
+				t.Fatalf("%s inspected the active daemon under another backend's evidence", operation)
+			}
+		})
+	}
+}
+
+func TestDockerCatalogObservationPreservesEvidenceWhenBackendChangesDuringInspect(t *testing.T) {
+	environment := &buildxCommandEnvironment{backendIDs: []string{"daemon-one", "daemon-two"}}
+	coordinator := Coordinator{environment: environment}
+	resource := storagecatalog.Resource{BackendID: "docker:daemon-one", Kind: catalogDockerImageKind, Identity: "sha256:buildkit", Locator: buildkitImageReference}
+	exists, err := coordinator.catalogResourceExists(context.Background(), resource)
+	if err != nil || !exists {
+		t.Fatalf("mid-inspection backend change = exists %t, err %v", exists, err)
+	}
+	if environment.imageInspectCalls != 1 {
+		t.Fatalf("mid-inspection backend test issued %d image inspections, want one", environment.imageInspectCalls)
+	}
+}
+
+func TestDockerCatalogCleanupDoesNotCompleteWhenBackendChangesDuringInspect(t *testing.T) {
+	environment := &buildxCommandEnvironment{backendIDs: []string{"daemon-one", "daemon-two"}}
+	coordinator := Coordinator{environment: environment}
+	resource := storagecatalog.Resource{BackendID: "docker:daemon-one", Kind: catalogDockerImageKind, Identity: "sha256:buildkit", Locator: buildkitImageReference}
+	err := coordinator.removeCatalogResource(context.Background(), resource)
+	if err == nil || !strings.Contains(err.Error(), "active backend changed") {
+		t.Fatalf("mid-inspection backend cleanup error = %v", err)
+	}
+	if environment.dockerPSCalls != 1 || environment.imageInspectCalls != 0 {
+		t.Fatalf("mid-inspection cleanup observations = ps %d, image inspect %d; want one preflight observation and no further mutation path", environment.dockerPSCalls, environment.imageInspectCalls)
 	}
 }
 

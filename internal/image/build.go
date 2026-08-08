@@ -136,6 +136,17 @@ func (m *Coordinator) buildDockerContainerImageUntimed(ctx context.Context, opts
 	if err != nil {
 		return err
 	}
+	builderNeedsStop := !m.DryRun
+	defer func() {
+		if !builderNeedsStop {
+			return
+		}
+		stopContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if stopErr := m.stopBuildxBuilder(stopContext, builder, "release resident memory after the Docker Container build"); stopErr != nil {
+			m.warnf("EPAR Buildx builder shutdown warning: %v\n", stopErr)
+		}
+	}()
 	attempts := 1
 	if m.hostTrustEnabled() {
 		attempts = 3
