@@ -2,6 +2,7 @@ package image
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/filelock"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
@@ -25,8 +27,10 @@ import (
 )
 
 const (
-	dockerSandboxesReceiptSchema  = 3
-	dockerSandboxesMetadataSchema = 6
+	dockerSandboxesLegacyReceiptSchema   = 3
+	dockerSandboxesReceiptSchema         = 4
+	dockerSandboxesMetadataSchema        = 6
+	dockerSandboxesBuildGenerationSchema = 1
 )
 
 var dockerTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
@@ -170,6 +174,14 @@ type dockerSandboxesTemplateMetadata struct {
 		QEMUVersion               string `json:"qemuVersion"`
 	} `json:"compatibility"`
 	Artifacts map[string]artifactEvidence `json:"artifacts"`
+}
+
+type dockerSandboxesBuildGeneration struct {
+	SchemaVersion int       `json:"schemaVersion"`
+	ConfigID      string    `json:"configId"`
+	ManifestHash  string    `json:"manifestHash"`
+	Generation    string    `json:"generation"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 type artifactEvidence struct {
@@ -545,7 +557,7 @@ func readDockerSandboxesReceiptPath(path string) (dockerSandboxesReceipt, error)
 	if err := json.Unmarshal(content, &receipt); err != nil {
 		return dockerSandboxesReceipt{}, err
 	}
-	if receipt.SchemaVersion != dockerSandboxesReceiptSchema || receipt.ManifestHash == "" || receipt.Artifact.Reference == "" || receipt.Artifact.Digest == "" || receipt.Artifact.RootDisk == "" || receipt.MetadataSHA256 == "" || receipt.ArchiveSHA256 == "" || receipt.ArchiveBytes == 0 || len(receipt.Evidence) == 0 || receipt.ActivatedAt.IsZero() {
+	if (receipt.SchemaVersion != dockerSandboxesLegacyReceiptSchema && receipt.SchemaVersion != dockerSandboxesReceiptSchema) || receipt.ManifestHash == "" || receipt.Artifact.Reference == "" || receipt.Artifact.Digest == "" || receipt.Artifact.RootDisk == "" || receipt.MetadataSHA256 == "" || receipt.ArchiveSHA256 == "" || receipt.ArchiveBytes == 0 || len(receipt.Evidence) == 0 || receipt.ActivatedAt.IsZero() {
 		return dockerSandboxesReceipt{}, fmt.Errorf("invalid Docker Sandboxes active artifact receipt")
 	}
 	return receipt, nil
@@ -843,15 +855,17 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	profile := sourceProfile(source.Reference)
 	architecture := strings.TrimPrefix(source.Platform, "linux/")
 	tagProfile := sanitizeTemplateTag(profile)
-	templateTag := fmt.Sprintf("epar-docker-sandboxes-catthehacker-%s:%s-%s", tagProfile, manifestHash[:16], architecture)
-	artifactRoot, err := m.dockerSandboxesArtifactRoot(manifestHash)
+	generation, artifactRoot, buildLock, err := m.beginDockerSandboxesBuild(manifestHash)
 	if err != nil {
 		return fmt.Errorf("resolve Docker Sandboxes template workspace: %w", err)
 	}
-	if err := os.MkdirAll(artifactRoot, 0o755); err != nil {
-		return err
-	}
-	if err := m.recordSandboxWorkspace(ctx, artifactRoot, manifestHash, storagecatalog.StateStaging, time.Now().UTC()); err != nil {
+	defer func() {
+		if closeErr := buildLock.Close(); closeErr != nil {
+			m.warnf("Docker Sandboxes build-generation lock release warning: %v\n", closeErr)
+		}
+	}()
+	templateTag := dockerSandboxesGenerationTag(tagProfile, manifestHash, architecture, generation.ConfigID, generation.Generation)
+	if err := m.recordSandboxWorkspace(ctx, artifactRoot, manifestHash, storagecatalog.StateStaging, m.now().UTC()); err != nil {
 		return fmt.Errorf("record Docker Sandboxes archive workspace ownership: %w", err)
 	}
 	platformLock := lock.Platforms[source.Platform]
@@ -916,7 +930,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	archivePath := filepath.Join(artifactRoot, "runner-template.tar")
 	partialArchivePath := archivePath + ".partial"
 	metadataPath := filepath.Join(artifactRoot, "template-metadata.json")
-	resumed, err := m.resumeDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, artifactRoot, metadataPath, archivePath, runtime)
+	resumed, err := m.resumeDockerSandboxesTemplate(ctx, manifest, source, manifestHash, rootDisk, "docker.io/library/"+templateTag, artifactRoot, metadataPath, archivePath, runtime)
 	if err != nil {
 		return err
 	}
@@ -1374,7 +1388,10 @@ func validateDockerSandboxesReceiptEvidence(receiptPath string, receipt dockerSa
 			return fmt.Errorf("Docker Sandboxes receipt evidence %q is missing", name)
 		}
 		clean := filepath.Clean(filepath.FromSlash(evidence.Path))
-		expectedPath := filepath.ToSlash(filepath.Join("evidence", receipt.ManifestHash, filename))
+		expectedPath := filepath.ToSlash(filepath.Join("evidence", receipt.ManifestHash, receipt.Artifact.CacheID, filename))
+		if receipt.SchemaVersion == dockerSandboxesLegacyReceiptSchema {
+			expectedPath = filepath.ToSlash(filepath.Join("evidence", receipt.ManifestHash, filename))
+		}
 		if evidence.Path != expectedPath || filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || filepath.ToSlash(clean) != evidence.Path || !validSHA256(evidence.SHA256) {
 			return fmt.Errorf("Docker Sandboxes receipt evidence %q has an invalid path or digest", name)
 		}
@@ -1429,6 +1446,128 @@ func (m *Coordinator) dockerSandboxesArtifactRoot(manifestHash string) (string, 
 		return "", err
 	}
 	return filepath.Join(m.ProjectRoot, "work", "template-builds", "docker-sandboxes", configID, manifestHash), nil
+}
+
+func (m *Coordinator) beginDockerSandboxesBuild(manifestHash string) (dockerSandboxesBuildGeneration, string, *filelock.Lock, error) {
+	var generation dockerSandboxesBuildGeneration
+	if !validLowerHex(manifestHash, sha256.Size*2) {
+		return generation, "", nil, fmt.Errorf("invalid Docker Sandboxes manifest hash %q", manifestHash)
+	}
+	configID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return generation, "", nil, err
+	}
+	root, err := m.dockerSandboxesBuildGenerationRoot(manifestHash)
+	if err != nil {
+		return generation, "", nil, err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return generation, "", nil, err
+	}
+	buildLock, err := filelock.Acquire(filepath.Join(root, "build.lock"))
+	if err != nil {
+		return generation, "", nil, fmt.Errorf("lock exact Docker Sandboxes build generation: %w", err)
+	}
+	failed := true
+	defer func() {
+		if failed {
+			_ = buildLock.Close()
+		}
+	}()
+	candidatePath := filepath.Join(root, "candidate.json")
+	err = readJSONFile(candidatePath, &generation)
+	if errors.Is(err, os.ErrNotExist) {
+		generationID, generationErr := newDockerSandboxesBuildGenerationID()
+		if generationErr != nil {
+			return dockerSandboxesBuildGeneration{}, "", nil, generationErr
+		}
+		generation = dockerSandboxesBuildGeneration{
+			SchemaVersion: dockerSandboxesBuildGenerationSchema,
+			ConfigID:      configID,
+			ManifestHash:  manifestHash,
+			Generation:    generationID,
+			CreatedAt:     m.now().UTC(),
+		}
+		if err := writeJSONFile(candidatePath, generation); err != nil {
+			return dockerSandboxesBuildGeneration{}, "", nil, fmt.Errorf("persist Docker Sandboxes build generation: %w", err)
+		}
+	} else if err != nil {
+		return dockerSandboxesBuildGeneration{}, "", nil, fmt.Errorf("read Docker Sandboxes build generation: %w", err)
+	}
+	if generation.SchemaVersion != dockerSandboxesBuildGenerationSchema || generation.ConfigID != configID || generation.ManifestHash != manifestHash || !validLowerHex(generation.Generation, 32) || generation.CreatedAt.IsZero() {
+		return dockerSandboxesBuildGeneration{}, "", nil, fmt.Errorf("Docker Sandboxes build generation record is invalid")
+	}
+	workspace, err := m.dockerSandboxesGenerationWorkspace(manifestHash, generation.Generation)
+	if err != nil {
+		return dockerSandboxesBuildGeneration{}, "", nil, err
+	}
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		return dockerSandboxesBuildGeneration{}, "", nil, err
+	}
+	failed = false
+	return generation, workspace, buildLock, nil
+}
+
+func newDockerSandboxesBuildGenerationID() (string, error) {
+	content := make([]byte, 16)
+	if _, err := rand.Read(content); err != nil {
+		return "", fmt.Errorf("generate Docker Sandboxes build generation: %w", err)
+	}
+	return hex.EncodeToString(content), nil
+}
+
+func dockerSandboxesGenerationTag(profile, manifestHash, architecture, configID, generation string) string {
+	return fmt.Sprintf("epar-docker-sandboxes-catthehacker-%s:%s-%s-%s-%s", profile, manifestHash[:16], architecture, configID, generation)
+}
+
+func (m *Coordinator) clearDockerSandboxesBuildGeneration(manifestHash, workspace string) error {
+	root, err := m.dockerSandboxesBuildGenerationRoot(manifestHash)
+	if err != nil {
+		return err
+	}
+	candidatePath := filepath.Join(root, "candidate.json")
+	var generation dockerSandboxesBuildGeneration
+	if err := readJSONFile(candidatePath, &generation); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	expectedWorkspace, err := m.dockerSandboxesGenerationWorkspace(manifestHash, generation.Generation)
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(workspace) != filepath.Clean(expectedWorkspace) {
+		return fmt.Errorf("active build generation points to %s, not completed workspace %s", expectedWorkspace, workspace)
+	}
+	if err := os.Remove(candidatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (m *Coordinator) dockerSandboxesBuildGenerationRoot(manifestHash string) (string, error) {
+	configID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(m.ProjectRoot, "work", "template-builds", "docker-sandboxes", configID, "generation-state", manifestHash), nil
+}
+
+func (m *Coordinator) dockerSandboxesGenerationWorkspace(manifestHash, generation string) (string, error) {
+	configID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(m.ProjectRoot, "work", "template-builds", "docker-sandboxes", configID, "generation-workspaces", manifestHash, generation), nil
+}
+
+func validLowerHex(value string, length int) bool {
+	if len(value) != length || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func readVerifiedBuildEvidence(path string, maximumBytes uint64) ([]byte, error) {
@@ -1625,16 +1764,24 @@ func (m *Coordinator) verifyDockerSandboxesNativeBuilder(ctx context.Context, pl
 	return nil
 }
 
-func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk, artifactRoot, metadataPath, archivePath string, runtime provider.TemplateArtifactRuntime) (bool, error) {
+func (m *Coordinator) resumeDockerSandboxesTemplate(ctx context.Context, manifest Manifest, source ResolvedDockerSource, manifestHash, rootDisk, expectedReference, artifactRoot, metadataPath, archivePath string, runtime provider.TemplateArtifactRuntime) (bool, error) {
 	metadata, artifact, metadataSHA, archiveSHA, valid, err := verifiedDockerSandboxesBuildArtifact(artifactRoot, metadataPath, archivePath, manifestHash, source)
 	if err != nil {
 		return false, err
 	}
 	if !valid {
+		if _, metadataErr := os.Lstat(metadataPath); metadataErr == nil {
+			return false, fmt.Errorf("Docker Sandboxes candidate metadata for %s is present but not exact; refusing to overwrite its generation", manifestHash)
+		} else if !errors.Is(metadataErr, os.ErrNotExist) {
+			return false, metadataErr
+		}
 		return false, nil
 	}
+	if artifact.Reference != expectedReference {
+		return false, fmt.Errorf("Docker Sandboxes candidate reference %s does not match persisted build generation %s", artifact.Reference, expectedReference)
+	}
 	if artifact.RootDisk != rootDisk {
-		return false, nil
+		return false, fmt.Errorf("Docker Sandboxes candidate root disk %s does not match requested root disk %s; refusing to overwrite its generation", artifact.RootDisk, rootDisk)
 	}
 	activatedAt := time.Time{}
 	if err := m.withSandboxBackendLock(ctx, func() error {
@@ -1772,7 +1919,7 @@ func (m *Coordinator) publishDockerSandboxesTemplateLocked(manifest Manifest, so
 	if !archiveInfo.Mode().IsRegular() {
 		return time.Time{}, errors.New("verified Docker Sandboxes archive is not a regular file")
 	}
-	evidence, err := m.persistDockerSandboxesCompactEvidence(manifestHash, filepath.Dir(metadataPath))
+	evidence, err := m.persistDockerSandboxesCompactEvidence(manifestHash, artifact.CacheID, filepath.Dir(metadataPath))
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -1803,8 +1950,12 @@ func (m *Coordinator) publishDockerSandboxesTemplateLocked(manifest Manifest, so
 }
 
 func (m *Coordinator) finishDockerSandboxesTemplateActivation(ctx context.Context, archivePath, manifestHash string, activatedAt time.Time) error {
-	if err := m.recordSandboxWorkspace(ctx, filepath.Dir(archivePath), manifestHash, storagecatalog.StateSuperseded, activatedAt); err != nil {
+	workspace := filepath.Dir(archivePath)
+	if err := m.recordSandboxWorkspace(ctx, workspace, manifestHash, storagecatalog.StateSuperseded, activatedAt); err != nil {
 		return fmt.Errorf("record Docker Sandboxes staging ownership: %w", err)
+	}
+	if err := m.clearDockerSandboxesBuildGeneration(manifestHash, workspace); err != nil {
+		return fmt.Errorf("complete Docker Sandboxes build generation: %w", err)
 	}
 	if err := m.cleanupSupersededCatalog(ctx); err != nil {
 		return err
@@ -1812,12 +1963,16 @@ func (m *Coordinator) finishDockerSandboxesTemplateActivation(ctx context.Contex
 	return nil
 }
 
-func (m *Coordinator) persistDockerSandboxesCompactEvidence(manifestHash, artifactRoot string) (map[string]artifactEvidence, error) {
+func (m *Coordinator) persistDockerSandboxesCompactEvidence(manifestHash, artifactCacheID, artifactRoot string) (map[string]artifactEvidence, error) {
 	receiptPath, err := m.dockerSandboxesReceiptPath()
 	if err != nil {
 		return nil, err
 	}
-	evidenceRoot := filepath.Join(filepath.Dir(receiptPath), "evidence", manifestHash)
+	if !validLowerHex(artifactCacheID, 12) {
+		return nil, fmt.Errorf("invalid Docker Sandboxes artifact cache ID %q", artifactCacheID)
+	}
+	relativeEvidenceRoot := filepath.Join("evidence", manifestHash, artifactCacheID)
+	evidenceRoot := filepath.Join(filepath.Dir(receiptPath), relativeEvidenceRoot)
 	if err := os.MkdirAll(evidenceRoot, 0o700); err != nil {
 		return nil, err
 	}
@@ -1835,7 +1990,7 @@ func (m *Coordinator) persistDockerSandboxesCompactEvidence(manifestHash, artifa
 		if err != nil {
 			return nil, err
 		}
-		result[name] = artifactEvidence{Path: filepath.ToSlash(filepath.Join("evidence", manifestHash, filename)), SHA256: digest}
+		result[name] = artifactEvidence{Path: filepath.ToSlash(filepath.Join(relativeEvidenceRoot, filename)), SHA256: digest}
 	}
 	sbomPath := filepath.Join(artifactRoot, "sbom.intoto.json")
 	sbomDigest, sbomBytes, err := hashFile(sbomPath)
@@ -1854,7 +2009,7 @@ func (m *Coordinator) persistDockerSandboxesCompactEvidence(manifestHash, artifa
 	if err != nil {
 		return nil, err
 	}
-	result["sbomDescriptor"] = artifactEvidence{Path: filepath.ToSlash(filepath.Join("evidence", manifestHash, "sbom-descriptor.json")), SHA256: descriptorDigest, SourceDigest: sbomDigest}
+	result["sbomDescriptor"] = artifactEvidence{Path: filepath.ToSlash(filepath.Join(relativeEvidenceRoot, "sbom-descriptor.json")), SHA256: descriptorDigest, SourceDigest: sbomDigest}
 	return result, nil
 }
 
