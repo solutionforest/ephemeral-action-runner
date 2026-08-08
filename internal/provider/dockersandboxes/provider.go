@@ -626,7 +626,10 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 	if err := validateCommandRequest(request); err != nil {
 		return nil, err
 	}
-	command := exec.CommandContext(ctx, p.Binary, request.args...)
+	// The caller's context bounds startup only. The returned keepalive owns the
+	// sandbox lifetime and must survive the provisioning-attempt context that the
+	// pool cancels as soon as Start returns.
+	command := exec.Command(p.Binary, request.args...)
 	isolateKeepaliveProcess(command)
 	command.WaitDelay = commandWaitDelay
 	command.Stdin = request.stdin
@@ -655,6 +658,10 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 		}
 		return nil, fmt.Errorf("%s failed: %w", request.operation, err)
 	case <-ctx.Done():
+		if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return nil, errors.Join(ctx.Err(), fmt.Errorf("stop keepalive after canceled startup: %w", err))
+		}
+		<-finished
 		return nil, ctx.Err()
 	case <-timer.C:
 		return &provider.RunningProcess{Name: name, PID: command.Process.Pid}, nil

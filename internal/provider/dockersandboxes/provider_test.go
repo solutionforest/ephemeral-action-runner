@@ -1089,6 +1089,70 @@ func TestExecCancellationPropagatesWithoutRealSbx(t *testing.T) {
 	}
 }
 
+func TestKeepaliveSurvivesSuccessfulStartContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	marker := filepath.Join(t.TempDir(), "survived")
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 1\nprintf survived >\"$2\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := New(helper)
+	ctx, cancel := context.WithCancel(context.Background())
+	process, err := p.startKeepalive(ctx, testName, commandRequest{
+		args:      []string{"exec", marker},
+		operation: "test managed keepalive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if content, readErr := os.ReadFile(marker); readErr == nil {
+			if string(content) != "survived" {
+				t.Fatalf("marker = %q", content)
+			}
+			break
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatal(readErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("keepalive was terminated when the successful Start context was canceled")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if process.PID <= 0 {
+		t.Fatalf("keepalive PID = %d", process.PID)
+	}
+}
+
+func TestKeepaliveCancellationDuringStartupStopsProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	marker := filepath.Join(t.TempDir(), "unexpected")
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 1\nprintf unexpected >\"$2\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := New(helper)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	_, err := p.startKeepalive(ctx, testName, commandRequest{
+		args:      []string{"exec", marker},
+		operation: "test managed keepalive",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("canceled startup left the keepalive running: %v", statErr)
+	}
+}
+
 func TestRunRawNormalizesCommandContextKillToCancellation(t *testing.T) {
 	if os.Getenv("EPAR_DOCKER_SANDBOXES_RUN_RAW_HELPER") == "1" {
 		_, _ = os.Stdout.WriteString("ready\n")

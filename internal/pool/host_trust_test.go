@@ -632,6 +632,9 @@ func TestHostTrustImageBuildRetriesChangedGenerationBeforePublishing(t *testing.
 	}
 	runHostOutputCommand = func(_ context.Context, _ string, args ...string) (string, error) {
 		if len(args) > 1 && args[0] == "buildx" && args[1] == "inspect" {
+			if len(args) > 2 && args[2] == "--bootstrap" {
+				return "Status: running\n", nil
+			}
 			return "", errors.New("builder not found")
 		}
 		if len(args) > 3 && args[0] == "exec" && strings.Contains(args[3], "/certs/") {

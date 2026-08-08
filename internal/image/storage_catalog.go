@@ -636,6 +636,16 @@ func (m *Coordinator) recordDockerRoleAcquisition(ctx context.Context, role, ref
 	if err != nil {
 		return err
 	}
+	return m.recordDockerRoleAcquisitionForBackend(backendID, role, reference, previousID, currentID, now)
+}
+
+func (m *Coordinator) recordDockerRoleAcquisitionForBackend(backendID, role, reference, previousID, currentID string, now time.Time) error {
+	if m.DryRun || currentID == "" {
+		return nil
+	}
+	if !validDockerBackendID(backendID) {
+		return fmt.Errorf("invalid Docker backend identity %q for image acquisition", backendID)
+	}
 	tag := reference
 	if strings.LastIndex(tag, ":") <= strings.LastIndex(tag, "/") {
 		tag += ":latest"
@@ -872,6 +882,20 @@ func (m *Coordinator) cleanupSupersededCatalog(ctx context.Context) error {
 			m.warnf("EPAR storage cleanup backend lock deferred for %s %s: %v\n", resource.Kind, resource.Identity, lockErr)
 			continue
 		}
+		if resource.Kind == catalogDockerImageKind {
+			matches, backendErr := m.activeDockerBackendMatches(ctx, resource.BackendID)
+			if backendErr != nil || !matches {
+				if closeErr := backendLock.Close(); closeErr != nil {
+					m.warnf("EPAR storage cleanup backend lock release warning: %v\n", closeErr)
+				}
+				if backendErr != nil {
+					m.warnf("EPAR Docker image cleanup backend discovery deferred for %s: %v\n", resource.Identity, backendErr)
+				} else {
+					m.infof("EPAR Docker image cleanup deferred for %s because its recorded backend %s is inactive\n", resource.Identity, resource.BackendID)
+				}
+				continue
+			}
+		}
 		startedAt := time.Now().UTC()
 		removeCandidate := resource
 		shouldRemove := false
@@ -1068,12 +1092,36 @@ func (m *Coordinator) reconcileInterruptedDockerAcquisitions(ctx context.Context
 		if lockErr != nil {
 			return lockErr
 		}
+		activeBackendID, backendErr := m.dockerBackendID(ctx)
+		if backendErr != nil {
+			_ = lock.Close()
+			return backendErr
+		}
+		if activeBackendID != journal.BackendID {
+			if closeErr := lock.Close(); closeErr != nil {
+				return closeErr
+			}
+			m.infof("EPAR interrupted Docker acquisition reconciliation deferred for %s because its recorded backend %s differs from the current backend %s\n", journal.Locator, journal.BackendID, activeBackendID)
+			continue
+		}
 		currentID, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", journal.Locator)
 		if inspectErr != nil && !dockerInspectMeansMissing(inspectErr) {
 			_ = lock.Close()
 			return inspectErr
 		}
 		currentID = strings.TrimSpace(currentID)
+		confirmedBackendID, backendErr := m.dockerBackendID(ctx)
+		if backendErr != nil {
+			_ = lock.Close()
+			return backendErr
+		}
+		if confirmedBackendID != journal.BackendID {
+			if closeErr := lock.Close(); closeErr != nil {
+				return closeErr
+			}
+			m.infof("EPAR interrupted Docker acquisition reconciliation deferred for %s because the Docker backend changed during inspection (%s -> %s)\n", journal.Locator, journal.BackendID, confirmedBackendID)
+			continue
+		}
 		now := time.Now().UTC()
 		_, updateErr := store.WithLock(now, func(current *storagecatalog.Catalog) error {
 			if currentID != "" && currentID != journal.PreviousIdentity {
@@ -1131,7 +1179,23 @@ func upsertCleanupJournal(value *storagecatalog.Catalog, resource storagecatalog
 func (m *Coordinator) catalogResourceExists(ctx context.Context, resource storagecatalog.Resource) (bool, error) {
 	switch resource.Kind {
 	case catalogDockerImageKind:
+		matches, err := m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if err != nil {
+			return false, err
+		}
+		if !matches {
+			// Preserve evidence owned by an inactive daemon. It can be observed
+			// only after that exact backend becomes current again.
+			return true, nil
+		}
 		identity, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", resource.Identity)
+		matches, backendErr := m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if backendErr != nil {
+			return false, backendErr
+		}
+		if !matches {
+			return true, nil
+		}
 		if err != nil {
 			if dockerInspectMeansMissing(err) {
 				return false, nil
@@ -1198,6 +1262,22 @@ func (m *Coordinator) enforceDedicatedBuildxCache(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Schema 4 proves exact config ownership but predates daemon identity. It is
+	// migrated only by the full builder verification path; housekeeping cannot
+	// safely attribute its cache to the currently selected Docker backend.
+	if metadata.SchemaVersion != buildxMetadataSchemaVersion {
+		m.infof("EPAR BuildKit cache housekeeping deferred for builder %s because its schema-%d metadata predates Docker backend identity; reconciliation will occur when a build is required\n", metadata.Builder, metadata.SchemaVersion)
+		return nil
+	}
+	backendID, releaseBackend, err := m.acquireDockerBackendLock(ctx)
+	if err != nil {
+		return nil
+	}
+	defer releaseBackend()
+	if backendID != metadata.BackendID {
+		m.infof("EPAR BuildKit cache housekeeping deferred for builder %s because its recorded Docker backend %s differs from the current backend %s; reconciliation will occur when a build is required\n", metadata.Builder, metadata.BackendID, backendID)
+		return nil
+	}
 	limitBytes, err := m.effectiveBuildCacheLimit()
 	if err != nil {
 		return err
@@ -1206,9 +1286,20 @@ func (m *Coordinator) enforceDedicatedBuildxCache(ctx context.Context) error {
 	if err != nil {
 		return nil
 	}
+	if buildxInspectShowsNodeError(inspectOutput) {
+		m.infof("EPAR BuildKit cache housekeeping deferred for builder %s because Buildx reported a node error; reconciliation will occur when a build is required\n", metadata.Builder)
+		return nil
+	}
 	if buildxInspectShowsStoppedBuilder(inspectOutput) {
 		// A stopped worker cannot grow its cache. The cache ceiling is checked
-		// again after the next build starts this exact worker.
+		// again after the next build starts and verifies this exact worker.
+		return nil
+	}
+	confirmedBackendID, err := m.dockerBackendID(ctx)
+	if err != nil || confirmedBackendID != backendID {
+		if err == nil {
+			m.infof("EPAR BuildKit cache housekeeping deferred for builder %s because the Docker backend changed during inspection; reconciliation will occur when a build is required\n", metadata.Builder)
+		}
 		return nil
 	}
 	usageOutput, err := m.runHostOutput(ctx, "docker", "buildx", "du", "--builder", metadata.Builder, "--format", "json")
@@ -1320,7 +1411,21 @@ func parseBuildxUsageBytes(content []byte) (uint64, error) {
 func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storagecatalog.Resource) error {
 	switch resource.Kind {
 	case catalogDockerImageKind:
+		matches, err := m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return fmt.Errorf("refusing Docker image cleanup for inactive backend %s", resource.BackendID)
+		}
 		containers, err := m.runHostOutput(ctx, "docker", "ps", "-a", "--filter", "ancestor="+resource.Identity, "--format", "{{.ID}}")
+		matches, backendErr := m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if backendErr != nil {
+			return backendErr
+		}
+		if !matches {
+			return fmt.Errorf("refusing Docker image cleanup after the active backend changed from %s", resource.BackendID)
+		}
 		if err != nil {
 			return err
 		}
@@ -1328,6 +1433,13 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 			return errors.New("a Docker container still references the image")
 		}
 		tagsJSON, err := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{json .RepoTags}}", resource.Identity)
+		matches, backendErr = m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if backendErr != nil {
+			return backendErr
+		}
+		if !matches {
+			return fmt.Errorf("refusing Docker image cleanup after the active backend changed from %s", resource.BackendID)
+		}
 		if err != nil {
 			if dockerInspectMeansMissing(err) {
 				return nil
@@ -1344,6 +1456,13 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 		}
 		for _, tag := range resource.IntroducedTags {
 			tagID, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", tag)
+			matches, backendErr := m.activeDockerBackendMatches(ctx, resource.BackendID)
+			if backendErr != nil {
+				return backendErr
+			}
+			if !matches {
+				return fmt.Errorf("refusing Docker image cleanup after the active backend changed from %s", resource.BackendID)
+			}
 			if inspectErr == nil && strings.TrimSpace(tagID) == resource.Identity {
 				if err := m.runHostQuiet(ctx, "docker", "image", "rm", tag); err != nil {
 					return err
@@ -1351,22 +1470,40 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 			}
 		}
 		remainingTagsJSON, inspectErr := m.runHostOutput(ctx, "docker", "image", "inspect", "--format", "{{json .RepoTags}}", resource.Identity)
-		if inspectErr == nil {
-			var remaining []string
-			if err := json.Unmarshal([]byte(strings.TrimSpace(remainingTagsJSON)), &remaining); err != nil {
-				return err
+		matches, backendErr = m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if backendErr != nil {
+			return backendErr
+		}
+		if !matches {
+			return fmt.Errorf("refusing Docker image cleanup after the active backend changed from %s", resource.BackendID)
+		}
+		if inspectErr != nil {
+			if dockerInspectMeansMissing(inspectErr) {
+				return nil
 			}
-			for _, tag := range remaining {
-				if !introduced[tag] {
-					return nil
-				}
+			return inspectErr
+		}
+		var remaining []string
+		if err := json.Unmarshal([]byte(strings.TrimSpace(remainingTagsJSON)), &remaining); err != nil {
+			return err
+		}
+		for _, tag := range remaining {
+			if !introduced[tag] {
+				return nil
 			}
-			if len(remaining) != 0 {
-				return fmt.Errorf("EPAR-introduced Docker image tags remain after exact removal: %s", strings.Join(remaining, ", "))
-			}
-			if err := m.runHostQuiet(ctx, "docker", "image", "rm", resource.Identity); err != nil {
-				return err
-			}
+		}
+		if len(remaining) != 0 {
+			return fmt.Errorf("EPAR-introduced Docker image tags remain after exact removal: %s", strings.Join(remaining, ", "))
+		}
+		matches, backendErr = m.activeDockerBackendMatches(ctx, resource.BackendID)
+		if backendErr != nil {
+			return backendErr
+		}
+		if !matches {
+			return fmt.Errorf("refusing Docker image cleanup after the active backend changed from %s", resource.BackendID)
+		}
+		if err := m.runHostQuiet(ctx, "docker", "image", "rm", resource.Identity); err != nil {
+			return err
 		}
 		return nil
 	case catalogSandboxTemplateKind:
@@ -1453,4 +1590,15 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 	default:
 		return fmt.Errorf("automatic cleanup is not implemented for catalog resource kind %q", resource.Kind)
 	}
+}
+
+func (m *Coordinator) activeDockerBackendMatches(ctx context.Context, expected string) (bool, error) {
+	if !validDockerBackendID(expected) {
+		return false, fmt.Errorf("invalid Docker backend identity %q", expected)
+	}
+	active, err := m.dockerBackendID(ctx)
+	if err != nil {
+		return false, err
+	}
+	return active == expected, nil
 }
