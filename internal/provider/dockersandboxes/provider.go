@@ -62,6 +62,8 @@ type Provider struct {
 	Binary string
 
 	runCommand            runCommandFunc
+	activationMu          sync.RWMutex
+	admissionBlockReason  string
 	activeMu              sync.RWMutex
 	activeTemplate        provider.TemplateArtifact
 	dryRun                bool
@@ -192,6 +194,11 @@ func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, erro
 func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (provider.Instance, error) {
 	if p.dryRun {
 		return provider.Instance{}, fmt.Errorf("docker-sandboxes does not support dry-run instance creation because exact sandbox and template-cache readback is required")
+	}
+	p.activationMu.RLock()
+	defer p.activationMu.RUnlock()
+	if p.admissionBlockReason != "" {
+		return provider.Instance{}, fmt.Errorf("Docker Sandboxes admission is blocked: %s", p.admissionBlockReason)
 	}
 	if request.Template == "" && request.TemplateDigest == "" {
 		p.activeMu.RLock()
@@ -381,6 +388,57 @@ func (p *Provider) ActivateTemplate(artifact provider.TemplateArtifact) error {
 	p.activeMu.Lock()
 	p.activeTemplate = artifact
 	p.activeMu.Unlock()
+	return nil
+}
+
+// WithTemplateActivation blocks new Create calls while the shared image
+// coordinator activates and durably commits one exact template generation.
+// Existing instances are unaffected; scheduled updates already drain them in
+// the common pool before entering this transaction.
+func (p *Provider) WithTemplateActivation(operation func() error) error {
+	if operation == nil {
+		return fmt.Errorf("Docker Sandboxes template activation operation is required")
+	}
+	p.activationMu.Lock()
+	defer p.activationMu.Unlock()
+	return operation()
+}
+
+func (p *Provider) SetTemplateAdmissionBlock(reason string) {
+	p.activationMu.Lock()
+	defer p.activationMu.Unlock()
+	p.admissionBlockReason = strings.TrimSpace(reason)
+}
+
+func (p *Provider) ClearTemplateAdmissionBlock() {
+	p.activationMu.Lock()
+	defer p.activationMu.Unlock()
+	p.admissionBlockReason = ""
+}
+
+func (p *Provider) TemplateAdmissionBlock() (string, bool) {
+	p.activationMu.RLock()
+	defer p.activationMu.RUnlock()
+	return p.admissionBlockReason, p.admissionBlockReason != ""
+}
+
+// ActiveTemplate returns the exact in-process generation used when Create
+// requests omit an explicit template identity.
+func (p *Provider) ActiveTemplate() (provider.TemplateArtifact, bool) {
+	p.activeMu.RLock()
+	defer p.activeMu.RUnlock()
+	return p.activeTemplate, p.activeTemplate.Reference != ""
+}
+
+// ClearActiveTemplate removes only the expected uncommitted generation. It is
+// used when first activation fails and there is no previous receipt to restore.
+func (p *Provider) ClearActiveTemplate(expected provider.TemplateArtifact) error {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	if p.activeTemplate != expected {
+		return fmt.Errorf("cannot clear Docker Sandboxes template because the active identity changed")
+	}
+	p.activeTemplate = provider.TemplateArtifact{}
 	return nil
 }
 
@@ -1151,5 +1209,7 @@ var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)
 var _ provider.TemplateArtifactRuntime = (*Provider)(nil)
+var _ provider.TemplateArtifactActivationController = (*Provider)(nil)
+var _ provider.TemplateAdmissionController = (*Provider)(nil)
 var _ provider.TemplateArtifactCleaner = (*Provider)(nil)
 var _ provider.TemplateArtifactObserver = (*Provider)(nil)

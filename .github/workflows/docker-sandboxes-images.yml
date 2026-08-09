@@ -1,0 +1,1450 @@
+name: Docker Sandboxes prebuilt images
+
+on:
+  schedule:
+    - cron: '37 */6 * * *'
+  push:
+    branches:
+      - develop
+      # Temporary candidate-publication trigger for the prebuilt-image pilot.
+      # Remove this branch before merging the workflow to main.
+      - feature/prebuilt_img
+      - main
+    paths:
+      - '.github/workflows/docker-sandboxes-images.yml'
+      - 'templates/docker-sandboxes/**'
+      - 'scripts/docker-sandboxes/**'
+      - 'internal/prebuilt/**'
+      - 'cmd/epar-prebuilt-publisher/**'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Profile to build. Full is candidate-only until its independent gates are enabled.'
+        required: true
+        type: choice
+        options:
+          - act
+          - full
+        default: act
+      force_candidate:
+        description: 'Keep the result as a candidate even when the source-only tuple is eligible for alias advancement.'
+        required: true
+        type: boolean
+        default: false
+      promote_candidate:
+        description: 'Promote one already-published candidate digest without rebuilding; requires protected environment approval and PROMOTE confirmation.'
+        required: true
+        type: boolean
+        default: false
+      candidate_digest:
+        description: 'Exact candidate package index digest (sha256:<64 lowercase hex>) for manual promotion.'
+        required: false
+        type: string
+        default: ''
+      promotion_confirmation:
+        description: 'Type PROMOTE exactly when promoting the supplied candidate digest.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: docker-sandboxes-prebuilt-publisher
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: ghcr.io/catthehacker/ubuntu
+  PACKAGE_REPOSITORY: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template
+  CATALOG_ARTIFACT_TYPE: application/vnd.epar.prebuilt.catalog.v1
+  CATALOG_CONFIG_MEDIA_TYPE: application/vnd.epar.prebuilt.catalog.config.v1+json
+  CATALOG_LAYER_MEDIA_TYPE: application/vnd.epar.prebuilt.catalog.v1+json
+  RUNTIME_CONTRACT: docker-sandboxes-v1
+  TEMPLATE_SCHEMA: '2'
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
+
+jobs:
+  resolve:
+    name: Resolve immutable upstream and publication state
+    if: inputs.promote_candidate != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      profile: ${{ steps.select.outputs.profile }}
+      source_tag: ${{ steps.select.outputs.source_tag }}
+      source_reference: ${{ steps.select.outputs.source_reference }}
+      source_index_digest: ${{ steps.source.outputs.index_digest }}
+      source_amd64_digest: ${{ steps.source.outputs.amd64_digest }}
+      source_arm64_digest: ${{ steps.source.outputs.arm64_digest }}
+      recipe_digest: ${{ steps.recipe.outputs.recipe_digest }}
+      source_lock_digest: ${{ steps.recipe.outputs.source_lock_digest }}
+      tool_digest: ${{ steps.recipe.outputs.tool_digest }}
+      runner_version: ${{ steps.runner.outputs.version }}
+      runner_amd64_url: ${{ steps.runner.outputs.amd64_url }}
+      runner_amd64_digest: ${{ steps.runner.outputs.amd64_digest }}
+      runner_arm64_url: ${{ steps.runner.outputs.arm64_url }}
+      runner_arm64_digest: ${{ steps.runner.outputs.arm64_digest }}
+      noop: ${{ steps.noop.outputs.noop }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.3
+
+      - name: Log in to GHCR for idempotent pointer reconciliation
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up Go for signed catalog verification
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Select profile and immutable source selector
+        id: select
+        shell: bash
+        env:
+          DISPATCH_PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          profile="${DISPATCH_PROFILE:-act}"
+          case "$profile" in
+            act|full) ;;
+            *) echo "unsupported profile: $profile" >&2; exit 1 ;;
+          esac
+          if [[ "$profile" == full && "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
+            echo 'full is candidate-only and may be selected only by an explicit workflow dispatch' >&2
+            exit 1
+          fi
+          source_tag="${profile}-latest"
+          source_reference="${SOURCE_REPOSITORY}:${source_tag}"
+          {
+            echo "profile=$profile"
+            echo "source_tag=$source_tag"
+            echo "source_reference=$source_reference"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve OCI source index and platform descriptors
+        id: source
+        shell: bash
+        env:
+          SOURCE_REFERENCE: ${{ steps.select.outputs.source_reference }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/epar-source"
+          oras manifest fetch "$SOURCE_REFERENCE" --format json > "$RUNNER_TEMP/epar-source/source.json"
+          index_digest="$(oras resolve "$SOURCE_REFERENCE")"
+          [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          platform_count="$(jq '[(.content.manifests // .manifests)[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/epar-source/source.json")"
+          [[ "$platform_count" == 2 ]]
+          platform_names="$(jq -r '(.content.manifests // .manifests)[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture' "$RUNNER_TEMP/epar-source/source.json" | sort -u | paste -sd, -)"
+          [[ "$platform_names" == 'amd64,arm64' ]]
+          amd64_digest="$(jq -er '(.content.manifests // .manifests)[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' "$RUNNER_TEMP/epar-source/source.json" | head -n 1)"
+          arm64_digest="$(jq -er '(.content.manifests // .manifests)[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$RUNNER_TEMP/epar-source/source.json" | head -n 1)"
+          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "index_digest=$index_digest"
+            echo "amd64_digest=$amd64_digest"
+            echo "arm64_digest=$arm64_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the exact Actions runner release assets
+        id: runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/actions-runner-release.json"
+          curl --fail --silent --show-error --retry 4 --retry-delay 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/actions/runner/releases/latest > "$release_json"
+          version="$(jq -er '.tag_name | ltrimstr("v")' "$release_json")"
+          amd64_name="actions-runner-linux-x64-${version}.tar.gz"
+          arm64_name="actions-runner-linux-arm64-${version}.tar.gz"
+          amd64_url="$(jq -er --arg name "$amd64_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")"
+          arm64_url="$(jq -er --arg name "$arm64_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")"
+          amd64_digest="$(jq -er --arg name "$amd64_name" '.assets[] | select(.name == $name) | .digest' "$release_json")"
+          arm64_digest="$(jq -er --arg name "$arm64_name" '.assets[] | select(.name == $name) | .digest' "$release_json")"
+          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "version=$version"
+            echo "amd64_url=$amd64_url"
+            echo "amd64_digest=$amd64_digest"
+            echo "arm64_url=$arm64_url"
+            echo "arm64_digest=$arm64_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute immutable recipe and tool identities
+        id: recipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_lock_digest="sha256:$(sha256sum templates/docker-sandboxes/sources.lock.json | awk '{print $1}')"
+          tool_digest="sha256:$(jq -cS '{dockerfileFrontend,sbomGenerator,goBuilder,emulation,tini}' templates/docker-sandboxes/sources.lock.json | sha256sum | awk '{print $1}')"
+          mapfile -t recipe_files < <(
+            git ls-files --cached -- \
+              'templates/docker-sandboxes/Dockerfile.prebuilt' \
+              'templates/docker-sandboxes/helpers.sha256' \
+              'templates/docker-sandboxes/prebuilt.lock.json' \
+              'templates/docker-sandboxes/prebuilt/**' \
+              'templates/docker-sandboxes/guest/**' \
+              'templates/docker-sandboxes/hook-launcher/**' \
+              'templates/docker-sandboxes/egress-bridge/**' \
+              'templates/docker-sandboxes/profiles/**' \
+              'scripts/docker-sandboxes/**' \
+              'internal/prebuilt/**' | sort
+          )
+          ((${#recipe_files[@]} > 0))
+          recipe_digest="sha256:$(printf '%s\n' "${recipe_files[@]}" | xargs sha256sum | sha256sum | awk '{print $1}')"
+          {
+            echo "source_lock_digest=$source_lock_digest"
+            echo "tool_digest=$tool_digest"
+            echo "recipe_digest=$recipe_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch current signed catalog state or initialize an empty ledger
+        shell: bash
+        env:
+          PROFILE: ${{ steps.select.outputs.profile }}
+          RUNNER_VERSION: ${{ steps.runner.outputs.version }}
+          RUNNER_AMD64_DIGEST: ${{ steps.runner.outputs.amd64_digest }}
+          RUNNER_ARM64_DIGEST: ${{ steps.runner.outputs.arm64_digest }}
+          SOURCE_INDEX_DIGEST: ${{ steps.source.outputs.index_digest }}
+          RECIPE_DIGEST: ${{ steps.recipe.outputs.recipe_digest }}
+          RECIPE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          catalog_dir="$RUNNER_TEMP/epar-catalog"
+          mkdir -p "$catalog_dir"
+          catalog_reference="${PACKAGE_REPOSITORY}:catalog-v1"
+          catalog_error="$catalog_dir/catalog-fetch.error"
+          if catalog_digest="$(oras resolve "$catalog_reference" 2>"$catalog_error")"; then
+            [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${catalog_digest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
+            oras pull "${PACKAGE_REPOSITORY}@${catalog_digest}" --output "$catalog_dir/pulled" >/dev/null
+            catalog_file="$(find "$catalog_dir/pulled" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
+            [[ -n "$catalog_file" && -f "$catalog_file" ]]
+            cp "$catalog_file" "$catalog_dir/catalog-state.json"
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_error"; then
+              cat "$catalog_error" >&2
+              exit 1
+            fi
+            cat > "$catalog_dir/catalog-state.json" <<'JSON'
+          {
+            "schemaVersion": 1,
+            "artifactKind": "docker-sandboxes-template",
+            "packageRepository": "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template",
+            "policies": {
+              "act": {"enabled": true, "wizardDefault": false, "autoAdvance": true},
+              "full": {"enabled": false, "wizardDefault": false, "autoAdvance": false, "reason": "Full remains gated until independent live validation passes"}
+            },
+            "entries": [],
+            "aliases": {},
+            "transitions": []
+          }
+          JSON
+          fi
+          jq -e . "$catalog_dir/catalog-state.json" >/dev/null
+
+      - name: Reconcile an interrupted catalog-first alias promotion
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          PROFILE: ${{ steps.select.outputs.profile }}
+        run: |
+          set -euo pipefail
+          catalog="$RUNNER_TEMP/epar-catalog/catalog-state.json"
+          alias_ref="${PACKAGE_REPOSITORY}:${PROFILE}-latest"
+          observed=''
+          alias_error="$RUNNER_TEMP/epar-catalog/alias-reconcile.error"
+          if observed="$(oras resolve "$alias_ref" 2>"$alias_error")"; then
+            [[ "$observed" =~ ^sha256:[0-9a-f]{64}$ ]]
+          elif ! grep -Eqi 'manifest unknown|not found|404' "$alias_error"; then
+            cat "$alias_error" >&2
+            exit 1
+          fi
+          plan="$RUNNER_TEMP/epar-catalog/alias-reconciliation.json"
+          go run ./cmd/epar-prebuilt-publisher reconcile-alias --catalog "$catalog" --profile "$PROFILE" --observed-digest "$observed" --output "$plan"
+          if [[ "$(jq -r '.needsRepair' "$plan")" == true ]]; then
+            target="$(jq -er '.targetDigest' "$plan")"
+            [[ "$(oras resolve "${PACKAGE_REPOSITORY}@${target}")" == "$target" ]]
+            oras tag "${PACKAGE_REPOSITORY}@${target}" "${PROFILE}-latest"
+            [[ "$(oras resolve "$alias_ref")" == "$target" ]]
+            echo "Recovered interrupted ${PROFILE} alias promotion to ${target}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Determine whether the immutable tuple is already active
+        id: noop
+        shell: bash
+        env:
+          PROFILE: ${{ steps.select.outputs.profile }}
+          SOURCE_INDEX_DIGEST: ${{ steps.source.outputs.index_digest }}
+          SOURCE_AMD64_DIGEST: ${{ steps.source.outputs.amd64_digest }}
+          SOURCE_ARM64_DIGEST: ${{ steps.source.outputs.arm64_digest }}
+          RECIPE_DIGEST: ${{ steps.recipe.outputs.recipe_digest }}
+          RECIPE_REVISION: ${{ github.sha }}
+          SOURCE_LOCK_DIGEST: ${{ steps.recipe.outputs.source_lock_digest }}
+          TOOL_DIGEST: ${{ steps.recipe.outputs.tool_digest }}
+          RUNNER_VERSION: ${{ steps.runner.outputs.version }}
+          RUNNER_AMD64_DIGEST: ${{ steps.runner.outputs.amd64_digest }}
+          RUNNER_ARM64_DIGEST: ${{ steps.runner.outputs.arm64_digest }}
+          FORCE_CANDIDATE: ${{ inputs.force_candidate }}
+        run: |
+          set -euo pipefail
+          catalog="$RUNNER_TEMP/epar-catalog/catalog-state.json"
+          noop=false
+          if [[ "$FORCE_CANDIDATE" != true ]]; then
+            # A retained candidate is also a no-op: rebuilding it can produce a
+            # different index digest and make the immutable catalog reject the
+            # same complete tuple. Only revoked/critical entries are ignored.
+            jq -e --arg profile "$PROFILE" --arg source "$SOURCE_INDEX_DIGEST" \
+              --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" \
+              --arg recipe "$RECIPE_DIGEST" --arg revision "$RECIPE_REVISION" --arg sourceLock "$SOURCE_LOCK_DIGEST" --arg tool "$TOOL_DIGEST" \
+              --arg runtime "$RUNTIME_CONTRACT" --arg schema "$TEMPLATE_SCHEMA" --arg runner "$RUNNER_VERSION" \
+              --arg amd64 "$RUNNER_AMD64_DIGEST" --arg arm64 "$RUNNER_ARM64_DIGEST" \
+              '.entries[] as $entry | (([.transitions[]? | select(.packageIndexDigest == $entry.packageIndexDigest) | .toStatus] | last) // $entry.status) as $effectiveStatus | select(($effectiveStatus == "candidate" or $effectiveStatus == "active" or $effectiveStatus == "superseded") and $entry.profile == $profile and $entry.source.indexDigest == $source and $entry.source.platformDigests["linux/amd64"] == $sourceAmd64 and $entry.source.platformDigests["linux/arm64"] == $sourceArm64 and $entry.recipe.digest == $recipe and $entry.recipe.recipeRevision == $revision and $entry.recipe.sourceLockDigest == $sourceLock and $entry.recipe.toolDigest == $tool and $entry.recipe.runtimeContract == $runtime and ($entry.recipe.templateSchema | tostring) == $schema and $entry.runner.version == $runner and $entry.runner.assetDigests["linux/amd64"] == $amd64 and $entry.runner.assetDigests["linux/arm64"] == $arm64)' \
+              "$catalog" >/dev/null && noop=true || true
+          fi
+          echo "noop=$noop" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve catalog state for the publication job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epar-prebuilt-catalog-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/epar-catalog/catalog-state.json
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build immutable ${{ matrix.platform }} package layer
+    needs: resolve
+    if: needs.resolve.outputs.noop != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            slug: amd64
+            source_digest: ${{ needs.resolve.outputs.source_amd64_digest }}
+            runner_url: ${{ needs.resolve.outputs.runner_amd64_url }}
+            runner_digest: ${{ needs.resolve.outputs.runner_amd64_digest }}
+          - platform: linux/arm64
+            slug: arm64
+            source_digest: ${{ needs.resolve.outputs.source_arm64_digest }}
+            runner_url: ${{ needs.resolve.outputs.runner_arm64_url }}
+            runner_digest: ${{ needs.resolve.outputs.runner_arm64_digest }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up QEMU for the declared foreign platform
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: all
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Fetch immutable runner, Tini, and emulation license inputs
+        id: inputs
+        shell: bash
+        env:
+          RUNNER_URL: ${{ matrix.runner_url }}
+          RUNNER_DIGEST: ${{ matrix.runner_digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          mkdir -p templates/docker-sandboxes/inputs/emulation-licenses
+          curl --fail --silent --show-error --retry 4 --retry-delay 2 "$RUNNER_URL" -o templates/docker-sandboxes/inputs/actions-runner.tar.gz
+          echo "${RUNNER_DIGEST#sha256:}  templates/docker-sandboxes/inputs/actions-runner.tar.gz" | sha256sum --check -
+          tini_url="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.url' templates/docker-sandboxes/sources.lock.json)"
+          tini_digest="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.sha256' templates/docker-sandboxes/sources.lock.json)"
+          curl --fail --silent --show-error --retry 4 --retry-delay 2 "$tini_url" -o templates/docker-sandboxes/inputs/tini
+          echo "${tini_digest#sha256:}  templates/docker-sandboxes/inputs/tini" | sha256sum --check -
+          chmod 0555 templates/docker-sandboxes/inputs/tini
+          licenses=(
+            'tonistiigi-binfmt-MIT.txt|https://raw.githubusercontent.com/tonistiigi/binfmt/e29e7d72c9672c8c8bf846655ab149b50e1a62bd/LICENSE|bba3332a1e2ec03031b587452cd9254bd7ab6ec701aef20b12e642f47f423dd6'
+            'qemu-COPYING.txt|https://raw.githubusercontent.com/qemu/qemu/v10.2.3/COPYING|dd3ce02338c3a48abb6ba59b48809f7108a8bd242cb0cc8be90daafa30707c28'
+          )
+          for item in "${licenses[@]}"; do
+            IFS='|' read -r name url digest <<< "$item"
+            curl --fail --silent --show-error --retry 4 --retry-delay 2 "$url" -o "templates/docker-sandboxes/inputs/emulation-licenses/$name"
+            echo "$digest  templates/docker-sandboxes/inputs/emulation-licenses/$name" | sha256sum --check -
+          done
+          go_builder="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].goBuilderReference' templates/docker-sandboxes/sources.lock.json)"
+          binfmt="$(jq -er --arg platform "$PLATFORM" '.emulation.platforms[$platform].sourceReference' templates/docker-sandboxes/sources.lock.json)"
+          tini_sha="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.sha256' templates/docker-sandboxes/sources.lock.json)"
+          hook_sha="$(jq -er '.hookLauncher.sha256' templates/docker-sandboxes/sources.lock.json)"
+          egress_sha="$(jq -er '.egressBridge.sha256' templates/docker-sandboxes/sources.lock.json)"
+          echo "go_builder=$go_builder" >> "$GITHUB_OUTPUT"
+          echo "binfmt=$binfmt" >> "$GITHUB_OUTPUT"
+          echo "tini_sha=$tini_sha" >> "$GITHUB_OUTPUT"
+          echo "hook_sha=$hook_sha" >> "$GITHUB_OUTPUT"
+          echo "egress_sha=$egress_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push platform candidate with SBOM and provenance
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: templates/docker-sandboxes
+          file: templates/docker-sandboxes/Dockerfile.prebuilt
+          platforms: ${{ matrix.platform }}
+          push: true
+          pull: true
+          tags: ${{ env.PACKAGE_REPOSITORY }}:candidate-${{ needs.resolve.outputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
+          build-args: |
+            TEMPLATE_PLATFORM=${{ matrix.platform }}
+            SOURCE_IMAGE=${{ env.SOURCE_REPOSITORY }}@${{ matrix.source_digest }}
+            SOURCE_PROFILE=${{ needs.resolve.outputs.profile }}
+            SOURCE_INDEX_DIGEST=${{ needs.resolve.outputs.source_index_digest }}
+            SOURCE_MANIFEST_DIGEST=${{ matrix.source_digest }}
+            GO_BUILDER_IMAGE=${{ steps.inputs.outputs.go_builder }}
+            BINFMT_IMAGE=${{ steps.inputs.outputs.binfmt }}
+            EPAR_RECIPE_DIGEST=${{ needs.resolve.outputs.recipe_digest }}
+            EPAR_RUNTIME_CONTRACT=${{ env.RUNTIME_CONTRACT }}
+            TEMPLATE_VERSION=${{ github.sha }}-${{ matrix.slug }}
+            COMPATIBILITY_FILE=prebuilt.compatibility.json
+            HOOK_LAUNCHER_SHA256=${{ steps.inputs.outputs.hook_sha }}
+            EGRESS_BRIDGE_SHA256=${{ steps.inputs.outputs.egress_sha }}
+            TINI_SHA256=${{ steps.inputs.outputs.tini_sha }}
+            RUNNER_SELECTOR=latest
+            RUNNER_VERSION=${{ needs.resolve.outputs.runner_version }}
+            RUNNER_ASSET_DIGEST=${{ matrix.runner_digest }}
+            ACTIONS_RUNNER_VERSION=${{ needs.resolve.outputs.runner_version }}
+            ACTIONS_RUNNER_SHA256=${{ matrix.runner_digest }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Record platform digest and runner tuple
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PLATFORM_SLUG: ${{ matrix.slug }}
+          PACKAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          RUNNER_VERSION: ${{ needs.resolve.outputs.runner_version }}
+          RUNNER_DIGEST: ${{ matrix.runner_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$PACKAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -n --arg platform "$PLATFORM" --arg slug "$PLATFORM_SLUG" --arg digest "$PACKAGE_DIGEST" --arg runner "$RUNNER_VERSION" --arg runnerDigest "$RUNNER_DIGEST" \
+            '{platform:$platform,slug:$slug,packageManifestDigest:$digest,runnerVersion:$runner,runnerAssetDigest:$runnerDigest}' > "$RUNNER_TEMP/platform-result.json"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epar-prebuilt-platform-${{ needs.resolve.outputs.profile }}-${{ matrix.slug }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/platform-result.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Verify, attest, and publish catalog state
+    needs:
+      - resolve
+      - build
+    if: needs.resolve.outputs.noop != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      profile: ${{ needs.resolve.outputs.profile }}
+      index_digest: ${{ steps.index.outputs.index_digest }}
+      package_ref: ${{ steps.index.outputs.package_ref }}
+      source_rechecked: ${{ steps.index.outputs.source_rechecked }}
+      publication_artifact: epar-prebuilt-publication-${{ needs.resolve.outputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Set up QEMU and Buildx for readback
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: all
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Download catalog and platform results
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          pattern: epar-prebuilt-*
+          path: ${{ runner.temp }}/epar-artifacts
+          merge-multiple: false
+
+      - name: Merge platform manifests and verify immutable index
+        id: index
+        shell: bash
+        env:
+          PROFILE: ${{ needs.resolve.outputs.profile }}
+          SOURCE_REFERENCE: ${{ needs.resolve.outputs.source_reference }}
+          SOURCE_INDEX_DIGEST: ${{ needs.resolve.outputs.source_index_digest }}
+        run: |
+          set -euo pipefail
+          amd64_result="$(find "$RUNNER_TEMP/epar-artifacts" -path '*amd64*/platform-result.json' -print -quit)"
+          arm64_result="$(find "$RUNNER_TEMP/epar-artifacts" -path '*arm64*/platform-result.json' -print -quit)"
+          [[ -f "$amd64_result" && -f "$arm64_result" ]]
+          amd64_digest="$(jq -er '.packageManifestDigest' "$amd64_result")"
+          arm64_digest="$(jq -er '.packageManifestDigest' "$arm64_result")"
+          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          staging_ref="${PACKAGE_REPOSITORY}:candidate-${PROFILE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx imagetools create --tag "$staging_ref" \
+            "${PACKAGE_REPOSITORY}:candidate-${PROFILE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64" \
+            "${PACKAGE_REPOSITORY}:candidate-${PROFILE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64"
+          index_digest="$(oras resolve "$staging_ref")"
+          [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          oras manifest fetch "$staging_ref" --format json > "$RUNNER_TEMP/epar-index.json"
+          jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" \
+            '[((.content.manifests // .manifests)[]) | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length == 2 and (map(.platform.architecture) | sort == ["amd64","arm64"]) and (map(.digest) | sort == ([$amd64,$arm64] | sort))' "$RUNNER_TEMP/epar-index.json" >/dev/null
+          current_source_digest="$(oras resolve "$SOURCE_REFERENCE")"
+          [[ "$current_source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          source_rechecked=true
+          if [[ "$current_source_digest" != "$SOURCE_INDEX_DIGEST" ]]; then
+            source_rechecked=false
+            echo "upstream source moved from $SOURCE_INDEX_DIGEST to $current_source_digest; keeping candidate only" >&2
+          fi
+          package_tag="${PROFILE}-latest-pkg-${index_digest#sha256:}"
+          package_ref="${PACKAGE_REPOSITORY}@${index_digest}"
+          immutable_tag_ref="${PACKAGE_REPOSITORY}:${package_tag}"
+          tag_error="$RUNNER_TEMP/epar-package-tag-resolve.error"
+          if existing_digest="$(oras resolve "$immutable_tag_ref" 2>"$tag_error")"; then
+            [[ "$existing_digest" == "$index_digest" ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$tag_error"; then
+              cat "$tag_error" >&2
+              exit 1
+            fi
+            docker buildx imagetools create --tag "$immutable_tag_ref" "$staging_ref"
+            [[ "$(oras resolve "$immutable_tag_ref")" == "$index_digest" ]]
+          fi
+          {
+            echo "index_digest=$index_digest"
+            echo "package_tag=$package_tag"
+            echo "package_ref=$package_ref"
+            echo "immutable_tag_ref=$immutable_tag_ref"
+            echo "amd64_digest=$amd64_digest"
+            echo "arm64_digest=$arm64_digest"
+            echo "source_rechecked=$source_rechecked"
+            echo "source_observed_digest=$current_source_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare EPAR SLSA predicate and SPDX SBOM
+        id: evidence
+        shell: bash
+        env:
+          SOURCE_INDEX_DIGEST: ${{ needs.resolve.outputs.source_index_digest }}
+          SOURCE_AMD64_DIGEST: ${{ needs.resolve.outputs.source_amd64_digest }}
+          SOURCE_ARM64_DIGEST: ${{ needs.resolve.outputs.source_arm64_digest }}
+          PACKAGE_INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+          PACKAGE_AMD64_DIGEST: ${{ steps.index.outputs.amd64_digest }}
+          PACKAGE_ARM64_DIGEST: ${{ steps.index.outputs.arm64_digest }}
+          RECIPE_DIGEST: ${{ needs.resolve.outputs.recipe_digest }}
+          RECIPE_REVISION: ${{ github.sha }}
+          TOOL_DIGEST: ${{ needs.resolve.outputs.tool_digest }}
+          RUNNER_VERSION: ${{ needs.resolve.outputs.runner_version }}
+          RUNNER_AMD64_DIGEST: ${{ needs.resolve.outputs.runner_amd64_digest }}
+          RUNNER_ARM64_DIGEST: ${{ needs.resolve.outputs.runner_arm64_digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/epar-evidence"
+          resolved_dependencies="$(jq -cn --arg source "$SOURCE_INDEX_DIGEST" --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" --arg tool "$TOOL_DIGEST" '[ $source,$sourceAmd64,$sourceArm64,$runnerAmd64,$runnerArm64,$tool ] | map({uri:"oci",digest:{sha256:(sub("^sha256:";""))}})')"
+          jq -n \
+            --arg source "$SOURCE_INDEX_DIGEST" --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" \
+            --arg recipe "$RECIPE_DIGEST" --arg runtime "$RUNTIME_CONTRACT" --arg runner "$RUNNER_VERSION" \
+            --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" --arg tool "$TOOL_DIGEST" \
+            --arg package "$PACKAGE_INDEX_DIGEST" --arg packageAmd64 "$PACKAGE_AMD64_DIGEST" --arg packageArm64 "$PACKAGE_ARM64_DIGEST" \
+            --arg revision "$RECIPE_REVISION" --argjson dependencies "$resolved_dependencies" \
+            '{buildDefinition:{buildType:"https://solutionforest.dev/epar/docker-sandboxes/v1",externalParameters:{source:{indexDigest:$source,platformDigests:{"linux/amd64":$sourceAmd64,"linux/arm64":$sourceArm64}},recipe:{digest:$recipe,runtimeContract:$runtime,templateSchema:2,revision:$revision},runner:{version:$runner,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64}},tools:{"locked-build-inputs":{digest:$tool}},platforms:{"linux/amd64":{packageManifestDigest:$packageAmd64},"linux/arm64":{packageManifestDigest:$packageArm64}},subjectDigest:$package},resolvedDependencies:$dependencies},runDetails:{builder:{id:"https://github.com/solutionforest/ephemeral-action-runner"}}}' > "$RUNNER_TEMP/epar-evidence/slsa-predicate.json"
+          jq -n --arg package "$PACKAGE_INDEX_DIGEST" --arg recipe "$RECIPE_DIGEST" --arg amd64 "$PACKAGE_AMD64_DIGEST" --arg arm64 "$PACKAGE_ARM64_DIGEST" \
+            '{spdxVersion:"SPDX-2.3",dataLicense:"CC0-1.0",SPDXID:"SPDXRef-DOCUMENT",documentNamespace:("https://solutionforest.dev/epar/docker-sandboxes/" + $package),packages:[{name:"epar-package-index",SPDXID:"SPDXRef-Package-index",checksums:[{algorithm:"SHA256",checksumValue:($package | sub("^sha256:";""))}]},{name:"epar-runtime-config",SPDXID:"SPDXRef-Package-runtime",checksums:[{algorithm:"SHA256",checksumValue:($recipe | sub("^sha256:";""))}]},{name:"epar-platform-linux-amd64",SPDXID:"SPDXRef-Package-amd64",checksums:[{algorithm:"SHA256",checksumValue:($amd64 | sub("^sha256:";""))}]},{name:"epar-platform-linux-arm64",SPDXID:"SPDXRef-Package-arm64",checksums:[{algorithm:"SHA256",checksumValue:($arm64 | sub("^sha256:";""))}]}]}' > "$RUNNER_TEMP/epar-evidence/sbom.spdx.json"
+
+      - name: Detect existing index evidence for idempotent reruns
+        id: existing-evidence
+        shell: bash
+        env:
+          PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
+          INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          referrers="$RUNNER_TEMP/epar-evidence/existing-index-referrers.json"
+          oras discover "${PACKAGE_REPOSITORY}@${INDEX_DIGEST}" --format json > "$referrers"
+          jq -e '.referrers | type == "array"' "$referrers" >/dev/null
+          reuse=false
+          expected_provenance_digest=''
+          expected_sbom_digest=''
+          catalog="$(find "$RUNNER_TEMP/epar-artifacts" -path '*epar-prebuilt-catalog*' -name catalog-state.json -print -quit || true)"
+          if [[ -n "$catalog" && -f "$catalog" ]]; then
+            existing_entry="$(jq -c --arg digest "$INDEX_DIGEST" '[.entries[]? | select(.packageIndexDigest == $digest)] | last // empty' "$catalog")"
+            if [[ -n "$existing_entry" ]]; then
+              existing_entry_path="$RUNNER_TEMP/epar-evidence/existing-entry.json"
+              printf '%s\n' "$existing_entry" > "$existing_entry_path"
+              expected_provenance_digest="$(jq -r '.evidence.provenanceDigest // empty' <<< "$existing_entry")"
+              expected_sbom_digest="$(jq -r '.evidence.sbomDigest // empty' <<< "$existing_entry")"
+              expected_attestation_digest="$(jq -r '.evidence.attestationDigest // empty' <<< "$existing_entry")"
+              if [[ "$expected_provenance_digest" =~ ^sha256:[0-9a-f]{64}$ && "$expected_sbom_digest" =~ ^sha256:[0-9a-f]{64}$ && "$expected_attestation_digest" == "$expected_provenance_digest" ]]; then
+                if go run ./cmd/epar-prebuilt-publisher verify-package \
+                  --reference "${PACKAGE_REPOSITORY}@${INDEX_DIGEST}" \
+                  --entry "$existing_entry_path" \
+                  --repository "$PACKAGE_REPOSITORY" \
+                  --ref refs/heads/main \
+                  --allowed-events schedule,workflow_dispatch,push \
+                  > "$RUNNER_TEMP/epar-evidence/existing-package-verification.json"; then
+                  if jq -e --arg provenance "$expected_provenance_digest" --arg sbom "$expected_sbom_digest" \
+                    '[.referrers[].digest] | index($provenance) != null and index($sbom) != null' "$referrers" >/dev/null; then
+                    reuse=true
+                  fi
+                fi
+              fi
+            fi
+          fi
+          {
+            echo "reuse=$reuse"
+            echo "provenance_digest=$expected_provenance_digest"
+            echo "sbom_digest=$expected_sbom_digest"
+            echo "baseline_referrers=$referrers"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate signed index SLSA referrer
+        id: attest-provenance
+        if: steps.existing-evidence.outputs.reuse != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.PACKAGE_REPOSITORY }}
+          subject-digest: ${{ steps.index.outputs.index_digest }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ runner.temp }}/epar-evidence/slsa-predicate.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Record the provenance referrer before publishing the SBOM
+        id: provenance-referrer
+        if: steps.existing-evidence.outputs.reuse != 'true'
+        shell: bash
+        env:
+          PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
+          INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+          BASELINE_REFERRERS: ${{ steps.existing-evidence.outputs.baseline_referrers }}
+        run: |
+          set -euo pipefail
+          [[ -f "$BASELINE_REFERRERS" ]]
+          after_provenance="$RUNNER_TEMP/epar-evidence/after-provenance-referrers.json"
+          oras discover "${PACKAGE_REPOSITORY}@${INDEX_DIGEST}" --format json > "$after_provenance"
+          provenance_digest="$(jq -er --slurpfile baseline "$BASELINE_REFERRERS" '
+            [ .referrers[] as $r
+              | select((($baseline[0].referrers // []) | map(.digest) | index($r.digest)) == null)
+              | $r.digest ]
+            | if length == 1 then .[0] else error("expected exactly one new provenance referrer") end' "$after_provenance")"
+          [[ "$provenance_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$provenance_digest" >> "$GITHUB_OUTPUT"
+          echo "referrers=$after_provenance" >> "$GITHUB_OUTPUT"
+
+      - name: Generate signed index SPDX SBOM referrer
+        id: attest-sbom
+        if: steps.existing-evidence.outputs.reuse != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.PACKAGE_REPOSITORY }}
+          subject-digest: ${{ steps.index.outputs.index_digest }}
+          sbom-path: ${{ runner.temp }}/epar-evidence/sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Record actual signed OCI referrer descriptors
+        id: gates
+        shell: bash
+        env:
+          PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
+          INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+          SOURCE_RECHECKED: ${{ steps.index.outputs.source_rechecked }}
+          REUSE_EVIDENCE: ${{ steps.existing-evidence.outputs.reuse }}
+          EXPECTED_PROVENANCE_DIGEST: ${{ steps.existing-evidence.outputs.provenance_digest }}
+          EXPECTED_SBOM_DIGEST: ${{ steps.existing-evidence.outputs.sbom_digest }}
+          FRESH_PROVENANCE_DIGEST: ${{ steps.provenance-referrer.outputs.digest }}
+          AFTER_PROVENANCE_REFERRERS: ${{ steps.provenance-referrer.outputs.referrers }}
+        run: |
+          set -euo pipefail
+          referrers="$RUNNER_TEMP/epar-evidence/index-referrers.json"
+          oras discover "${PACKAGE_REPOSITORY}@${INDEX_DIGEST}" --format json > "$referrers"
+          jq -e '.referrers | length >= 2' "$referrers" >/dev/null
+          if [[ "$REUSE_EVIDENCE" == true ]]; then
+            provenance_digest="$EXPECTED_PROVENANCE_DIGEST"
+            sbom_digest="$EXPECTED_SBOM_DIGEST"
+            jq -e --arg provenance "$provenance_digest" --arg sbom "$sbom_digest" \
+              '[.referrers[].digest] | index($provenance) != null and index($sbom) != null' "$referrers" >/dev/null
+          else
+            [[ -f "$AFTER_PROVENANCE_REFERRERS" ]]
+            provenance_digest="$FRESH_PROVENANCE_DIGEST"
+            # Each attestation action must add exactly one descriptor relative
+            # to the immediately preceding snapshot. This identifies the
+            # evidence by publication order instead of optional OCI annotations.
+            sbom_digest="$(jq -er --slurpfile baseline "$AFTER_PROVENANCE_REFERRERS" '
+              [ .referrers[] as $r
+                | select((($baseline[0].referrers // []) | map(.digest) | index($r.digest)) == null)
+                | $r.digest ]
+              | if length == 1 then .[0] else error("expected exactly one new SBOM referrer") end' "$referrers")"
+          fi
+          [[ "$provenance_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$sbom_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "source_rechecked=$SOURCE_RECHECKED" >> "$GITHUB_OUTPUT"
+          echo 'provenance_generated=true' >> "$GITHUB_OUTPUT"
+          echo 'sbom_generated=true' >> "$GITHUB_OUTPUT"
+          echo 'attestation_verified=false' >> "$GITHUB_OUTPUT"
+          echo 'runtime_validated=false' >> "$GITHUB_OUTPUT"
+          echo 'import_readback=false' >> "$GITHUB_OUTPUT"
+          echo "provenance_digest=$provenance_digest" >> "$GITHUB_OUTPUT"
+          echo "sbom_digest=$sbom_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Build the immutable publisher input (live gates remain closed)
+        id: input
+        shell: bash
+        env:
+          PROFILE: ${{ needs.resolve.outputs.profile }}
+          SOURCE_TAG: ${{ needs.resolve.outputs.source_tag }}
+          SOURCE_REFERENCE: ${{ needs.resolve.outputs.source_reference }}
+          SOURCE_INDEX_DIGEST: ${{ needs.resolve.outputs.source_index_digest }}
+          SOURCE_AMD64_DIGEST: ${{ needs.resolve.outputs.source_amd64_digest }}
+          SOURCE_ARM64_DIGEST: ${{ needs.resolve.outputs.source_arm64_digest }}
+          OBSERVED_SOURCE_DIGEST: ${{ steps.index.outputs.source_observed_digest }}
+          PACKAGE_REF: ${{ steps.index.outputs.package_ref }}
+          PACKAGE_INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+          PACKAGE_AMD64_DIGEST: ${{ steps.index.outputs.amd64_digest }}
+          PACKAGE_ARM64_DIGEST: ${{ steps.index.outputs.arm64_digest }}
+          RECIPE_DIGEST: ${{ needs.resolve.outputs.recipe_digest }}
+          RECIPE_REVISION: ${{ github.sha }}
+          SOURCE_LOCK_DIGEST: ${{ needs.resolve.outputs.source_lock_digest }}
+          TOOL_DIGEST: ${{ needs.resolve.outputs.tool_digest }}
+          RUNNER_VERSION: ${{ needs.resolve.outputs.runner_version }}
+          RUNNER_AMD64_DIGEST: ${{ needs.resolve.outputs.runner_amd64_digest }}
+          RUNNER_ARM64_DIGEST: ${{ needs.resolve.outputs.runner_arm64_digest }}
+          SOURCE_RECHECKED: ${{ steps.gates.outputs.source_rechecked }}
+          PROVENANCE_GENERATED: ${{ steps.gates.outputs.provenance_generated }}
+          SBOM_GENERATED: ${{ steps.gates.outputs.sbom_generated }}
+          ATTESTATION_VERIFIED: ${{ steps.gates.outputs.attestation_verified }}
+          RUNTIME_VALIDATED: ${{ steps.gates.outputs.runtime_validated }}
+          IMPORT_READBACK: ${{ steps.gates.outputs.import_readback }}
+          PROVENANCE_DIGEST: ${{ steps.gates.outputs.provenance_digest }}
+          SBOM_DIGEST: ${{ steps.gates.outputs.sbom_digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/epar-publisher"
+          tools_json="$(jq -cn --arg digest "$TOOL_DIGEST" '[{name:"locked-build-inputs",digest:$digest}]')"
+          package_platforms="$(jq -cn --arg amd64 "$PACKAGE_AMD64_DIGEST" --arg arm64 "$PACKAGE_ARM64_DIGEST" --arg samd64 "$SOURCE_AMD64_DIGEST" --arg sarm64 "$SOURCE_ARM64_DIGEST" '[{platform:"linux/amd64",packageManifestDigest:$amd64,sourceManifestDigest:$samd64,validated:false},{platform:"linux/arm64",packageManifestDigest:$arm64,sourceManifestDigest:$sarm64,validated:false}]')"
+          input="$RUNNER_TEMP/epar-publisher/publication-input.json"
+          jq -n \
+            --arg profile "$PROFILE" --arg sourceTag "$SOURCE_TAG" --arg sourceReference "$SOURCE_REFERENCE" \
+            --arg packageRepository "$PACKAGE_REPOSITORY" --arg packageReference "$PACKAGE_REF" --arg packageDigest "$PACKAGE_INDEX_DIGEST" \
+            --arg recipeDigest "$RECIPE_DIGEST" --arg recipeRevision "$RECIPE_REVISION" --arg sourceLockDigest "$SOURCE_LOCK_DIGEST" --arg toolDigest "$TOOL_DIGEST" --arg runtime "$RUNTIME_CONTRACT" \
+            --arg runnerVersion "$RUNNER_VERSION" --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" \
+            --arg provenanceDigest "$PROVENANCE_DIGEST" --arg sbomDigest "$SBOM_DIGEST" --arg attestationDigest "$PROVENANCE_DIGEST" \
+            --arg candidateId "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PROFILE}-${PACKAGE_INDEX_DIGEST#sha256:}" --argjson platforms "$package_platforms" --argjson tools "$tools_json" \
+            --arg sourceRechecked "$SOURCE_RECHECKED" --arg provenanceGenerated "$PROVENANCE_GENERATED" --arg sbomGenerated "$SBOM_GENERATED" --arg attestationVerified "$ATTESTATION_VERIFIED" --arg runtimeValidated "$RUNTIME_VALIDATED" --arg importReadback "$IMPORT_READBACK" \
+            '{profile:$profile,channel:"stable",sourceReference:$sourceReference,sourceTag:$sourceTag,packageRepository:$packageRepository,packageReference:$packageReference,packageIndexDigest:$packageDigest,packagePlatforms:$platforms,recipe:{digest:$recipeDigest,runtimeContract:$runtime,templateSchema:2,recipeRevision:$recipeRevision,sourceLockDigest:$sourceLockDigest,toolDigest:$toolDigest},runner:{selector:"latest",version:$runnerVersion,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64},overlayRequired:false},tools:$tools,evidence:{provenanceDigest:$provenanceDigest,sbomDigest:$sbomDigest,attestationDigest:$attestationDigest},gates:{sourceResolved:true,sourceRechecked:($sourceRechecked == "true"),buildSucceeded:true,platformsValidated:true,importReadback:($importReadback == "true"),runtimeValidated:($runtimeValidated == "true"),provenanceGenerated:($provenanceGenerated == "true"),sbomGenerated:($sbomGenerated == "true"),attestationVerified:($attestationVerified == "true")},candidateId:$candidateId}' > "$input"
+          if [[ "$SOURCE_RECHECKED" != true ]]; then
+            jq --arg immutable "${SOURCE_REPOSITORY}@${SOURCE_INDEX_DIGEST}" '.sourceReference = $immutable' "$input" > "$input.tmp"
+            mv "$input.tmp" "$input"
+          fi
+          echo "input=$input" >> "$GITHUB_OUTPUT"
+          echo "index_digest=${{ steps.index.outputs.index_digest }}" >> "$GITHUB_OUTPUT"
+          echo "package_ref=${{ steps.index.outputs.package_ref }}" >> "$GITHUB_OUTPUT"
+          echo "source_rechecked=$SOURCE_RECHECKED" >> "$GITHUB_OUTPUT"
+
+      - name: Upload publication input and evidence receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epar-prebuilt-publication-${{ needs.resolve.outputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/epar-publisher/publication-input.json
+            ${{ runner.temp }}/epar-evidence/index-referrers.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish candidate summary and explicit no-Git-mutation proof
+        shell: bash
+        env:
+          PACKAGE_REF: ${{ steps.index.outputs.package_ref }}
+          INDEX_DIGEST: ${{ steps.index.outputs.index_digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## Docker Sandboxes prebuilt candidate'
+            echo
+            echo "- Profile: \\`${{ needs.resolve.outputs.profile }}\\`"
+            echo "- Package: \\`${PACKAGE_REF}\\`"
+            echo "- Index digest: \\`${INDEX_DIGEST}\\`"
+            echo '- Candidate assembly, immutable package tagging, and OCI evidence completed; live Sandbox gates are evaluated only on controlled self-hosted runners.'
+            echo '- This workflow has contents:read and does not commit, tag, release, open a pull request, or push Git refs.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  live-amd64:
+    name: Controlled Docker Sandbox live gate (amd64)
+    needs: publish
+    if: needs.publish.result == 'success' && vars.EPAR_PREBUILT_LIVE == 'true'
+    runs-on: [self-hosted, linux, epar-docker-sandboxes, amd64]
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - name: Check out source for template verifier
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Run native runtime and Sandbox import/readback gates
+        shell: bash
+        env:
+          PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
+          INDEX_DIGEST: ${{ needs.publish.outputs.index_digest }}
+          PROFILE: ${{ needs.publish.outputs.profile }}
+          LIVE_STAGING_ROOT: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT }}
+          LIVE_REGISTRY_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE }}
+          LIVE_HTPASSWD_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE }}
+        run: |
+          set -euo pipefail
+          platform_tag="epar-prebuilt-live:${PROFILE}-amd64-${INDEX_DIGEST#sha256:}"
+          cleanup() { sbx template rm "$platform_tag" >/dev/null 2>&1 || true; docker image rm -f "$platform_tag" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"; }
+          trap cleanup EXIT
+          docker pull --platform linux/amd64 "$PACKAGE_REF" >/dev/null
+          docker tag "$PACKAGE_REF" "$platform_tag"
+          config_digest="$(docker image inspect "$platform_tag" --format '{{.Id}}' | sed -n '1p')"
+          [[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cache_id="${config_digest#sha256:}"
+          cache_id="${cache_id:0:12}"
+          docker save "$platform_tag" -o "$RUNNER_TEMP/epar-sandbox-template.tar"
+          sbx template load "$RUNNER_TEMP/epar-sandbox-template.tar"
+          sbx template ls --json > "$RUNNER_TEMP/sbx-template-readback.json"
+          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' --arg cache "$cache_id" '[.images[] | select(.repository == $repository and .tag == $tag and .id == $cache)] | length == 1' "$RUNNER_TEMP/sbx-template-readback.json" >/dev/null
+          [[ -n "$LIVE_STAGING_ROOT" && -n "$LIVE_REGISTRY_IMAGE" && -n "$LIVE_HTPASSWD_IMAGE" ]]
+          export EPAR_LIVE_DOCKER_SANDBOXES=1
+          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE="$platform_tag"
+          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE_DIGEST="$config_digest"
+          export EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT="$LIVE_STAGING_ROOT"
+          export EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE="$LIVE_REGISTRY_IMAGE"
+          export EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE="$LIVE_HTPASSWD_IMAGE"
+          go test ./internal/provider/dockersandboxes -run '^TestLiveRunnerTemplateIsolation$' -count=1 -timeout=30m
+          sbx template rm "$platform_tag"
+          sbx template ls --json > "$RUNNER_TEMP/sbx-template-after.json"
+          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' '[.images[] | select(.repository == $repository and .tag == $tag)] | length == 0' "$RUNNER_TEMP/sbx-template-after.json" >/dev/null
+          docker image rm -f "$platform_tag" >/dev/null
+          rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"
+          trap - EXIT
+          jq -n --arg platform linux/amd64 --arg digest "$INDEX_DIGEST" --arg imageDigest "$config_digest" --arg cache "$cache_id" --arg reference "$platform_tag" '{platform:$platform,indexDigest:$digest,configDigest:$imageDigest,cacheID:$cache,reference:$reference,runtimeValidated:true,importReadback:true,cleanupVerified:true}' > "$RUNNER_TEMP/live-receipt.json"
+
+      - name: Upload amd64 live receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epar-prebuilt-live-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
+  live-arm64:
+    name: Controlled Docker Sandbox live gate (arm64)
+    needs: publish
+    if: needs.publish.result == 'success' && vars.EPAR_PREBUILT_LIVE == 'true'
+    runs-on: [self-hosted, linux, epar-docker-sandboxes, arm64]
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - name: Check out source for template verifier
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Run native runtime and Sandbox import/readback gates
+        shell: bash
+        env:
+          PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
+          INDEX_DIGEST: ${{ needs.publish.outputs.index_digest }}
+          PROFILE: ${{ needs.publish.outputs.profile }}
+          LIVE_STAGING_ROOT: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT }}
+          LIVE_REGISTRY_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE }}
+          LIVE_HTPASSWD_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE }}
+        run: |
+          set -euo pipefail
+          platform_tag="epar-prebuilt-live:${PROFILE}-arm64-${INDEX_DIGEST#sha256:}"
+          cleanup() { sbx template rm "$platform_tag" >/dev/null 2>&1 || true; docker image rm -f "$platform_tag" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"; }
+          trap cleanup EXIT
+          docker pull --platform linux/arm64 "$PACKAGE_REF" >/dev/null
+          docker tag "$PACKAGE_REF" "$platform_tag"
+          config_digest="$(docker image inspect "$platform_tag" --format '{{.Id}}' | sed -n '1p')"
+          [[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cache_id="${config_digest#sha256:}"
+          cache_id="${cache_id:0:12}"
+          docker save "$platform_tag" -o "$RUNNER_TEMP/epar-sandbox-template.tar"
+          sbx template load "$RUNNER_TEMP/epar-sandbox-template.tar"
+          sbx template ls --json > "$RUNNER_TEMP/sbx-template-readback.json"
+          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' --arg cache "$cache_id" '[.images[] | select(.repository == $repository and .tag == $tag and .id == $cache)] | length == 1' "$RUNNER_TEMP/sbx-template-readback.json" >/dev/null
+          [[ -n "$LIVE_STAGING_ROOT" && -n "$LIVE_REGISTRY_IMAGE" && -n "$LIVE_HTPASSWD_IMAGE" ]]
+          export EPAR_LIVE_DOCKER_SANDBOXES=1
+          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE="$platform_tag"
+          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE_DIGEST="$config_digest"
+          export EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT="$LIVE_STAGING_ROOT"
+          export EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE="$LIVE_REGISTRY_IMAGE"
+          export EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE="$LIVE_HTPASSWD_IMAGE"
+          go test ./internal/provider/dockersandboxes -run '^TestLiveRunnerTemplateIsolation$' -count=1 -timeout=30m
+          sbx template rm "$platform_tag"
+          sbx template ls --json > "$RUNNER_TEMP/sbx-template-after.json"
+          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' '[.images[] | select(.repository == $repository and .tag == $tag)] | length == 0' "$RUNNER_TEMP/sbx-template-after.json" >/dev/null
+          docker image rm -f "$platform_tag" >/dev/null
+          rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"
+          trap - EXIT
+          jq -n --arg platform linux/arm64 --arg digest "$INDEX_DIGEST" --arg imageDigest "$config_digest" --arg cache "$cache_id" --arg reference "$platform_tag" '{platform:$platform,indexDigest:$digest,configDigest:$imageDigest,cacheID:$cache,reference:$reference,runtimeValidated:true,importReadback:true,cleanupVerified:true}' > "$RUNNER_TEMP/live-receipt.json"
+
+      - name: Upload arm64 live receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: epar-prebuilt-live-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/live-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
+  promote:
+    name: Verify gates, sign catalog, and move protected aliases
+    needs:
+      - resolve
+      - publish
+      - live-amd64
+      - live-arm64
+    if: always() && github.ref == 'refs/heads/main' && needs.resolve.outputs.noop != 'true' && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Download catalog, publication input, and live receipts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          pattern: epar-prebuilt-*
+          path: ${{ runner.temp }}/epar-promotion-artifacts
+          merge-multiple: false
+
+      - name: Merge live receipts and plan immutable catalog publication
+        id: plan
+        shell: bash
+        env:
+          PROFILE: ${{ needs.resolve.outputs.profile }}
+          PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
+          SOURCE_RECHECKED: ${{ needs.publish.outputs.source_rechecked }}
+          FORCE_CANDIDATE: ${{ inputs.force_candidate }}
+          ALLOW_ALIAS: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          set -euo pipefail
+          catalog="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*epar-prebuilt-catalog*' -name catalog-state.json -print -quit)"
+          input="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*epar-prebuilt-publication*' -name publication-input.json -print -quit)"
+          [[ -f "$catalog" && -f "$input" ]]
+          mkdir -p "$RUNNER_TEMP/epar-promotion"
+          amd64_receipt="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*live-amd64*' -name live-receipt.json -print -quit || true)"
+          arm64_receipt="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*live-arm64*' -name live-receipt.json -print -quit || true)"
+          runtime_validated=false
+          import_readback=false
+          if [[ -f "$amd64_receipt" && -f "$arm64_receipt" ]]; then
+            jq -e --arg digest "${{ needs.publish.outputs.index_digest }}" '.["indexDigest"] == $digest and .runtimeValidated == true and .importReadback == true and .cleanupVerified == true' "$amd64_receipt" >/dev/null
+            jq -e --arg digest "${{ needs.publish.outputs.index_digest }}" '.["indexDigest"] == $digest and .runtimeValidated == true and .importReadback == true and .cleanupVerified == true' "$arm64_receipt" >/dev/null
+            runtime_validated=true
+            import_readback=true
+          fi
+          jq --arg runtime "$runtime_validated" --arg import "$import_readback" --arg validated "$runtime_validated" \
+            '.gates.runtimeValidated=($runtime == "true") | .gates.importReadback=($import == "true") | .gates.platformsValidated=($validated == "true") | .packagePlatforms |= map(.validated=($validated == "true"))' "$input" > "$input.tmp"
+          mv "$input.tmp" "$input"
+          if [[ "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true || "$runtime_validated" != true || "$import_readback" != true ]]; then
+            jq '.gates.attestationVerified=false' "$input" > "$input.tmp"
+            mv "$input.tmp" "$input"
+          else
+            go run ./cmd/epar-prebuilt-publisher plan --catalog "$catalog" --input "$input" --output "$RUNNER_TEMP/epar-promotion/pre-plan.json"
+            jq '.entry' "$RUNNER_TEMP/epar-promotion/pre-plan.json" > "$RUNNER_TEMP/epar-promotion/package-entry.json"
+            go run ./cmd/epar-prebuilt-publisher verify-package --reference "$PACKAGE_REF" --entry "$RUNNER_TEMP/epar-promotion/package-entry.json" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
+            jq '.gates.attestationVerified=true' "$input" > "$input.tmp"
+            mv "$input.tmp" "$input"
+          fi
+          go run ./cmd/epar-prebuilt-publisher plan --catalog "$catalog" --input "$input" --output "$RUNNER_TEMP/epar-promotion/plan.json"
+          if [[ "$FORCE_CANDIDATE" == true || "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true || "$runtime_validated" != true || "$import_readback" != true ]]; then
+            jq '.action="candidate" | .reason="protected live or branch gate is incomplete; candidate retained"' "$RUNNER_TEMP/epar-promotion/plan.json" > "$RUNNER_TEMP/epar-promotion/plan.tmp"
+            mv "$RUNNER_TEMP/epar-promotion/plan.tmp" "$RUNNER_TEMP/epar-promotion/plan.json"
+          fi
+          echo "catalog=$catalog" >> "$GITHUB_OUTPUT"
+          echo "input=$input" >> "$GITHUB_OUTPUT"
+          echo "plan=$RUNNER_TEMP/epar-promotion/plan.json" >> "$GITHUB_OUTPUT"
+
+      - name: Append candidate or protected active alias state locally
+        id: promote-catalog
+        shell: bash
+        env:
+          CATALOG: ${{ steps.plan.outputs.catalog }}
+          PLAN: ${{ steps.plan.outputs.plan }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/epar-prebuilt-publisher promote --catalog "$CATALOG" --plan "$PLAN"
+          echo "action=$(jq -r '.action' "$PLAN")" >> "$GITHUB_OUTPUT"
+
+      - name: Canonicalize and publish immutable catalog tag with collision guard
+        id: catalog
+        shell: bash
+        env:
+          CATALOG: ${{ steps.plan.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          catalog_json="$RUNNER_TEMP/epar-promotion/catalog.json"
+          catalog_output="$(go run ./cmd/epar-prebuilt-publisher catalog --catalog "$CATALOG" --output "$catalog_json")"
+          [[ -s "$catalog_json" ]]
+          catalog_digest="$(printf '%s\n' "$catalog_output" | grep -Eo 'sha256:[0-9a-f]{64}' | tail -n 1 || true)"
+          [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          immutable_ref="${PACKAGE_REPOSITORY}:catalog-v1-pkg-${catalog_digest#sha256:}"
+          catalog_tag_error="$RUNNER_TEMP/epar-promotion/catalog-tag-resolve.error"
+          if existing_manifest="$(oras resolve "$immutable_ref" 2>"$catalog_tag_error")"; then
+            [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            existing_dir="$RUNNER_TEMP/epar-promotion/existing-catalog"
+            mkdir -p "$existing_dir"
+            oras pull "$immutable_ref" --output "$existing_dir" >/dev/null
+            existing_json="$(find "$existing_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
+            [[ -f "$existing_json" ]]
+            existing_canonical="$RUNNER_TEMP/epar-promotion/existing-catalog.canonical.json"
+            existing_output="$(go run ./cmd/epar-prebuilt-publisher catalog --catalog "$existing_json" --output "$existing_canonical")"
+            existing_digest="$(printf '%s\n' "$existing_output" | grep -Eo 'sha256:[0-9a-f]{64}' | tail -n 1 || true)"
+            [[ "$existing_digest" == "$catalog_digest" ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_tag_error"; then
+              cat "$catalog_tag_error" >&2
+              exit 1
+            fi
+            config_file="$RUNNER_TEMP/epar-promotion/catalog-config.json"
+            printf '%s\n' '{}' > "$config_file"
+            oras push "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
+            existing_manifest="$(oras resolve "$immutable_ref")"
+          fi
+          [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          oras manifest fetch "$immutable_ref" --format json > "$RUNNER_TEMP/epar-promotion/catalog-manifest.json"
+          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.content // .) as $m | ($m.artifactType == $artifact) and ($m.config.mediaType == $config) and ([$m.layers[] | select(.mediaType == $layer)] | length == 1)' "$RUNNER_TEMP/epar-promotion/catalog-manifest.json" >/dev/null
+          echo "catalog_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
+          echo "manifest_digest=$existing_manifest" >> "$GITHUB_OUTPUT"
+          echo "immutable_ref=$immutable_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Detect existing signed catalog evidence for idempotent reruns
+        id: catalog-evidence
+        shell: bash
+        env:
+          CATALOG_MANIFEST: ${{ steps.catalog.outputs.manifest_digest }}
+          IMMUTABLE_REF: ${{ steps.catalog.outputs.immutable_ref }}
+        run: |
+          set -euo pipefail
+          oras discover "${PACKAGE_REPOSITORY}@${CATALOG_MANIFEST}" --format json > "$RUNNER_TEMP/epar-promotion/catalog-referrers.json"
+          jq -e '.referrers | type == "array"' "$RUNNER_TEMP/epar-promotion/catalog-referrers.json" >/dev/null
+          if go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$IMMUTABLE_REF" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null; then
+            echo 'signed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign immutable catalog and verify it before moving catalog-v1
+        id: sign-catalog
+        if: steps.catalog-evidence.outputs.signed != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.PACKAGE_REPOSITORY }}
+          subject-digest: ${{ steps.catalog.outputs.manifest_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify signed catalog and move only authorized aliases
+        shell: bash
+        env:
+          CATALOG_MANIFEST: ${{ steps.catalog.outputs.manifest_digest }}
+          CATALOG_DIGEST: ${{ steps.catalog.outputs.catalog_digest }}
+          PLAN: ${{ steps.plan.outputs.plan }}
+          PROFILE: ${{ needs.resolve.outputs.profile }}
+          PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
+          SOURCE_RECHECKED: ${{ needs.publish.outputs.source_rechecked }}
+          ALLOW_ALIAS: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          set -euo pipefail
+          immutable_catalog_ref="${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}"
+          [[ "$(oras resolve "$immutable_catalog_ref")" == "$CATALOG_MANIFEST" ]]
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile "$PROFILE" --reference "$immutable_catalog_ref" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          catalog_moving="${PACKAGE_REPOSITORY}:catalog-v1"
+          catalog_pointer_error="$RUNNER_TEMP/epar-promotion/catalog-pointer-resolve.error"
+          old_catalog_digest=''
+          if old_catalog_digest="$(oras resolve "$catalog_moving" 2>"$catalog_pointer_error")"; then
+            [[ "$old_catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_pointer_error"; then
+              cat "$catalog_pointer_error" >&2
+              exit 1
+            fi
+            old_catalog_digest=''
+          fi
+          plan_action="$(jq -r '.action' "$PLAN")"
+          move_alias=false
+          alias_ref="${PACKAGE_REPOSITORY}:${PROFILE}-latest"
+          old_alias_digest=''
+          if [[ "$plan_action" == advance-alias && "$ALLOW_ALIAS" == true && "$SOURCE_RECHECKED" == true ]]; then
+            move_alias=true
+            expected_alias="$(jq -r '.expectedAliasDigest // empty' "$PLAN")"
+            alias_pointer_error="$RUNNER_TEMP/epar-promotion/alias-pointer-resolve.error"
+            if old_alias_digest="$(oras resolve "$alias_ref" 2>"$alias_pointer_error")"; then
+              [[ "$old_alias_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ -z "$expected_alias" || "$old_alias_digest" == "$expected_alias" ]]
+            else
+              if ! grep -Eqi 'manifest unknown|not found|404' "$alias_pointer_error"; then
+                cat "$alias_pointer_error" >&2
+                exit 1
+              fi
+              [[ -z "$expected_alias" ]]
+              old_alias_digest=''
+            fi
+          fi
+          catalog_moved=false
+          alias_moved=false
+          rollback_pointers() {
+            rc=$?
+            trap - EXIT
+            set +e
+            if [[ "$alias_moved" == true ]]; then
+              if [[ -n "$old_alias_digest" ]]; then
+                oras tag "${PACKAGE_REPOSITORY}@${old_alias_digest}" "${PROFILE}-latest" >/dev/null
+                [[ "$(oras resolve "$alias_ref")" == "$old_alias_digest" ]] || echo 'alias rollback readback failed' >&2
+              else
+                echo 'alias rollback cannot remove a first-publication alias; catalog rollback remains authoritative' >&2
+              fi
+            fi
+            if [[ "$catalog_moved" == true && -n "$old_catalog_digest" ]]; then
+              oras tag "${PACKAGE_REPOSITORY}@${old_catalog_digest}" catalog-v1 >/dev/null
+              [[ "$(oras resolve "$catalog_moving")" == "$old_catalog_digest" ]] || echo 'catalog rollback readback failed' >&2
+            elif [[ "$catalog_moved" == true ]]; then
+              echo 'catalog rollback cannot remove a first-publication catalog pointer; it remains signed with no trusted alias' >&2
+            fi
+            exit "$rc"
+          }
+          trap rollback_pointers EXIT
+          oras tag "${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}" catalog-v1
+          catalog_moved=true
+          [[ "$(oras resolve "$catalog_moving")" == "$CATALOG_MANIFEST" ]]
+          if [[ "$move_alias" == true ]]; then
+            alias_cas_error="$RUNNER_TEMP/epar-promotion/alias-cas-resolve.error"
+            if actual_alias_digest="$(oras resolve "$alias_ref" 2>"$alias_cas_error")"; then
+              [[ -z "$expected_alias" || "$actual_alias_digest" == "$expected_alias" ]]
+            else
+              if ! grep -Eqi 'manifest unknown|not found|404' "$alias_cas_error"; then
+                cat "$alias_cas_error" >&2
+                exit 1
+              fi
+              [[ -z "$expected_alias" ]]
+            fi
+            oras tag "$PACKAGE_REF" "${PROFILE}-latest"
+            alias_moved=true
+            [[ "$(oras resolve "$alias_ref")" == "${PACKAGE_REF##*@}" ]]
+          fi
+          trap - EXIT
+          echo 'Signed catalog was verified before catalog-v1 and any protected profile alias movement; pointer rollback is armed until both readbacks pass.' >> "$GITHUB_STEP_SUMMARY"
+
+  manual-promote:
+    name: Manually promote one verified candidate digest
+    environment: epar-prebuilt-promotion
+    if: inputs.promote_candidate == true && github.ref == 'refs/heads/main' && inputs.promotion_confirmation == 'PROMOTE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Verify exact candidate input and signed current catalog
+        id: verify
+        shell: bash
+        env:
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          current_catalog_manifest="$(oras resolve "${PACKAGE_REPOSITORY}:catalog-v1")"
+          [[ "$current_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${current_catalog_manifest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          pull_dir="$RUNNER_TEMP/manual-catalog"
+          mkdir -p "$pull_dir"
+          oras pull "${PACKAGE_REPOSITORY}:catalog-v1" --output "$pull_dir" >/dev/null
+          catalog="$(find "$pull_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
+          [[ -f "$catalog" ]]
+          alias_ref="${PACKAGE_REPOSITORY}:act-latest"
+          observed_alias=''
+          alias_reconcile_error="$RUNNER_TEMP/manual-alias-reconcile.error"
+          if observed_alias="$(oras resolve "$alias_ref" 2>"$alias_reconcile_error")"; then
+            [[ "$observed_alias" =~ ^sha256:[0-9a-f]{64}$ ]]
+          elif ! grep -Eqi 'manifest unknown|not found|404' "$alias_reconcile_error"; then
+            cat "$alias_reconcile_error" >&2
+            exit 1
+          fi
+          reconcile_plan="$RUNNER_TEMP/manual-alias-reconciliation.json"
+          go run ./cmd/epar-prebuilt-publisher reconcile-alias --catalog "$catalog" --profile act --observed-digest "$observed_alias" --output "$reconcile_plan"
+          if [[ "$(jq -r '.needsRepair' "$reconcile_plan")" == true ]]; then
+            repair_target="$(jq -er '.targetDigest' "$reconcile_plan")"
+            [[ "$(oras resolve "${PACKAGE_REPOSITORY}@${repair_target}")" == "$repair_target" ]]
+            oras tag "${PACKAGE_REPOSITORY}@${repair_target}" act-latest
+            [[ "$(oras resolve "$alias_ref")" == "$repair_target" ]]
+            echo "Recovered interrupted Act alias promotion to ${repair_target}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")' "$catalog" > "$RUNNER_TEMP/manual-entry.json"
+          jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and ([.gates | to_entries[] | select(.value != true)] | length == 0) and (.platforms | length == 2)' "$RUNNER_TEMP/manual-entry.json" >/dev/null
+          go run ./cmd/epar-prebuilt-publisher verify-package --reference "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --entry "$RUNNER_TEMP/manual-entry.json" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
+          source_reference="$(jq -er '.source.reference' "$RUNNER_TEMP/manual-entry.json")"
+          source_digest="$(jq -er '.source.indexDigest' "$RUNNER_TEMP/manual-entry.json")"
+          [[ "$(oras resolve "$source_reference")" == "$source_digest" ]]
+          alias_digest="$(jq -r '.aliases.act.packageIndexDigest // empty' "$catalog")"
+          jq -n --slurpfile entry "$RUNNER_TEMP/manual-entry.json" --arg source "$source_digest" --arg sourceReference "$source_reference" --arg alias "$alias_digest" '{action:"candidate",reason:"explicit protected manual candidate promotion",expectedSourceDigest:$source,expectedAliasDigest:$alias,sourceReference:$sourceReference,entry:$entry[0]}' > "$RUNNER_TEMP/manual-plan.json"
+          echo "catalog=$catalog" >> "$GITHUB_OUTPUT"
+          echo "plan=$RUNNER_TEMP/manual-plan.json" >> "$GITHUB_OUTPUT"
+
+      - name: Promote the exact candidate with publisher CAS
+        shell: bash
+        env:
+          CATALOG: ${{ steps.verify.outputs.catalog }}
+          PLAN: ${{ steps.verify.outputs.plan }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/epar-prebuilt-publisher promote --protected --catalog "$CATALOG" --plan "$PLAN"
+
+      - name: Canonicalize, sign, verify, and expose the promoted catalog
+        id: manual-catalog
+        shell: bash
+        env:
+          CATALOG: ${{ steps.verify.outputs.catalog }}
+        run: |
+          set -euo pipefail
+          catalog_json="$RUNNER_TEMP/manual-catalog.canonical.json"
+          catalog_output="$(go run ./cmd/epar-prebuilt-publisher catalog --catalog "$CATALOG" --output "$catalog_json")"
+          catalog_digest="$(printf '%s\n' "$catalog_output" | grep -Eo 'sha256:[0-9a-f]{64}' | tail -n 1 || true)"
+          [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          immutable_ref="${PACKAGE_REPOSITORY}:catalog-v1-pkg-${catalog_digest#sha256:}"
+          config_file="$RUNNER_TEMP/manual-catalog-config.json"
+          printf '%s\n' '{}' > "$config_file"
+          catalog_tag_error="$RUNNER_TEMP/manual-catalog-tag-resolve.error"
+          if existing_manifest="$(oras resolve "$immutable_ref" 2>"$catalog_tag_error")"; then
+            existing_dir="$RUNNER_TEMP/manual-existing-catalog"
+            mkdir -p "$existing_dir"
+            oras pull "$immutable_ref" --output "$existing_dir" >/dev/null
+            existing_json="$(find "$existing_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
+            [[ -f "$existing_json" ]]
+            existing_output="$(go run ./cmd/epar-prebuilt-publisher catalog --catalog "$existing_json" --output "$RUNNER_TEMP/manual-existing-canonical.json")"
+            existing_digest="$(printf '%s\n' "$existing_output" | grep -Eo 'sha256:[0-9a-f]{64}' | tail -n 1 || true)"
+            [[ "$existing_digest" == "$catalog_digest" ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_tag_error"; then
+              cat "$catalog_tag_error" >&2
+              exit 1
+            fi
+            oras push "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
+            existing_manifest="$(oras resolve "$immutable_ref")"
+          fi
+          [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          oras manifest fetch "$immutable_ref" --format json > "$RUNNER_TEMP/manual-catalog-manifest.json"
+          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.content // .) as $m | ($m.artifactType == $artifact) and ($m.config.mediaType == $config) and ([$m.layers[] | select(.mediaType == $layer)] | length == 1)' "$RUNNER_TEMP/manual-catalog-manifest.json" >/dev/null
+          echo "catalog_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
+          echo "manifest_digest=$existing_manifest" >> "$GITHUB_OUTPUT"
+          echo "immutable_ref=$immutable_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Detect existing manual catalog evidence for idempotent reruns
+        id: manual-catalog-evidence
+        shell: bash
+        env:
+          CATALOG_MANIFEST: ${{ steps.manual-catalog.outputs.manifest_digest }}
+          IMMUTABLE_REF: ${{ steps.manual-catalog.outputs.immutable_ref }}
+        run: |
+          set -euo pipefail
+          oras discover "${PACKAGE_REPOSITORY}@${CATALOG_MANIFEST}" --format json > "$RUNNER_TEMP/manual-catalog-referrers.json"
+          jq -e '.referrers | type == "array"' "$RUNNER_TEMP/manual-catalog-referrers.json" >/dev/null
+          if go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$IMMUTABLE_REF" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null; then
+            echo 'signed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign the manually promoted catalog
+        if: steps.manual-catalog-evidence.outputs.signed != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.PACKAGE_REPOSITORY }}
+          subject-digest: ${{ steps.manual-catalog.outputs.manifest_digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify signed manual catalog and move exact aliases
+        shell: bash
+        env:
+          CATALOG_DIGEST: ${{ steps.manual-catalog.outputs.catalog_digest }}
+          CATALOG_MANIFEST: ${{ steps.manual-catalog.outputs.manifest_digest }}
+          IMMUTABLE_REF: ${{ steps.manual-catalog.outputs.immutable_ref }}
+          PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          PLAN: ${{ steps.verify.outputs.plan }}
+        run: |
+          set -euo pipefail
+          [[ "$(oras resolve "$IMMUTABLE_REF")" == "$CATALOG_MANIFEST" ]]
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "$IMMUTABLE_REF" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          catalog_moving="${PACKAGE_REPOSITORY}:catalog-v1"
+          catalog_pointer_error="$RUNNER_TEMP/manual-catalog-pointer-resolve.error"
+          old_catalog_digest=''
+          if old_catalog_digest="$(oras resolve "$catalog_moving" 2>"$catalog_pointer_error")"; then
+            [[ "$old_catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_pointer_error"; then
+              cat "$catalog_pointer_error" >&2
+              exit 1
+            fi
+            old_catalog_digest=''
+          fi
+          alias_ref="${PACKAGE_REPOSITORY}:act-latest"
+          expected_alias="$(jq -r '.expectedAliasDigest // empty' "$PLAN")"
+          alias_pointer_error="$RUNNER_TEMP/manual-alias-pointer-resolve.error"
+          old_alias_digest=''
+          if old_alias_digest="$(oras resolve "$alias_ref" 2>"$alias_pointer_error")"; then
+            [[ "$old_alias_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ -z "$expected_alias" || "$old_alias_digest" == "$expected_alias" ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$alias_pointer_error"; then
+              cat "$alias_pointer_error" >&2
+              exit 1
+            fi
+            [[ -z "$expected_alias" ]]
+            old_alias_digest=''
+          fi
+          catalog_moved=false
+          alias_moved=false
+          rollback_manual_pointers() {
+            rc=$?
+            trap - EXIT
+            set +e
+            if [[ "$alias_moved" == true ]]; then
+              if [[ -n "$old_alias_digest" ]]; then
+                oras tag "${PACKAGE_REPOSITORY}@${old_alias_digest}" act-latest >/dev/null
+                [[ "$(oras resolve "$alias_ref")" == "$old_alias_digest" ]] || echo 'manual alias rollback readback failed' >&2
+              else
+                echo 'manual alias rollback cannot remove a first-publication alias; catalog rollback remains authoritative' >&2
+              fi
+            fi
+            if [[ "$catalog_moved" == true && -n "$old_catalog_digest" ]]; then
+              oras tag "${PACKAGE_REPOSITORY}@${old_catalog_digest}" catalog-v1 >/dev/null
+              [[ "$(oras resolve "$catalog_moving")" == "$old_catalog_digest" ]] || echo 'manual catalog rollback readback failed' >&2
+            elif [[ "$catalog_moved" == true ]]; then
+              echo 'manual catalog rollback cannot remove a first-publication catalog pointer; it remains signed with no trusted alias' >&2
+            fi
+            exit "$rc"
+          }
+          trap rollback_manual_pointers EXIT
+          oras tag "$IMMUTABLE_REF" catalog-v1
+          catalog_moved=true
+          [[ "$(oras resolve "$catalog_moving")" == "$CATALOG_MANIFEST" ]]
+          alias_cas_error="$RUNNER_TEMP/manual-alias-cas-resolve.error"
+          if actual_alias="$(oras resolve "$alias_ref" 2>"$alias_cas_error")"; then
+            [[ -z "$expected_alias" || "$actual_alias" == "$expected_alias" ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$alias_cas_error"; then
+              cat "$alias_cas_error" >&2
+              exit 1
+            fi
+            [[ -z "$expected_alias" ]]
+          fi
+          oras tag "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" act-latest
+          alias_moved=true
+          [[ "$(oras resolve "$alias_ref")" == "$CANDIDATE_DIGEST" ]]
+          trap - EXIT
+          echo 'Manual candidate promotion completed only after exact digest, package evidence, source recheck, catalog media, alias CAS, and pointer rollback checks.' >> "$GITHUB_STEP_SUMMARY"
+
+  noop:
+    name: Report unchanged immutable tuple
+    needs: resolve
+    if: needs.resolve.outputs.noop == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report no-op
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Upstream source, recipe, runner, and locked-tool tuple is unchanged; no package or catalog mutation was attempted.' >> "$GITHUB_STEP_SUMMARY"

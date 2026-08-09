@@ -62,6 +62,30 @@ func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
 	}
 }
 
+func TestCriticalTemplateAdmissionBlockFailsBeforeProviderSideEffects(t *testing.T) {
+	p := New("sbx")
+	called := false
+	p.runCommand = func(context.Context, commandRequest) (provider.ExecResult, error) {
+		called = true
+		return provider.ExecResult{}, nil
+	}
+	p.SetTemplateAdmissionBlock("critical-revoked sha256:deadbeef")
+	if reason, blocked := p.TemplateAdmissionBlock(); !blocked || !strings.Contains(reason, "critical-revoked") {
+		t.Fatalf("admission block = %q, %t", reason, blocked)
+	}
+	_, err := p.Create(context.Background(), provider.CreateRequest{Name: testName})
+	if err == nil || !strings.Contains(err.Error(), "critical-revoked") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if called {
+		t.Fatal("blocked admission invoked a provider command")
+	}
+	p.ClearTemplateAdmissionBlock()
+	if _, blocked := p.TemplateAdmissionBlock(); blocked {
+		t.Fatal("admission block was not cleared")
+	}
+}
+
 func TestStartDaemonUsesExactDetachedCommand(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"daemon", "start", "--detach"}},

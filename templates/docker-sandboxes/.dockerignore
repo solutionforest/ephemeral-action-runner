@@ -1,5 +1,10 @@
 *
 !Dockerfile
+!Dockerfile.prebuilt
+!prebuilt.lock.json
+!prebuilt/
+!prebuilt/*.sh
+!prebuilt/*.json
 !helpers.sha256
 !guest/
 !guest/*.sh

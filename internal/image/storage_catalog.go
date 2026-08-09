@@ -26,15 +26,16 @@ import (
 var buildxUsageSizePattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([kMGTPE]?i?B)$`)
 
 const (
-	catalogDockerImageKind          = "docker-image"
-	catalogSandboxTemplateKind      = "sandbox-template"
-	catalogWSLArtifactKind          = "provider-image"
-	catalogTartImageKind            = "tart-image"
-	catalogTemplateStagingKind      = "template-staging-directory"
-	catalogDockerOutputTagClaimKind = "docker-output-tag-claim"
-	dockerOutputTagClaimLifetime    = 2 * time.Minute
-	dockerOutputTagClaimRefresh     = 30 * time.Second
-	dockerOutputTagClaimLockTimeout = 15 * time.Second
+	catalogDockerImageKind            = "docker-image"
+	catalogSandboxTemplateKind        = "sandbox-template"
+	catalogWSLArtifactKind            = "provider-image"
+	catalogTartImageKind              = "tart-image"
+	catalogTemplateStagingKind        = "template-staging-directory"
+	catalogDockerOutputTagClaimKind   = "docker-output-tag-claim"
+	catalogPrebuiltPackageArchiveKind = "prebuilt-package-archive"
+	dockerOutputTagClaimLifetime      = 2 * time.Minute
+	dockerOutputTagClaimRefresh       = 30 * time.Second
+	dockerOutputTagClaimLockTimeout   = 15 * time.Second
 )
 
 func (m *Coordinator) effectiveConfigPath() string {
@@ -555,6 +556,56 @@ func (m *Coordinator) recordCurrentSandboxArtifactLocked(artifact provider.Templ
 		return err
 	}
 	return m.releaseCatalogRole("build-source", now)
+}
+
+// recordSupersededSandboxArtifactLocked gives an imported-but-rolled-back
+// cache exact generated custody without attaching the current provider role.
+// A matching cache already referenced by another configuration is shared and
+// remains current; rollback must never retire or delete that identity.
+func (m *Coordinator) recordSupersededSandboxArtifactLocked(artifact provider.TemplateArtifact, manifestHash string, now time.Time) error {
+	backendID, err := sandboxBackendID()
+	if err != nil {
+		return err
+	}
+	store, err := m.hostCatalog()
+	if err != nil {
+		return err
+	}
+	_, err = store.WithLock(now, func(value *storagecatalog.Catalog) error {
+		configRecord, err := storagecatalog.RegisterConfig(value, m.ProjectRoot, m.effectiveConfigPath(), now)
+		if err != nil {
+			return err
+		}
+		if err := m.applyCatalogConfigSettings(value, configRecord.ID); err != nil {
+			return err
+		}
+		resource := storagecatalog.Resource{
+			BackendID: backendID, Kind: catalogSandboxTemplateKind, Provider: "docker-sandboxes", Role: "runtime-template",
+			Locator: artifact.Reference, Identity: artifact.CacheID, Fingerprint: artifact.Digest,
+			Custody: storagecatalog.CustodyGenerated, ManifestHash: manifestHash, State: storagecatalog.StateSuperseded,
+			CreatedAt: now, LastSeenAt: now, InstallationIDs: []string{configRecord.InstallationID},
+		}
+		resource.Key = storagecatalog.ResourceKey(resource.BackendID, resource.Kind, resource.Identity)
+		supersededAt := now.UTC()
+		resource.SupersededAt = &supersededAt
+		for _, existing := range value.Resources {
+			if existing.Key != resource.Key {
+				continue
+			}
+			if existing.Locator != resource.Locator || existing.Fingerprint != resource.Fingerprint {
+				return errors.New("rolled-back Docker Sandboxes candidate cache identity conflicts with existing catalog evidence")
+			}
+			if len(existing.References) != 0 || existing.State == storagecatalog.StateCurrent {
+				return nil
+			}
+			resource.CreatedAt = existing.CreatedAt
+			resource.InstallationIDs = unionStrings(existing.InstallationIDs, resource.InstallationIDs)
+			resource.IntroducedTags = unionStrings(existing.IntroducedTags, resource.IntroducedTags)
+			break
+		}
+		return storagecatalog.UpsertResource(value, resource)
+	})
+	return err
 }
 
 func (m *Coordinator) recordSandboxWorkspace(ctx context.Context, workspacePath, manifestHash string, state storagecatalog.State, now time.Time) error {
@@ -1213,7 +1264,7 @@ func (m *Coordinator) catalogResourceExists(ctx context.Context, resource storag
 			CacheID:   resource.Identity,
 			Digest:    resource.Fingerprint,
 		})
-	case catalogWSLArtifactKind:
+	case catalogWSLArtifactKind, catalogPrebuiltPackageArchiveKind:
 		target, err := storage.SnapshotFilesystemTarget(resource.Locator)
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
@@ -1539,6 +1590,60 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 			return errors.New("filesystem artifact identity changed")
 		}
 		return os.Remove(absolute)
+	case catalogPrebuiltPackageArchiveKind:
+		absolute, err := filepath.Abs(resource.Locator)
+		if err != nil {
+			return err
+		}
+		acquisitionRoot, err := filepath.Abs(filepath.Join(m.ProjectRoot, ".local", "state", "image"))
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(acquisitionRoot, absolute)
+		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return errors.New("prebuilt acquisition belongs to another project or lies outside the exact acquisition root")
+		}
+		executor, err := storage.NewFilesystemExecutor(acquisitionRoot)
+		if err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(absolute)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if len(entries) != 2 || entries[0].IsDir() || entries[1].IsDir() {
+			return errors.New("prebuilt acquisition directory contains unexpected objects")
+		}
+		names := map[string]bool{entries[0].Name(): true, entries[1].Name(): true}
+		if !names["acquisition.json"] || !names["base-template.tar"] {
+			return errors.New("prebuilt acquisition directory contents changed")
+		}
+		var acquisition dockerSandboxesPrebuiltAcquisition
+		if err := readJSONFile(filepath.Join(absolute, "acquisition.json"), &acquisition); err != nil {
+			return err
+		}
+		archiveDigest, archiveBytes, err := hashFile(filepath.Join(absolute, "base-template.tar"))
+		if err != nil {
+			return err
+		}
+		if acquisition.SchemaVersion != dockerSandboxesPrebuiltDerivativeSchema || acquisition.PackageIndexDigest != resource.ManifestHash || acquisition.ArchiveSHA256 != archiveDigest || acquisition.ArchiveBytes != archiveBytes {
+			return errors.New("prebuilt acquisition evidence changed before exact cleanup")
+		}
+		target := storage.Target{Kind: storage.TargetDirectory, Locator: absolute, Identity: resource.Identity, Fingerprint: resource.Fingerprint, Match: storage.MatchExact}
+		observation, err := executor.ObserveExact(ctx, target)
+		if err != nil {
+			return err
+		}
+		if !observation.Exists {
+			return nil
+		}
+		if observation.Target != target {
+			return errors.New("prebuilt acquisition directory exact identity changed")
+		}
+		return executor.RemoveExact(ctx, storage.Removal{Target: target})
 	case catalogTemplateStagingKind:
 		executor, err := storage.NewFilesystemExecutor(filepath.Join(m.ProjectRoot, "work", "template-builds", "docker-sandboxes"))
 		if err != nil {

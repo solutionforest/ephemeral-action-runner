@@ -1218,6 +1218,79 @@ func TestDockerSandboxesWizardResolvesEveryBuiltInImageChoice(t *testing.T) {
 	}
 }
 
+func TestDockerSandboxesWizardOffersVerifiedPrebuiltActChoice(t *testing.T) {
+	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+		PolicyFingerprint: policyFingerprint,
+	}, nil)
+	var out bytes.Buffer
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("P\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted || profile == nil {
+		t.Fatalf("prebuilt wizard profile = %+v, accepted=%t", profile, accepted)
+	}
+	if got, want := profile.Distribution, config.ImageDistributionPrebuilt; got != want {
+		t.Fatalf("profile distribution = %q, want %q", got, want)
+	}
+	if got, want := profile.PrebuiltReference, config.DockerSandboxesPrebuiltActReference; got != want {
+		t.Fatalf("profile prebuilt reference = %q, want %q", got, want)
+	}
+	if got, want := profile.SourceImage, "ghcr.io/catthehacker/ubuntu:act-latest"; got != want {
+		t.Fatalf("profile source image = %q, want %q", got, want)
+	}
+	if !profile.PrebuiltPreview {
+		t.Fatal("prebuilt profile is not marked preview")
+	}
+	if profile.PrebuiltDigest != "" {
+		t.Fatalf("prebuilt digest = %q, want unresolved until startup", profile.PrebuiltDigest)
+	}
+	for _, want := range []string{
+		"P. EPAR verified prebuilt Act (preview)",
+		"immutable digest plus GitHub/Sigstore attestation",
+		"Host and enterprise CAs are applied at runtime where safe",
+		"first-use Docker Sandboxes materialization remains local",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("prebuilt wizard output omitted %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestDockerSandboxesPrebuiltConfigRendersExplicitDistributionAndReference(t *testing.T) {
+	profile := initDockerSandboxesProfile{
+		Provider:          "docker-sandboxes",
+		GuestPlatform:     "linux/amd64",
+		Distribution:      config.ImageDistributionPrebuilt,
+		SourceImage:       "ghcr.io/catthehacker/ubuntu:act-latest",
+		PrebuiltReference: config.DockerSandboxesPrebuiltActReference,
+		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
+		RootDisk:          config.DockerSandboxesAutomaticRootDisk,
+		DockerDisk:        config.DockerSandboxesDefaultDockerDisk,
+	}
+	text := defaultDockerSandboxesConfig(123, "solutionforest", ".local/github-app.pem", "epar-build-box", config.HostTrustModeOverlay, []string{config.HostTrustScopeSystem}, initRunnerGroupSelection{
+		Group: gh.RunnerGroup{Name: "epar"},
+		Policy: config.RunnerGroupSecurityConfig{
+			Enforcement: config.RunnerGroupEnforcementEnforce,
+		},
+	}, profile, initImageUpdatePolicy{Frequency: config.ImageUpdateFrequencyWeekly, Time: config.DefaultImageUpdateTime}, "linux/amd64", "X64", config.DockerSandboxesArchitectureEmulationBestEffort)
+	for _, want := range []string{
+		"distribution: prebuilt",
+		"prebuiltReference: " + config.DockerSandboxesPrebuiltActReference,
+		"sourceImage: ghcr.io/catthehacker/ubuntu:act-latest",
+		"updateFrequency: weekly",
+		"updateTime: \"07:00\"",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("prebuilt config omitted %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "prebuiltDigest:") {
+		t.Fatalf("prebuilt config rendered an unresolved digest:\n%s", text)
+	}
+}
+
 func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.T) {
 	for _, providerType := range []string{"docker-container", "docker-sandboxes", "wsl"} {
 		t.Run(providerType, func(t *testing.T) {
@@ -1669,25 +1742,7 @@ func TestReadDockerSandboxesActiveProfilesUsesOnlyCurrentLockedTemplates(t *test
 	if err := os.MkdirAll(lockDirectory, 0755); err != nil {
 		t.Fatal(err)
 	}
-	const lock = `{
-  "schemaVersion": 2,
-  "profiles": {
-    "full": {
-      "observedTagReference": "ghcr.io/catthehacker/ubuntu:full-latest",
-      "platforms": {"linux/amd64": {"templateTag": "epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64"}}
-    },
-    "act-22.04": {
-      "observedTagReference": "ghcr.io/catthehacker/ubuntu:act-22.04",
-      "platforms": {"linux/amd64": {"templateTag": "epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64"}}
-    }
-  },
-  "supersededRecords": {
-    "linux/amd64": {
-      "full": {"templateTag": "epar-docker-sandboxes-catthehacker-full:20260723-r1-amd64"},
-      "act-22.04": {"templateTag": "epar-docker-sandboxes-catthehacker-act-22.04:20260723-r3-amd64"}
-    }
-  }
-}`
+	const lock = `{"schemaVersion":4,"sourceAuthority":"registry-catalog"}`
 	if err := os.WriteFile(filepath.Join(lockDirectory, "sources.lock.json"), []byte(lock), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1702,8 +1757,8 @@ func TestReadDockerSandboxesActiveProfilesUsesOnlyCurrentLockedTemplates(t *test
 	for index, want := range []struct {
 		name, channel, reference, label string
 	}{
-		{"full", "ghcr.io/catthehacker/ubuntu:full-latest", "docker.io/library/epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64", "Catthehacker Ubuntu Full (recommended)"},
-		{"act-22.04", "ghcr.io/catthehacker/ubuntu:act-22.04", "docker.io/library/epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64", "Catthehacker Ubuntu Act 22.04 (current lean profile)"},
+		{"full", "ghcr.io/catthehacker/ubuntu:full-latest", "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:full-latest", "Catthehacker Ubuntu Full (catalog-gated)"},
+		{"act", "ghcr.io/catthehacker/ubuntu:act-latest", "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest", "Catthehacker Ubuntu Act (recommended)"},
 	} {
 		got := profiles[index]
 		if got.Name != want.name || got.ObservedTag != want.channel || got.TemplateReference != want.reference || got.DisplayLabel != want.label {
@@ -1721,13 +1776,13 @@ func TestReadDockerSandboxesActiveProfilesRejectsUnexpectedSourceChannel(t *test
 	if err := os.MkdirAll(lockDirectory, 0755); err != nil {
 		t.Fatal(err)
 	}
-	const lock = `{"schemaVersion":2,"profiles":{"full":{"observedTagReference":"ghcr.io/catthehacker/ubuntu:full-latest\nnot-a-channel","platforms":{"linux/amd64":{"templateTag":"epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64"}}},"act-22.04":{"observedTagReference":"ghcr.io/catthehacker/ubuntu:act-22.04","platforms":{"linux/amd64":{"templateTag":"epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64"}}}}}`
+	const lock = `{"schemaVersion":2,"profiles":{}}`
 	if err := os.WriteFile(filepath.Join(lockDirectory, "sources.lock.json"), []byte(lock), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := readDockerSandboxesActiveProfiles(projectRoot, "linux/amd64"); err == nil || !strings.Contains(err.Error(), "unexpected observedTagReference") {
-		t.Fatalf("unexpected source channel was accepted: %v", err)
+	if _, err := readDockerSandboxesActiveProfiles(projectRoot, "linux/amd64"); err == nil || !strings.Contains(err.Error(), "unsupported schemaVersion") {
+		t.Fatalf("legacy source lock was accepted: %v", err)
 	}
 }
 

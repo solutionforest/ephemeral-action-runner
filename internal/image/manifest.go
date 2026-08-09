@@ -23,33 +23,47 @@ type HostTrustMetadata struct {
 	CertificateCount int      `json:"certificateCount"`
 }
 
+type PrebuiltManifestMetadata struct {
+	Reference             string `json:"reference"`
+	Pinned                bool   `json:"pinned,omitempty"`
+	ConfiguredDigest      string `json:"configuredDigest,omitempty"`
+	PackageIndexDigest    string `json:"packageIndexDigest,omitempty"`
+	PackagePlatformDigest string `json:"packagePlatformDigest,omitempty"`
+	CatalogDigest         string `json:"catalogDigest,omitempty"`
+	RecipeDigest          string `json:"recipeDigest,omitempty"`
+	RuntimeContract       string `json:"runtimeContract,omitempty"`
+	EffectiveStatus       string `json:"effectiveStatus,omitempty"`
+}
+
 type FileDigest struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 }
 
 type Manifest struct {
-	SchemaVersion         int                `json:"schemaVersion"`
-	ProviderType          string             `json:"providerType"`
-	ProviderPlatform      string             `json:"providerPlatform,omitempty"`
-	ProviderRosettaTag    string             `json:"providerRosettaTag,omitempty"`
-	SourceType            string             `json:"sourceType,omitempty"`
-	SourceImage           string             `json:"sourceImage"`
-	SourcePlatform        string             `json:"sourcePlatform,omitempty"`
-	SourceDigest          string             `json:"sourceDigest,omitempty"`
-	SourcePlatformDigest  string             `json:"sourcePlatformDigest,omitempty"`
-	OutputImage           string             `json:"outputImage"`
-	RunnerSelector        string             `json:"runnerSelector"`
-	RunnerVersion         string             `json:"runnerVersion"`
-	RunnerAssetName       string             `json:"runnerAssetName,omitempty"`
-	RunnerAssetURL        string             `json:"runnerAssetUrl,omitempty"`
-	RunnerAssetDigest     string             `json:"runnerAssetDigest,omitempty"`
-	UpstreamCommit        string             `json:"upstreamCommit,omitempty"`
-	EPARScripts           []FileDigest       `json:"eparScripts,omitempty"`
-	TemplateInputs        []FileDigest       `json:"templateInputs,omitempty"`
-	CustomInstallScripts  []FileDigest       `json:"customInstallScripts,omitempty"`
-	TrustedCACertificates []FileDigest       `json:"trustedCaCertificates,omitempty"`
-	HostTrust             *HostTrustMetadata `json:"hostTrust,omitempty"`
+	SchemaVersion         int                       `json:"schemaVersion"`
+	Distribution          string                    `json:"distribution,omitempty"`
+	Prebuilt              *PrebuiltManifestMetadata `json:"prebuilt,omitempty"`
+	ProviderType          string                    `json:"providerType"`
+	ProviderPlatform      string                    `json:"providerPlatform,omitempty"`
+	ProviderRosettaTag    string                    `json:"providerRosettaTag,omitempty"`
+	SourceType            string                    `json:"sourceType,omitempty"`
+	SourceImage           string                    `json:"sourceImage"`
+	SourcePlatform        string                    `json:"sourcePlatform,omitempty"`
+	SourceDigest          string                    `json:"sourceDigest,omitempty"`
+	SourcePlatformDigest  string                    `json:"sourcePlatformDigest,omitempty"`
+	OutputImage           string                    `json:"outputImage"`
+	RunnerSelector        string                    `json:"runnerSelector"`
+	RunnerVersion         string                    `json:"runnerVersion"`
+	RunnerAssetName       string                    `json:"runnerAssetName,omitempty"`
+	RunnerAssetURL        string                    `json:"runnerAssetUrl,omitempty"`
+	RunnerAssetDigest     string                    `json:"runnerAssetDigest,omitempty"`
+	UpstreamCommit        string                    `json:"upstreamCommit,omitempty"`
+	EPARScripts           []FileDigest              `json:"eparScripts,omitempty"`
+	TemplateInputs        []FileDigest              `json:"templateInputs,omitempty"`
+	CustomInstallScripts  []FileDigest              `json:"customInstallScripts,omitempty"`
+	TrustedCACertificates []FileDigest              `json:"trustedCaCertificates,omitempty"`
+	HostTrust             *HostTrustMetadata        `json:"hostTrust,omitempty"`
 }
 
 type StoredManifest struct {

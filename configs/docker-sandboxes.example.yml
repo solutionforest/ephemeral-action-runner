@@ -6,6 +6,8 @@ github:
   webBaseUrl: https://github.com
 
 image:
+  # local-build is the new-wizard default; use prebuilt only with EPAR's verified Act reference.
+  distribution: local-build
   sourceType: docker-image
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64

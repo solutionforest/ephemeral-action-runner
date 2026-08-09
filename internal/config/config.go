@@ -42,10 +42,13 @@ type GitHubConfig struct {
 }
 
 type ImageConfig struct {
+	Distribution              string
 	SourceImage               string
 	SourceType                string
 	SourcePlatform            string
 	OutputImage               string
+	PrebuiltReference         string
+	PrebuiltDigest            string
 	UpstreamDir               string
 	UpstreamLock              string
 	RunnerVersion             string
@@ -70,6 +73,10 @@ const (
 	ImageUpdateFrequencyMonthly  = "monthly"
 	ImageUpdateFrequencyManual   = "manual"
 	DefaultImageUpdateTime       = "07:00"
+
+	ImageDistributionLocalBuild         = "local-build"
+	ImageDistributionPrebuilt           = "prebuilt"
+	DockerSandboxesPrebuiltActReference = "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest"
 )
 
 type PoolConfig struct {
@@ -234,6 +241,7 @@ func Default() Config {
 			WebBaseURL: "https://github.com",
 		},
 		Image: ImageConfig{
+			Distribution:    ImageDistributionLocalBuild,
 			UpstreamDir:     "third_party/runner-images",
 			UpstreamLock:    "third_party/runner-images.lock",
 			RunnerVersion:   "latest",
@@ -432,6 +440,9 @@ func Load(path string) (Config, error) {
 		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s: image update policy is not configured; using weekly checks at 07:00 local time", path))
 	}
 	applyProviderDefaults(&cfg, explicit)
+	if strings.TrimSpace(cfg.Image.Distribution) == "" {
+		cfg.Image.Distribution = ImageDistributionLocalBuild
+	}
 	applyRunnerHostLabel(&cfg)
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
 	for i, path := range cfg.Image.TrustedCACertificatePaths {
@@ -470,6 +481,8 @@ func apply(cfg *Config, section, key, value string) error {
 		}
 	case "image":
 		switch key {
+		case "distribution":
+			cfg.Image.Distribution = strings.ToLower(strings.TrimSpace(value))
 		case "sourceImage":
 			cfg.Image.SourceImage = value
 		case "sourceType":
@@ -478,6 +491,10 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Image.SourcePlatform = value
 		case "outputImage":
 			cfg.Image.OutputImage = value
+		case "prebuiltReference":
+			cfg.Image.PrebuiltReference = value
+		case "prebuiltDigest":
+			cfg.Image.PrebuiltDigest = value
 		case "upstreamDir":
 			cfg.Image.UpstreamDir = value
 		case "upstreamLock":
@@ -1142,6 +1159,9 @@ func Validate(cfg Config) error {
 		if cfg.Image.SourcePlatform != "" && cfg.Image.SourcePlatform != cfg.Provider.Platform {
 			return fmt.Errorf("image.sourcePlatform must match provider.platform with provider.type=docker-sandboxes")
 		}
+		if err := validateDockerSandboxesImageDistribution(cfg.Image); err != nil {
+			return err
+		}
 		if !cfg.Runner.Ephemeral {
 			return fmt.Errorf("runner.ephemeral must be true with provider.type=docker-sandboxes")
 		}
@@ -1177,6 +1197,9 @@ func Validate(cfg Config) error {
 		if strings.TrimSpace(path) == "" {
 			return fmt.Errorf("image.trustedCaCertificatePaths must not contain empty paths")
 		}
+	}
+	if err := validateImageDistributionFields(cfg.Image, cfg.Provider.Type); err != nil {
+		return err
 	}
 	if err := ValidateHostTrust(cfg.Image, cfg.Provider, cfg.Runner); err != nil {
 		return err
@@ -1371,6 +1394,60 @@ func validDockerSandboxesSourceImage(value string) bool {
 	default:
 		return false
 	}
+}
+
+func validateDockerSandboxesImageDistribution(image ImageConfig) error {
+	distribution := strings.TrimSpace(image.Distribution)
+	if distribution == "" {
+		distribution = ImageDistributionLocalBuild
+	}
+	switch distribution {
+	case ImageDistributionLocalBuild:
+		return nil
+	case ImageDistributionPrebuilt:
+		if strings.TrimSpace(image.SourceImage) != "ghcr.io/catthehacker/ubuntu:act-latest" {
+			return fmt.Errorf("image.distribution=prebuilt currently supports only the Catthehacker Act profile ghcr.io/catthehacker/ubuntu:act-latest")
+		}
+		if err := validatePrebuiltReference(image.PrebuiltReference); err != nil {
+			return fmt.Errorf("image.prebuiltReference: %w", err)
+		}
+		if strings.TrimSpace(image.RunnerVersion) != "" && strings.TrimSpace(image.RunnerVersion) != "latest" {
+			return fmt.Errorf("image.runnerVersion=%q is not supported with image.distribution=prebuilt; use latest because the published package carries its catalog-pinned runner identity", image.RunnerVersion)
+		}
+		if digest := strings.TrimSpace(image.PrebuiltDigest); digest != "" {
+			if err := validateSHA256Fingerprint("image.prebuiltDigest", digest); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported image.distribution %q; supported values are %s and %s", image.Distribution, ImageDistributionLocalBuild, ImageDistributionPrebuilt)
+	}
+}
+
+func validateImageDistributionFields(image ImageConfig, providerType string) error {
+	distribution := strings.TrimSpace(image.Distribution)
+	if distribution == "" {
+		distribution = ImageDistributionLocalBuild
+	}
+	if distribution != ImageDistributionPrebuilt && (strings.TrimSpace(image.PrebuiltReference) != "" || strings.TrimSpace(image.PrebuiltDigest) != "") {
+		return fmt.Errorf("image.prebuiltReference and image.prebuiltDigest require image.distribution=%s", ImageDistributionPrebuilt)
+	}
+	if distribution == ImageDistributionPrebuilt && providerType != "docker-sandboxes" {
+		return fmt.Errorf("image.distribution=prebuilt is supported only with provider.type=docker-sandboxes")
+	}
+	return nil
+}
+
+func validatePrebuiltReference(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("must be %s", DockerSandboxesPrebuiltActReference)
+	}
+	if value != DockerSandboxesPrebuiltActReference {
+		return fmt.Errorf("must be the official EPAR reference %s; arbitrary GHCR packages are not accepted", DockerSandboxesPrebuiltActReference)
+	}
+	return nil
 }
 
 func validateDockerSandboxesStagingRoot(value string) error {

@@ -773,10 +773,5 @@ func writeAtomicFile(path string, content []byte, mode os.FileMode) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if runtime.GOOS == "windows" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return os.Rename(temporaryPath, path)
+	return replaceAtomicFile(temporaryPath, path)
 }

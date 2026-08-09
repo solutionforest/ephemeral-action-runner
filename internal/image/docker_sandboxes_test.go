@@ -1,6 +1,7 @@
 package image
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -10,8 +11,31 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
 )
+
+type fixedDockerSourceDescriptorResolver struct {
+	descriptor prebuilt.ResolvedReference
+	reference  string
+}
+
+func (resolver *fixedDockerSourceDescriptorResolver) Resolve(_ context.Context, reference string) (prebuilt.ResolvedReference, error) {
+	resolver.reference = reference
+	return resolver.descriptor, nil
+}
+
+type dockerSourceResolutionEnvironment struct {
+	Environment
+	reference string
+	raw       string
+}
+
+func (environment *dockerSourceResolutionEnvironment) RunHostOutput(_ context.Context, name string, args ...string) (string, error) {
+	environment.reference = args[len(args)-1]
+	return environment.raw, nil
+}
 
 func TestDockerSandboxesHelperChecksumsMatchGuestScripts(t *testing.T) {
 	templateRoot := filepath.Join("..", "..", "templates", "docker-sandboxes")
@@ -556,32 +580,49 @@ func TestNormalizeCatthehackerSourceRejectsOtherRepositoriesAndInvalidTags(t *te
 }
 
 func TestParseResolvedDockerSourceSelectsExactNativeManifestAndSize(t *testing.T) {
-	index := dockerManifestDocument{MediaType: "application/vnd.oci.image.index.v1+json"}
-	amd64 := dockerManifestDescriptor{Digest: "sha256:" + strings.Repeat("a", 64)}
-	amd64.Platform.OS = "linux"
-	amd64.Platform.Architecture = "amd64"
 	arm64 := dockerManifestDescriptor{Digest: "sha256:" + strings.Repeat("b", 64)}
-	arm64.Platform.OS = "linux"
-	arm64.Platform.Architecture = "arm64"
-	index.Manifests = []dockerManifestDescriptor{amd64, arm64}
-	indexRaw, err := json.Marshal(index)
-	if err != nil {
-		t.Fatal(err)
-	}
 	manifestRaw := []byte(`{"layers":[{"size":100},{"size":23}]}`)
-	resolved, err := parseResolvedDockerSource("ghcr.io/catthehacker/ubuntu:full-latest", "linux/arm64", indexRaw, manifestRaw)
+	indexDigest := "sha256:" + strings.Repeat("c", 64)
+	resolved, err := parseResolvedDockerSource("ghcr.io/catthehacker/ubuntu:full-latest", "linux/arm64", indexDigest, arm64.Digest, manifestRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resolved.PlatformDigest != arm64.Digest || resolved.CompressedLayerBytes != 123 || !strings.HasPrefix(resolved.ImmutableReference, "ghcr.io/catthehacker/ubuntu@sha256:") {
 		t.Fatalf("resolved source = %+v", resolved)
 	}
-	withCommandNewline, err := parseResolvedDockerSource("ghcr.io/catthehacker/ubuntu:full-latest", "linux/arm64", append(append([]byte(nil), indexRaw...), '\n'), append(append([]byte(nil), manifestRaw...), '\n'))
+	withCommandNewline, err := parseResolvedDockerSource("ghcr.io/catthehacker/ubuntu:full-latest", "linux/arm64", indexDigest, arm64.Digest, append(append([]byte(nil), manifestRaw...), '\n'))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if withCommandNewline.IndexDigest != resolved.IndexDigest {
-		t.Fatalf("index digest changed because the CLI appended a newline: %s != %s", withCommandNewline.IndexDigest, resolved.IndexDigest)
+	if withCommandNewline.IndexDigest != indexDigest || resolved.IndexDigest != indexDigest {
+		t.Fatalf("registry descriptor digest was not authoritative: %s != %s", withCommandNewline.IndexDigest, indexDigest)
+	}
+}
+
+func TestResolveDockerSandboxesSourceUsesRegistryDescriptorAsAuthoritativeIdentity(t *testing.T) {
+	indexDigest := "sha256:" + strings.Repeat("c", 64)
+	platformDigest := "sha256:" + strings.Repeat("d", 64)
+	resolver := &fixedDockerSourceDescriptorResolver{descriptor: prebuilt.ResolvedReference{
+		Reference:  "ghcr.io/catthehacker/ubuntu:act-latest",
+		Repository: "ghcr.io/catthehacker/ubuntu",
+		Digest:     indexDigest,
+		Platforms:  map[string]prebuilt.PlatformDescriptor{"linux/amd64": {Platform: "linux/amd64", Digest: platformDigest, Size: 123}},
+	}}
+	environment := &dockerSourceResolutionEnvironment{raw: "{\"layers\":[{\"size\":123}]}\n"}
+	coordinator := &Coordinator{
+		Config:                         config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}, Image: config.ImageConfig{SourceImage: "act", SourcePlatform: "linux/amd64"}},
+		DockerSourceDescriptorResolver: resolver,
+		environment:                    environment,
+	}
+	resolved, err := coordinator.resolveDockerSandboxesSource(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.reference != "ghcr.io/catthehacker/ubuntu:act-latest" || environment.reference != "ghcr.io/catthehacker/ubuntu@"+platformDigest {
+		t.Fatalf("unexpected descriptor/raw observations: resolver=%q platform=%q", resolver.reference, environment.reference)
+	}
+	if resolved.IndexDigest != indexDigest || resolved.PlatformDigest != platformDigest || resolved.CompressedLayerBytes != 123 {
+		t.Fatalf("registry descriptor was not authoritative: %+v", resolved)
 	}
 }
 
@@ -735,7 +776,7 @@ func TestDockerSandboxesEmulationLockAndTemplateAssetsAreExact(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if lock.SchemaVersion != 3 || lock.Emulation.SchemaVersion != 1 || lock.Emulation.Backend != "qemu" || lock.Emulation.Source.Release != "qemu-v10.2.3-68" || lock.Emulation.Source.QEMUVersion != "10.2.3" || lock.Emulation.Source.IndexDigest != "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0" {
+			if lock.SchemaVersion != 4 || lock.Emulation.SchemaVersion != 1 || lock.Emulation.Backend != "qemu" || lock.Emulation.Source.Release != "qemu-v10.2.3-68" || lock.Emulation.Source.QEMUVersion != "10.2.3" || lock.Emulation.Source.IndexDigest != "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0" {
 				t.Fatalf("unexpected emulation source lock: %+v", lock.Emulation.Source)
 			}
 			platformLock := lock.Emulation.Platforms[platform]

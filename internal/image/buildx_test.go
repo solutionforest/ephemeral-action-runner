@@ -38,6 +38,23 @@ func TestBuildxBuilderNameIsStableAndProjectScoped(t *testing.T) {
 	}
 }
 
+func TestWriteAtomicFileReplacesExistingStateFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "activation-journal.json")
+	if err := writeAtomicFile(path, []byte("previous\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomicFile(path, []byte("candidate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "candidate\n" {
+		t.Fatalf("atomic replacement content = %q", content)
+	}
+}
+
 func TestConfigScopedBuildxWorkersAreStoppedAfterImageBuilds(t *testing.T) {
 	dockerContainerBuild, err := os.ReadFile("build.go")
 	if err != nil {

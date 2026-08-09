@@ -40,7 +40,7 @@ EPAR recommends this provider in the wizard by capability, not by an operating-s
 - Enough physical backing storage in every measurable Engine, project, Sandbox cache, and Sandbox state capacity domain for the phase-overlapping template and sandbox bootstrap work while retaining `storage.minimumFree` once per domain. Use `./start storage status --operation template-build --provider docker-sandboxes --config <path> --project-root <path>` to inspect the same plan; an unmeasurable local domain is shown as unknown with its reason and warns without blocking the operation. Sparse root and inner-Docker logical maxima are reported separately and are not counted as immediate host allocation.
 - A GitHub runner group that meets enforced policy. Docker Sandboxes requires `security.runnerGroup.enforcement: enforce` and `runner.ephemeral: true`.
 
-The wizard builds and imports the template. The recipes in `templates/docker-sandboxes` are build inputs, not prebuilt images.
+The wizard can select a signed GHCR prebuilt template from the EPAR catalog or build and import the template locally. The recipes in `templates/docker-sandboxes` remain reproducible local-build inputs, while the catalog's immutable package entries are the prebuilt image authority.
 
 ## Private Filesystem and VM Helper Approval
 
@@ -58,6 +58,7 @@ provider:
   platform: linux/amd64
 
 image:
+  distribution: local-build
   sourceType: docker-image
   sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
   sourcePlatform: linux/amd64
@@ -81,6 +82,8 @@ dockerSandboxes:
 
 `provider.sourceImage` is invalid for this provider; use the common `image` section. `rootDisk: auto` derives a sparse logical root maximum from the selected artifact. `dockerDisk` is an independent sparse workload limit whose default is 50 GiB and minimum is 1 GiB. Neither virtual maximum is treated as immediately consumed host space; the only physical reserve is `storage.minimumFree`, whose generated default is 1 GiB. See [Configuration](../configuration.md) for the complete schema.
 
+The initial wizard keeps `distribution: local-build` as the default and offers `P. EPAR verified prebuilt Act (preview)`. That option uses only `ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest`, verifies its immutable digest plus GitHub/Sigstore attestation in-process before activation, and materializes the first-use Sandbox runtime locally. Host and enterprise CA roots are overlaid where safe; custom scripts are intentionally empty in the base path and create only a small local derivative when configured. Prebuilt acquisition size is resolved during startup rather than presented as the local Buildx estimate. There is no silent fallback to a local build or another provider. See [Docker Sandboxes prebuilt image publication](../development/docker-sandboxes-prebuilt.md) for the public recipe, catalog, attestation, promotion, and rollback contracts.
+
 `networkBaseline: open` adds EPAR-owned sandbox-scoped public egress plus deny-wins guardrails for host aliases; it does not change the host-global Docker Sandboxes policy. Use `balanced` with `additionalAllow` for default-deny public egress. Additional allow/deny entries are exact hostnames or `*.domain[:port]`; they cannot override the Open host-alias denies.
 
 ## Cross-Architecture Containers
@@ -95,7 +98,7 @@ The provider keeps architecture admission behind an internal target-agnostic bou
 
 ## Normal Workflow
 
-1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose the Catthehacker `full-latest` or `act-latest` profile, then review the non-blocking physical-growth estimate, sparse logical limits, and reserve. The generated config uses no custom install scripts; add them afterward when needed. The wizard's initial screen keeps compatibility providers behind `C. Show compatibility providers`; their specialized and custom tags do not change Docker Sandboxes' requirement for a private Docker daemon and runtime closure.
+1. Run `./start` with no config and select Docker Sandboxes when its tooling and diagnostics pass. Choose a local Catthehacker `full-latest` or `act-latest` profile, or explicitly choose the verified prebuilt Act preview, then review the non-blocking physical-growth estimate or the startup-resolved prebuilt acquisition note. The generated config uses no custom install scripts; add them afterward when a small local derivative is intended. The wizard's initial screen keeps compatibility providers behind `C. Show compatibility providers`; their specialized and custom tags do not change Docker Sandboxes' requirement for a private Docker daemon and runtime closure.
 2. The wizard writes the desired configuration. Embedded `./start` then enters the ordinary provisioning path, enforces measured storage capacity while warning about any unmeasurable local domain, builds and imports the template, and activates it only after exact readback. On macOS or Linux, review the narrowly scoped helper prompts described in [Private Filesystem and VM Helper Approval](#private-filesystem-and-vm-helper-approval) if the host presents them.
 3. Prewarm the selected template without GitHub registration:
 

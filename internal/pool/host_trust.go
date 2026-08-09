@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
@@ -68,7 +69,7 @@ type HostTrustMarker = hostTrustMarker
 type HostTrustLease = hostTrustLease
 
 func (m *Manager) hostTrustEnabled() bool {
-	return hosttrust.Enabled(m.Config.Image.HostTrustMode)
+	return hosttrust.Enabled(m.Config.Image.HostTrustMode) || (m.Config.Provider.Type == "docker-sandboxes" && strings.EqualFold(strings.TrimSpace(m.Config.Image.Distribution), config.ImageDistributionPrebuilt) && len(m.Config.Image.TrustedCACertificatePaths) != 0)
 }
 
 func (m *Manager) hostTrustCollectionInterval() time.Duration {
@@ -113,12 +114,16 @@ func (m *Manager) resolveHostTrust(ctx context.Context) (hosttrust.Snapshot, err
 	if !m.hostTrustEnabled() {
 		return hosttrust.Snapshot{}, nil
 	}
+	hostOverlay := hosttrust.Enabled(m.Config.Image.HostTrustMode)
 	if m.hostTrustResolver != nil {
 		snapshot, err := m.hostTrustResolver(ctx)
 		if err != nil {
 			return hosttrust.Snapshot{}, err
 		}
-		return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+		return m.mergePrebuiltRuntimeTrustedCAs(snapshot, time.Now().UTC())
+	}
+	if !hostOverlay {
+		return m.mergePrebuiltRuntimeTrustedCAs(hosttrust.Snapshot{HostOS: hostTrustControllerOS, CollectedAt: time.Now().UTC()}, time.Now().UTC())
 	}
 	feedPath := strings.TrimSpace(os.Getenv("EPAR_HOST_TRUST_FEED"))
 	controllerHostOS := strings.TrimSpace(os.Getenv("EPAR_CONTROLLER_HOST_OS"))
@@ -134,7 +139,35 @@ func (m *Manager) resolveHostTrust(ctx context.Context) (hosttrust.Snapshot, err
 	if err != nil {
 		return hosttrust.Snapshot{}, err
 	}
-	return validateHostTrustSnapshot(snapshot, time.Now().UTC())
+	return m.mergePrebuiltRuntimeTrustedCAs(snapshot, time.Now().UTC())
+}
+
+func (m *Manager) mergePrebuiltRuntimeTrustedCAs(snapshot hosttrust.Snapshot, now time.Time) (hosttrust.Snapshot, error) {
+	if m.Config.Provider.Type == "docker-sandboxes" && strings.EqualFold(strings.TrimSpace(m.Config.Image.Distribution), config.ImageDistributionPrebuilt) {
+		explicit, err := m.trustedCACertificates()
+		if err != nil {
+			return hosttrust.Snapshot{}, err
+		}
+		for _, certificate := range explicit {
+			parsed, err := hosttrust.CertificatesFromBytes(certificate.PEM)
+			if err != nil {
+				return hosttrust.Snapshot{}, fmt.Errorf("canonicalize explicit runtime CA %s: %w", certificate.DestinationName, err)
+			}
+			snapshot.Certificates = append(snapshot.Certificates, parsed...)
+		}
+		if len(explicit) != 0 && len(snapshot.Scopes) == 0 {
+			snapshot.Scopes = []string{"explicit-ca"}
+		}
+		if snapshot.CollectedAt.IsZero() {
+			snapshot.CollectedAt = now
+		}
+		canonical, err := hosttrust.Canonicalize(snapshot)
+		if err != nil {
+			return hosttrust.Snapshot{}, err
+		}
+		snapshot = canonical
+	}
+	return validateHostTrustSnapshot(snapshot, now)
 }
 
 func (m *Manager) resolveBuildTrust(ctx context.Context) (hosttrust.Snapshot, error) {

@@ -2,6 +2,7 @@ package image
 
 import (
 	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,6 +31,7 @@ type dockerArchiveVerification struct {
 
 type archivedFile struct {
 	digest string
+	diffID string
 	size   uint64
 	data   []byte
 }
@@ -151,6 +153,7 @@ func scanTemplateArchive(reader io.Reader) (map[string]archivedFile, error) {
 		}
 		hasher := sha256.New()
 		var capture []byte
+		var diffID string
 		if shouldCaptureArchiveControl(name, header.Size) {
 			if uint64(header.Size) > maxTemplateControlFileSize || controlBytes > maxTemplateControlBytes-uint64(header.Size) {
 				return nil, errors.New("template archive control data exceeds the bounded verification limit")
@@ -160,6 +163,25 @@ func scanTemplateArchive(reader io.Reader) (map[string]archivedFile, error) {
 				return nil, fmt.Errorf("read template archive entry %q: %w", name, err)
 			}
 			controlBytes += uint64(header.Size)
+		} else if strings.HasSuffix(name, ".tar.gz") {
+			// go-containerregistry emits Docker-save layers in compressed form,
+			// while image config rootfs.diff_ids bind the uncompressed stream.
+			// Hash both in one pass so cache reuse proves the exact archive bytes
+			// and the semantic layer identity expected by the image config.
+			compressed := io.TeeReader(tarReader, hasher)
+			reader, err := gzip.NewReader(compressed)
+			if err != nil {
+				return nil, fmt.Errorf("open compressed Docker archive layer %q: %w", name, err)
+			}
+			uncompressedHasher := sha256.New()
+			if _, err := io.Copy(uncompressedHasher, reader); err != nil {
+				_ = reader.Close()
+				return nil, fmt.Errorf("verify compressed Docker archive layer %q: %w", name, err)
+			}
+			if err := reader.Close(); err != nil {
+				return nil, fmt.Errorf("close compressed Docker archive layer %q: %w", name, err)
+			}
+			diffID = "sha256:" + hex.EncodeToString(uncompressedHasher.Sum(nil))
 		} else {
 			if _, err := io.Copy(hasher, tarReader); err != nil {
 				return nil, fmt.Errorf("hash template archive entry %q: %w", name, err)
@@ -167,6 +189,7 @@ func scanTemplateArchive(reader io.Reader) (map[string]archivedFile, error) {
 		}
 		result[name] = archivedFile{
 			digest: "sha256:" + hex.EncodeToString(hasher.Sum(nil)),
+			diffID: diffID,
 			size:   uint64(header.Size),
 			data:   capture,
 		}
@@ -190,7 +213,11 @@ func shouldCaptureArchiveControl(name string, size int64) bool {
 	if size > maxTemplateControlFileSize {
 		return false
 	}
-	return name == "manifest.json" || name == "index.json" || name == "oci-layout" || strings.HasSuffix(name, ".json") || strings.HasPrefix(name, "blobs/sha256/")
+	// go-containerregistry's Docker tar writer uses the canonical config digest
+	// (for example sha256:<hex>) as the config filename. Capture that bounded
+	// control blob so a verified OCI image can be materialized without rewriting
+	// the library-produced archive into a second, non-canonical layout.
+	return name == "manifest.json" || name == "index.json" || name == "oci-layout" || validSHA256(name) || strings.HasSuffix(name, ".json") || strings.HasPrefix(name, "blobs/sha256/")
 }
 
 func verifyDockerSaveArchive(files map[string]archivedFile, expectedTag, expectedPlatform string, expectedLabels map[string]string) (string, error) {
@@ -211,7 +238,13 @@ func verifyDockerSaveArchive(files map[string]archivedFile, expectedTag, expecte
 	}
 	configDigest := configFile.digest
 	configName := strings.TrimSuffix(filepath.Base(entry.Config), ".json")
-	if len(configName) != 64 || configDigest != "sha256:"+configName {
+	configNameDigest := ""
+	if validSHA256(configName) {
+		configNameDigest = configName
+	} else if len(configName) == 64 {
+		configNameDigest = "sha256:" + configName
+	}
+	if configNameDigest == "" || configDigest != configNameDigest {
 		return "", errors.New("Docker archive configuration filename does not match its recomputed digest")
 	}
 	var config dockerImageConfig
@@ -234,7 +267,11 @@ func verifyDockerSaveArchive(files map[string]archivedFile, expectedTag, expecte
 		if !ok {
 			return "", fmt.Errorf("Docker archive is missing layer %q", layerName)
 		}
-		if layer.digest != config.RootFS.DiffIDs[index] {
+		layerDiffID := layer.diffID
+		if layerDiffID == "" {
+			layerDiffID = layer.digest
+		}
+		if layerDiffID != config.RootFS.DiffIDs[index] {
 			return "", fmt.Errorf("Docker archive layer %q digest does not match configuration diff ID", layerName)
 		}
 	}
