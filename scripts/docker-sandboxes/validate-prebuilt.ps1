@@ -65,6 +65,9 @@ foreach ($requiredEvidence in @('provenance', 'sbom', 'attestation', 'platform-r
 $dockerfilePath = Join-Path $templateDirectory 'Dockerfile.prebuilt'
 $dockerfile = Get-Content -Raw -LiteralPath $dockerfilePath
 foreach ($required in @(
+    'ARG TARGETPLATFORM',
+    'ARG TARGETOS',
+    'ARG TARGETARCH',
     'io.solutionforest.epar.artifact.kind="docker-sandboxes-template-base"',
     'io.solutionforest.epar.runtime.contract="${EPAR_RUNTIME_CONTRACT}"',
     'io.solutionforest.epar.recipe.digest="${EPAR_RECIPE_DIGEST}"',

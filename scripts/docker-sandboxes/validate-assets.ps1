@@ -177,6 +177,9 @@ foreach ($required in @(
     }
 }
 foreach ($required in @(
+    'ARG TARGETPLATFORM',
+    'ARG TARGETOS',
+    'ARG TARGETARCH',
     'COPY prebuilt/host-trust-generation.disabled.json /opt/epar/host-trust-generation.disabled.json',
     'install -m 0444 -o root -g root host-trust-generation.disabled.json /opt/epar/host-trust-generation.json',
     'install -m 0444 -o root -g root /etc/ssl/certs/ca-certificates.crt /opt/epar/trust/ca-bundle.pem',
