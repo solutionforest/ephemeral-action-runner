@@ -303,7 +303,7 @@ func isSigstoreArtifactType(value string) bool {
 
 func isSigstoreBundleMediaType(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
-	return value == strings.ToLower(ReferrerBundleMediaType) || strings.HasPrefix(value, "application/vnd.dev.sigstore.bundle+")
+	return value == strings.ToLower(ReferrerBundleMediaType) || value == "application/vnd.dev.sigstore.bundle.v0.3+json" || strings.HasPrefix(value, "application/vnd.dev.sigstore.bundle+")
 }
 
 func (r *RemoteCatalogRegistry) fetchLayer(ctx context.Context, repo name.Repository, descriptor v1.Descriptor, maxBytes int64) ([]byte, v1.Descriptor, error) {

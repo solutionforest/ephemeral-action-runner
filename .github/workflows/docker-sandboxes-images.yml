@@ -861,9 +861,9 @@ jobs:
           {
             echo '## Docker Sandboxes prebuilt candidate'
             echo
-            echo "- Profile: \\`${{ needs.resolve.outputs.profile }}\\`"
-            echo "- Package: \\`${PACKAGE_REF}\\`"
-            echo "- Index digest: \\`${INDEX_DIGEST}\\`"
+            echo "- Profile: \`${{ needs.resolve.outputs.profile }}\`"
+            echo "- Package: \`${PACKAGE_REF}\`"
+            echo "- Index digest: \`${INDEX_DIGEST}\`"
             echo '- Candidate assembly, immutable package tagging, hosted two-platform smoke checks, and OCI evidence completed; real Sandbox acceptance is performed later through temporary EPAR pools.'
             echo '- This workflow has contents:read and does not commit, tag, release, open a pull request, or push Git refs.'
           } >> "$GITHUB_STEP_SUMMARY"
