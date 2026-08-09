@@ -139,6 +139,13 @@ type TemplateArtifactRuntime interface {
 	ActivateTemplate(artifact TemplateArtifact) error
 }
 
+// TemplateArtifactCacheResolver exposes the provider-assigned opaque cache ID
+// for one exact template reference. The cache ID is not a content digest; the
+// shared image receipt retains both identities and verifies them independently.
+type TemplateArtifactCacheResolver interface {
+	ResolveTemplateCacheID(ctx context.Context, reference string) (cacheID string, found bool, err error)
+}
+
 // TemplateArtifactActivationController serializes reusable-artifact activation
 // against new instance admission and exposes exact in-process readback for the
 // shared image coordinator's activation journal. ClearActiveTemplate is

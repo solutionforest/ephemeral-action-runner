@@ -68,6 +68,13 @@ func (runtime *activationJournalRuntime) ClearActiveTemplate(expected provider.T
 	return nil
 }
 
+func (runtime *activationJournalRuntime) ResolveTemplateCacheID(_ context.Context, reference string) (string, bool, error) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	artifact, found := runtime.cached[reference]
+	return artifact.CacheID, found, nil
+}
+
 func TestDockerSandboxesActivationFaultsPreservePreviousReceipt(t *testing.T) {
 	phases := []string{
 		dockerSandboxesActivationPrepared,
@@ -246,6 +253,87 @@ func TestDockerSandboxesImportedCandidateRollbackRetainsExactGeneratedCustody(t 
 		t.Fatal("rolled-back imported candidate cache was left outside the storage catalog")
 	}
 	assertActivationCatalogCurrent(t, previous)
+}
+
+func TestDockerSandboxesRecoveryReconcilesOpaqueImportedCacheID(t *testing.T) {
+	coordinator, _, candidate := activationJournalFixture(t, false)
+	oldPredictedID := candidate.Artifact.CacheID
+	actualArtifact := candidate.Artifact
+	actualArtifact.CacheID = "ec2006fea720"
+	runtime := &activationJournalRuntime{cached: map[string]provider.TemplateArtifact{actualArtifact.Reference: actualArtifact}}
+
+	journal, err := coordinator.prepareDockerSandboxesActivationJournal(candidate, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.Imported = true
+	if err := coordinator.updateDockerSandboxesActivationJournal(&journal, dockerSandboxesActivationImported, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.recoverDockerSandboxesActivation(context.Background(), runtime); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := storagecatalog.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := store.Load(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundActual := false
+	for _, resource := range value.Resources {
+		if resource.Kind != catalogSandboxTemplateKind {
+			continue
+		}
+		if resource.Identity == oldPredictedID {
+			t.Fatalf("recovery retained predicted digest-prefix cache identity: %+v", resource)
+		}
+		if resource.Identity == actualArtifact.CacheID {
+			foundActual = true
+			if resource.Fingerprint != actualArtifact.Digest || resource.Custody != storagecatalog.CustodyGenerated || resource.State != storagecatalog.StateSuperseded {
+				t.Fatalf("reconciled candidate custody = %+v", resource)
+			}
+		}
+	}
+	if !foundActual {
+		t.Fatal("recovery did not retain the provider-assigned cache identity")
+	}
+}
+
+func TestDockerSandboxesPrebuiltWarmActivationResolvesOpaqueCacheWithoutImport(t *testing.T) {
+	coordinator, _, candidate := activationJournalFixture(t, false)
+	candidate.Distribution = dockerSandboxesDistributionPrebuilt
+	candidate.Artifact.CacheID = ""
+	candidate.MetadataSHA256 = ""
+	candidate.Evidence = nil
+	actualArtifact := candidate.Artifact
+	actualArtifact.CacheID = "ec2006fea720"
+	runtime := &activationJournalRuntime{cached: map[string]provider.TemplateArtifact{actualArtifact.Reference: actualArtifact}}
+	receiptPath := mustDockerSandboxesReceiptPath(t, coordinator)
+
+	if err := coordinator.withSandboxBackendLock(context.Background(), func() error {
+		_, err := coordinator.activateDockerSandboxesCandidateWithFinalizerLocked(context.Background(), candidate, "", false, false, runtime, func(finalized *dockerSandboxesReceipt) error {
+			finalized.MetadataSHA256 = "sha256:" + strings.Repeat("1", 64)
+			finalized.Evidence = writeActivationReceiptEvidence(t, receiptPath, *finalized)
+			return nil
+		})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	active, found := runtime.ActiveTemplate()
+	if !found || active != actualArtifact {
+		t.Fatalf("active template = %+v, found=%t; want provider-assigned artifact %+v", active, found, actualArtifact)
+	}
+	journalPath, err := coordinator.dockerSandboxesActivationJournalPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm activation journal remains: %v", err)
+	}
 }
 
 func TestDockerSandboxesRecoveryCommitsPublishedReceipt(t *testing.T) {

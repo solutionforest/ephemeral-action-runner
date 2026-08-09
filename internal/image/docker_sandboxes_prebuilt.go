@@ -427,36 +427,53 @@ func (m *Coordinator) validateDockerSandboxesPrebuiltRecipe(entry prebuilt.Entry
 	}
 	sourceDigest := sha256.Sum256(sourceLock)
 	wantSourceDigest := "sha256:" + hex.EncodeToString(sourceDigest[:])
+	wantToolDigest, err := dockerSandboxesSupportedPrebuiltToolDigest(sourceLock)
+	if err != nil {
+		return err
+	}
+	wantRecipeDigest, err := dockerSandboxesSupportedPrebuiltRecipeDigest(m.ProjectRoot)
+	if err != nil {
+		return err
+	}
+	if entry.Recipe.SourceLockDigest != wantSourceDigest {
+		return fmt.Errorf("prebuilt package source lock identity %s is not supported by this controller (expected %s)", entry.Recipe.SourceLockDigest, wantSourceDigest)
+	}
+	if entry.Recipe.ToolDigest != wantToolDigest {
+		return fmt.Errorf("prebuilt package tool identity %s is not supported by this controller (expected %s)", entry.Recipe.ToolDigest, wantToolDigest)
+	}
+	if entry.Recipe.Digest != wantRecipeDigest {
+		return fmt.Errorf("prebuilt package recipe identity %s is not supported by this controller (expected %s)", entry.Recipe.Digest, wantRecipeDigest)
+	}
+	return nil
+}
+
+func dockerSandboxesSupportedPrebuiltToolDigest(sourceLock []byte) (string, error) {
 	var lock map[string]json.RawMessage
 	if err := json.Unmarshal(sourceLock, &lock); err != nil {
-		return fmt.Errorf("parse supported prebuilt source lock: %w", err)
+		return "", fmt.Errorf("parse supported prebuilt source lock: %w", err)
 	}
 	toolMaterial := make(map[string]any)
 	for _, key := range []string{"dockerfileFrontend", "sbomGenerator", "goBuilder", "emulation", "tini"} {
 		value, ok := lock[key]
 		if !ok {
-			return fmt.Errorf("supported prebuilt source lock omitted %s", key)
+			return "", fmt.Errorf("supported prebuilt source lock omitted %s", key)
 		}
 		var canonical any
 		if err := json.Unmarshal(value, &canonical); err != nil {
-			return fmt.Errorf("canonicalize supported prebuilt tool identity %s: %w", key, err)
+			return "", fmt.Errorf("canonicalize supported prebuilt tool identity %s: %w", key, err)
 		}
 		toolMaterial[key] = canonical
 	}
 	toolJSON, err := json.Marshal(toolMaterial)
 	if err != nil {
-		return err
+		return "", err
 	}
+	// The publisher defines this identity with `jq -cS | sha256sum`; jq emits
+	// one trailing newline. Preserve that byte so every controller platform
+	// verifies the same already-attested tool identity.
+	toolJSON = append(toolJSON, '\n')
 	toolDigest := sha256.Sum256(toolJSON)
-	wantToolDigest := "sha256:" + hex.EncodeToString(toolDigest[:])
-	wantRecipeDigest, err := dockerSandboxesSupportedPrebuiltRecipeDigest(m.ProjectRoot)
-	if err != nil {
-		return err
-	}
-	if entry.Recipe.SourceLockDigest != wantSourceDigest || entry.Recipe.ToolDigest != wantToolDigest || entry.Recipe.Digest != wantRecipeDigest {
-		return errors.New("prebuilt package recipe, source lock, or tool identity is not supported by this controller")
-	}
-	return nil
+	return "sha256:" + hex.EncodeToString(toolDigest[:]), nil
 }
 
 func dockerSandboxesSupportedPrebuiltRecipeDigest(projectRoot string) (string, error) {
@@ -1028,17 +1045,10 @@ func (m *Coordinator) buildDockerSandboxesPrebuiltTemplate(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	artifact := provider.TemplateArtifact{Reference: artifactTag, Digest: imageDigest, CacheID: strings.TrimPrefix(imageDigest, "sha256:")[:12], Platform: verified.Platform.Platform, RootDisk: rootDisk}
-	if err := m.writeDockerSandboxesPrebuiltEvidence(workspace, manifest, source, verified, artifact, archivePath, archiveSHA, archiveBytes, acquisition, derivative); err != nil {
-		return err
-	}
-	evidence, err := m.persistDockerSandboxesCompactEvidence(manifestHash, artifact.CacheID, workspace)
-	if err != nil {
-		return err
-	}
+	artifact := provider.TemplateArtifact{Reference: artifactTag, Digest: imageDigest, Platform: verified.Platform.Platform, RootDisk: rootDisk}
 	receipt := dockerSandboxesReceipt{
 		SchemaVersion: dockerSandboxesReceiptSchema, Distribution: dockerSandboxesDistributionPrebuilt, ManifestHash: manifestHash, Manifest: manifest, Source: source, Artifact: artifact,
-		MetadataSHA256: evidence["templateMetadata"].SHA256, ArchiveSHA256: archiveSHA, ArchiveBytes: archiveBytes, Evidence: evidence, ActivatedAt: m.now().UTC(),
+		ArchiveSHA256: archiveSHA, ArchiveBytes: archiveBytes, ActivatedAt: m.now().UTC(),
 		Prebuilt: &dockerSandboxesPrebuiltReceiptEvidence{
 			CatalogDigest: verified.CatalogDigest, CatalogReference: verified.CatalogReference, EvidenceRef: verified.EvidenceRef, Acceptance: verified.Acceptance,
 			Entry: verified.Entry, PackageReference: verified.Package.Reference, PackageIndexDigest: verified.Entry.PackageIndexDigest,
@@ -1049,7 +1059,18 @@ func (m *Coordinator) buildDockerSandboxesPrebuiltTemplate(ctx context.Context, 
 	activatedAt := time.Time{}
 	if err := m.withSandboxBackendLock(ctx, func() error {
 		var activationErr error
-		activatedAt, activationErr = m.activateDockerSandboxesCandidateLocked(ctx, receipt, archivePath, true, runtime)
+		activatedAt, activationErr = m.activateDockerSandboxesCandidateWithFinalizerLocked(ctx, receipt, archivePath, true, false, runtime, func(candidate *dockerSandboxesReceipt) error {
+			if err := m.writeDockerSandboxesPrebuiltEvidence(workspace, manifest, source, verified, candidate.Artifact, archivePath, archiveSHA, archiveBytes, acquisition, derivative); err != nil {
+				return err
+			}
+			evidence, err := m.persistDockerSandboxesCompactEvidence(manifestHash, candidate.Artifact.CacheID, workspace)
+			if err != nil {
+				return err
+			}
+			candidate.Evidence = evidence
+			candidate.MetadataSHA256 = evidence["templateMetadata"].SHA256
+			return nil
+		})
 		return activationErr
 	}); err != nil {
 		return err

@@ -343,6 +343,25 @@ func TestDockerSandboxesPrebuiltCompatibilityGateRejectsUnsupportedContractSchem
 	}
 }
 
+func TestDockerSandboxesSupportedPrebuiltToolDigestMatchesPublisherCanonicalJSON(t *testing.T) {
+	lock := []byte(`{
+		"dockerfileFrontend":{"reference":"frontend"},
+		"sbomGenerator":{"reference":"sbom"},
+		"goBuilder":{"version":"1.25"},
+		"emulation":{"backend":"qemu"},
+		"tini":{"version":"0.19.0"},
+		"ignored":{"changes":"do not affect the tool identity"}
+	}`)
+	got, err := dockerSandboxesSupportedPrebuiltToolDigest(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "sha256:6ddef591a74f68147acca7a9534bc19a3f1c21c2c70ce4d4dafa0692d379754c"
+	if got != want {
+		t.Fatalf("tool digest = %s, want publisher-compatible %s", got, want)
+	}
+}
+
 func dockerSandboxesPrebuiltFixture() VerifiedDockerSandboxesPrebuilt {
 	indexDigest := "sha256:" + strings.Repeat("a", 64)
 	platformDigest := "sha256:" + strings.Repeat("d", 64)

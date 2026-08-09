@@ -179,6 +179,10 @@ func (m *Coordinator) activateDockerSandboxesCandidateLocked(ctx context.Context
 }
 
 func (m *Coordinator) activateDockerSandboxesCandidateWithPreflightLocked(ctx context.Context, candidate dockerSandboxesReceipt, archivePath string, buildWorkspace, alreadyVerified bool, runtime provider.TemplateArtifactRuntime) (time.Time, error) {
+	return m.activateDockerSandboxesCandidateWithFinalizerLocked(ctx, candidate, archivePath, buildWorkspace, alreadyVerified, runtime, nil)
+}
+
+func (m *Coordinator) activateDockerSandboxesCandidateWithFinalizerLocked(ctx context.Context, candidate dockerSandboxesReceipt, archivePath string, buildWorkspace, alreadyVerified bool, runtime provider.TemplateArtifactRuntime, finalize func(*dockerSandboxesReceipt) error) (time.Time, error) {
 	controller, ok := runtime.(provider.TemplateArtifactActivationController)
 	if !ok {
 		return time.Time{}, fmt.Errorf("docker-sandboxes provider is missing transactional template activation integration")
@@ -187,8 +191,12 @@ func (m *Coordinator) activateDockerSandboxesCandidateWithPreflightLocked(ctx co
 	if err != nil {
 		return time.Time{}, err
 	}
-	if err := validateDockerSandboxesReceiptEvidence(receiptPath, candidate); err != nil {
-		return time.Time{}, fmt.Errorf("validate candidate Docker Sandboxes receipt evidence: %w", err)
+	if finalize == nil {
+		if err := validateDockerSandboxesReceiptEvidence(receiptPath, candidate); err != nil {
+			return time.Time{}, fmt.Errorf("validate candidate Docker Sandboxes receipt evidence: %w", err)
+		}
+	} else if candidate.Distribution != dockerSandboxesDistributionPrebuilt || candidate.Artifact.CacheID != "" || len(candidate.Evidence) != 0 {
+		return time.Time{}, fmt.Errorf("deferred Docker Sandboxes evidence finalization is only valid for an unresolved prebuilt cache identity")
 	}
 	journal, err := m.prepareDockerSandboxesActivationJournal(candidate, archivePath, buildWorkspace)
 	if err != nil {
@@ -197,6 +205,21 @@ func (m *Coordinator) activateDockerSandboxesCandidateWithPreflightLocked(ctx co
 	if err := func() error {
 		if alreadyVerified {
 			return nil
+		}
+		if candidate.Artifact.CacheID == "" {
+			resolver, ok := runtime.(provider.TemplateArtifactCacheResolver)
+			if !ok {
+				return fmt.Errorf("docker-sandboxes provider is missing authoritative template cache identity resolution")
+			}
+			cacheID, found, resolveErr := resolver.ResolveTemplateCacheID(ctx, candidate.Artifact.Reference)
+			if resolveErr != nil {
+				return fmt.Errorf("resolve existing Docker Sandboxes cache identity: %w", resolveErr)
+			}
+			if !found {
+				return provider.ErrTemplateNotFound
+			}
+			candidate.Artifact.CacheID = cacheID
+			journal.Candidate = candidate
 		}
 		return runtime.VerifyImportedTemplate(ctx, candidate.Artifact)
 	}(); err != nil {
@@ -221,9 +244,36 @@ func (m *Coordinator) activateDockerSandboxesCandidateWithPreflightLocked(ctx co
 			return time.Time{}, err
 		}
 		journal.Imported = true
+		if candidate.Artifact.CacheID == "" {
+			resolver, ok := runtime.(provider.TemplateArtifactCacheResolver)
+			if !ok {
+				return time.Time{}, fmt.Errorf("docker-sandboxes provider is missing authoritative template cache identity resolution")
+			}
+			cacheID, found, resolveErr := resolver.ResolveTemplateCacheID(ctx, candidate.Artifact.Reference)
+			if resolveErr != nil {
+				return time.Time{}, fmt.Errorf("resolve imported Docker Sandboxes cache identity: %w", resolveErr)
+			}
+			if !found {
+				return time.Time{}, fmt.Errorf("imported Docker Sandboxes template is absent from authoritative cache readback")
+			}
+			candidate.Artifact.CacheID = cacheID
+			journal.Candidate = candidate
+		}
 	}
 	if err := m.updateDockerSandboxesActivationJournal(&journal, dockerSandboxesActivationImported, nil); err != nil {
 		return time.Time{}, err
+	}
+	if finalize != nil {
+		if err := finalize(&candidate); err != nil {
+			return time.Time{}, fmt.Errorf("finalize imported Docker Sandboxes candidate evidence: %w", err)
+		}
+		if err := validateDockerSandboxesReceiptEvidence(receiptPath, candidate); err != nil {
+			return time.Time{}, fmt.Errorf("validate finalized candidate Docker Sandboxes receipt evidence: %w", err)
+		}
+		journal.Candidate = candidate
+		if err := m.updateDockerSandboxesActivationJournal(&journal, dockerSandboxesActivationImported, nil); err != nil {
+			return time.Time{}, err
+		}
 	}
 	if err := runtime.VerifyImportedTemplate(ctx, candidate.Artifact); err != nil {
 		return time.Time{}, fmt.Errorf("verify imported Docker Sandboxes runner template: %w", err)
@@ -301,7 +351,7 @@ func (m *Coordinator) rollbackDockerSandboxesActivationLocked(ctx context.Contex
 	var rollbackErr error
 	candidateNeedsCustody := journal.Imported
 	if journal.Previous == nil || journal.Previous.Artifact != journal.Candidate.Artifact {
-		if !candidateNeedsCustody {
+		if !candidateNeedsCustody && journal.Candidate.Artifact.CacheID != "" {
 			if err := runtime.VerifyImportedTemplate(ctx, journal.Candidate.Artifact); err == nil {
 				candidateNeedsCustody = true
 			} else if !errors.Is(err, provider.ErrTemplateNotFound) {
@@ -377,6 +427,17 @@ func (m *Coordinator) recoverDockerSandboxesActivation(ctx context.Context, runt
 	}
 	return m.withSandboxBackendLock(ctx, func() error {
 		return controller.WithTemplateActivation(func() error {
+			if journal.Imported {
+				if resolver, ok := runtime.(provider.TemplateArtifactCacheResolver); ok {
+					cacheID, found, resolveErr := resolver.ResolveTemplateCacheID(ctx, journal.Candidate.Artifact.Reference)
+					if resolveErr != nil {
+						return fmt.Errorf("recover imported Docker Sandboxes cache identity: %w", resolveErr)
+					}
+					if found {
+						journal.Candidate.Artifact.CacheID = cacheID
+					}
+				}
+			}
 			receiptPath, pathErr := m.dockerSandboxesReceiptPath()
 			if pathErr != nil {
 				return pathErr
