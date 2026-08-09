@@ -81,6 +81,10 @@ func (p EvidencePolicy) workflowURI() string {
 	return "https://github.com/" + strings.TrimSpace(p.Repository) + "/" + workflow
 }
 
+func (p EvidencePolicy) buildConfigURI() string {
+	return p.workflowURI() + "@" + p.Ref
+}
+
 // CertificateIdentity builds the Sigstore certificate identity matcher. The
 // SAN and modern Fulcio extensions are all exact, preventing a valid
 // certificate from another workflow/ref/commit from being accepted.
@@ -88,8 +92,8 @@ func (p EvidencePolicy) CertificateIdentity() (verify.CertificateIdentity, error
 	if err := p.Validate(); err != nil {
 		return verify.CertificateIdentity{}, err
 	}
-	workflowURI := p.workflowURI()
-	san, err := verify.NewSANMatcher(workflowURI+"@"+p.Ref, "")
+	buildConfigURI := p.buildConfigURI()
+	san, err := verify.NewSANMatcher(buildConfigURI, "")
 	if err != nil {
 		return verify.CertificateIdentity{}, err
 	}
@@ -102,7 +106,7 @@ func (p EvidencePolicy) CertificateIdentity() (verify.CertificateIdentity, error
 		SourceRepositoryRef:      p.Ref,
 		GithubWorkflowRepository: p.Repository,
 		GithubWorkflowRef:        p.Ref,
-		BuildConfigURI:           workflowURI,
+		BuildConfigURI:           buildConfigURI,
 	}
 	if p.Commit != "" {
 		ext.SourceRepositoryDigest = p.Commit
@@ -392,7 +396,7 @@ func validateVerifiedStatement(result *verify.VerificationResult, subjectDigest 
 	if policy.Commit != "" && (summary.SourceRepositoryDigest != policy.Commit || summary.GithubWorkflowSHA != policy.Commit || summary.BuildConfigDigest != policy.Commit) {
 		return errors.New("certificate commit mismatch")
 	}
-	if summary.BuildConfigURI != policy.workflowURI() || !commitPattern.MatchString(summary.BuildConfigDigest) {
+	if summary.BuildConfigURI != policy.buildConfigURI() || !commitPattern.MatchString(summary.BuildConfigDigest) {
 		return errors.New("certificate workflow/event identity mismatch")
 	}
 	if policy.Event != "" && summary.BuildTrigger != policy.Event {
