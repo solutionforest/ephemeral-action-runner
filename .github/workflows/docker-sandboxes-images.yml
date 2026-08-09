@@ -596,12 +596,15 @@ jobs:
       - name: Run hosted two-platform template smoke checks
         shell: bash
         env:
-          PACKAGE_REF: ${{ steps.index.outputs.package_ref }}
+          PACKAGE_AMD64_DIGEST: ${{ steps.index.outputs.amd64_digest }}
+          PACKAGE_ARM64_DIGEST: ${{ steps.index.outputs.arm64_digest }}
         run: |
           set -euo pipefail
-          for platform in linux/amd64 linux/arm64; do
-            docker pull --platform "$platform" "$PACKAGE_REF" >/dev/null
-            docker run --rm --platform "$platform" --entrypoint /bin/bash "$PACKAGE_REF" -lc '
+          for platform_and_digest in "linux/amd64|$PACKAGE_AMD64_DIGEST" "linux/arm64|$PACKAGE_ARM64_DIGEST"; do
+            IFS='|' read -r platform platform_digest <<< "$platform_and_digest"
+            platform_ref="${PACKAGE_REPOSITORY}@${platform_digest}"
+            docker pull --platform "$platform" "$platform_ref" >/dev/null
+            docker run --rm --platform "$platform" --entrypoint /bin/bash "$platform_ref" -lc '
               set -euo pipefail
               test -x /opt/actions-runner/bin/Runner.Listener
               test -x /usr/local/bin/tini

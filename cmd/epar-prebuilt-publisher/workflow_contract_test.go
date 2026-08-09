@@ -27,6 +27,7 @@ func TestWorkflowForceCandidatePreservesVerifiedEvidence(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{
 		"target: runner-template",
+		`platform_ref="${PACKAGE_REPOSITORY}@${platform_digest}"`,
 		`verify-package --reference "$PACKAGE_REF"`,
 		`--ref "$GITHUB_REF"`,
 		`jq '.gates.attestationVerified=true'`,
