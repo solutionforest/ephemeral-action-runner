@@ -386,7 +386,7 @@ jobs:
           echo "${RUNNER_DIGEST#sha256:}  templates/docker-sandboxes/inputs/actions-runner.tar.gz" | sha256sum --check -
           tini_url="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.url' templates/docker-sandboxes/sources.lock.json)"
           tini_digest="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.sha256' templates/docker-sandboxes/sources.lock.json)"
-          curl --fail --silent --show-error --retry 4 --retry-delay 2 "$tini_url" -o templates/docker-sandboxes/inputs/tini
+          curl --fail --location --proto '=https' --proto-redir '=https' --silent --show-error --retry 4 --retry-delay 2 "$tini_url" -o templates/docker-sandboxes/inputs/tini
           echo "${tini_digest#sha256:}  templates/docker-sandboxes/inputs/tini" | sha256sum --check -
           chmod 0555 templates/docker-sandboxes/inputs/tini
           licenses=(
