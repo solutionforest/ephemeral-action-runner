@@ -295,7 +295,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			if err := p.verifyNoPublishedPorts(ctx, item.Instance); err != nil {
 				return instance, err
 			}
-			if err := p.verifyInspection(ctx, item.Instance, &request); err != nil {
+			if err := p.verifyInspection(ctx, item.Instance, &request, cacheID); err != nil {
 				return instance, err
 			}
 			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
@@ -567,7 +567,7 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	if err := p.verifyNoPublishedPorts(ctx, instance); err != nil {
 		return err
 	}
-	if err := p.verifyInspection(ctx, instance, nil); err != nil {
+	if err := p.verifyInspection(ctx, instance, nil, ""); err != nil {
 		return err
 	}
 	if p.architectureEmulation == nil {
@@ -581,7 +581,7 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	return nil
 }
 
-func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest) error {
+func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest, expectedCacheID string) error {
 	result, err := p.run(ctx, commandRequest{
 		args:        []string{"inspect", "--json", instance.Name},
 		operation:   "verify docker sandbox attached capabilities",
@@ -597,8 +597,15 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
-	if expected != nil && (stringValue(inspection["image"]) != expected.Template || stringValue(inspection["image_digest"]) != expected.TemplateDigest || stringValue(inspection["workspace"]) != expected.StagingPath) {
-		return fmt.Errorf("docker sandbox inspection did not bind the exact template identity and staging path")
+	if expected != nil {
+		inspectionDigest := stringValue(inspection["image_digest"])
+		runtimeCacheID := ""
+		if validFullTemplateDigest(inspectionDigest) {
+			runtimeCacheID = strings.TrimPrefix(inspectionDigest, "sha256:")[:12]
+		}
+		if stringValue(inspection["image"]) != expected.Template || runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
+			return fmt.Errorf("docker sandbox inspection did not bind the exact template reference, cache identity, and staging path")
+		}
 	}
 	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
 		value, ok := inspection[field]

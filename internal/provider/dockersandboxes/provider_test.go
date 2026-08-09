@@ -716,6 +716,7 @@ func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T)
 
 func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
 	opaqueTemplateList := strings.Replace(templateListJSON, "39cf20eca861", "ec2006fea720", 1)
+	opaqueInspection := strings.Replace(inspectionJSON, testDigest, "sha256:ec2006fea720"+strings.Repeat("9", 52), 1)
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: opaqueTemplateList}},
@@ -723,7 +724,7 @@ func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
-		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: opaqueInspection}},
 		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
 	)
 	active := provider.TemplateArtifact{Reference: testTemplate, Digest: testDigest, CacheID: "ec2006fea720", Platform: "linux/amd64", RootDisk: "20GiB"}
