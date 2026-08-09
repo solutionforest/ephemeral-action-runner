@@ -34,6 +34,20 @@ func TestWorkflowForceCandidatePreservesVerifiedEvidence(t *testing.T) {
 	}
 }
 
+func TestWorkflowRecordsRunnablePlatformManifestFromAttestedCandidateIndex(t *testing.T) {
+	workflow := readPublisherWorkflow(t)
+	for _, required := range []string{
+		`docker buildx imagetools inspect "$CANDIDATE_REFERENCE" --raw`,
+		`select(.platform.os == "linux" and .platform.architecture == $architecture)`,
+		`if length == 1 then .[0].digest else error("expected exactly one runnable platform manifest") end`,
+		`packageManifestDigest:$digest,candidateIndexDigest:$candidateIndexDigest`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("workflow no longer records an exact runnable platform manifest from the attested candidate index: missing %q", required)
+		}
+	}
+}
+
 func readPublisherWorkflow(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", ".github", "workflows", "docker-sandboxes-images.yml")

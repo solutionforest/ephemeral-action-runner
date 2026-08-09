@@ -447,14 +447,21 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
           PLATFORM_SLUG: ${{ matrix.slug }}
-          PACKAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          CANDIDATE_INDEX_DIGEST: ${{ steps.push.outputs.digest }}
+          CANDIDATE_REFERENCE: ${{ env.PACKAGE_REPOSITORY }}:candidate-${{ needs.resolve.outputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
           RUNNER_VERSION: ${{ needs.resolve.outputs.runner_version }}
           RUNNER_DIGEST: ${{ matrix.runner_digest }}
         run: |
           set -euo pipefail
-          [[ "$PACKAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          jq -n --arg platform "$PLATFORM" --arg slug "$PLATFORM_SLUG" --arg digest "$PACKAGE_DIGEST" --arg runner "$RUNNER_VERSION" --arg runnerDigest "$RUNNER_DIGEST" \
-            '{platform:$platform,slug:$slug,packageManifestDigest:$digest,runnerVersion:$runner,runnerAssetDigest:$runnerDigest}' > "$RUNNER_TEMP/platform-result.json"
+          [[ "$CANDIDATE_INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$CANDIDATE_REFERENCE" --raw > "$RUNNER_TEMP/platform-candidate-index.json"
+          architecture="${PLATFORM#linux/}"
+          package_manifest_digest="$(jq -er --arg architecture "$architecture" \
+            '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | if length == 1 then .[0].digest else error("expected exactly one runnable platform manifest") end' \
+            "$RUNNER_TEMP/platform-candidate-index.json")"
+          [[ "$package_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -n --arg platform "$PLATFORM" --arg slug "$PLATFORM_SLUG" --arg digest "$package_manifest_digest" --arg candidateIndexDigest "$CANDIDATE_INDEX_DIGEST" --arg runner "$RUNNER_VERSION" --arg runnerDigest "$RUNNER_DIGEST" \
+            '{platform:$platform,slug:$slug,packageManifestDigest:$digest,candidateIndexDigest:$candidateIndexDigest,runnerVersion:$runner,runnerAssetDigest:$runnerDigest}' > "$RUNNER_TEMP/platform-result.json"
 
       - name: Upload platform digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
