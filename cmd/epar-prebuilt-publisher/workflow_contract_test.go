@@ -26,6 +26,7 @@ func TestWorkflowRepairsCatalogFirstPromotionBeforeNoop(t *testing.T) {
 func TestWorkflowForceCandidatePreservesVerifiedEvidence(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{
+		"target: runner-template",
 		`verify-package --reference "$PACKAGE_REF"`,
 		`--ref "$GITHUB_REF"`,
 		`jq '.gates.attestationVerified=true'`,

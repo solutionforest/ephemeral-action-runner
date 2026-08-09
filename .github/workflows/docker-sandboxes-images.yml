@@ -427,6 +427,7 @@ jobs:
         with:
           context: templates/docker-sandboxes
           file: templates/docker-sandboxes/Dockerfile.prebuilt
+          target: runner-template
           platforms: ${{ matrix.platform }}
           push: true
           pull: true
