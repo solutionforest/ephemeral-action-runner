@@ -601,7 +601,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/epar-evidence"
-          resolved_dependencies="$(jq -cn --arg source "$SOURCE_INDEX_DIGEST" --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" --arg tool "$TOOL_DIGEST" '[ $source,$sourceAmd64,$sourceArm64,$runnerAmd64,$runnerArm64,$tool ] | map({uri:"oci",digest:{sha256:(sub("^sha256:";""))}})')"
+          resolved_dependencies="$(jq -cn --arg gitUri "git+$GITHUB_SERVER_URL/$GITHUB_REPOSITORY@$GITHUB_REF" --arg revision "$RECIPE_REVISION" --arg source "$SOURCE_INDEX_DIGEST" --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" --arg tool "$TOOL_DIGEST" '[{uri:$gitUri,digest:{gitCommit:$revision}}] + ([ $source,$sourceAmd64,$sourceArm64,$runnerAmd64,$runnerArm64,$tool ] | map({uri:"oci",digest:{sha256:(sub("^sha256:";""))}}))')"
           jq -n \
             --arg source "$SOURCE_INDEX_DIGEST" --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" \
             --arg recipe "$RECIPE_DIGEST" --arg runtime "$RUNTIME_CONTRACT" --arg runner "$RUNNER_VERSION" \

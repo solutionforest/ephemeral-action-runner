@@ -52,6 +52,7 @@ func TestWorkflowUsesGitHubSupportedSLSAWorkflowBuildType(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{
 		`buildType:"https://actions.github.io/buildtypes/workflow/v1"`,
+		`[{uri:$gitUri,digest:{gitCommit:$revision}}]`,
 		`workflow:{ref:$workflowRef,repository:$workflowRepository,path:".github/workflows/docker-sandboxes-images.yml"}`,
 		`internalParameters:{github:{event_name:$eventName,repository_id:$repositoryId,repository_owner_id:$repositoryOwnerId,runner_environment:"github-hosted"}}`,
 		`runDetails:{builder:{id:$builderId},metadata:{invocationId:$invocationId}}`,

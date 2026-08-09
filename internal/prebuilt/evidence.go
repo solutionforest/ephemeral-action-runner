@@ -550,6 +550,19 @@ func parseSLSAClaims(predicate *structpb.Struct) (EvidenceClaims, error) {
 		if !ok {
 			return EvidenceClaims{}, fmt.Errorf("resolvedDependencies[%d] must be an object", index)
 		}
+		if digestValues, ok := dependency["digest"].(map[string]any); ok {
+			if gitCommit, hasGitCommit := digestValues["gitCommit"]; hasGitCommit {
+				commit, valid := gitCommit.(string)
+				uri, uriValid := dependency["uri"].(string)
+				if len(digestValues) != 1 || !valid || !commitPattern.MatchString(commit) || !strings.EqualFold(commit, claims.RecipeRevision) {
+					return EvidenceClaims{}, fmt.Errorf("resolvedDependencies[%d] gitCommit must exactly match recipe revision", index)
+				}
+				if !uriValid || !strings.HasPrefix(uri, "git+https://github.com/") || !strings.Contains(uri, "@refs/") {
+					return EvidenceClaims{}, fmt.Errorf("resolvedDependencies[%d] GitHub workflow source URI is invalid", index)
+				}
+				continue
+			}
+		}
 		digest, err := resourceDigest(dependency, "digest")
 		if err != nil {
 			return EvidenceClaims{}, fmt.Errorf("resolvedDependencies[%d]: %w", index, err)

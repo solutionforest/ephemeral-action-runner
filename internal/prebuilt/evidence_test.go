@@ -37,6 +37,25 @@ func TestParseSLSAClaimsRejectsAmbiguousResourceDigest(t *testing.T) {
 	}
 }
 
+func TestParseSLSAClaimsAcceptsMatchingGitHubWorkflowMaterial(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	predicate := slsaPredicate(digest)
+	root := predicate.AsMap()
+	buildDefinition := root["buildDefinition"].(map[string]any)
+	dependencies := buildDefinition["resolvedDependencies"].([]any)
+	gitMaterial := map[string]any{"uri": "git+https://github.com/solutionforest/ephemeral-action-runner@refs/heads/main", "digest": map[string]any{"gitCommit": strings.Repeat("a", 40)}}
+	buildDefinition["resolvedDependencies"] = append([]any{gitMaterial}, dependencies...)
+	mutated, _ := structpb.NewStruct(root)
+	if _, err := parseSLSAClaims(mutated); err != nil {
+		t.Fatal(err)
+	}
+	gitMaterial["digest"] = map[string]any{"gitCommit": strings.Repeat("b", 40)}
+	mutated, _ = structpb.NewStruct(root)
+	if _, err := parseSLSAClaims(mutated); err == nil || !strings.Contains(err.Error(), "exactly match recipe revision") {
+		t.Fatalf("mismatched git material error = %v", err)
+	}
+}
+
 func TestParseSPDXClaimsRequiresSHA256PackageChecksums(t *testing.T) {
 	predicate, err := structpb.NewStruct(map[string]any{"spdxVersion": "SPDX-2.3", "documentNamespace": "https://spdx.example/doc", "packages": []any{map[string]any{"name": "epar", "checksums": []any{map[string]any{"algorithm": "SHA1", "checksumValue": strings.Repeat("a", 40)}}}}})
 	if err != nil {
