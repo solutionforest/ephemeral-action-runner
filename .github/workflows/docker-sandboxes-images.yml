@@ -596,6 +596,8 @@ jobs:
           RUNNER_VERSION: ${{ needs.resolve.outputs.runner_version }}
           RUNNER_AMD64_DIGEST: ${{ needs.resolve.outputs.runner_amd64_digest }}
           RUNNER_ARM64_DIGEST: ${{ needs.resolve.outputs.runner_arm64_digest }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/epar-evidence"
@@ -605,8 +607,11 @@ jobs:
             --arg recipe "$RECIPE_DIGEST" --arg runtime "$RUNTIME_CONTRACT" --arg runner "$RUNNER_VERSION" \
             --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" --arg tool "$TOOL_DIGEST" \
             --arg package "$PACKAGE_INDEX_DIGEST" --arg packageAmd64 "$PACKAGE_AMD64_DIGEST" --arg packageArm64 "$PACKAGE_ARM64_DIGEST" \
-            --arg revision "$RECIPE_REVISION" --argjson dependencies "$resolved_dependencies" \
-            '{buildDefinition:{buildType:"https://actions.github.io/buildtypes/workflow/v1",externalParameters:{source:{indexDigest:$source,platformDigests:{"linux/amd64":$sourceAmd64,"linux/arm64":$sourceArm64}},recipe:{digest:$recipe,runtimeContract:$runtime,templateSchema:2,revision:$revision},runner:{version:$runner,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64}},tools:{"locked-build-inputs":{digest:$tool}},platforms:{"linux/amd64":{packageManifestDigest:$packageAmd64},"linux/arm64":{packageManifestDigest:$packageArm64}},subjectDigest:$package},resolvedDependencies:$dependencies},runDetails:{builder:{id:"https://github.com/solutionforest/ephemeral-action-runner"}}}' > "$RUNNER_TEMP/epar-evidence/slsa-predicate.json"
+            --arg revision "$RECIPE_REVISION" --arg workflowRef "$GITHUB_REF" --arg workflowRepository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --arg eventName "$GITHUB_EVENT_NAME" --arg repositoryId "$REPOSITORY_ID" --arg repositoryOwnerId "$REPOSITORY_OWNER_ID" \
+            --arg builderId "$GITHUB_SERVER_URL/$GITHUB_WORKFLOW_REF" --arg invocationId "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            --argjson dependencies "$resolved_dependencies" \
+            '{buildDefinition:{buildType:"https://actions.github.io/buildtypes/workflow/v1",externalParameters:{workflow:{ref:$workflowRef,repository:$workflowRepository,path:".github/workflows/docker-sandboxes-images.yml"},source:{indexDigest:$source,platformDigests:{"linux/amd64":$sourceAmd64,"linux/arm64":$sourceArm64}},recipe:{digest:$recipe,runtimeContract:$runtime,templateSchema:2,revision:$revision},runner:{version:$runner,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64}},tools:{"locked-build-inputs":{digest:$tool}},platforms:{"linux/amd64":{packageManifestDigest:$packageAmd64},"linux/arm64":{packageManifestDigest:$packageArm64}},subjectDigest:$package},internalParameters:{github:{event_name:$eventName,repository_id:$repositoryId,repository_owner_id:$repositoryOwnerId,runner_environment:"github-hosted"}},resolvedDependencies:$dependencies},runDetails:{builder:{id:$builderId},metadata:{invocationId:$invocationId}}}' > "$RUNNER_TEMP/epar-evidence/slsa-predicate.json"
           jq -n --arg package "$PACKAGE_INDEX_DIGEST" --arg recipe "$RECIPE_DIGEST" --arg amd64 "$PACKAGE_AMD64_DIGEST" --arg arm64 "$PACKAGE_ARM64_DIGEST" \
             '{spdxVersion:"SPDX-2.3",dataLicense:"CC0-1.0",SPDXID:"SPDXRef-DOCUMENT",documentNamespace:("https://solutionforest.dev/epar/docker-sandboxes/" + $package),packages:[{name:"epar-package-index",SPDXID:"SPDXRef-Package-index",checksums:[{algorithm:"SHA256",checksumValue:($package | sub("^sha256:";""))}]},{name:"epar-runtime-config",SPDXID:"SPDXRef-Package-runtime",checksums:[{algorithm:"SHA256",checksumValue:($recipe | sub("^sha256:";""))}]},{name:"epar-platform-linux-amd64",SPDXID:"SPDXRef-Package-amd64",checksums:[{algorithm:"SHA256",checksumValue:($amd64 | sub("^sha256:";""))}]},{name:"epar-platform-linux-arm64",SPDXID:"SPDXRef-Package-arm64",checksums:[{algorithm:"SHA256",checksumValue:($arm64 | sub("^sha256:";""))}]}]}' > "$RUNNER_TEMP/epar-evidence/sbom.spdx.json"
 

@@ -50,8 +50,15 @@ func TestWorkflowRecordsRunnablePlatformManifestFromAttestedCandidateIndex(t *te
 
 func TestWorkflowUsesGitHubSupportedSLSAWorkflowBuildType(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
-	if !strings.Contains(workflow, `buildType:"https://actions.github.io/buildtypes/workflow/v1"`) {
-		t.Fatal("workflow must use GitHub's supported SLSA workflow build type")
+	for _, required := range []string{
+		`buildType:"https://actions.github.io/buildtypes/workflow/v1"`,
+		`workflow:{ref:$workflowRef,repository:$workflowRepository,path:".github/workflows/docker-sandboxes-images.yml"}`,
+		`internalParameters:{github:{event_name:$eventName,repository_id:$repositoryId,repository_owner_id:$repositoryOwnerId,runner_environment:"github-hosted"}}`,
+		`runDetails:{builder:{id:$builderId},metadata:{invocationId:$invocationId}}`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("workflow must use GitHub's supported SLSA workflow provenance envelope: missing %q", required)
+		}
 	}
 	if strings.Contains(workflow, `buildType:"https://solutionforest.dev/epar/docker-sandboxes/v1"`) {
 		t.Fatal("workflow still uses the unsupported custom SLSA build type")
