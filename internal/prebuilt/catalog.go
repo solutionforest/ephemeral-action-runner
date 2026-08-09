@@ -235,6 +235,10 @@ func (g GateResults) AllPass() bool {
 	return g.SourceResolved && g.SourceRechecked && g.BuildSucceeded && g.PlatformsValidated && g.ImportReadback && g.RuntimeValidated && g.ProvenanceGenerated && g.SBOMGenerated && g.AttestationVerified
 }
 
+func (g GateResults) HostedPass() bool {
+	return g.SourceResolved && g.SourceRechecked && g.BuildSucceeded && g.PlatformsValidated && g.ProvenanceGenerated && g.SBOMGenerated && g.AttestationVerified
+}
+
 // ProfilePolicy controls promotion and wizard exposure. Full remains present
 // in the schema but disabled until its independent gates are promoted.
 type ProfilePolicy struct {
@@ -303,17 +307,62 @@ type StatusTransition struct {
 	At                 time.Time `json:"at"`
 }
 
+const AcceptanceRecordSchemaVersion = 1
+
+// WorkflowRunEvidence is human-reviewed evidence from the private EPAR test
+// repository. The publisher intentionally has no cross-repository credential;
+// a protected-environment reviewer verifies these immutable run URLs before
+// the signed catalog is published.
+type WorkflowRunEvidence struct {
+	Repository string `json:"repository"`
+	Workflow   string `json:"workflow"`
+	RunID      int64  `json:"runId"`
+	URL        string `json:"url"`
+	Conclusion string `json:"conclusion"`
+}
+
+// PlatformAcceptance records one real Docker-Sandboxes acceptance performed
+// by an EPAR-managed ephemeral runner. It is append-only and never changes the
+// immutable package Entry that was created by hosted publication.
+type PlatformAcceptance struct {
+	SchemaVersion      int                   `json:"schemaVersion"`
+	PackageIndexDigest string                `json:"packageIndexDigest"`
+	Platform           string                `json:"platform"`
+	RunnerGroup        string                `json:"runnerGroup"`
+	RunnerLabel        string                `json:"runnerLabel"`
+	RunnerName         string                `json:"runnerName"`
+	ReceiptSHA256      string                `json:"receiptSha256"`
+	ImportReadback     bool                  `json:"importReadback"`
+	RuntimeValidated   bool                  `json:"runtimeValidated"`
+	CleanupValidated   bool                  `json:"cleanupValidated"`
+	WorkflowRuns       []WorkflowRunEvidence `json:"workflowRuns"`
+	ReviewedBy         string                `json:"reviewedBy"`
+	AcceptedAt         time.Time             `json:"acceptedAt"`
+}
+
+// SourceOnlyPromotion records the deliberate reuse of an already accepted
+// EPAR recipe/runtime/runner/tool tuple when only the upstream source identity
+// changed. It never authorizes an EPAR-controlled tuple change.
+type SourceOnlyPromotion struct {
+	PackageIndexDigest string    `json:"packageIndexDigest"`
+	AcceptedFromDigest string    `json:"acceptedFromDigest"`
+	Reason             string    `json:"reason"`
+	At                 time.Time `json:"at"`
+}
+
 // Catalog is an append-only publication ledger. Aliases are a projection of
 // the latest successful promotion and can be regenerated from Entries.
 type Catalog struct {
-	SchemaVersion     int                      `json:"schemaVersion"`
-	ArtifactKind      string                   `json:"artifactKind"`
-	PackageRepository string                   `json:"packageRepository"`
-	GeneratedAt       time.Time                `json:"generatedAt"`
-	Policies          map[string]ProfilePolicy `json:"policies"`
-	Entries           []Entry                  `json:"entries"`
-	Aliases           map[string]Alias         `json:"aliases"`
-	Transitions       []StatusTransition       `json:"transitions"`
+	SchemaVersion        int                      `json:"schemaVersion"`
+	ArtifactKind         string                   `json:"artifactKind"`
+	PackageRepository    string                   `json:"packageRepository"`
+	GeneratedAt          time.Time                `json:"generatedAt"`
+	Policies             map[string]ProfilePolicy `json:"policies"`
+	Entries              []Entry                  `json:"entries"`
+	Aliases              map[string]Alias         `json:"aliases"`
+	Transitions          []StatusTransition       `json:"transitions"`
+	Acceptances          []PlatformAcceptance     `json:"acceptances,omitempty"`
+	SourceOnlyPromotions []SourceOnlyPromotion    `json:"sourceOnlyPromotions,omitempty"`
 }
 
 // PlanAliasReconciliation compares the observed registry alias with the
@@ -467,6 +516,32 @@ func (c Catalog) Validate() error {
 		}
 		if _, exists := seen[transition.PackageIndexDigest]; !exists {
 			return fmt.Errorf("catalog transition %d references unknown package digest %s", i, transition.PackageIndexDigest)
+		}
+	}
+	acceptanceKeys := make(map[string]struct{}, len(c.Acceptances))
+	for i, acceptance := range c.Acceptances {
+		if err := acceptance.Validate(); err != nil {
+			return fmt.Errorf("catalog acceptance %d: %w", i, err)
+		}
+		if _, exists := seen[acceptance.PackageIndexDigest]; !exists {
+			return fmt.Errorf("catalog acceptance %d references unknown package digest %s", i, acceptance.PackageIndexDigest)
+		}
+		key := acceptance.PackageIndexDigest + "|" + NormalizePlatform(acceptance.Platform)
+		if _, exists := acceptanceKeys[key]; exists {
+			return fmt.Errorf("duplicate platform acceptance for %s", key)
+		}
+		acceptanceKeys[key] = struct{}{}
+	}
+	for i, promotion := range c.SourceOnlyPromotions {
+		if err := c.validateSourceOnlyPromotion(promotion); err != nil {
+			return fmt.Errorf("catalog source-only promotion %d: %w", i, err)
+		}
+		gates, err := c.EffectiveGates(promotion.PackageIndexDigest)
+		if err != nil {
+			return fmt.Errorf("catalog source-only promotion %d effective gates: %w", i, err)
+		}
+		if !gates.AllPass() {
+			return fmt.Errorf("catalog source-only promotion %d has incomplete effective gates", i)
 		}
 	}
 	for key, alias := range c.Aliases {
@@ -658,6 +733,194 @@ func validTransition(from, to string) bool {
 	}
 }
 
+func (a PlatformAcceptance) Validate() error {
+	if a.SchemaVersion != AcceptanceRecordSchemaVersion {
+		return fmt.Errorf("unsupported acceptance schema %d", a.SchemaVersion)
+	}
+	if _, err := NormalizeDigest(a.PackageIndexDigest); err != nil {
+		return err
+	}
+	platform := NormalizePlatform(a.Platform)
+	if platform != "linux/amd64" && platform != "linux/arm64" {
+		return fmt.Errorf("unsupported acceptance platform %q", a.Platform)
+	}
+	if a.Platform != platform {
+		return fmt.Errorf("acceptance platform is not normalized: %q", a.Platform)
+	}
+	if a.RunnerGroup != "epar-dev-test" || strings.TrimSpace(a.RunnerName) == "" {
+		return errors.New("acceptance requires epar-dev-test runner group and exact runner name")
+	}
+	wantLabel := "epar-prebuilt-act-" + strings.TrimPrefix(a.PackageIndexDigest, "sha256:")[:12] + "-" + strings.TrimPrefix(platform, "linux/")
+	if a.RunnerLabel != wantLabel {
+		return fmt.Errorf("acceptance runner label must be %s", wantLabel)
+	}
+	if !strings.HasPrefix(a.RunnerName, wantLabel+"-") {
+		return fmt.Errorf("acceptance runner name must be generated from pool prefix %s", wantLabel)
+	}
+	if _, err := NormalizeDigest(a.ReceiptSHA256); err != nil {
+		return fmt.Errorf("acceptance receipt digest: %w", err)
+	}
+	if !a.ImportReadback || !a.RuntimeValidated || !a.CleanupValidated {
+		return errors.New("acceptance import/readback, runtime, and cleanup gates must all pass")
+	}
+	if strings.TrimSpace(a.ReviewedBy) == "" || a.AcceptedAt.IsZero() {
+		return errors.New("acceptance reviewer and timestamp are required")
+	}
+	wantWorkflows := map[string]bool{"playwright-docker.yml": false, "dockerhub-private-pull.yml": false}
+	if len(a.WorkflowRuns) != len(wantWorkflows) {
+		return errors.New("acceptance must contain exactly the Playwright and private Docker Hub workflow runs")
+	}
+	for _, run := range a.WorkflowRuns {
+		if run.Repository != "solutionforest/ephemeral-action-runner-test" || run.RunID <= 0 || run.Conclusion != "success" {
+			return errors.New("acceptance workflow run has invalid repository, id, or conclusion")
+		}
+		if _, ok := wantWorkflows[run.Workflow]; !ok || wantWorkflows[run.Workflow] {
+			return fmt.Errorf("unexpected or duplicate acceptance workflow %q", run.Workflow)
+		}
+		wantURL := fmt.Sprintf("https://github.com/%s/actions/runs/%d", run.Repository, run.RunID)
+		if run.URL != wantURL {
+			return fmt.Errorf("acceptance workflow URL must be %s", wantURL)
+		}
+		wantWorkflows[run.Workflow] = true
+	}
+	return nil
+}
+
+// AppendAcceptance records one reviewed platform result. An exact duplicate
+// is idempotent; a different record for the same digest/platform is rejected.
+func (c *Catalog) AppendAcceptance(acceptance PlatformAcceptance) (bool, error) {
+	if c == nil {
+		return false, errors.New("nil prebuilt catalog")
+	}
+	if err := acceptance.Validate(); err != nil {
+		return false, err
+	}
+	if _, ok := c.EntryByDigest(acceptance.PackageIndexDigest); !ok {
+		return false, fmt.Errorf("acceptance references unknown package digest %s", acceptance.PackageIndexDigest)
+	}
+	for _, existing := range c.Acceptances {
+		if existing.PackageIndexDigest != acceptance.PackageIndexDigest || existing.Platform != acceptance.Platform {
+			continue
+		}
+		a, _ := json.Marshal(existing)
+		b, _ := json.Marshal(acceptance)
+		if string(a) == string(b) {
+			return false, nil
+		}
+		return false, fmt.Errorf("acceptance for %s %s is already recorded with different evidence", acceptance.PackageIndexDigest, acceptance.Platform)
+	}
+	c.Acceptances = append(c.Acceptances, acceptance)
+	return true, nil
+}
+
+// EffectiveGates overlays reviewed two-platform acceptance onto immutable
+// hosted publication gates without rewriting the package Entry.
+func (c Catalog) EffectiveGates(digest string) (GateResults, error) {
+	return c.effectiveGates(digest, map[string]bool{})
+}
+
+func (c Catalog) HasCompletePlatformAcceptance(digest string) bool {
+	accepted := map[string]bool{"linux/amd64": false, "linux/arm64": false}
+	for _, acceptance := range c.Acceptances {
+		if acceptance.PackageIndexDigest == digest && acceptance.Validate() == nil {
+			accepted[acceptance.Platform] = true
+		}
+	}
+	return accepted["linux/amd64"] && accepted["linux/arm64"]
+}
+
+func (c Catalog) effectiveGates(digest string, visiting map[string]bool) (GateResults, error) {
+	if visiting[digest] {
+		return GateResults{}, fmt.Errorf("source-only promotion cycle for %s", digest)
+	}
+	visiting[digest] = true
+	defer delete(visiting, digest)
+	entry, ok := c.EntryByDigest(digest)
+	if !ok {
+		return GateResults{}, fmt.Errorf("unknown package digest %s", digest)
+	}
+	gates := entry.Gates
+	accepted := map[string]bool{"linux/amd64": false, "linux/arm64": false}
+	for _, acceptance := range c.Acceptances {
+		if acceptance.PackageIndexDigest != digest {
+			continue
+		}
+		if err := acceptance.Validate(); err != nil {
+			return GateResults{}, err
+		}
+		accepted[acceptance.Platform] = true
+	}
+	if accepted["linux/amd64"] && accepted["linux/arm64"] {
+		gates.PlatformsValidated = true
+		gates.ImportReadback = true
+		gates.RuntimeValidated = true
+	}
+	for _, promotion := range c.SourceOnlyPromotions {
+		if promotion.PackageIndexDigest != digest {
+			continue
+		}
+		baseline, err := c.effectiveGates(promotion.AcceptedFromDigest, visiting)
+		if err != nil {
+			return GateResults{}, err
+		}
+		if !baseline.AllPass() || !gates.HostedPass() {
+			return GateResults{}, fmt.Errorf("source-only promotion %s has incomplete baseline or hosted gates", digest)
+		}
+		gates.ImportReadback = true
+		gates.RuntimeValidated = true
+	}
+	return gates, nil
+}
+
+func (c Catalog) validateSourceOnlyPromotion(promotion SourceOnlyPromotion) error {
+	if _, err := NormalizeDigest(promotion.PackageIndexDigest); err != nil {
+		return err
+	}
+	if _, err := NormalizeDigest(promotion.AcceptedFromDigest); err != nil {
+		return err
+	}
+	if promotion.PackageIndexDigest == promotion.AcceptedFromDigest || promotion.At.IsZero() || strings.TrimSpace(promotion.Reason) == "" {
+		return errors.New("source-only promotion requires distinct digests, reason, and timestamp")
+	}
+	target, targetOK := c.EntryByDigest(promotion.PackageIndexDigest)
+	baseline, baselineOK := c.EntryByDigest(promotion.AcceptedFromDigest)
+	if !targetOK || !baselineOK {
+		return errors.New("source-only promotion references unknown package digest")
+	}
+	if !SourceTupleUnchanged(baseline, target) || SourceIdentityEqual(baseline, target) {
+		return errors.New("source-only promotion changed an EPAR tuple or retained the same upstream identity")
+	}
+	return nil
+}
+
+func (c *Catalog) AppendSourceOnlyPromotion(packageDigest, acceptedFromDigest, reason string, at time.Time) (bool, error) {
+	if c == nil {
+		return false, errors.New("nil prebuilt catalog")
+	}
+	promotion := SourceOnlyPromotion{PackageIndexDigest: packageDigest, AcceptedFromDigest: acceptedFromDigest, Reason: strings.TrimSpace(reason), At: at.UTC()}
+	if err := c.validateSourceOnlyPromotion(promotion); err != nil {
+		return false, err
+	}
+	baselineGates, err := c.EffectiveGates(acceptedFromDigest)
+	if err != nil || !baselineGates.AllPass() {
+		return false, errors.New("source-only promotion baseline has not passed complete acceptance")
+	}
+	targetGates, err := c.EffectiveGates(packageDigest)
+	if err != nil || !targetGates.HostedPass() {
+		return false, errors.New("source-only promotion target has incomplete hosted gates")
+	}
+	for _, existing := range c.SourceOnlyPromotions {
+		if existing.PackageIndexDigest == packageDigest {
+			if existing.AcceptedFromDigest == acceptedFromDigest {
+				return false, nil
+			}
+			return false, fmt.Errorf("source-only promotion for %s already uses another baseline", packageDigest)
+		}
+	}
+	c.SourceOnlyPromotions = append(c.SourceOnlyPromotions, promotion)
+	return true, nil
+}
+
 // EffectiveStatus applies the append-only transition ledger to an immutable
 // entry. Runtime consumers must use this rather than Entry.Status alone.
 func (c Catalog) EffectiveStatus(digest string) (string, error) {
@@ -776,6 +1039,8 @@ func cloneCatalog(value Catalog) Catalog {
 	clone := value
 	clone.Entries = append([]Entry(nil), value.Entries...)
 	clone.Transitions = append([]StatusTransition(nil), value.Transitions...)
+	clone.Acceptances = append([]PlatformAcceptance(nil), value.Acceptances...)
+	clone.SourceOnlyPromotions = append([]SourceOnlyPromotion(nil), value.SourceOnlyPromotions...)
 	clone.Aliases = make(map[string]Alias, len(value.Aliases))
 	for key, alias := range value.Aliases {
 		clone.Aliases[key] = alias
@@ -820,7 +1085,11 @@ func (c *Catalog) moveAliasInPlace(profile, reference, packageDigest, channel, e
 			if status == StatusRevoked || status == StatusCriticalRevoked {
 				return fmt.Errorf("alias %s cannot point to revoked package digest %s", profile, packageDigest)
 			}
-			if !entry.Gates.AllPass() {
+			gates, gateErr := c.EffectiveGates(packageDigest)
+			if gateErr != nil {
+				return gateErr
+			}
+			if !gates.AllPass() {
 				return fmt.Errorf("alias %s cannot point to package digest %s with incomplete gates", profile, packageDigest)
 			}
 			if status == StatusCandidate || status == StatusSuperseded {
@@ -856,6 +1125,8 @@ func (c *Catalog) moveAliasInPlace(profile, reference, packageDigest, channel, e
 func (c Catalog) MarshalCanonical() ([]byte, error) {
 	clone := c
 	clone.Entries = append([]Entry(nil), c.Entries...)
+	clone.Acceptances = append([]PlatformAcceptance(nil), c.Acceptances...)
+	clone.SourceOnlyPromotions = append([]SourceOnlyPromotion(nil), c.SourceOnlyPromotions...)
 	clone.Aliases = make(map[string]Alias, len(c.Aliases))
 	for key, value := range c.Aliases {
 		clone.Aliases[key] = value
@@ -870,6 +1141,15 @@ func (c Catalog) MarshalCanonical() ([]byte, error) {
 			return clone.Entries[i].Platforms[a].Platform < clone.Entries[i].Platforms[b].Platform
 		})
 	}
+	sort.SliceStable(clone.Acceptances, func(i, j int) bool {
+		if clone.Acceptances[i].PackageIndexDigest == clone.Acceptances[j].PackageIndexDigest {
+			return clone.Acceptances[i].Platform < clone.Acceptances[j].Platform
+		}
+		return clone.Acceptances[i].PackageIndexDigest < clone.Acceptances[j].PackageIndexDigest
+	})
+	sort.SliceStable(clone.SourceOnlyPromotions, func(i, j int) bool {
+		return clone.SourceOnlyPromotions[i].PackageIndexDigest < clone.SourceOnlyPromotions[j].PackageIndexDigest
+	})
 	return json.MarshalIndent(clone, "", "  ")
 }
 

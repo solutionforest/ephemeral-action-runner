@@ -96,9 +96,23 @@ func (r RemoteDescriptorResolver) Resolve(ctx context.Context, reference string)
 		// policy explicitly.
 		return result, nil
 	}
-	result.Platforms = make(map[string]PlatformDescriptor, len(index.Manifests))
+	result.Platforms, err = runnablePlatformDescriptors(index, trimmed)
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func runnablePlatformDescriptors(index *v1.IndexManifest, reference string) (map[string]PlatformDescriptor, error) {
+	platforms := make(map[string]PlatformDescriptor, len(index.Manifests))
 	for _, manifest := range index.Manifests {
 		if manifest.Platform == nil || manifest.Platform.OS == "" || manifest.Platform.Architecture == "" {
+			continue
+		}
+		// BuildKit attaches per-platform provenance/SBOM manifests to an OCI
+		// index as unknown/unknown descriptors. They are evidence, not runnable
+		// package platforms, and multiple such descriptors are valid.
+		if manifest.Annotations["vnd.docker.reference.type"] == "attestation-manifest" || manifest.Platform.OS == "unknown" || manifest.Platform.Architecture == "unknown" {
 			continue
 		}
 		platform := NormalizePlatform(manifest.Platform.OS + "/" + manifest.Platform.Architecture + func() string {
@@ -107,12 +121,12 @@ func (r RemoteDescriptorResolver) Resolve(ctx context.Context, reference string)
 			}
 			return "/" + manifest.Platform.Variant
 		}())
-		if _, exists := result.Platforms[platform]; exists {
-			return result, fmt.Errorf("OCI index %s contains duplicate platform %s", trimmed, platform)
+		if _, exists := platforms[platform]; exists {
+			return nil, fmt.Errorf("OCI index %s contains duplicate platform %s", reference, platform)
 		}
-		result.Platforms[platform] = PlatformDescriptor{Platform: platform, Digest: manifest.Digest.String(), MediaType: string(manifest.MediaType), Size: manifest.Size}
+		platforms[platform] = PlatformDescriptor{Platform: platform, Digest: manifest.Digest.String(), MediaType: string(manifest.MediaType), Size: manifest.Size}
 	}
-	return result, nil
+	return platforms, nil
 }
 
 // ResolvePlatform requires a unique platform descriptor in an immutable

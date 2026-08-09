@@ -124,12 +124,7 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 	}
 	alias, hasAlias := catalog.Aliases[profile]
 	if !hasAlias {
-		if policy, ok := catalog.Policies[profile]; ok && policy.Enabled && policy.AutoAdvance && entry.Gates.AllPass() {
-			plan.Action = PlanAdvanceAlias
-			plan.Reason = "first publication satisfies enabled profile policy"
-		} else {
-			plan.Reason = "first publication requires protected promotion"
-		}
+		plan.Reason = "first publication requires protected two-platform acceptance"
 		return plan, nil
 	}
 	plan.ExpectedAliasDigest = alias.PackageIndexDigest
@@ -150,9 +145,15 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 	if unchangedEPARTuple && !sourceChanged {
 		return PublicationPlan{}, fmt.Errorf("package index digest %s differs while the complete source and EPAR tuple is unchanged; protected rebuild is required", entry.PackageIndexDigest)
 	}
-	if policy, ok := catalog.Policies[profile]; ok && policy.Enabled && policy.AutoAdvance && sourceChanged && unchangedEPARTuple && entry.Gates.AllPass() {
-		plan.Action = PlanAdvanceAlias
-		plan.Reason = "upstream source digest changed while recipe/runtime/runner/tool tuple remained unchanged"
+	if policy, ok := catalog.Policies[profile]; ok && policy.Enabled && policy.AutoAdvance && sourceChanged && unchangedEPARTuple && entry.Gates.HostedPass() {
+		baselineGates, gateErr := catalog.EffectiveGates(previous.PackageIndexDigest)
+		if gateErr != nil {
+			return PublicationPlan{}, fmt.Errorf("evaluate accepted source-only baseline: %w", gateErr)
+		}
+		if baselineGates.AllPass() {
+			plan.Action = PlanAdvanceAlias
+			plan.Reason = "upstream source digest changed while an accepted recipe/runtime/runner/tool tuple remained unchanged"
+		}
 	}
 	return plan, nil
 }
@@ -201,6 +202,9 @@ func (p Publisher) Promote(ctx context.Context, catalog *Catalog, plan Publicati
 	}
 	profile := entry.Profile
 	previousDigest := plan.ExpectedAliasDigest
+	if _, err := clone.AppendSourceOnlyPromotion(entry.PackageIndexDigest, previousDigest, plan.Reason, p.now()); err != nil {
+		return err
+	}
 	tag, _ := AliasTag(profile)
 	if err := clone.MoveAlias(profile, entry.PackageRepository+":"+tag, entry.PackageIndexDigest, entry.Channel, previousDigest, p.now()); err != nil {
 		return err
@@ -229,8 +233,15 @@ func (p Publisher) PromoteProtected(ctx context.Context, catalog *Catalog, plan 
 	if !ok || !policy.Enabled {
 		return fmt.Errorf("profile %s is disabled for protected promotion", entry.Profile)
 	}
-	if !entry.Gates.AllPass() {
+	gates, err := catalog.EffectiveGates(entry.PackageIndexDigest)
+	if err != nil {
+		return err
+	}
+	if !gates.AllPass() {
 		return fmt.Errorf("candidate %s has incomplete publication gates", entry.PackageIndexDigest)
+	}
+	if !catalog.HasCompletePlatformAcceptance(entry.PackageIndexDigest) {
+		return fmt.Errorf("candidate %s is missing reviewed amd64 and arm64 acceptance records", entry.PackageIndexDigest)
 	}
 	if p.Resolver == nil {
 		return fmt.Errorf("publisher descriptor resolver is required")

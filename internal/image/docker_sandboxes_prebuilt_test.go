@@ -3,6 +3,7 @@ package image
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -15,8 +16,25 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	dockersandboxesprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes"
 )
+
+type candidateOnlyPrebuiltResolver struct {
+	stableCalls    int
+	candidateCalls int
+	err            error
+}
+
+func (r *candidateOnlyPrebuiltResolver) ResolveAndVerify(context.Context, string, string, string) (VerifiedDockerSandboxesPrebuilt, error) {
+	r.stableCalls++
+	return VerifiedDockerSandboxesPrebuilt{}, errors.New("stable resolver must not be used")
+}
+
+func (r *candidateOnlyPrebuiltResolver) ResolveCandidate(context.Context, string, string, string, string, string) (VerifiedDockerSandboxesPrebuilt, error) {
+	r.candidateCalls++
+	return VerifiedDockerSandboxesPrebuilt{}, r.err
+}
 
 type prebuiltAcquisitionEnvironment struct{ Environment }
 
@@ -60,6 +78,53 @@ func TestDockerSandboxesPrebuiltLocalIdentityExcludesRuntimeCAOverlay(t *testing
 	}
 	if firstHash != secondHash || len(firstManifest.TrustedCACertificates) != 0 || len(secondManifest.TrustedCACertificates) != 0 {
 		t.Fatalf("prebuilt base identity changed with runtime CA overlay: %s != %s", firstHash, secondHash)
+	}
+}
+
+func TestDockerSandboxesCandidateAcceptanceNeverFallsBackToStableAlias(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	resolver := &candidateOnlyPrebuiltResolver{err: errors.New("candidate evidence unavailable")}
+	coordinator := &Coordinator{
+		Config: config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}, Image: config.ImageConfig{
+			Distribution: config.ImageDistributionPrebuilt, SourcePlatform: "linux/amd64", PrebuiltReference: config.DockerSandboxesPrebuiltActReference,
+			PrebuiltDigest: digest, PrebuiltAcceptance: true, PrebuiltCatalogReference: prebuilt.DefaultPackageRepository + ":catalog-v1-pkg-" + strings.Repeat("b", 64), PrebuiltEvidenceRef: "refs/heads/feature/prebuilt_img",
+		}},
+		PrebuiltResolver: resolver,
+	}
+	_, err := coordinator.resolveVerifiedDockerSandboxesPrebuilt(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "candidate evidence unavailable") {
+		t.Fatalf("candidate resolution error = %v", err)
+	}
+	if resolver.candidateCalls != 1 || resolver.stableCalls != 0 {
+		t.Fatalf("candidate/stable calls = %d/%d, want 1/0", resolver.candidateCalls, resolver.stableCalls)
+	}
+}
+
+func TestDockerSandboxesCandidateReceiptRequiresAcceptanceEvidence(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	catalogDigest := "sha256:" + strings.Repeat("b", 64)
+	platformDigest := "sha256:" + strings.Repeat("c", 64)
+	catalogReference := prebuilt.DefaultPackageRepository + ":catalog-v1-pkg-" + strings.Repeat("d", 64)
+	receipt := dockerSandboxesReceipt{
+		SchemaVersion: dockerSandboxesReceiptSchema, Distribution: dockerSandboxesDistributionPrebuilt, ManifestHash: strings.Repeat("e", 64),
+		Manifest:       Manifest{SchemaVersion: ManifestSchemaVersion, Distribution: dockerSandboxesDistributionPrebuilt, Prebuilt: &PrebuiltManifestMetadata{PackageIndexDigest: digest, PackagePlatformDigest: platformDigest, CatalogDigest: catalogDigest, Acceptance: true, CatalogReference: catalogReference, EvidenceRef: "refs/heads/feature/prebuilt_img"}},
+		Artifact:       provider.TemplateArtifact{Reference: "docker.io/library/epar-candidate:test", Digest: platformDigest, CacheID: strings.Repeat("c", 12), Platform: "linux/amd64", RootDisk: "20GiB"},
+		MetadataSHA256: digest, ArchiveSHA256: digest, ArchiveBytes: 1, Evidence: map[string]artifactEvidence{"proof": {Path: "proof.json", SHA256: digest}}, ActivatedAt: time.Unix(100, 0).UTC(),
+		Prebuilt: &dockerSandboxesPrebuiltReceiptEvidence{CatalogDigest: catalogDigest, CatalogReference: catalogReference, EvidenceRef: "refs/heads/feature/prebuilt_img", Acceptance: true, Entry: prebuilt.Entry{PackageIndexDigest: digest, PackageReference: prebuilt.DefaultPackageRepository + "@" + digest}, PackageReference: prebuilt.DefaultPackageRepository + "@" + digest, PackageIndexDigest: digest, PackagePlatformDigest: platformDigest, EffectiveStatus: prebuilt.StatusCandidate, VerifiedAt: time.Unix(90, 0).UTC(), BaseArchiveSHA256: digest, BaseArchiveBytes: 1},
+	}
+	path := filepath.Join(t.TempDir(), "active.json")
+	if err := writeJSONFile(path, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDockerSandboxesReceiptPath(path); err != nil {
+		t.Fatalf("candidate acceptance receipt rejected: %v", err)
+	}
+	receipt.Prebuilt.Acceptance = false
+	if err := writeJSONFile(path, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDockerSandboxesReceiptPath(path); err == nil || !strings.Contains(err.Error(), "prebuilt receipt evidence") {
+		t.Fatalf("candidate receipt without acceptance error = %v", err)
 	}
 }
 

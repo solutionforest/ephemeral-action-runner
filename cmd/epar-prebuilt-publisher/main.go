@@ -20,12 +20,14 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: epar-prebuilt-publisher <plan|promote|catalog|reconcile-alias|verify-catalog|verify-package> [flags]"))
+		fatal(errors.New("usage: epar-prebuilt-publisher <plan|accept|promote|catalog|reconcile-alias|verify-catalog|verify-package> [flags]"))
 	}
 	var err error
 	switch os.Args[1] {
 	case "plan":
 		err = planCommand(os.Args[2:])
+	case "accept":
+		err = acceptCommand(os.Args[2:])
 	case "promote":
 		err = promoteCommand(os.Args[2:])
 	case "catalog":
@@ -42,6 +44,48 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+}
+
+func acceptCommand(args []string) error {
+	flags := flag.NewFlagSet("accept", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	catalogPath := flags.String("catalog", "", "append-only catalog JSON path")
+	inputPath := flags.String("input", "", "reviewed platform acceptance JSON path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *catalogPath == "" || *inputPath == "" {
+		return errors.New("accept requires --catalog and --input")
+	}
+	catalog, err := readCatalog(*catalogPath)
+	if err != nil {
+		return err
+	}
+	content, err := os.ReadFile(*inputPath)
+	if err != nil {
+		return fmt.Errorf("read acceptance input: %w", err)
+	}
+	var acceptances []prebuilt.PlatformAcceptance
+	if err := json.Unmarshal(content, &acceptances); err != nil {
+		var one prebuilt.PlatformAcceptance
+		if oneErr := json.Unmarshal(content, &one); oneErr != nil {
+			return fmt.Errorf("parse acceptance input: %w", err)
+		}
+		acceptances = []prebuilt.PlatformAcceptance{one}
+	}
+	if len(acceptances) == 0 {
+		return errors.New("acceptance input must contain at least one platform record")
+	}
+	for _, acceptance := range acceptances {
+		if _, err := catalog.AppendAcceptance(acceptance); err != nil {
+			return fmt.Errorf("append %s acceptance: %w", acceptance.Platform, err)
+		}
+	}
+	if err := writeCatalog(*catalogPath, catalog); err != nil {
+		return err
+	}
+	fmt.Printf("accepted packageIndexDigest=%s platforms=%d\n", acceptances[0].PackageIndexDigest, len(acceptances))
+	return nil
 }
 
 func reconcileAliasCommand(args []string) error {

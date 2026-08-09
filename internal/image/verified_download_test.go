@@ -62,6 +62,34 @@ func TestVerifiedDownloadResumesAndPublishesOnlyLockedContent(t *testing.T) {
 	}
 }
 
+func TestVerifiedDownloadFollowsRunnerArchiveRedirect(t *testing.T) {
+	content := []byte("redirected-actions-runner-archive")
+	sum := sha256.Sum256(content)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/release-asset":
+			http.Redirect(response, request, "/objects/runner.tar.gz", http.StatusFound)
+		case "/objects/runner.tar.gz":
+			_, _ = response.Write(content)
+		default:
+			response.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	destination := filepath.Join(t.TempDir(), "actions-runner.tar.gz")
+	if err := verifiedDownload(context.Background(), server.Client(), server.URL+"/release-asset", destination, hex.EncodeToString(sum[:]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("redirected runner archive = %q", got)
+	}
+}
+
 func TestVerifiedDownloadReturnsTypedTransientHTTPFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.WriteHeader(http.StatusServiceUnavailable)

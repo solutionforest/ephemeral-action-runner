@@ -2,6 +2,7 @@ package prebuilt
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,81 @@ func TestCatalogRejectsActiveEntryWithoutAllGates(t *testing.T) {
 	}
 }
 
+func TestCatalogAcceptanceCompletesCandidateGatesOnlyAfterBothPlatforms(t *testing.T) {
+	entry := validEntry(ProfileAct, "a", StatusCandidate)
+	entry.Gates.ImportReadback = false
+	entry.Gates.RuntimeValidated = false
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true}}, Aliases: map[string]Alias{}}
+	if _, err := catalog.AppendEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptance(entry.PackageIndexDigest, "linux/amd64", 101, 102)); err != nil {
+		t.Fatal(err)
+	}
+	if gates, err := catalog.EffectiveGates(entry.PackageIndexDigest); err != nil || gates.AllPass() {
+		t.Fatalf("one-platform effective gates = %+v, %v; want incomplete", gates, err)
+	}
+	if err := catalog.MoveAlias(ProfileAct, DefaultPackageRepository+":act-latest", entry.PackageIndexDigest, ChannelStable, "", time.Unix(3, 0)); err == nil || !strings.Contains(err.Error(), "incomplete gates") {
+		t.Fatalf("one-platform alias move error = %v", err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptance(entry.PackageIndexDigest, "linux/arm64", 201, 202)); err != nil {
+		t.Fatal(err)
+	}
+	if gates, err := catalog.EffectiveGates(entry.PackageIndexDigest); err != nil || !gates.AllPass() {
+		t.Fatalf("two-platform effective gates = %+v, %v; want complete", gates, err)
+	}
+	if err := catalog.MoveAlias(ProfileAct, DefaultPackageRepository+":act-latest", entry.PackageIndexDigest, ChannelStable, "", time.Unix(4, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCatalogAcceptanceRejectsWrongWorkflowAndConflictingPlatformEvidence(t *testing.T) {
+	entry := validEntry(ProfileAct, "a", StatusCandidate)
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Entries: []Entry{entry}}
+	wrong := validAcceptance(entry.PackageIndexDigest, "linux/amd64", 101, 102)
+	wrong.WorkflowRuns[0].Workflow = "unapproved.yml"
+	if _, err := catalog.AppendAcceptance(wrong); err == nil || !strings.Contains(err.Error(), "unexpected") {
+		t.Fatalf("wrong workflow error = %v", err)
+	}
+	first := validAcceptance(entry.PackageIndexDigest, "linux/amd64", 101, 102)
+	if _, err := catalog.AppendAcceptance(first); err != nil {
+		t.Fatal(err)
+	}
+	changed := first
+	changed.RunnerName = first.RunnerLabel + "-20260810-000000-002"
+	if _, err := catalog.AppendAcceptance(changed); err == nil || !strings.Contains(err.Error(), "different evidence") {
+		t.Fatalf("conflicting acceptance error = %v", err)
+	}
+}
+
+func TestAcceptanceRejectsFailedOrMisroutedRuns(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	cases := []struct {
+		name string
+		edit func(*PlatformAcceptance)
+		want string
+	}{
+		{name: "failed", edit: func(value *PlatformAcceptance) { value.WorkflowRuns[0].Conclusion = "failure" }, want: "conclusion"},
+		{name: "wrong repository", edit: func(value *PlatformAcceptance) {
+			value.WorkflowRuns[0].Repository = "solutionforest/another-repository"
+		}, want: "repository"},
+		{name: "wrong group", edit: func(value *PlatformAcceptance) { value.RunnerGroup = "Default" }, want: "epar-dev-test"},
+		{name: "wrong label", edit: func(value *PlatformAcceptance) { value.RunnerLabel = "epar-docker-sandboxes" }, want: "runner label"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			acceptance := validAcceptance(digest, "linux/amd64", 101, 102)
+			tc.edit(&acceptance)
+			if err := acceptance.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("acceptance error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestRecheckUnchangedDetectsMutableTagRace(t *testing.T) {
 	resolver := fakeResolver{resolved: ResolvedReference{Reference: "ghcr.io/catthehacker/ubuntu:act-latest", Digest: "sha256:" + strings.Repeat("c", 64)}}
 	_, err := RecheckUnchanged(context.Background(), resolver, resolver.resolved.Reference, "sha256:"+strings.Repeat("d", 64))
@@ -159,6 +235,20 @@ func validEntry(profile, hexChar, status string) Entry {
 		Gates: GateResults{SourceResolved: true, SourceRechecked: true, BuildSucceeded: true, PlatformsValidated: true, ImportReadback: true, RuntimeValidated: true, ProvenanceGenerated: true, SBOMGenerated: true, AttestationVerified: true},
 	}
 	return entry
+}
+
+func validAcceptance(digest, platform string, playwrightRun, dockerHubRun int64) PlatformAcceptance {
+	arch := strings.TrimPrefix(platform, "linux/")
+	return PlatformAcceptance{
+		SchemaVersion: AcceptanceRecordSchemaVersion, PackageIndexDigest: digest, Platform: platform,
+		RunnerGroup: "epar-dev-test", RunnerLabel: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch, RunnerName: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch + "-20260810-000000-001",
+		ReceiptSHA256: "sha256:" + strings.Repeat("f", 64), ImportReadback: true, RuntimeValidated: true, CleanupValidated: true,
+		WorkflowRuns: []WorkflowRunEvidence{
+			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "playwright-docker.yml", RunID: playwrightRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(playwrightRun), Conclusion: "success"},
+			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "dockerhub-private-pull.yml", RunID: dockerHubRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(dockerHubRun), Conclusion: "success"},
+		},
+		ReviewedBy: "reviewer", AcceptedAt: time.Unix(2, 0),
+	}
 }
 
 type fakeResolver struct{ resolved ResolvedReference }

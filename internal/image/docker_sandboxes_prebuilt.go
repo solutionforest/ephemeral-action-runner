@@ -44,6 +44,10 @@ type DockerSandboxesPrebuiltResolver interface {
 	ResolveAndVerify(ctx context.Context, packageAlias, optionalDigest, platform string) (VerifiedDockerSandboxesPrebuilt, error)
 }
 
+type dockerSandboxesPrebuiltAcceptanceResolver interface {
+	ResolveCandidate(ctx context.Context, packageAlias, packageDigest, platform, catalogReference, evidenceRef string) (VerifiedDockerSandboxesPrebuilt, error)
+}
+
 type dockerSandboxesPrebuiltStatusResolver interface {
 	ResolveStatus(ctx context.Context, packageDigest string) (prebuilt.CatalogStatus, error)
 }
@@ -133,6 +137,56 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveAndVerify(ctx context
 	return VerifiedDockerSandboxesPrebuilt{Catalog: catalog, CatalogDigest: catalogDigest, Entry: entry, Package: immutableDescriptor, Platform: selected, EffectiveStatus: effectiveStatus, VerifiedAt: time.Now().UTC(), CompressedBytes: uint64(selected.Size)}, nil
 }
 
+func (r *productionDockerSandboxesPrebuiltResolver) ResolveCandidate(ctx context.Context, packageAlias, packageDigest, platform, catalogReference, evidenceRef string) (VerifiedDockerSandboxesPrebuilt, error) {
+	if err := r.initialize(ctx); err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
+	}
+	wantAlias := prebuilt.DefaultPackageRepository + ":" + prebuilt.ProfileAct + "-latest"
+	if strings.TrimSpace(packageAlias) != wantAlias {
+		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("unsupported prebuilt package alias %q", packageAlias)
+	}
+	packageDigest, err := prebuilt.NormalizeDigest(packageDigest)
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
+	}
+	evidenceRef = strings.TrimSpace(evidenceRef)
+	resolver := r.resolver
+	resolver.EvidencePolicy.Ref = evidenceRef
+	verifiedCatalog, err := resolver.VerifyCatalogReference(ctx, strings.TrimSpace(catalogReference))
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
+	}
+	catalog := verifiedCatalog.Artifact.Catalog
+	status, err := catalog.EffectiveStatus(packageDigest)
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
+	}
+	if status != prebuilt.StatusCandidate {
+		entry, _ := catalog.EntryByDigest(packageDigest)
+		return VerifiedDockerSandboxesPrebuilt{}, &DockerSandboxesPrebuiltStatusError{Digest: packageDigest, Status: status, Reason: entry.RevocationReason}
+	}
+	entry, ok := catalog.EntryByDigest(packageDigest)
+	if !ok {
+		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("package digest %s is not present in immutable candidate catalog", packageDigest)
+	}
+	verifiedPackage, err := resolver.VerifyPackage(ctx, packageDigest, entry)
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
+	}
+	selected, err := prebuilt.ResolvePlatform(verifiedPackage.Package, platform)
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
+	}
+	if selected.Size <= 0 {
+		return VerifiedDockerSandboxesPrebuilt{}, errors.New("verified prebuilt platform descriptor omitted compressed size")
+	}
+	return VerifiedDockerSandboxesPrebuilt{
+		Catalog: catalog, CatalogDigest: verifiedCatalog.Artifact.CanonicalDigest, CatalogReference: verifiedCatalog.Artifact.Reference,
+		EvidenceRef: evidenceRef, Acceptance: true, Entry: entry, Package: verifiedPackage.Package, Platform: selected,
+		EffectiveStatus: status, VerifiedAt: time.Now().UTC(), CompressedBytes: uint64(selected.Size),
+	}, nil
+}
+
 func (r *productionDockerSandboxesPrebuiltResolver) ResolveStatus(ctx context.Context, packageDigest string) (prebuilt.CatalogStatus, error) {
 	if err := r.initialize(ctx); err != nil {
 		return prebuilt.CatalogStatus{}, err
@@ -154,18 +208,24 @@ func (e *DockerSandboxesPrebuiltStatusError) Error() string {
 }
 
 type VerifiedDockerSandboxesPrebuilt struct {
-	Catalog         prebuilt.Catalog            `json:"catalog"`
-	CatalogDigest   string                      `json:"catalogDigest"`
-	Entry           prebuilt.Entry              `json:"entry"`
-	Package         prebuilt.ResolvedReference  `json:"package"`
-	Platform        prebuilt.PlatformDescriptor `json:"platform"`
-	EffectiveStatus string                      `json:"effectiveStatus"`
-	VerifiedAt      time.Time                   `json:"verifiedAt"`
-	CompressedBytes uint64                      `json:"compressedBytes"`
+	Catalog          prebuilt.Catalog            `json:"catalog"`
+	CatalogDigest    string                      `json:"catalogDigest"`
+	CatalogReference string                      `json:"catalogReference,omitempty"`
+	EvidenceRef      string                      `json:"evidenceRef,omitempty"`
+	Acceptance       bool                        `json:"acceptance,omitempty"`
+	Entry            prebuilt.Entry              `json:"entry"`
+	Package          prebuilt.ResolvedReference  `json:"package"`
+	Platform         prebuilt.PlatformDescriptor `json:"platform"`
+	EffectiveStatus  string                      `json:"effectiveStatus"`
+	VerifiedAt       time.Time                   `json:"verifiedAt"`
+	CompressedBytes  uint64                      `json:"compressedBytes"`
 }
 
 type dockerSandboxesPrebuiltReceiptEvidence struct {
 	CatalogDigest         string         `json:"catalogDigest"`
+	CatalogReference      string         `json:"catalogReference,omitempty"`
+	EvidenceRef           string         `json:"evidenceRef,omitempty"`
+	Acceptance            bool           `json:"acceptance,omitempty"`
 	Entry                 prebuilt.Entry `json:"entry"`
 	PackageReference      string         `json:"packageReference"`
 	PackageIndexDigest    string         `json:"packageIndexDigest"`
@@ -286,7 +346,16 @@ func (m *Coordinator) resolveVerifiedDockerSandboxesPrebuilt(ctx context.Context
 	}
 	reference := strings.TrimSpace(m.Config.Image.PrebuiltReference)
 	pin := strings.TrimSpace(m.Config.Image.PrebuiltDigest)
-	verified, err := m.PrebuiltResolver.ResolveAndVerify(ctx, reference, pin, platform)
+	var verified VerifiedDockerSandboxesPrebuilt
+	if m.Config.Image.PrebuiltAcceptance {
+		resolver, ok := m.PrebuiltResolver.(dockerSandboxesPrebuiltAcceptanceResolver)
+		if !ok {
+			return VerifiedDockerSandboxesPrebuilt{}, errors.New("prebuilt Docker Sandboxes candidate verification is unavailable; EPAR will not follow act-latest or fall back to a local build")
+		}
+		verified, err = resolver.ResolveCandidate(ctx, reference, pin, platform, strings.TrimSpace(m.Config.Image.PrebuiltCatalogReference), strings.TrimSpace(m.Config.Image.PrebuiltEvidenceRef))
+	} else {
+		verified, err = m.PrebuiltResolver.ResolveAndVerify(ctx, reference, pin, platform)
+	}
 	if err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("resolve and verify Docker Sandboxes prebuilt package: %w", err)
 	}
@@ -313,7 +382,11 @@ func (m *Coordinator) resolveVerifiedDockerSandboxesPrebuilt(ctx context.Context
 	if err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, err
 	}
-	if status != prebuilt.StatusActive && !(pin != "" && status == prebuilt.StatusSuperseded) {
+	allowedStatus := status == prebuilt.StatusActive || (pin != "" && status == prebuilt.StatusSuperseded)
+	if m.Config.Image.PrebuiltAcceptance {
+		allowedStatus = status == prebuilt.StatusCandidate && verified.Acceptance && verified.CatalogReference == strings.TrimSpace(m.Config.Image.PrebuiltCatalogReference) && verified.EvidenceRef == strings.TrimSpace(m.Config.Image.PrebuiltEvidenceRef)
+	}
+	if !allowedStatus {
 		return VerifiedDockerSandboxesPrebuilt{}, &DockerSandboxesPrebuiltStatusError{Digest: entry.PackageIndexDigest, Status: status, Reason: entry.RevocationReason}
 	}
 	if err := m.validateDockerSandboxesPrebuiltRecipe(entry); err != nil {
@@ -453,7 +526,10 @@ func (m *Coordinator) dockerSandboxesPrebuiltLocalManifest() (Manifest, error) {
 		Prebuilt: &PrebuiltManifestMetadata{
 			Reference:        strings.TrimSpace(m.Config.Image.PrebuiltReference),
 			Pinned:           strings.TrimSpace(m.Config.Image.PrebuiltDigest) != "",
+			Acceptance:       m.Config.Image.PrebuiltAcceptance,
 			ConfiguredDigest: strings.TrimSpace(m.Config.Image.PrebuiltDigest),
+			CatalogReference: strings.TrimSpace(m.Config.Image.PrebuiltCatalogReference),
+			EvidenceRef:      strings.TrimSpace(m.Config.Image.PrebuiltEvidenceRef),
 		},
 	}, nil
 }
@@ -495,7 +571,10 @@ func (m *Coordinator) dockerSandboxesPrebuiltDesiredManifest(ctx context.Context
 	manifest.Prebuilt = &PrebuiltManifestMetadata{
 		Reference:             entry.PackageRepository + "@" + entry.PackageIndexDigest,
 		Pinned:                strings.TrimSpace(m.Config.Image.PrebuiltDigest) != "",
+		Acceptance:            m.Config.Image.PrebuiltAcceptance,
 		ConfiguredDigest:      strings.TrimSpace(m.Config.Image.PrebuiltDigest),
+		CatalogReference:      verified.CatalogReference,
+		EvidenceRef:           verified.EvidenceRef,
 		PackageIndexDigest:    entry.PackageIndexDigest,
 		PackagePlatformDigest: verified.Platform.Digest,
 		CatalogDigest:         verified.CatalogDigest,
@@ -961,7 +1040,8 @@ func (m *Coordinator) buildDockerSandboxesPrebuiltTemplate(ctx context.Context, 
 		SchemaVersion: dockerSandboxesReceiptSchema, Distribution: dockerSandboxesDistributionPrebuilt, ManifestHash: manifestHash, Manifest: manifest, Source: source, Artifact: artifact,
 		MetadataSHA256: evidence["templateMetadata"].SHA256, ArchiveSHA256: archiveSHA, ArchiveBytes: archiveBytes, Evidence: evidence, ActivatedAt: m.now().UTC(),
 		Prebuilt: &dockerSandboxesPrebuiltReceiptEvidence{
-			CatalogDigest: verified.CatalogDigest, Entry: verified.Entry, PackageReference: verified.Package.Reference, PackageIndexDigest: verified.Entry.PackageIndexDigest,
+			CatalogDigest: verified.CatalogDigest, CatalogReference: verified.CatalogReference, EvidenceRef: verified.EvidenceRef, Acceptance: verified.Acceptance,
+			Entry: verified.Entry, PackageReference: verified.Package.Reference, PackageIndexDigest: verified.Entry.PackageIndexDigest,
 			PackagePlatformDigest: verified.Platform.Digest, EffectiveStatus: verified.EffectiveStatus, VerifiedAt: verified.VerifiedAt,
 			BaseArchiveSHA256: acquisition.ArchiveSHA256, BaseArchiveBytes: acquisition.ArchiveBytes, Derivative: derivative,
 		},

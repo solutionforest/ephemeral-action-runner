@@ -118,6 +118,15 @@ func TestPublisherProtectedPromotionAdvancesRecipeCandidate(t *testing.T) {
 	if err != nil || plan.Action != PlanCandidate {
 		t.Fatalf("candidate plan = %#v, %v", plan, err)
 	}
+	if err := publisher.Promote(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptance(newDigest, "linux/amd64", 101, 102)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptance(newDigest, "linux/arm64", 201, 202)); err != nil {
+		t.Fatal(err)
+	}
 	if err := publisher.PromoteProtected(context.Background(), &catalog, plan); err != nil {
 		t.Fatal(err)
 	}
@@ -155,8 +164,42 @@ func TestPublisherProtectedPromotionRejectsIncompleteCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := (Publisher{Resolver: resolver}).Promote(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
 	if err := (Publisher{Resolver: resolver}).PromoteProtected(context.Background(), &catalog, plan); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("incomplete candidate error = %v", err)
+	}
+}
+
+func TestPublisherProtectedPromotionUsesAppendOnlyTwoPlatformAcceptance(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest), sourceObservation(digest)}}
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true}}, Aliases: map[string]Alias{}}
+	input := publicationInput(digest)
+	input.SourceReference = resolver.observations[0].Reference
+	input.SourceTag = "act-latest"
+	input.Gates.ImportReadback = false
+	input.Gates.RuntimeValidated = false
+	publisher := Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(3, 0) }}
+	plan, err := publisher.Plan(context.Background(), catalog, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Promote(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptance(digest, "linux/amd64", 101, 102)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptance(digest, "linux/arm64", 201, 202)); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.PromoteProtected(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if got := catalog.Aliases[ProfileAct].PackageIndexDigest; got != digest {
+		t.Fatalf("protected alias digest = %s, want %s", got, digest)
 	}
 }
 

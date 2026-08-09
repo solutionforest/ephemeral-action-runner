@@ -49,6 +49,9 @@ type ImageConfig struct {
 	OutputImage               string
 	PrebuiltReference         string
 	PrebuiltDigest            string
+	PrebuiltAcceptance        bool
+	PrebuiltCatalogReference  string
+	PrebuiltEvidenceRef       string
 	UpstreamDir               string
 	UpstreamLock              string
 	RunnerVersion             string
@@ -495,6 +498,16 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Image.PrebuiltReference = value
 		case "prebuiltDigest":
 			cfg.Image.PrebuiltDigest = value
+		case "prebuiltAcceptance":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid image.prebuiltAcceptance: %w", err)
+			}
+			cfg.Image.PrebuiltAcceptance = v
+		case "prebuiltCatalogReference":
+			cfg.Image.PrebuiltCatalogReference = value
+		case "prebuiltEvidenceRef":
+			cfg.Image.PrebuiltEvidenceRef = value
 		case "upstreamDir":
 			cfg.Image.UpstreamDir = value
 		case "upstreamLock":
@@ -1162,6 +1175,26 @@ func Validate(cfg Config) error {
 		if err := validateDockerSandboxesImageDistribution(cfg.Image); err != nil {
 			return err
 		}
+		if cfg.Image.PrebuiltAcceptance {
+			if cfg.Pool.Instances != 1 {
+				return fmt.Errorf("pool.instances must be 1 when image.prebuiltAcceptance=true")
+			}
+			if cfg.Runner.Group != "epar-dev-test" {
+				return fmt.Errorf("runner.group must be epar-dev-test when image.prebuiltAcceptance=true")
+			}
+			policy := cfg.Security.RunnerGroup
+			if policy.Enforcement != RunnerGroupEnforcementEnforce || !policy.RequireExplicitGroup || !policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessSelected || !policy.RequirePublicRepositoriesDisabled {
+				return fmt.Errorf("candidate acceptance requires enforced explicit non-default selected-repository runner-group access with public repositories disabled")
+			}
+			wantLabelPrefix := "epar-prebuilt-act-" + strings.TrimPrefix(cfg.Image.PrebuiltDigest, "sha256:")[:12] + "-"
+			wantLabel := wantLabelPrefix + strings.TrimPrefix(cfg.Provider.Platform, "linux/")
+			if len(cfg.Runner.Labels) != 1 || cfg.Runner.Labels[0] != wantLabel || !cfg.Runner.NoDefaultLabels || cfg.Runner.IncludeHostLabel {
+				return fmt.Errorf("candidate acceptance requires only runner.labels: [%s], runner.noDefaultLabels: true, and runner.includeHostLabel: false", wantLabel)
+			}
+			if cfg.Pool.NamePrefix != wantLabel {
+				return fmt.Errorf("pool.namePrefix must be the digest-bound acceptance name %s", wantLabel)
+			}
+		}
 		if !cfg.Runner.Ephemeral {
 			return fmt.Errorf("runner.ephemeral must be true with provider.type=docker-sandboxes")
 		}
@@ -1419,6 +1452,28 @@ func validateDockerSandboxesImageDistribution(image ImageConfig) error {
 				return err
 			}
 		}
+		if image.PrebuiltAcceptance {
+			if strings.TrimSpace(image.PrebuiltDigest) == "" {
+				return fmt.Errorf("image.prebuiltDigest is required when image.prebuiltAcceptance=true")
+			}
+			if err := validatePrebuiltCatalogReference(image.PrebuiltCatalogReference); err != nil {
+				return fmt.Errorf("image.prebuiltCatalogReference: %w", err)
+			}
+			if err := validatePrebuiltEvidenceRef(image.PrebuiltEvidenceRef); err != nil {
+				return fmt.Errorf("image.prebuiltEvidenceRef: %w", err)
+			}
+			if image.UpdateFrequency != ImageUpdateFrequencyManual {
+				return fmt.Errorf("image.updateFrequency must be manual when image.prebuiltAcceptance=true")
+			}
+			if len(image.CustomInstallScripts) != 0 || len(image.TrustedCACertificatePaths) != 0 {
+				return fmt.Errorf("candidate acceptance requires empty image.customInstallScripts and image.trustedCaCertificatePaths so the published package is tested without a local derivative")
+			}
+			if image.HostTrustMode != HostTrustModeOverlay {
+				return fmt.Errorf("image.hostTrustMode must be overlay when image.prebuiltAcceptance=true")
+			}
+		} else if strings.TrimSpace(image.PrebuiltCatalogReference) != "" || strings.TrimSpace(image.PrebuiltEvidenceRef) != "" {
+			return fmt.Errorf("image.prebuiltCatalogReference and image.prebuiltEvidenceRef require image.prebuiltAcceptance=true")
+		}
 		return nil
 	default:
 		return fmt.Errorf("unsupported image.distribution %q; supported values are %s and %s", image.Distribution, ImageDistributionLocalBuild, ImageDistributionPrebuilt)
@@ -1430,11 +1485,36 @@ func validateImageDistributionFields(image ImageConfig, providerType string) err
 	if distribution == "" {
 		distribution = ImageDistributionLocalBuild
 	}
-	if distribution != ImageDistributionPrebuilt && (strings.TrimSpace(image.PrebuiltReference) != "" || strings.TrimSpace(image.PrebuiltDigest) != "") {
-		return fmt.Errorf("image.prebuiltReference and image.prebuiltDigest require image.distribution=%s", ImageDistributionPrebuilt)
+	if distribution != ImageDistributionPrebuilt && (strings.TrimSpace(image.PrebuiltReference) != "" || strings.TrimSpace(image.PrebuiltDigest) != "" || image.PrebuiltAcceptance || strings.TrimSpace(image.PrebuiltCatalogReference) != "" || strings.TrimSpace(image.PrebuiltEvidenceRef) != "") {
+		return fmt.Errorf("image prebuilt fields require image.distribution=%s", ImageDistributionPrebuilt)
 	}
 	if distribution == ImageDistributionPrebuilt && providerType != "docker-sandboxes" {
 		return fmt.Errorf("image.distribution=prebuilt is supported only with provider.type=docker-sandboxes")
+	}
+	return nil
+}
+
+func validatePrebuiltCatalogReference(value string) error {
+	value = strings.TrimSpace(value)
+	prefix := strings.TrimSuffix(DockerSandboxesPrebuiltActReference, ":act-latest")
+	if strings.HasPrefix(value, prefix+":catalog-v1-pkg-") {
+		digest := strings.TrimPrefix(value, prefix+":catalog-v1-pkg-")
+		if err := validateSHA256Fingerprint("catalog digest", "sha256:"+digest); err == nil {
+			return nil
+		}
+	}
+	if strings.HasPrefix(value, prefix+"@") {
+		if err := validateSHA256Fingerprint("catalog digest", strings.TrimPrefix(value, prefix+"@")); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("must be an immutable official catalog-v1-pkg tag or repository@sha256 digest")
+}
+
+func validatePrebuiltEvidenceRef(value string) error {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "refs/heads/") || len(value) <= len("refs/heads/") || strings.ContainsAny(value, " \t\r\n~^:?*[\\") || strings.Contains(value, "..") || strings.HasSuffix(value, "/") {
+		return fmt.Errorf("must be an exact canonical refs/heads/<branch> value")
 	}
 	return nil
 }

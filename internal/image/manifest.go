@@ -26,7 +26,10 @@ type HostTrustMetadata struct {
 type PrebuiltManifestMetadata struct {
 	Reference             string `json:"reference"`
 	Pinned                bool   `json:"pinned,omitempty"`
+	Acceptance            bool   `json:"acceptance,omitempty"`
 	ConfiguredDigest      string `json:"configuredDigest,omitempty"`
+	CatalogReference      string `json:"catalogReference,omitempty"`
+	EvidenceRef           string `json:"evidenceRef,omitempty"`
 	PackageIndexDigest    string `json:"packageIndexDigest,omitempty"`
 	PackagePlatformDigest string `json:"packagePlatformDigest,omitempty"`
 	CatalogDigest         string `json:"catalogDigest,omitempty"`

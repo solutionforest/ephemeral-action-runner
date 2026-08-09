@@ -15,22 +15,63 @@ func TestWorkflowRepairsCatalogFirstPromotionBeforeNoop(t *testing.T) {
 	if immutableCatalogVerification < 0 || reconcile < 0 || noop < 0 || immutableCatalogVerification >= reconcile || reconcile >= noop {
 		t.Fatalf("immutable catalog verification and alias reconciliation must run before no-op evaluation: verify=%d reconcile=%d noop=%d", immutableCatalogVerification, reconcile, noop)
 	}
-	manualReconcile := strings.Index(workflow, "manual-alias-reconciliation.json")
-	manualCandidate := strings.Index(workflow, "'.entries[] | select(.packageIndexDigest == $digest and .status == \"candidate\")'")
-	if manualReconcile < 0 || manualCandidate < 0 || manualReconcile >= manualCandidate {
-		t.Fatalf("manual alias reconciliation must run before candidate promotion checks: reconcile=%d candidate=%d", manualReconcile, manualCandidate)
+	manualCatalog := strings.Index(workflow, `CANDIDATE_CATALOG_REFERENCE: ${{ inputs.candidate_catalog_reference }}`)
+	manualAcceptance := strings.Index(workflow, `epar-prebuilt-publisher accept --catalog "$catalog"`)
+	manualPromotion := strings.Index(workflow, `epar-prebuilt-publisher promote --protected`)
+	if manualCatalog < 0 || manualAcceptance < 0 || manualPromotion < 0 || manualCatalog >= manualAcceptance || manualAcceptance >= manualPromotion {
+		t.Fatalf("manual promotion must verify an exact candidate catalog and append acceptance before promotion: catalog=%d acceptance=%d promotion=%d", manualCatalog, manualAcceptance, manualPromotion)
 	}
 }
 
 func TestWorkflowForceCandidatePreservesVerifiedEvidence(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
-	verificationGate := `if [[ "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true || "$runtime_validated" != true || "$import_readback" != true ]]; then`
-	if !strings.Contains(workflow, verificationGate) {
-		t.Fatal("attestation verification gate unexpectedly changed")
+	for _, required := range []string{
+		`verify-package --reference "$PACKAGE_REF"`,
+		`--ref "$GITHUB_REF"`,
+		`jq '.gates.attestationVerified=true'`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("hosted package evidence verification changed: missing %q", required)
+		}
 	}
-	candidateGate := `if [[ "$FORCE_CANDIDATE" == true || "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true || "$runtime_validated" != true || "$import_readback" != true ]]; then`
+	candidateGate := `if [[ "$FORCE_CANDIDATE" == true || "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true ]]; then`
 	if !strings.Contains(workflow, candidateGate) {
 		t.Fatal("force_candidate no longer suppresses automatic alias advancement")
+	}
+}
+
+func TestWorkflowUsesHostedBuildsAndExternalEPARAcceptance(t *testing.T) {
+	workflow := readPublisherWorkflow(t)
+	for _, forbidden := range []string{"live-amd64:", "live-arm64:", "EPAR_PREBUILT_LIVE", "runs-on: [self-hosted, linux, epar-docker-sandboxes"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("publisher still depends on persistent native runner gate %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`runs-on: ${{ matrix.runner }}`,
+		`runner: ubuntu-latest`,
+		`runner: ubuntu-24.04-arm`,
+		`acceptance_evidence_json:`,
+		`playwright-docker.yml`,
+		`dockerhub-private-pull.yml`,
+		`runnerGroup:"epar-dev-test"`,
+		`catalog-v1 and the profile alias were not moved`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("publisher candidate acceptance contract is missing %q", required)
+		}
+	}
+}
+
+func TestWorkflowPublicationCannotMutateGitOrSourceReleaseState(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	if !strings.Contains(workflow, "permissions:\n  contents: read") {
+		t.Fatal("publisher no longer has read-only repository contents permission")
+	}
+	for _, forbidden := range []string{"git push", "git commit", "gh pr create", "gh release create", "gh api --method POST /repos/"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("package-only workflow contains forbidden source/release mutation %q", forbidden)
+		}
 	}
 }
 

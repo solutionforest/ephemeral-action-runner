@@ -91,6 +91,29 @@ func TestVerifyCatalogReferenceRejectsUnsignedExactCatalog(t *testing.T) {
 	}
 }
 
+func TestVerifyCatalogReferenceBootstrapsWithoutMovingCatalog(t *testing.T) {
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Entries: []Entry{validEntry(ProfileAct, "a", StatusCandidate)}}
+	canonicalDigest, err := catalog.CatalogDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := CatalogArtifact{Catalog: catalog, ManifestDigest: "sha256:" + strings.Repeat("b", 64), CanonicalDigest: canonicalDigest}
+	ref, err := CatalogReference(DefaultPackageRepository, canonicalDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := immutableOnlyCatalogRegistry{artifact: artifact}
+	resolver := CatalogResolver{Registry: registry, Evidence: fakeEvidenceVerifier{}, PackageRepository: DefaultPackageRepository, EvidencePolicy: EvidencePolicy{Issuer: GitHubActionsIssuer, Repository: "solutionforest/ephemeral-action-runner", Workflow: "docker-sandboxes-images.yml", Ref: "refs/heads/feature/prebuilt_img", AllowedEvents: []string{"push"}}}
+	verified, err := resolver.VerifyCatalogReference(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := verified.Artifact.Catalog.EffectiveStatus("sha256:" + strings.Repeat("a", 64))
+	if err != nil || status != StatusCandidate {
+		t.Fatalf("candidate bootstrap status = %q, %v", status, err)
+	}
+}
+
 func TestResolvePackageUsesExactDigestAfterAliasMove(t *testing.T) {
 	oldDigest := "sha256:" + strings.Repeat("a", 64)
 	newDigest := "sha256:" + strings.Repeat("b", 64)
@@ -202,6 +225,27 @@ func (f exactPackageEvidence) Verify(_ context.Context, subjectDigest string, _ 
 type fakeCatalogRegistry struct {
 	moving    CatalogArtifact
 	immutable CatalogArtifact
+}
+
+type immutableOnlyCatalogRegistry struct {
+	artifact CatalogArtifact
+}
+
+func (f immutableOnlyCatalogRegistry) Resolve(context.Context, string) (ResolvedReference, error) {
+	return ResolvedReference{}, errors.New("unexpected descriptor resolution")
+}
+
+func (f immutableOnlyCatalogRegistry) FetchCatalog(_ context.Context, reference string) (CatalogArtifact, error) {
+	if strings.HasSuffix(reference, ":"+CatalogMovingTag) {
+		return CatalogArtifact{}, errors.New("moving catalog does not exist")
+	}
+	artifact := f.artifact
+	artifact.Reference = reference
+	return artifact, nil
+}
+
+func (f immutableOnlyCatalogRegistry) Referrers(context.Context, string) ([]RegistryReferrer, error) {
+	return []RegistryReferrer{{Descriptor: RegistryDescriptor{Digest: "sha256:" + strings.Repeat("c", 64)}, Payload: []byte("verified")}}, nil
 }
 
 func (f fakeCatalogRegistry) Resolve(context.Context, string) (ResolvedReference, error) {

@@ -41,6 +41,16 @@ on:
         required: false
         type: string
         default: ''
+      candidate_catalog_reference:
+        description: 'Exact immutable signed candidate catalog reference used for protected promotion.'
+        required: false
+        type: string
+        default: ''
+      acceptance_evidence_json:
+        description: 'Reviewed JSON containing four run IDs, two receipt SHA-256 values, and exact amd64/arm64 runner names.'
+        required: false
+        type: string
+        default: ''
       promotion_confirmation:
         description: 'Type PROMOTE exactly when promoting the supplied candidate digest.'
         required: false
@@ -253,7 +263,7 @@ jobs:
             "packageRepository": "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template",
             "policies": {
               "act": {"enabled": true, "wizardDefault": false, "autoAdvance": true},
-              "full": {"enabled": false, "wizardDefault": false, "autoAdvance": false, "reason": "Full remains gated until independent live validation passes"}
+              "full": {"enabled": false, "wizardDefault": false, "autoAdvance": false, "reason": "Full remains gated until independent two-platform EPAR acceptance passes"}
             },
             "entries": [],
             "aliases": {},
@@ -336,7 +346,7 @@ jobs:
     name: Build immutable ${{ matrix.platform }} package layer
     needs: resolve
     if: needs.resolve.outputs.noop != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -344,11 +354,13 @@ jobs:
         include:
           - platform: linux/amd64
             slug: amd64
+            runner: ubuntu-latest
             source_digest: ${{ needs.resolve.outputs.source_amd64_digest }}
             runner_url: ${{ needs.resolve.outputs.runner_amd64_url }}
             runner_digest: ${{ needs.resolve.outputs.runner_amd64_digest }}
           - platform: linux/arm64
             slug: arm64
+            runner: ubuntu-24.04-arm
             source_digest: ${{ needs.resolve.outputs.source_arm64_digest }}
             runner_url: ${{ needs.resolve.outputs.runner_arm64_url }}
             runner_digest: ${{ needs.resolve.outputs.runner_arm64_digest }}
@@ -579,6 +591,26 @@ jobs:
             echo "source_rechecked=$source_rechecked"
             echo "source_observed_digest=$current_source_digest"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Run hosted two-platform template smoke checks
+        shell: bash
+        env:
+          PACKAGE_REF: ${{ steps.index.outputs.package_ref }}
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            docker pull --platform "$platform" "$PACKAGE_REF" >/dev/null
+            docker run --rm --platform "$platform" --entrypoint /bin/bash "$PACKAGE_REF" -lc '
+              set -euo pipefail
+              test -x /opt/actions-runner/bin/Runner.Listener
+              test -x /usr/local/bin/tini
+              test -x /opt/epar/verify-template.sh
+              /opt/actions-runner/bin/Runner.Listener --version >/dev/null
+              /usr/local/bin/tini --version 2>&1 | grep -qi tini
+              docker --version >/dev/null
+              dockerd --version >/dev/null
+            '
+          done
 
       - name: Prepare EPAR SLSA predicate and SPDX SBOM
         id: evidence
@@ -828,150 +860,16 @@ jobs:
             echo "- Profile: \\`${{ needs.resolve.outputs.profile }}\\`"
             echo "- Package: \\`${PACKAGE_REF}\\`"
             echo "- Index digest: \\`${INDEX_DIGEST}\\`"
-            echo '- Candidate assembly, immutable package tagging, and OCI evidence completed; live Sandbox gates are evaluated only on controlled self-hosted runners.'
+            echo '- Candidate assembly, immutable package tagging, hosted two-platform smoke checks, and OCI evidence completed; real Sandbox acceptance is performed later through temporary EPAR pools.'
             echo '- This workflow has contents:read and does not commit, tag, release, open a pull request, or push Git refs.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  live-amd64:
-    name: Controlled Docker Sandbox live gate (amd64)
-    needs: publish
-    if: needs.publish.result == 'success' && vars.EPAR_PREBUILT_LIVE == 'true'
-    runs-on: [self-hosted, linux, epar-docker-sandboxes, amd64]
-    continue-on-error: true
-    timeout-minutes: 45
-    steps:
-      - name: Check out source for template verifier
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Run native runtime and Sandbox import/readback gates
-        shell: bash
-        env:
-          PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
-          INDEX_DIGEST: ${{ needs.publish.outputs.index_digest }}
-          PROFILE: ${{ needs.publish.outputs.profile }}
-          LIVE_STAGING_ROOT: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT }}
-          LIVE_REGISTRY_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE }}
-          LIVE_HTPASSWD_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE }}
-        run: |
-          set -euo pipefail
-          platform_tag="epar-prebuilt-live:${PROFILE}-amd64-${INDEX_DIGEST#sha256:}"
-          cleanup() { sbx template rm "$platform_tag" >/dev/null 2>&1 || true; docker image rm -f "$platform_tag" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"; }
-          trap cleanup EXIT
-          docker pull --platform linux/amd64 "$PACKAGE_REF" >/dev/null
-          docker tag "$PACKAGE_REF" "$platform_tag"
-          config_digest="$(docker image inspect "$platform_tag" --format '{{.Id}}' | sed -n '1p')"
-          [[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          cache_id="${config_digest#sha256:}"
-          cache_id="${cache_id:0:12}"
-          docker save "$platform_tag" -o "$RUNNER_TEMP/epar-sandbox-template.tar"
-          sbx template load "$RUNNER_TEMP/epar-sandbox-template.tar"
-          sbx template ls --json > "$RUNNER_TEMP/sbx-template-readback.json"
-          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' --arg cache "$cache_id" '[.images[] | select(.repository == $repository and .tag == $tag and .id == $cache)] | length == 1' "$RUNNER_TEMP/sbx-template-readback.json" >/dev/null
-          [[ -n "$LIVE_STAGING_ROOT" && -n "$LIVE_REGISTRY_IMAGE" && -n "$LIVE_HTPASSWD_IMAGE" ]]
-          export EPAR_LIVE_DOCKER_SANDBOXES=1
-          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE="$platform_tag"
-          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE_DIGEST="$config_digest"
-          export EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT="$LIVE_STAGING_ROOT"
-          export EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE="$LIVE_REGISTRY_IMAGE"
-          export EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE="$LIVE_HTPASSWD_IMAGE"
-          go test ./internal/provider/dockersandboxes -run '^TestLiveRunnerTemplateIsolation$' -count=1 -timeout=30m
-          sbx template rm "$platform_tag"
-          sbx template ls --json > "$RUNNER_TEMP/sbx-template-after.json"
-          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' '[.images[] | select(.repository == $repository and .tag == $tag)] | length == 0' "$RUNNER_TEMP/sbx-template-after.json" >/dev/null
-          docker image rm -f "$platform_tag" >/dev/null
-          rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"
-          trap - EXIT
-          jq -n --arg platform linux/amd64 --arg digest "$INDEX_DIGEST" --arg imageDigest "$config_digest" --arg cache "$cache_id" --arg reference "$platform_tag" '{platform:$platform,indexDigest:$digest,configDigest:$imageDigest,cacheID:$cache,reference:$reference,runtimeValidated:true,importReadback:true,cleanupVerified:true}' > "$RUNNER_TEMP/live-receipt.json"
-
-      - name: Upload amd64 live receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: epar-prebuilt-live-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/live-receipt.json
-          if-no-files-found: error
-          retention-days: 14
-
-  live-arm64:
-    name: Controlled Docker Sandbox live gate (arm64)
-    needs: publish
-    if: needs.publish.result == 'success' && vars.EPAR_PREBUILT_LIVE == 'true'
-    runs-on: [self-hosted, linux, epar-docker-sandboxes, arm64]
-    continue-on-error: true
-    timeout-minutes: 45
-    steps:
-      - name: Check out source for template verifier
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Run native runtime and Sandbox import/readback gates
-        shell: bash
-        env:
-          PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
-          INDEX_DIGEST: ${{ needs.publish.outputs.index_digest }}
-          PROFILE: ${{ needs.publish.outputs.profile }}
-          LIVE_STAGING_ROOT: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT }}
-          LIVE_REGISTRY_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE }}
-          LIVE_HTPASSWD_IMAGE: ${{ vars.EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE }}
-        run: |
-          set -euo pipefail
-          platform_tag="epar-prebuilt-live:${PROFILE}-arm64-${INDEX_DIGEST#sha256:}"
-          cleanup() { sbx template rm "$platform_tag" >/dev/null 2>&1 || true; docker image rm -f "$platform_tag" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"; }
-          trap cleanup EXIT
-          docker pull --platform linux/arm64 "$PACKAGE_REF" >/dev/null
-          docker tag "$PACKAGE_REF" "$platform_tag"
-          config_digest="$(docker image inspect "$platform_tag" --format '{{.Id}}' | sed -n '1p')"
-          [[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          cache_id="${config_digest#sha256:}"
-          cache_id="${cache_id:0:12}"
-          docker save "$platform_tag" -o "$RUNNER_TEMP/epar-sandbox-template.tar"
-          sbx template load "$RUNNER_TEMP/epar-sandbox-template.tar"
-          sbx template ls --json > "$RUNNER_TEMP/sbx-template-readback.json"
-          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' --arg cache "$cache_id" '[.images[] | select(.repository == $repository and .tag == $tag and .id == $cache)] | length == 1' "$RUNNER_TEMP/sbx-template-readback.json" >/dev/null
-          [[ -n "$LIVE_STAGING_ROOT" && -n "$LIVE_REGISTRY_IMAGE" && -n "$LIVE_HTPASSWD_IMAGE" ]]
-          export EPAR_LIVE_DOCKER_SANDBOXES=1
-          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE="$platform_tag"
-          export EPAR_LIVE_DOCKER_SANDBOXES_TEMPLATE_DIGEST="$config_digest"
-          export EPAR_LIVE_DOCKER_SANDBOXES_STAGING_ROOT="$LIVE_STAGING_ROOT"
-          export EPAR_LIVE_DOCKER_SANDBOXES_REGISTRY_IMAGE="$LIVE_REGISTRY_IMAGE"
-          export EPAR_LIVE_DOCKER_SANDBOXES_HTPASSWD_IMAGE="$LIVE_HTPASSWD_IMAGE"
-          go test ./internal/provider/dockersandboxes -run '^TestLiveRunnerTemplateIsolation$' -count=1 -timeout=30m
-          sbx template rm "$platform_tag"
-          sbx template ls --json > "$RUNNER_TEMP/sbx-template-after.json"
-          jq -e --arg tag "${platform_tag#*:}" --arg repository 'docker.io/library/epar-prebuilt-live' '[.images[] | select(.repository == $repository and .tag == $tag)] | length == 0' "$RUNNER_TEMP/sbx-template-after.json" >/dev/null
-          docker image rm -f "$platform_tag" >/dev/null
-          rm -f "$RUNNER_TEMP/epar-sandbox-template.tar"
-          trap - EXIT
-          jq -n --arg platform linux/arm64 --arg digest "$INDEX_DIGEST" --arg imageDigest "$config_digest" --arg cache "$cache_id" --arg reference "$platform_tag" '{platform:$platform,indexDigest:$digest,configDigest:$imageDigest,cacheID:$cache,reference:$reference,runtimeValidated:true,importReadback:true,cleanupVerified:true}' > "$RUNNER_TEMP/live-receipt.json"
-
-      - name: Upload arm64 live receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: epar-prebuilt-live-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/live-receipt.json
-          if-no-files-found: error
-          retention-days: 14
-
   promote:
-    name: Verify gates, sign catalog, and move protected aliases
+    name: Publish signed candidate catalog and move only authorized aliases
     needs:
       - resolve
       - publish
-      - live-amd64
-      - live-arm64
-    if: always() && github.ref == 'refs/heads/main' && needs.resolve.outputs.noop != 'true' && needs.publish.result == 'success'
+    if: always() && needs.resolve.outputs.noop != 'true' && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -996,14 +894,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Download catalog, publication input, and live receipts
+      - name: Download catalog and publication input
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           pattern: epar-prebuilt-*
           path: ${{ runner.temp }}/epar-promotion-artifacts
           merge-multiple: false
 
-      - name: Merge live receipts and plan immutable catalog publication
+      - name: Verify hosted package evidence and plan immutable catalog publication
         id: plan
         shell: bash
         env:
@@ -1018,32 +916,16 @@ jobs:
           input="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*epar-prebuilt-publication*' -name publication-input.json -print -quit)"
           [[ -f "$catalog" && -f "$input" ]]
           mkdir -p "$RUNNER_TEMP/epar-promotion"
-          amd64_receipt="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*live-amd64*' -name live-receipt.json -print -quit || true)"
-          arm64_receipt="$(find "$RUNNER_TEMP/epar-promotion-artifacts" -path '*live-arm64*' -name live-receipt.json -print -quit || true)"
-          runtime_validated=false
-          import_readback=false
-          if [[ -f "$amd64_receipt" && -f "$arm64_receipt" ]]; then
-            jq -e --arg digest "${{ needs.publish.outputs.index_digest }}" '.["indexDigest"] == $digest and .runtimeValidated == true and .importReadback == true and .cleanupVerified == true' "$amd64_receipt" >/dev/null
-            jq -e --arg digest "${{ needs.publish.outputs.index_digest }}" '.["indexDigest"] == $digest and .runtimeValidated == true and .importReadback == true and .cleanupVerified == true' "$arm64_receipt" >/dev/null
-            runtime_validated=true
-            import_readback=true
-          fi
-          jq --arg runtime "$runtime_validated" --arg import "$import_readback" --arg validated "$runtime_validated" \
-            '.gates.runtimeValidated=($runtime == "true") | .gates.importReadback=($import == "true") | .gates.platformsValidated=($validated == "true") | .packagePlatforms |= map(.validated=($validated == "true"))' "$input" > "$input.tmp"
+          jq '.gates.platformsValidated=true | .packagePlatforms |= map(.validated=true)' "$input" > "$input.tmp"
           mv "$input.tmp" "$input"
-          if [[ "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true || "$runtime_validated" != true || "$import_readback" != true ]]; then
-            jq '.gates.attestationVerified=false' "$input" > "$input.tmp"
-            mv "$input.tmp" "$input"
-          else
-            go run ./cmd/epar-prebuilt-publisher plan --catalog "$catalog" --input "$input" --output "$RUNNER_TEMP/epar-promotion/pre-plan.json"
-            jq '.entry' "$RUNNER_TEMP/epar-promotion/pre-plan.json" > "$RUNNER_TEMP/epar-promotion/package-entry.json"
-            go run ./cmd/epar-prebuilt-publisher verify-package --reference "$PACKAGE_REF" --entry "$RUNNER_TEMP/epar-promotion/package-entry.json" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
-            jq '.gates.attestationVerified=true' "$input" > "$input.tmp"
-            mv "$input.tmp" "$input"
-          fi
+          go run ./cmd/epar-prebuilt-publisher plan --catalog "$catalog" --input "$input" --output "$RUNNER_TEMP/epar-promotion/pre-plan.json"
+          jq '.entry' "$RUNNER_TEMP/epar-promotion/pre-plan.json" > "$RUNNER_TEMP/epar-promotion/package-entry.json"
+          go run ./cmd/epar-prebuilt-publisher verify-package --reference "$PACKAGE_REF" --entry "$RUNNER_TEMP/epar-promotion/package-entry.json" --repository "$PACKAGE_REPOSITORY" --ref "$GITHUB_REF" --allowed-events schedule,workflow_dispatch,push
+          jq '.gates.attestationVerified=true' "$input" > "$input.tmp"
+          mv "$input.tmp" "$input"
           go run ./cmd/epar-prebuilt-publisher plan --catalog "$catalog" --input "$input" --output "$RUNNER_TEMP/epar-promotion/plan.json"
-          if [[ "$FORCE_CANDIDATE" == true || "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true || "$runtime_validated" != true || "$import_readback" != true ]]; then
-            jq '.action="candidate" | .reason="protected live or branch gate is incomplete; candidate retained"' "$RUNNER_TEMP/epar-promotion/plan.json" > "$RUNNER_TEMP/epar-promotion/plan.tmp"
+          if [[ "$FORCE_CANDIDATE" == true || "$ALLOW_ALIAS" != true || "$SOURCE_RECHECKED" != true ]]; then
+            jq '.action="candidate" | .reason="protected acceptance or trusted-main gate is incomplete; candidate retained"' "$RUNNER_TEMP/epar-promotion/plan.json" > "$RUNNER_TEMP/epar-promotion/plan.tmp"
             mv "$RUNNER_TEMP/epar-promotion/plan.tmp" "$RUNNER_TEMP/epar-promotion/plan.json"
           fi
           echo "catalog=$catalog" >> "$GITHUB_OUTPUT"
@@ -1113,7 +995,7 @@ jobs:
           set -euo pipefail
           oras discover "${PACKAGE_REPOSITORY}@${CATALOG_MANIFEST}" --format json > "$RUNNER_TEMP/epar-promotion/catalog-referrers.json"
           jq -e '.referrers | type == "array"' "$RUNNER_TEMP/epar-promotion/catalog-referrers.json" >/dev/null
-          if go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$IMMUTABLE_REF" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null; then
+          if go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$IMMUTABLE_REF" --ref "$GITHUB_REF" --allowed-events schedule,workflow_dispatch,push >/dev/null; then
             echo 'signed=true' >> "$GITHUB_OUTPUT"
           else
             echo 'signed=false' >> "$GITHUB_OUTPUT"
@@ -1143,7 +1025,7 @@ jobs:
           set -euo pipefail
           immutable_catalog_ref="${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}"
           [[ "$(oras resolve "$immutable_catalog_ref")" == "$CATALOG_MANIFEST" ]]
-          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile "$PROFILE" --reference "$immutable_catalog_ref" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile "$PROFILE" --reference "$immutable_catalog_ref" --ref "$GITHUB_REF" --allowed-events schedule,workflow_dispatch,push >/dev/null
           catalog_moving="${PACKAGE_REPOSITORY}:catalog-v1"
           catalog_pointer_error="$RUNNER_TEMP/epar-promotion/catalog-pointer-resolve.error"
           old_catalog_digest=''
@@ -1198,11 +1080,11 @@ jobs:
             fi
             exit "$rc"
           }
-          trap rollback_pointers EXIT
-          oras tag "${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}" catalog-v1
-          catalog_moved=true
-          [[ "$(oras resolve "$catalog_moving")" == "$CATALOG_MANIFEST" ]]
           if [[ "$move_alias" == true ]]; then
+            trap rollback_pointers EXIT
+            oras tag "${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}" catalog-v1
+            catalog_moved=true
+            [[ "$(oras resolve "$catalog_moving")" == "$CATALOG_MANIFEST" ]]
             alias_cas_error="$RUNNER_TEMP/epar-promotion/alias-cas-resolve.error"
             if actual_alias_digest="$(oras resolve "$alias_ref" 2>"$alias_cas_error")"; then
               [[ -z "$expected_alias" || "$actual_alias_digest" == "$expected_alias" ]]
@@ -1216,9 +1098,12 @@ jobs:
             oras tag "$PACKAGE_REF" "${PROFILE}-latest"
             alias_moved=true
             [[ "$(oras resolve "$alias_ref")" == "${PACKAGE_REF##*@}" ]]
+            trap - EXIT
+            echo 'Signed catalog was moved before the authorized source-only profile alias; pointer rollback was armed until both readbacks passed.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Signed immutable candidate catalog: ${immutable_catalog_ref}" >> "$GITHUB_STEP_SUMMARY"
+            echo 'catalog-v1 and the profile alias were not moved; protected EPAR acceptance remains required.' >> "$GITHUB_STEP_SUMMARY"
           fi
-          trap - EXIT
-          echo 'Signed catalog was verified before catalog-v1 and any protected profile alias movement; pointer rollback is armed until both readbacks pass.' >> "$GITHUB_STEP_SUMMARY"
 
   manual-promote:
     name: Manually promote one verified candidate digest
@@ -1248,49 +1133,73 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Verify exact candidate input and signed current catalog
+      - name: Verify exact candidate catalog and record human-reviewed acceptance
         id: verify
         shell: bash
         env:
           CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          CANDIDATE_CATALOG_REFERENCE: ${{ inputs.candidate_catalog_reference }}
+          ACCEPTANCE_EVIDENCE_JSON: ${{ inputs.acceptance_evidence_json }}
           PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
         run: |
           set -euo pipefail
           [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          current_catalog_manifest="$(oras resolve "${PACKAGE_REPOSITORY}:catalog-v1")"
-          [[ "$current_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${current_catalog_manifest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          [[ "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}:catalog-v1-pkg-"* || "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
+          evidence_input="$RUNNER_TEMP/manual-acceptance-input.json"
+          printf '%s' "$ACCEPTANCE_EVIDENCE_JSON" > "$evidence_input"
+          jq -e 'type == "object" and (keys | sort) == ["amd64DockerHubRunId","amd64PlaywrightRunId","amd64ReceiptSha256","amd64RunnerName","arm64DockerHubRunId","arm64PlaywrightRunId","arm64ReceiptSha256","arm64RunnerName"]' "$evidence_input" >/dev/null
+          AMD64_PLAYWRIGHT_RUN_ID="$(jq -er '.amd64PlaywrightRunId | tostring' "$evidence_input")"
+          AMD64_DOCKERHUB_RUN_ID="$(jq -er '.amd64DockerHubRunId | tostring' "$evidence_input")"
+          ARM64_PLAYWRIGHT_RUN_ID="$(jq -er '.arm64PlaywrightRunId | tostring' "$evidence_input")"
+          ARM64_DOCKERHUB_RUN_ID="$(jq -er '.arm64DockerHubRunId | tostring' "$evidence_input")"
+          AMD64_RECEIPT_SHA256="$(jq -er '.amd64ReceiptSha256' "$evidence_input")"
+          ARM64_RECEIPT_SHA256="$(jq -er '.arm64ReceiptSha256' "$evidence_input")"
+          AMD64_RUNNER_NAME="$(jq -er '.amd64RunnerName' "$evidence_input")"
+          ARM64_RUNNER_NAME="$(jq -er '.arm64RunnerName' "$evidence_input")"
+          for run_id in "$AMD64_PLAYWRIGHT_RUN_ID" "$AMD64_DOCKERHUB_RUN_ID" "$ARM64_PLAYWRIGHT_RUN_ID" "$ARM64_DOCKERHUB_RUN_ID"; do
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$AMD64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ARM64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ -n "$AMD64_RUNNER_NAME" && -n "$ARM64_RUNNER_NAME" ]]
+          candidate_catalog_manifest="$(oras resolve "$CANDIDATE_CATALOG_REFERENCE")"
+          [[ "$candidate_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$CANDIDATE_CATALOG_REFERENCE" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
           pull_dir="$RUNNER_TEMP/manual-catalog"
           mkdir -p "$pull_dir"
-          oras pull "${PACKAGE_REPOSITORY}:catalog-v1" --output "$pull_dir" >/dev/null
+          oras pull "$CANDIDATE_CATALOG_REFERENCE" --output "$pull_dir" >/dev/null
           catalog="$(find "$pull_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
           [[ -f "$catalog" ]]
-          alias_ref="${PACKAGE_REPOSITORY}:act-latest"
-          observed_alias=''
-          alias_reconcile_error="$RUNNER_TEMP/manual-alias-reconcile.error"
-          if observed_alias="$(oras resolve "$alias_ref" 2>"$alias_reconcile_error")"; then
-            [[ "$observed_alias" =~ ^sha256:[0-9a-f]{64}$ ]]
-          elif ! grep -Eqi 'manifest unknown|not found|404' "$alias_reconcile_error"; then
-            cat "$alias_reconcile_error" >&2
-            exit 1
-          fi
-          reconcile_plan="$RUNNER_TEMP/manual-alias-reconciliation.json"
-          go run ./cmd/epar-prebuilt-publisher reconcile-alias --catalog "$catalog" --profile act --observed-digest "$observed_alias" --output "$reconcile_plan"
-          if [[ "$(jq -r '.needsRepair' "$reconcile_plan")" == true ]]; then
-            repair_target="$(jq -er '.targetDigest' "$reconcile_plan")"
-            [[ "$(oras resolve "${PACKAGE_REPOSITORY}@${repair_target}")" == "$repair_target" ]]
-            oras tag "${PACKAGE_REPOSITORY}@${repair_target}" act-latest
-            [[ "$(oras resolve "$alias_ref")" == "$repair_target" ]]
-            echo "Recovered interrupted Act alias promotion to ${repair_target}." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")' "$catalog" > "$RUNNER_TEMP/manual-entry.json"
-          jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and ([.gates | to_entries[] | select(.value != true)] | length == 0) and (.platforms | length == 2)' "$RUNNER_TEMP/manual-entry.json" >/dev/null
+          jq -e --arg digest "$CANDIDATE_DIGEST" '([.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")] | length) == 1 and ([.transitions[]? | select(.packageIndexDigest == $digest)] | length) == 0' "$catalog" >/dev/null
+          jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest)' "$catalog" > "$RUNNER_TEMP/manual-entry.json"
+          jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and (.platforms | length == 2) and ([.platforms[] | select(.validated != true)] | length == 0)' "$RUNNER_TEMP/manual-entry.json" >/dev/null
           go run ./cmd/epar-prebuilt-publisher verify-package --reference "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --entry "$RUNNER_TEMP/manual-entry.json" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
           source_reference="$(jq -er '.source.reference' "$RUNNER_TEMP/manual-entry.json")"
           source_digest="$(jq -er '.source.indexDigest' "$RUNNER_TEMP/manual-entry.json")"
           [[ "$(oras resolve "$source_reference")" == "$source_digest" ]]
+          digest_prefix="${CANDIDATE_DIGEST#sha256:}"
+          digest_prefix="${digest_prefix:0:12}"
+          accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --arg digest "$CANDIDATE_DIGEST" --arg acceptedAt "$accepted_at" --arg reviewer "$GITHUB_ACTOR" \
+            --arg amd64Receipt "$AMD64_RECEIPT_SHA256" --arg arm64Receipt "$ARM64_RECEIPT_SHA256" \
+            --arg amd64Runner "$AMD64_RUNNER_NAME" --arg arm64Runner "$ARM64_RUNNER_NAME" \
+            --arg amd64Label "epar-prebuilt-act-${digest_prefix}-amd64" --arg arm64Label "epar-prebuilt-act-${digest_prefix}-arm64" \
+            --argjson amd64Playwright "$AMD64_PLAYWRIGHT_RUN_ID" --argjson amd64DockerHub "$AMD64_DOCKERHUB_RUN_ID" \
+            --argjson arm64Playwright "$ARM64_PLAYWRIGHT_RUN_ID" --argjson arm64DockerHub "$ARM64_DOCKERHUB_RUN_ID" \
+            '[
+              {schemaVersion:1,packageIndexDigest:$digest,platform:"linux/amd64",runnerGroup:"epar-dev-test",runnerLabel:$amd64Label,runnerName:$amd64Runner,receiptSha256:$amd64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$amd64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64Playwright|tostring)),conclusion:"success"},
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$amd64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64DockerHub|tostring)),conclusion:"success"}
+              ]},
+              {schemaVersion:1,packageIndexDigest:$digest,platform:"linux/arm64",runnerGroup:"epar-dev-test",runnerLabel:$arm64Label,runnerName:$arm64Runner,receiptSha256:$arm64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$arm64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64Playwright|tostring)),conclusion:"success"},
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$arm64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64DockerHub|tostring)),conclusion:"success"}
+              ]}
+            ]' > "$RUNNER_TEMP/manual-acceptance.json"
+          go run ./cmd/epar-prebuilt-publisher accept --catalog "$catalog" --input "$RUNNER_TEMP/manual-acceptance.json"
           alias_digest="$(jq -r '.aliases.act.packageIndexDigest // empty' "$catalog")"
-          jq -n --slurpfile entry "$RUNNER_TEMP/manual-entry.json" --arg source "$source_digest" --arg sourceReference "$source_reference" --arg alias "$alias_digest" '{action:"candidate",reason:"explicit protected manual candidate promotion",expectedSourceDigest:$source,expectedAliasDigest:$alias,sourceReference:$sourceReference,entry:$entry[0]}' > "$RUNNER_TEMP/manual-plan.json"
+          jq -n --slurpfile entry "$RUNNER_TEMP/manual-entry.json" --arg source "$source_digest" --arg sourceReference "$source_reference" --arg alias "$alias_digest" '{action:"candidate",reason:"protected human-reviewed two-platform EPAR acceptance",expectedSourceDigest:$source,expectedAliasDigest:$alias,sourceReference:$sourceReference,entry:$entry[0]}' > "$RUNNER_TEMP/manual-plan.json"
           echo "catalog=$catalog" >> "$GITHUB_OUTPUT"
           echo "plan=$RUNNER_TEMP/manual-plan.json" >> "$GITHUB_OUTPUT"
 
