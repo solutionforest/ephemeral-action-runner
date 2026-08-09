@@ -282,8 +282,20 @@ func entryFromInput(input PublicationInput, profile string, source ResolvedRefer
 		input.PublishedAt = publishedAt
 	}
 	sourceDescriptor := SourceDescriptor{Repository: source.Repository, SourceTag: input.SourceTag, Reference: source.Repository + "@" + source.Digest, IndexDigest: source.Digest, PlatformDigests: map[string]string{}}
+	resolvedPlatforms := make(map[string]PlatformDescriptor, len(source.Platforms))
 	for platform, descriptor := range source.Platforms {
-		sourceDescriptor.PlatformDigests[NormalizePlatform(platform)] = descriptor.Digest
+		resolvedPlatforms[NormalizePlatform(platform)] = descriptor
+	}
+	for _, publication := range input.PackagePlatforms {
+		platform := NormalizePlatform(publication.Platform)
+		descriptor, ok := resolvedPlatforms[platform]
+		if !ok {
+			return Entry{}, fmt.Errorf("source descriptor is missing published platform %s", platform)
+		}
+		if !strings.EqualFold(descriptor.Digest, publication.SourceManifestDigest) {
+			return Entry{}, fmt.Errorf("published platform %s source digest does not match resolved source", platform)
+		}
+		sourceDescriptor.PlatformDigests[platform] = descriptor.Digest
 	}
 	entry := Entry{
 		SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, Profile: profile, Channel: input.Channel, Status: StatusCandidate,

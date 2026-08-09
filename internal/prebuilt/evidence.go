@@ -22,6 +22,7 @@ const (
 	SLSAProvenanceV02   = "https://slsa.dev/provenance/v0.2"
 	SLSAProvenanceV1    = "https://slsa.dev/provenance/v1"
 	SPDXPredicate       = "https://spdx.dev/Document"
+	SPDXPredicateV23    = "https://spdx.dev/Document/v2.3"
 )
 
 var commitPattern = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
@@ -272,6 +273,7 @@ func (v *SigstoreEvidenceVerifier) Verify(ctx context.Context, subjectDigest str
 			result.Provenance = entry
 			result.Claims.SourceIndexDigest = claims.SourceIndexDigest
 			result.Claims.RecipeDigest = claims.RecipeDigest
+			result.Claims.RecipeRevision = claims.RecipeRevision
 			result.Claims.RuntimeContract = claims.RuntimeContract
 			result.Claims.TemplateSchema = claims.TemplateSchema
 			result.Claims.RunnerVersion = claims.RunnerVersion
@@ -280,7 +282,7 @@ func (v *SigstoreEvidenceVerifier) Verify(ctx context.Context, subjectDigest str
 			result.Claims.PlatformPackageDigests = claims.PlatformPackageDigests
 			result.Claims.SourcePlatformDigests = claims.SourcePlatformDigests
 			result.Claims.ResolvedDependencyDigests = claims.ResolvedDependencyDigests
-		case SPDXPredicate:
+		case SPDXPredicate, SPDXPredicateV23:
 			namespace, checksums, err := parseSPDXClaims(verification.Statement.Predicate)
 			if err != nil {
 				return EvidenceResult{}, fmt.Errorf("parse SPDX predicate %s: %w", referrer.Descriptor.Digest, err)

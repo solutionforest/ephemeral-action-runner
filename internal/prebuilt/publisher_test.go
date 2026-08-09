@@ -216,6 +216,9 @@ func TestPublisherRejectsRebuildWithSameCompleteTuple(t *testing.T) {
 	}
 	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: oldDigest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
 	input := publicationInput(newDigest)
+	for index := range input.PackagePlatforms {
+		input.PackagePlatforms[index].SourceManifestDigest = oldDigest
+	}
 	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(oldDigest)}}
 	if _, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input); err == nil || !strings.Contains(err.Error(), "complete source and EPAR tuple") {
 		t.Fatalf("same-tuple rebuild error = %v", err)
@@ -396,4 +399,22 @@ func sourceObservation(digest string) ResolvedReference {
 		"linux/amd64": {Platform: "linux/amd64", Digest: digest},
 		"linux/arm64": {Platform: "linux/arm64", Digest: digest},
 	}}
+}
+
+func TestPublisherCatalogsOnlyPublishedSourcePlatforms(t *testing.T) {
+	t.Parallel()
+	digest := "sha256:" + strings.Repeat("a", 64)
+	source := sourceObservation(digest)
+	source.Platforms["linux/arm/v7"] = PlatformDescriptor{Platform: "linux/arm/v7", Digest: "sha256:" + strings.Repeat("b", 64)}
+	publisher := Publisher{Resolver: &sequenceResolver{observations: []ResolvedReference{source}}, Now: func() time.Time { return time.Unix(2, 0) }}
+	plan, err := publisher.Plan(context.Background(), Catalog{}, publicationInput(digest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Entry.Source.PlatformDigests) != 2 {
+		t.Fatalf("source platform digests = %#v, want only published amd64 and arm64", plan.Entry.Source.PlatformDigests)
+	}
+	if _, ok := plan.Entry.Source.PlatformDigests["linux/arm/v7"]; ok {
+		t.Fatal("unpublished upstream linux/arm/v7 descriptor leaked into catalog identity")
+	}
 }
