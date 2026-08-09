@@ -77,6 +77,14 @@ func TestWorkflowPublicationCannotMutateGitOrSourceReleaseState(t *testing.T) {
 	}
 }
 
+func TestWorkflowAllowsAbsoluteCatalogPathsForORASPush(t *testing.T) {
+	workflow := readPublisherWorkflow(t)
+	const push = `oras push --disable-path-validation "$immutable_ref"`
+	if got := strings.Count(workflow, push); got != 2 {
+		t.Fatalf("automatic and manual catalog publication must allow their absolute runner-temp paths: got %d guarded pushes", got)
+	}
+}
+
 func TestWorkflowRecordsRunnablePlatformManifestFromAttestedCandidateIndex(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{

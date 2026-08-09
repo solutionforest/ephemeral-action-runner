@@ -979,7 +979,7 @@ jobs:
             fi
             config_file="$RUNNER_TEMP/epar-promotion/catalog-config.json"
             printf '%s\n' '{}' > "$config_file"
-            oras push "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
+            oras push --disable-path-validation "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
             existing_manifest="$(oras resolve "$immutable_ref")"
           fi
           [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -1245,7 +1245,7 @@ jobs:
               cat "$catalog_tag_error" >&2
               exit 1
             fi
-            oras push "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
+            oras push --disable-path-validation "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
             existing_manifest="$(oras resolve "$immutable_ref")"
           fi
           [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
