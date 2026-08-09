@@ -382,7 +382,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p templates/docker-sandboxes/inputs/emulation-licenses
-          curl --fail --silent --show-error --retry 4 --retry-delay 2 "$RUNNER_URL" -o templates/docker-sandboxes/inputs/actions-runner.tar.gz
+          curl --fail --location --proto '=https' --proto-redir '=https' --silent --show-error --retry 4 --retry-delay 2 "$RUNNER_URL" -o templates/docker-sandboxes/inputs/actions-runner.tar.gz
           echo "${RUNNER_DIGEST#sha256:}  templates/docker-sandboxes/inputs/actions-runner.tar.gz" | sha256sum --check -
           tini_url="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.url' templates/docker-sandboxes/sources.lock.json)"
           tini_digest="$(jq -er --arg platform "$PLATFORM" '.platforms[$platform].tini.sha256' templates/docker-sandboxes/sources.lock.json)"
