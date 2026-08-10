@@ -196,6 +196,13 @@ EPAR_HOST_TRUST_HELPER="$helper"
 # shellcheck disable=SC1091
 . "$project_root/scripts/host-trust/wrapper-lib.sh"
 
+missing_ready_config="$temporary/missing-ready-config.yml"
+cp "$config" "$missing_ready_config"
+if "$helper" watch --project-root "$project_root" --config "$missing_ready_config" --ready-from-current >/dev/null 2>&1; then
+  echo "watcher accepted a missing preflight feed" >&2
+  exit 1
+fi
+
 diagnostic_current="$($helper sync --project-root "$project_root" --config "$config")"
 diagnostic_feed_dir="$temporary/diagnostic-feed"
 mkdir -p "$diagnostic_feed_dir" "${diagnostic_feed_dir}.lock"
@@ -270,7 +277,7 @@ if "$helper" sync --project-root "$project_root" --config "$config" >/dev/null 2
   echo "second controller unexpectedly acquired the live wrapper lock" >&2
   exit 1
 fi
-refresh_deadline=$((SECONDS + 15))
+refresh_deadline=$((SECONDS + 30))
 refreshed_published_at="$first_published_at"
 while [[ "$refreshed_published_at" == "$first_published_at" && $SECONDS -lt $refresh_deadline ]]; do
   refreshed_published_at="$(epar_host_trust_feed_string_field "$published_feed" generatedAt 2>/dev/null || true)"

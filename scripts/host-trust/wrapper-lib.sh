@@ -168,7 +168,7 @@ epar_host_trust_prepare() {
     feed_dir="$(dirname "$feed_path")"
     if [[ "$purpose" == build ]]; then EPAR_BUILD_TRUST_FEED_DIR="$feed_dir"; else EPAR_RUNNER_TRUST_FEED_DIR="$feed_dir"; fi
     watcher_log="${feed_dir}/watcher.log"
-    "$EPAR_HOST_TRUST_HELPER" watch --project-root "$project_root" --config "$config_path" --purpose "$purpose" --interval 10 >>"$watcher_log" 2>&1 &
+    "$EPAR_HOST_TRUST_HELPER" watch --project-root "$project_root" --config "$config_path" --purpose "$purpose" --interval 10 --ready-from-current >>"$watcher_log" 2>&1 &
     watcher_pid="$!"
     EPAR_TRUST_WATCH_PIDS+=("$watcher_pid")
     if ! epar_host_trust_wait_for_watcher "$watcher_pid" "$feed_dir" "$purpose" "$watcher_log"; then

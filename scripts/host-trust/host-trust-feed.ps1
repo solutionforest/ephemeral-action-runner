@@ -10,7 +10,8 @@ param(
     [ValidateSet('runner', 'build')]
     [string] $Purpose = 'runner',
     [ValidateRange(1, 3600)]
-    [int] $Interval = 10
+    [int] $Interval = 10,
+    [switch] $ReadyFromCurrent
 )
 
 $ErrorActionPreference = 'Stop'
@@ -339,7 +340,14 @@ try {
         Write-Output (Write-Feed $feedRoot $settings.Scopes)
         exit 0
     }
-    [void](Write-Feed $feedRoot $settings.Scopes)
+    if ($ReadyFromCurrent) {
+        $currentPath = Join-Path $feedRoot 'current.json'
+        if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) {
+            throw "host trust watcher cannot reuse missing preflight feed $currentPath"
+        }
+    } else {
+        [void](Write-Feed $feedRoot $settings.Scopes)
+    }
     Publish-EparWatcherReady -LockDir $lockDir
     while ($true) {
         Start-Sleep -Seconds $Interval

@@ -192,7 +192,7 @@ function Start-EparHostTrustBridge {
             $feedDirectories[$purpose] = $feedDir
             $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
             $startInfo.FileName = $powershell
-            $startInfo.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $helper + '" watch -ProjectRoot "' + $ProjectRoot + '" -Config "' + $config + '" -Purpose ' + $purpose + ' -Interval 10'
+            $startInfo.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $helper + '" watch -ProjectRoot "' + $ProjectRoot + '" -Config "' + $config + '" -Purpose ' + $purpose + ' -Interval 10 -ReadyFromCurrent'
             $startInfo.UseShellExecute = $false
             $startInfo.CreateNoWindow = $true
             $watch = [System.Diagnostics.Process]::Start($startInfo)

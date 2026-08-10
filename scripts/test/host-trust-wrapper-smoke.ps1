@@ -46,6 +46,11 @@ image:
     [System.IO.File]::WriteAllText($config, $configContent, [System.Text.UTF8Encoding]::new($false))
 
     $helper = Join-Path $ProjectRoot 'scripts\host-trust\host-trust-feed.ps1'
+    $missingReadyConfig = Join-Path $temporary 'missing-ready-config.yml'
+    [System.IO.File]::WriteAllText($missingReadyConfig, $configContent, [System.Text.UTF8Encoding]::new($false))
+    $missingReadyError = ''
+    try { & $helper watch -ProjectRoot $ProjectRoot -Config $missingReadyConfig -ReadyFromCurrent } catch { $missingReadyError = $_.Exception.Message }
+    if ($missingReadyError -notmatch 'cannot reuse missing preflight feed') { throw "watcher accepted a missing preflight feed: $missingReadyError" }
     $tokens = $null
     $parseErrors = $null
     $helperAst = [System.Management.Automation.Language.Parser]::ParseFile($helper, [ref]$tokens, [ref]$parseErrors)

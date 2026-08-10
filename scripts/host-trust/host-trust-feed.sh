@@ -7,7 +7,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: host-trust-feed.sh sync|watch --project-root <path> --config <path> [--purpose runner|build] [--interval <seconds>]
+Usage: host-trust-feed.sh sync|watch --project-root <path> --config <path> [--purpose runner|build] [--interval <seconds>] [--ready-from-current]
 
 The config must opt in with:
   image:
@@ -21,6 +21,7 @@ project_root=""
 config_path=""
 interval=10
 purpose="runner"
+ready_from_current=false
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 while (($#)); do
@@ -29,6 +30,7 @@ while (($#)); do
     --config) config_path="${2:?missing value for --config}"; shift 2 ;;
     --interval) interval="${2:?missing value for --interval}"; shift 2 ;;
     --purpose) purpose="${2:?missing value for --purpose}"; shift 2 ;;
+    --ready-from-current) ready_from_current=true; shift ;;
     *) usage; exit 2 ;;
   esac
 done
@@ -423,7 +425,11 @@ acquire_lock
 case "$command_name" in
   sync) publish_once ;;
   watch)
-    publish_once
+    if [[ "$ready_from_current" == true ]]; then
+      [[ -f "$feed_root/current.json" && -s "$feed_root/current.json" ]] || { echo "host trust watcher cannot reuse missing preflight feed $feed_root/current.json" >&2; exit 1; }
+    else
+      publish_once
+    fi
     publish_ready_marker
     while :; do
       sleep "$interval"
