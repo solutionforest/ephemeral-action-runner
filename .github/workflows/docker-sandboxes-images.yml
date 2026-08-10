@@ -8,6 +8,7 @@ on:
       - main
     paths:
       - '.github/workflows/docker-sandboxes-images.yml'
+      - '.github/scripts/fetch-prebuilt-catalog.sh'
       - 'templates/docker-sandboxes/**'
       - 'scripts/docker-sandboxes/**'
       - 'internal/prebuilt/**'
@@ -18,6 +19,7 @@ on:
       - main
     paths:
       - '.github/workflows/docker-sandboxes-images.yml'
+      - '.github/scripts/fetch-prebuilt-catalog.sh'
       - 'templates/docker-sandboxes/**'
       - 'scripts/docker-sandboxes/**'
       - 'internal/prebuilt/**'
@@ -102,7 +104,9 @@ jobs:
           cache: true
 
       - name: Verify publisher and signed-evidence contracts
-        run: go test ./internal/prebuilt ./cmd/epar-prebuilt-publisher -count=1
+        run: |
+          go test ./internal/prebuilt ./cmd/epar-prebuilt-publisher -count=1
+          bash -n .github/scripts/fetch-prebuilt-catalog.sh
 
       - name: Validate committed Docker Sandboxes assets
         shell: pwsh
@@ -278,11 +282,7 @@ jobs:
           catalog_error="$catalog_dir/catalog-fetch.error"
           if catalog_digest="$(oras resolve "$catalog_reference" 2>"$catalog_error")"; then
             [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${catalog_digest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
-            oras pull "${PACKAGE_REPOSITORY}@${catalog_digest}" --output "$catalog_dir/pulled" >/dev/null
-            catalog_file="$(find "$catalog_dir/pulled" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
-            [[ -n "$catalog_file" && -f "$catalog_file" ]]
-            cp "$catalog_file" "$catalog_dir/catalog-state.json"
+            go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${catalog_digest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog_dir/catalog-state.json"
           else
             if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_error"; then
               cat "$catalog_error" >&2
@@ -1012,11 +1012,8 @@ jobs:
           catalog_tag_error="$RUNNER_TEMP/epar-promotion/catalog-tag-resolve.error"
           if existing_manifest="$(oras resolve "$immutable_ref" 2>"$catalog_tag_error")"; then
             [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            existing_dir="$RUNNER_TEMP/epar-promotion/existing-catalog"
-            mkdir -p "$existing_dir"
-            oras pull "$immutable_ref" --output "$existing_dir" >/dev/null
-            existing_json="$(find "$existing_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
-            [[ -f "$existing_json" ]]
+            existing_json="$RUNNER_TEMP/epar-promotion/existing-catalog.json"
+            bash .github/scripts/fetch-prebuilt-catalog.sh "$PACKAGE_REPOSITORY" "${PACKAGE_REPOSITORY}@${existing_manifest}" "$existing_json"
             existing_canonical="$RUNNER_TEMP/epar-promotion/existing-catalog.canonical.json"
             existing_output="$(go run ./cmd/epar-prebuilt-publisher catalog --catalog "$existing_json" --output "$existing_canonical")"
             existing_digest="$(printf '%s\n' "$existing_output" | grep -Eo 'sha256:[0-9a-f]{64}' | tail -n 1 || true)"
@@ -1028,12 +1025,15 @@ jobs:
             fi
             config_file="$RUNNER_TEMP/epar-promotion/catalog-config.json"
             printf '%s\n' '{}' > "$config_file"
-            oras push --disable-path-validation "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
+            (
+              cd "$RUNNER_TEMP/epar-promotion"
+              oras push "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "catalog-config.json:$CATALOG_CONFIG_MEDIA_TYPE" "catalog.json:$CATALOG_LAYER_MEDIA_TYPE"
+            )
             existing_manifest="$(oras resolve "$immutable_ref")"
           fi
           [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
           oras manifest fetch "$immutable_ref" --format json > "$RUNNER_TEMP/epar-promotion/catalog-manifest.json"
-          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.content // .) as $m | ($m.artifactType == $artifact) and ($m.config.mediaType == $config) and ([$m.layers[] | select(.mediaType == $layer)] | length == 1)' "$RUNNER_TEMP/epar-promotion/catalog-manifest.json" >/dev/null
+          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.schemaVersion == 2) and (.mediaType == "application/vnd.oci.image.manifest.v1+json") and (.artifactType == $artifact) and (.content.config.mediaType == $config) and ((.content.layers | length) == 1) and (.content.layers[0].mediaType == $layer)' "$RUNNER_TEMP/epar-promotion/catalog-manifest.json" >/dev/null
           echo "catalog_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
           echo "manifest_digest=$existing_manifest" >> "$GITHUB_OUTPUT"
           echo "immutable_ref=$immutable_ref" >> "$GITHUB_OUTPUT"
@@ -1158,8 +1158,135 @@ jobs:
             echo 'catalog-v1 and the profile alias were not moved; protected EPAR acceptance remains required.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  prepare-promotion-review:
+    name: Prepare protected promotion review
+    if: inputs.promote_candidate == true && github.ref == 'refs/heads/main' && inputs.promotion_confirmation == 'PROMOTE'
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.3
+
+      - name: Verify candidate identities and prepare the reviewer checklist
+        shell: bash
+        env:
+          PROFILE: ${{ inputs.profile }}
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
+          CANDIDATE_CATALOG_REFERENCE: ${{ inputs.candidate_catalog_reference }}
+          ACCEPTANCE_EVIDENCE_JSON: ${{ inputs.acceptance_evidence_json }}
+        run: |
+          set -euo pipefail
+          [[ "$PROFILE" == act ]]
+          [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}:catalog-v1-pkg-"* || "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
+          evidence_input="$RUNNER_TEMP/promotion-review-input.json"
+          printf '%s' "$ACCEPTANCE_EVIDENCE_JSON" > "$evidence_input"
+          jq -e 'type == "object" and (keys | sort) == ["amd64DockerHubRunId","amd64DockerHubRunnerName","amd64PlaywrightRunId","amd64PlaywrightRunnerName","amd64ReceiptSha256","arm64DockerHubRunId","arm64DockerHubRunnerName","arm64PlaywrightRunId","arm64PlaywrightRunnerName","arm64ReceiptSha256"]' "$evidence_input" >/dev/null
+          amd64_playwright_run_id="$(jq -er '.amd64PlaywrightRunId | tostring' "$evidence_input")"
+          amd64_dockerhub_run_id="$(jq -er '.amd64DockerHubRunId | tostring' "$evidence_input")"
+          arm64_playwright_run_id="$(jq -er '.arm64PlaywrightRunId | tostring' "$evidence_input")"
+          arm64_dockerhub_run_id="$(jq -er '.arm64DockerHubRunId | tostring' "$evidence_input")"
+          amd64_receipt="$(jq -er '.amd64ReceiptSha256' "$evidence_input")"
+          arm64_receipt="$(jq -er '.arm64ReceiptSha256' "$evidence_input")"
+          amd64_playwright_runner="$(jq -er '.amd64PlaywrightRunnerName' "$evidence_input")"
+          amd64_dockerhub_runner="$(jq -er '.amd64DockerHubRunnerName' "$evidence_input")"
+          arm64_playwright_runner="$(jq -er '.arm64PlaywrightRunnerName' "$evidence_input")"
+          arm64_dockerhub_runner="$(jq -er '.arm64DockerHubRunnerName' "$evidence_input")"
+          for run_id in "$amd64_playwright_run_id" "$amd64_dockerhub_run_id" "$arm64_playwright_run_id" "$arm64_dockerhub_run_id"; do
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$amd64_receipt" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_receipt" =~ ^sha256:[0-9a-f]{64}$ ]]
+          digest_prefix="${CANDIDATE_DIGEST#sha256:}"
+          digest_prefix="${digest_prefix:0:12}"
+          [[ "$amd64_playwright_runner" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$amd64_dockerhub_runner" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$arm64_playwright_runner" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$arm64_dockerhub_runner" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$amd64_playwright_runner" != "$amd64_dockerhub_runner" ]]
+          [[ "$arm64_playwright_runner" != "$arm64_dockerhub_runner" ]]
+
+          candidate_catalog_manifest="$(oras resolve "$CANDIDATE_CATALOG_REFERENCE")"
+          [[ "$candidate_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          exact_catalog_reference="${PACKAGE_REPOSITORY}@${candidate_catalog_manifest}"
+          catalog="$RUNNER_TEMP/promotion-review-catalog.json"
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$exact_catalog_reference" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog" >/dev/null
+          jq -e --arg digest "$CANDIDATE_DIGEST" '([.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")] | length) == 1 and ([.transitions[]? | select(.packageIndexDigest == $digest)] | length) == 0' "$catalog" >/dev/null
+          entry="$RUNNER_TEMP/promotion-review-entry.json"
+          jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest)' "$catalog" > "$entry"
+          jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and (.platforms | length == 2) and ([.platforms[] | select(.validated != true)] | length == 0)' "$entry" >/dev/null
+          go run ./cmd/epar-prebuilt-publisher verify-package --reference "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --entry "$entry" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          source_reference="$(jq -er '.source.reference' "$entry")"
+          source_digest="$(jq -er '.source.indexDigest' "$entry")"
+          [[ "$(oras resolve "$source_reference")" == "$source_digest" ]]
+
+          recipe_digest="$(jq -er '.recipe.digest' "$entry")"
+          recipe_revision="$(jq -er '.recipe.recipeRevision' "$entry")"
+          runtime_contract="$(jq -er '.recipe.runtimeContract' "$entry")"
+          template_schema="$(jq -er '.recipe.templateSchema' "$entry")"
+          runner_version="$(jq -er '.runner.version' "$entry")"
+          package_amd64="$(jq -er '.platforms[] | select(.platform == "linux/amd64") | .packageManifestDigest' "$entry")"
+          package_arm64="$(jq -er '.platforms[] | select(.platform == "linux/arm64") | .packageManifestDigest' "$entry")"
+          source_amd64="$(jq -er '.source.platformDigests["linux/amd64"]' "$entry")"
+          source_arm64="$(jq -er '.source.platformDigests["linux/arm64"]' "$entry")"
+          {
+            echo '## EPAR prebuilt promotion review'
+            echo
+            echo '> This unprotected job verified the signed candidate catalog and package evidence but did not approve a deployment or move any package tag. Review the private test runs below before approving the `epar-prebuilt-promotion` environment.'
+            echo
+            echo '### Candidate identity'
+            echo
+            echo '| Field | Verified value |'
+            echo '| --- | --- |'
+            echo "| Package index | \`${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}\` |"
+            echo "| Candidate catalog | \`${CANDIDATE_CATALOG_REFERENCE}\` |"
+            echo "| Catalog manifest | \`${candidate_catalog_manifest}\` |"
+            echo "| Upstream source | \`${source_reference}\` |"
+            echo "| Upstream index | \`${source_digest}\` |"
+            echo "| Recipe | \`${recipe_digest}\` at \`${recipe_revision}\` |"
+            echo "| Runtime contract | \`${runtime_contract}\`, template schema \`${template_schema}\` |"
+            echo "| Actions runner | \`${runner_version}\` |"
+            echo "| amd64 package/source | \`${package_amd64}\` / \`${source_amd64}\` |"
+            echo "| arm64 package/source | \`${package_arm64}\` / \`${source_arm64}\` |"
+            echo
+            echo '### Human-reviewed acceptance evidence'
+            echo
+            echo '| Platform | Workflow run | EPAR runner | Receipt |'
+            echo '| --- | --- | --- | --- |'
+            echo "| linux/amd64 | [playwright-docker.yml run ${amd64_playwright_run_id}](https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/${amd64_playwright_run_id}) | \`${amd64_playwright_runner}\` | \`${amd64_receipt}\` |"
+            echo "| linux/amd64 | [dockerhub-private-pull.yml run ${amd64_dockerhub_run_id}](https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/${amd64_dockerhub_run_id}) | \`${amd64_dockerhub_runner}\` | \`${amd64_receipt}\` |"
+            echo "| linux/arm64 | [playwright-docker.yml run ${arm64_playwright_run_id}](https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/${arm64_playwright_run_id}) | \`${arm64_playwright_runner}\` | \`${arm64_receipt}\` |"
+            echo "| linux/arm64 | [dockerhub-private-pull.yml run ${arm64_dockerhub_run_id}](https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/${arm64_dockerhub_run_id}) | \`${arm64_dockerhub_runner}\` | \`${arm64_receipt}\` |"
+            echo
+            echo '### Reviewer checklist'
+            echo
+            echo '- [ ] Open all four authenticated private-repository links and confirm each conclusion is `success`.'
+            echo '- [ ] Confirm every job used the listed unique EPAR runner and the `epar-dev-test` runner group.'
+            echo '- [ ] Confirm the two receipt hashes match the accepted amd64 and arm64 EPAR controllers.'
+            echo '- [ ] Confirm both EPAR controllers stopped with no owned Sandbox, runner, or staging residue.'
+            echo '- [ ] Confirm this exact package digest and catalog are the artifacts intended for `act-latest`.'
+            echo
+            echo 'After this review, approve the waiting protected deployment. The protected job repeats all machine-verifiable checks before it can move `catalog-v1` and then `act-latest`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   manual-promote:
     name: Manually promote one verified candidate digest
+    needs: prepare-promotion-review
     environment: epar-prebuilt-promotion
     if: inputs.promote_candidate == true && github.ref == 'refs/heads/main' && inputs.promotion_confirmation == 'PROMOTE'
     runs-on: ubuntu-latest
@@ -1190,12 +1317,14 @@ jobs:
         id: verify
         shell: bash
         env:
+          PROFILE: ${{ inputs.profile }}
           CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
           CANDIDATE_CATALOG_REFERENCE: ${{ inputs.candidate_catalog_reference }}
           ACCEPTANCE_EVIDENCE_JSON: ${{ inputs.acceptance_evidence_json }}
           PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
         run: |
           set -euo pipefail
+          [[ "$PROFILE" == act ]]
           [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}:catalog-v1-pkg-"* || "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
           evidence_input="$RUNNER_TEMP/manual-acceptance-input.json"
@@ -1216,18 +1345,19 @@ jobs:
           done
           [[ "$AMD64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$ARM64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ -n "$AMD64_PLAYWRIGHT_RUNNER_NAME" && -n "$AMD64_DOCKERHUB_RUNNER_NAME" ]]
-          [[ -n "$ARM64_PLAYWRIGHT_RUNNER_NAME" && -n "$ARM64_DOCKERHUB_RUNNER_NAME" ]]
+          digest_prefix="${CANDIDATE_DIGEST#sha256:}"
+          digest_prefix="${digest_prefix:0:12}"
+          [[ "$AMD64_PLAYWRIGHT_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$AMD64_DOCKERHUB_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$ARM64_PLAYWRIGHT_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$ARM64_DOCKERHUB_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
           [[ "$AMD64_PLAYWRIGHT_RUNNER_NAME" != "$AMD64_DOCKERHUB_RUNNER_NAME" ]]
           [[ "$ARM64_PLAYWRIGHT_RUNNER_NAME" != "$ARM64_DOCKERHUB_RUNNER_NAME" ]]
           candidate_catalog_manifest="$(oras resolve "$CANDIDATE_CATALOG_REFERENCE")"
           [[ "$candidate_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$CANDIDATE_CATALOG_REFERENCE" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
-          pull_dir="$RUNNER_TEMP/manual-catalog"
-          mkdir -p "$pull_dir"
-          oras pull "$CANDIDATE_CATALOG_REFERENCE" --output "$pull_dir" >/dev/null
-          catalog="$(find "$pull_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
-          [[ -f "$catalog" ]]
+          exact_catalog_reference="${PACKAGE_REPOSITORY}@${candidate_catalog_manifest}"
+          catalog="$RUNNER_TEMP/manual-catalog.json"
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$exact_catalog_reference" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog" >/dev/null
           jq -e --arg digest "$CANDIDATE_DIGEST" '([.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")] | length) == 1 and ([.transitions[]? | select(.packageIndexDigest == $digest)] | length) == 0' "$catalog" >/dev/null
           jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest)' "$catalog" > "$RUNNER_TEMP/manual-entry.json"
           jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and (.platforms | length == 2) and ([.platforms[] | select(.validated != true)] | length == 0)' "$RUNNER_TEMP/manual-entry.json" >/dev/null
@@ -1235,8 +1365,6 @@ jobs:
           source_reference="$(jq -er '.source.reference' "$RUNNER_TEMP/manual-entry.json")"
           source_digest="$(jq -er '.source.indexDigest' "$RUNNER_TEMP/manual-entry.json")"
           [[ "$(oras resolve "$source_reference")" == "$source_digest" ]]
-          digest_prefix="${CANDIDATE_DIGEST#sha256:}"
-          digest_prefix="${digest_prefix:0:12}"
           accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           jq -n \
             --arg digest "$CANDIDATE_DIGEST" --arg acceptedAt "$accepted_at" --arg reviewer "$GITHUB_ACTOR" \
@@ -1287,11 +1415,9 @@ jobs:
           printf '%s\n' '{}' > "$config_file"
           catalog_tag_error="$RUNNER_TEMP/manual-catalog-tag-resolve.error"
           if existing_manifest="$(oras resolve "$immutable_ref" 2>"$catalog_tag_error")"; then
-            existing_dir="$RUNNER_TEMP/manual-existing-catalog"
-            mkdir -p "$existing_dir"
-            oras pull "$immutable_ref" --output "$existing_dir" >/dev/null
-            existing_json="$(find "$existing_dir" -type f -name '*.json' -print | while IFS= read -r candidate; do jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$candidate" >/dev/null 2>&1 && { printf '%s' "$candidate"; break; }; done)"
-            [[ -f "$existing_json" ]]
+            [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            existing_json="$RUNNER_TEMP/manual-existing-catalog.json"
+            bash .github/scripts/fetch-prebuilt-catalog.sh "$PACKAGE_REPOSITORY" "${PACKAGE_REPOSITORY}@${existing_manifest}" "$existing_json"
             existing_output="$(go run ./cmd/epar-prebuilt-publisher catalog --catalog "$existing_json" --output "$RUNNER_TEMP/manual-existing-canonical.json")"
             existing_digest="$(printf '%s\n' "$existing_output" | grep -Eo 'sha256:[0-9a-f]{64}' | tail -n 1 || true)"
             [[ "$existing_digest" == "$catalog_digest" ]]
@@ -1300,12 +1426,15 @@ jobs:
               cat "$catalog_tag_error" >&2
               exit 1
             fi
-            oras push --disable-path-validation "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "$config_file:$CATALOG_CONFIG_MEDIA_TYPE" "$catalog_json:$CATALOG_LAYER_MEDIA_TYPE"
+            (
+              cd "$RUNNER_TEMP"
+              oras push "$immutable_ref" --artifact-type "$CATALOG_ARTIFACT_TYPE" --config "manual-catalog-config.json:$CATALOG_CONFIG_MEDIA_TYPE" "manual-catalog.canonical.json:$CATALOG_LAYER_MEDIA_TYPE"
+            )
             existing_manifest="$(oras resolve "$immutable_ref")"
           fi
           [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
           oras manifest fetch "$immutable_ref" --format json > "$RUNNER_TEMP/manual-catalog-manifest.json"
-          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.content // .) as $m | ($m.artifactType == $artifact) and ($m.config.mediaType == $config) and ([$m.layers[] | select(.mediaType == $layer)] | length == 1)' "$RUNNER_TEMP/manual-catalog-manifest.json" >/dev/null
+          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.schemaVersion == 2) and (.mediaType == "application/vnd.oci.image.manifest.v1+json") and (.artifactType == $artifact) and (.content.config.mediaType == $config) and ((.content.layers | length) == 1) and (.content.layers[0].mediaType == $layer)' "$RUNNER_TEMP/manual-catalog-manifest.json" >/dev/null
           echo "catalog_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
           echo "manifest_digest=$existing_manifest" >> "$GITHUB_OUTPUT"
           echo "immutable_ref=$immutable_ref" >> "$GITHUB_OUTPUT"
