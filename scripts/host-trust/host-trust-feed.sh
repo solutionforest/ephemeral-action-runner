@@ -431,6 +431,9 @@ case "$command_name" in
       publish_once
     fi
     publish_ready_marker
+    if [[ "$ready_from_current" == true ]]; then
+      publish_once || echo "host trust snapshot refresh failed; retaining the last published generation" >&2
+    fi
     while :; do
       sleep "$interval"
       publish_once || echo "host trust snapshot refresh failed; retaining the last published generation" >&2

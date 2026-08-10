@@ -277,9 +277,12 @@ if "$helper" sync --project-root "$project_root" --config "$config" >/dev/null 2
   echo "second controller unexpectedly acquired the live wrapper lock" >&2
   exit 1
 fi
-refresh_deadline=$((SECONDS + 30))
+# Keep a generous outer bound for a stuck watcher while continuously enforcing
+# the production 30-second freshness contract below.
+refresh_deadline=$((SECONDS + 120))
 refreshed_published_at="$first_published_at"
 while [[ "$refreshed_published_at" == "$first_published_at" && $SECONDS -lt $refresh_deadline ]]; do
+  epar_host_trust_current_feed_valid "$published_feed" || { echo "Unix host-trust feed became stale before its watcher refreshed it" >&2; exit 1; }
   refreshed_published_at="$(epar_host_trust_feed_string_field "$published_feed" generatedAt 2>/dev/null || true)"
   if [[ "$refreshed_published_at" == "$first_published_at" ]]; then sleep 0.05; fi
 done

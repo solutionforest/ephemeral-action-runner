@@ -349,6 +349,10 @@ try {
         [void](Write-Feed $feedRoot $settings.Scopes)
     }
     Publish-EparWatcherReady -LockDir $lockDir
+    if ($ReadyFromCurrent) {
+        try { [void](Write-Feed $feedRoot $settings.Scopes) }
+        catch { Write-Warning "host trust snapshot refresh failed; retaining the last published generation: $($_.Exception.Message)" }
+    }
     while ($true) {
         Start-Sleep -Seconds $Interval
         try { [void](Write-Feed $feedRoot $settings.Scopes) }
