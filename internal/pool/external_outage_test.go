@@ -510,7 +510,10 @@ func TestPartialInitialCapacitySurvivesRegistrationOutageWithoutCapacitySurge(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	statePath, err := dependency.ExternalOutageStatePath(manager.ProjectRoot, manager.ConfigPath)
+	if err := manager.ConfigureExternalOutageRetry(policy); err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := manager.externalOutageSupervisor()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,10 +536,7 @@ func TestPartialInitialCapacitySurvivesRegistrationOutageWithoutCapacitySurge(t 
 		case <-ctx.Done():
 			t.Fatalf("timed out waiting for supervised registration recovery: %v", ctx.Err())
 		case <-ticker.C:
-			state, err = dependency.ReadIncidentState(statePath)
-			if err != nil {
-				t.Fatal(err)
-			}
+			state = supervisor.State()
 		}
 	}
 	cancel()
@@ -547,6 +547,14 @@ func TestPartialInitialCapacitySurvivesRegistrationOutageWithoutCapacitySurge(t 
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("pool did not stop after acceptance condition was satisfied")
+	}
+	statePath, err := dependency.ExternalOutageStatePath(manager.ProjectRoot, manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = dependency.ReadIncidentState(statePath)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if got := atomic.LoadInt32(&g.registrationCalls); got < 3 {
 		t.Fatalf("registration token calls = %d, want success, outage, and supervised retry", got)
