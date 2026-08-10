@@ -5,6 +5,15 @@ on:
     - cron: '37 */6 * * *'
   push:
     branches:
+      - main
+    paths:
+      - '.github/workflows/docker-sandboxes-images.yml'
+      - 'templates/docker-sandboxes/**'
+      - 'scripts/docker-sandboxes/**'
+      - 'internal/prebuilt/**'
+      - 'cmd/epar-prebuilt-publisher/**'
+  pull_request:
+    branches:
       - develop
       - main
     paths:
@@ -61,8 +70,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: docker-sandboxes-prebuilt-publisher
-  cancel-in-progress: false
+  group: docker-sandboxes-prebuilt-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'publisher' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   SOURCE_REPOSITORY: ghcr.io/catthehacker/ubuntu
@@ -75,9 +84,35 @@ env:
   DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
+  validate:
+    name: Validate prebuilt publication contract without publishing
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify publisher and signed-evidence contracts
+        run: go test ./internal/prebuilt ./cmd/epar-prebuilt-publisher -count=1
+
+      - name: Validate committed Docker Sandboxes assets
+        shell: pwsh
+        run: |
+          scripts/docker-sandboxes/validate-assets.ps1 -Platform linux/amd64
+          scripts/docker-sandboxes/validate-assets.ps1 -Platform linux/arm64
+
   resolve:
     name: Resolve immutable upstream and publication state
-    if: inputs.promote_candidate != true
+    if: github.event_name != 'pull_request' && inputs.promote_candidate != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -418,7 +453,7 @@ jobs:
           echo "hook_sha=$hook_sha" >> "$GITHUB_OUTPUT"
           echo "egress_sha=$egress_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push platform candidate with SBOM and provenance
+      - name: Build and push platform candidate
         id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -449,29 +484,46 @@ jobs:
             RUNNER_ASSET_DIGEST=${{ matrix.runner_digest }}
             ACTIONS_RUNNER_VERSION=${{ needs.resolve.outputs.runner_version }}
             ACTIONS_RUNNER_SHA256=${{ matrix.runner_digest }}
-          provenance: mode=max
-          sbom: true
+          # The signed SLSA and SPDX referrers are generated for the completed
+          # multi-platform index below. Disabling BuildKit's additional
+          # per-platform attestations avoids duplicate evidence indexes while
+          # retaining the exact runnable platform manifests in that index.
+          provenance: false
+          sbom: false
 
       - name: Record platform digest and runner tuple
         shell: bash
         env:
           PLATFORM: ${{ matrix.platform }}
           PLATFORM_SLUG: ${{ matrix.slug }}
-          CANDIDATE_INDEX_DIGEST: ${{ steps.push.outputs.digest }}
-          CANDIDATE_REFERENCE: ${{ env.PACKAGE_REPOSITORY }}:candidate-${{ needs.resolve.outputs.profile }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
+          CANDIDATE_DESCRIPTOR_DIGEST: ${{ steps.push.outputs.digest }}
+          PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
           RUNNER_VERSION: ${{ needs.resolve.outputs.runner_version }}
           RUNNER_DIGEST: ${{ matrix.runner_digest }}
         run: |
           set -euo pipefail
-          [[ "$CANDIDATE_INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          docker buildx imagetools inspect "$CANDIDATE_REFERENCE" --raw > "$RUNNER_TEMP/platform-candidate-index.json"
-          architecture="${PLATFORM#linux/}"
-          package_manifest_digest="$(jq -er --arg architecture "$architecture" \
-            '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | if length == 1 then .[0].digest else error("expected exactly one runnable platform manifest") end' \
-            "$RUNNER_TEMP/platform-candidate-index.json")"
+          [[ "$CANDIDATE_DESCRIPTOR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          platform_candidate_ref="${PACKAGE_REPOSITORY}@${CANDIDATE_DESCRIPTOR_DIGEST}"
+          docker buildx imagetools inspect "$platform_candidate_ref" --raw > "$RUNNER_TEMP/platform-candidate-descriptor.json"
+          media_type="$(jq -er '.mediaType' "$RUNNER_TEMP/platform-candidate-descriptor.json")"
+          case "$media_type" in
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json)
+              package_manifest_digest="$CANDIDATE_DESCRIPTOR_DIGEST"
+              ;;
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
+              architecture="${PLATFORM#linux/}"
+              package_manifest_digest="$(jq -er --arg architecture "$architecture" \
+                '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | if length == 1 then .[0].digest else error("expected exactly one runnable platform manifest") end' \
+                "$RUNNER_TEMP/platform-candidate-descriptor.json")"
+              ;;
+            *)
+              echo "unsupported platform candidate media type: $media_type" >&2
+              exit 1
+              ;;
+          esac
           [[ "$package_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          jq -n --arg platform "$PLATFORM" --arg slug "$PLATFORM_SLUG" --arg digest "$package_manifest_digest" --arg candidateIndexDigest "$CANDIDATE_INDEX_DIGEST" --arg runner "$RUNNER_VERSION" --arg runnerDigest "$RUNNER_DIGEST" \
-            '{platform:$platform,slug:$slug,packageManifestDigest:$digest,candidateIndexDigest:$candidateIndexDigest,runnerVersion:$runner,runnerAssetDigest:$runnerDigest}' > "$RUNNER_TEMP/platform-result.json"
+          jq -n --arg platform "$PLATFORM" --arg slug "$PLATFORM_SLUG" --arg digest "$package_manifest_digest" --arg candidateDescriptorDigest "$CANDIDATE_DESCRIPTOR_DIGEST" --arg runner "$RUNNER_VERSION" --arg runnerDigest "$RUNNER_DIGEST" \
+            '{platform:$platform,slug:$slug,packageManifestDigest:$digest,candidateDescriptorDigest:$candidateDescriptorDigest,runnerVersion:$runner,runnerAssetDigest:$runnerDigest}' > "$RUNNER_TEMP/platform-result.json"
 
       - name: Upload platform digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -551,13 +603,13 @@ jobs:
           [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           staging_ref="${PACKAGE_REPOSITORY}:candidate-${PROFILE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker buildx imagetools create --tag "$staging_ref" \
-            "${PACKAGE_REPOSITORY}:candidate-${PROFILE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64" \
-            "${PACKAGE_REPOSITORY}:candidate-${PROFILE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64"
+            "${PACKAGE_REPOSITORY}@${amd64_digest}" \
+            "${PACKAGE_REPOSITORY}@${arm64_digest}"
           index_digest="$(oras resolve "$staging_ref")"
           [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           oras manifest fetch "$staging_ref" --format json > "$RUNNER_TEMP/epar-index.json"
           jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" \
-            '[((.content.manifests // .manifests)[]) | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length == 2 and (map(.platform.architecture) | sort == ["amd64","arm64"]) and (map(.digest) | sort == ([$amd64,$arm64] | sort))' "$RUNNER_TEMP/epar-index.json" >/dev/null
+            '[(.content.manifests // .manifests)[]] as $manifests | ($manifests | length) == 2 and ($manifests | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))) | length) == 2 and ($manifests | map(.platform.architecture) | sort == ["amd64","arm64"]) and ($manifests | map(.digest) | sort == ([$amd64,$arm64] | sort))' "$RUNNER_TEMP/epar-index.json" >/dev/null
           current_source_digest="$(oras resolve "$SOURCE_REFERENCE")"
           [[ "$current_source_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           source_rechecked=true
