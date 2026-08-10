@@ -57,6 +57,11 @@ func TestWorkflowUsesHostedBuildsAndExternalEPARAcceptance(t *testing.T) {
 		`playwright-docker.yml`,
 		`dockerhub-private-pull.yml`,
 		`runnerGroup:"epar-dev-test"`,
+		`schemaVersion:2`,
+		`runnerName:$amd64PlaywrightRunner`,
+		`runnerName:$amd64DockerHubRunner`,
+		`runnerName:$arm64PlaywrightRunner`,
+		`runnerName:$arm64DockerHubRunner`,
 		`catalog-v1 and the profile alias were not moved`,
 	} {
 		if !strings.Contains(workflow, required) {

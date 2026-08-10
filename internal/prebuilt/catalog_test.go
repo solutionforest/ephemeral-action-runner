@@ -144,7 +144,8 @@ func TestCatalogAcceptanceRejectsWrongWorkflowAndConflictingPlatformEvidence(t *
 		t.Fatal(err)
 	}
 	changed := first
-	changed.RunnerName = first.RunnerLabel + "-20260810-000000-002"
+	changed.WorkflowRuns = append([]WorkflowRunEvidence(nil), first.WorkflowRuns...)
+	changed.WorkflowRuns[0].RunnerName = first.RunnerLabel + "-20260810-000000-003"
 	if _, err := catalog.AppendAcceptance(changed); err == nil || !strings.Contains(err.Error(), "different evidence") {
 		t.Fatalf("conflicting acceptance error = %v", err)
 	}
@@ -163,6 +164,8 @@ func TestAcceptanceRejectsFailedOrMisroutedRuns(t *testing.T) {
 		}, want: "repository"},
 		{name: "wrong group", edit: func(value *PlatformAcceptance) { value.RunnerGroup = "Default" }, want: "epar-dev-test"},
 		{name: "wrong label", edit: func(value *PlatformAcceptance) { value.RunnerLabel = "epar-docker-sandboxes" }, want: "runner label"},
+		{name: "missing workflow runner", edit: func(value *PlatformAcceptance) { value.WorkflowRuns[0].RunnerName = "" }, want: "workflow runner name"},
+		{name: "reused ephemeral runner", edit: func(value *PlatformAcceptance) { value.WorkflowRuns[1].RunnerName = value.WorkflowRuns[0].RunnerName }, want: "distinct ephemeral runner"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -172,6 +175,19 @@ func TestAcceptanceRejectsFailedOrMisroutedRuns(t *testing.T) {
 				t.Fatalf("acceptance error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestAcceptanceRetainsSchemaOneReadCompatibility(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	acceptance := validAcceptance(digest, "linux/amd64", 101, 102)
+	acceptance.SchemaVersion = legacyAcceptanceRecordSchemaVersion
+	acceptance.RunnerName = acceptance.RunnerLabel + "-20260810-000000-001"
+	for i := range acceptance.WorkflowRuns {
+		acceptance.WorkflowRuns[i].RunnerName = ""
+	}
+	if err := acceptance.Validate(); err != nil {
+		t.Fatalf("legacy acceptance rejected: %v", err)
 	}
 }
 
@@ -241,11 +257,11 @@ func validAcceptance(digest, platform string, playwrightRun, dockerHubRun int64)
 	arch := strings.TrimPrefix(platform, "linux/")
 	return PlatformAcceptance{
 		SchemaVersion: AcceptanceRecordSchemaVersion, PackageIndexDigest: digest, Platform: platform,
-		RunnerGroup: "epar-dev-test", RunnerLabel: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch, RunnerName: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch + "-20260810-000000-001",
+		RunnerGroup: "epar-dev-test", RunnerLabel: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch,
 		ReceiptSHA256: "sha256:" + strings.Repeat("f", 64), ImportReadback: true, RuntimeValidated: true, CleanupValidated: true,
 		WorkflowRuns: []WorkflowRunEvidence{
-			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "playwright-docker.yml", RunID: playwrightRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(playwrightRun), Conclusion: "success"},
-			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "dockerhub-private-pull.yml", RunID: dockerHubRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(dockerHubRun), Conclusion: "success"},
+			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "playwright-docker.yml", RunID: playwrightRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(playwrightRun), Conclusion: "success", RunnerName: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch + "-20260810-000000-001"},
+			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "dockerhub-private-pull.yml", RunID: dockerHubRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(dockerHubRun), Conclusion: "success", RunnerName: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch + "-20260810-000000-002"},
 		},
 		ReviewedBy: "reviewer", AcceptedAt: time.Unix(2, 0),
 	}

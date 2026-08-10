@@ -6,9 +6,6 @@ on:
   push:
     branches:
       - develop
-      # Temporary candidate-publication trigger for the prebuilt-image pilot.
-      # Remove this branch before merging the workflow to main.
-      - feature/prebuilt_img
       - main
     paths:
       - '.github/workflows/docker-sandboxes-images.yml'
@@ -47,7 +44,7 @@ on:
         type: string
         default: ''
       acceptance_evidence_json:
-        description: 'Reviewed JSON containing four run IDs, two receipt SHA-256 values, and exact amd64/arm64 runner names.'
+        description: 'Reviewed JSON containing four run IDs, two receipt SHA-256 values, and the exact ephemeral runner name for every run.'
         required: false
         type: string
         default: ''
@@ -1151,21 +1148,26 @@ jobs:
           [[ "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}:catalog-v1-pkg-"* || "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
           evidence_input="$RUNNER_TEMP/manual-acceptance-input.json"
           printf '%s' "$ACCEPTANCE_EVIDENCE_JSON" > "$evidence_input"
-          jq -e 'type == "object" and (keys | sort) == ["amd64DockerHubRunId","amd64PlaywrightRunId","amd64ReceiptSha256","amd64RunnerName","arm64DockerHubRunId","arm64PlaywrightRunId","arm64ReceiptSha256","arm64RunnerName"]' "$evidence_input" >/dev/null
+          jq -e 'type == "object" and (keys | sort) == ["amd64DockerHubRunId","amd64DockerHubRunnerName","amd64PlaywrightRunId","amd64PlaywrightRunnerName","amd64ReceiptSha256","arm64DockerHubRunId","arm64DockerHubRunnerName","arm64PlaywrightRunId","arm64PlaywrightRunnerName","arm64ReceiptSha256"]' "$evidence_input" >/dev/null
           AMD64_PLAYWRIGHT_RUN_ID="$(jq -er '.amd64PlaywrightRunId | tostring' "$evidence_input")"
           AMD64_DOCKERHUB_RUN_ID="$(jq -er '.amd64DockerHubRunId | tostring' "$evidence_input")"
           ARM64_PLAYWRIGHT_RUN_ID="$(jq -er '.arm64PlaywrightRunId | tostring' "$evidence_input")"
           ARM64_DOCKERHUB_RUN_ID="$(jq -er '.arm64DockerHubRunId | tostring' "$evidence_input")"
           AMD64_RECEIPT_SHA256="$(jq -er '.amd64ReceiptSha256' "$evidence_input")"
           ARM64_RECEIPT_SHA256="$(jq -er '.arm64ReceiptSha256' "$evidence_input")"
-          AMD64_RUNNER_NAME="$(jq -er '.amd64RunnerName' "$evidence_input")"
-          ARM64_RUNNER_NAME="$(jq -er '.arm64RunnerName' "$evidence_input")"
+          AMD64_PLAYWRIGHT_RUNNER_NAME="$(jq -er '.amd64PlaywrightRunnerName' "$evidence_input")"
+          AMD64_DOCKERHUB_RUNNER_NAME="$(jq -er '.amd64DockerHubRunnerName' "$evidence_input")"
+          ARM64_PLAYWRIGHT_RUNNER_NAME="$(jq -er '.arm64PlaywrightRunnerName' "$evidence_input")"
+          ARM64_DOCKERHUB_RUNNER_NAME="$(jq -er '.arm64DockerHubRunnerName' "$evidence_input")"
           for run_id in "$AMD64_PLAYWRIGHT_RUN_ID" "$AMD64_DOCKERHUB_RUN_ID" "$ARM64_PLAYWRIGHT_RUN_ID" "$ARM64_DOCKERHUB_RUN_ID"; do
             [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
           done
           [[ "$AMD64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$ARM64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ -n "$AMD64_RUNNER_NAME" && -n "$ARM64_RUNNER_NAME" ]]
+          [[ -n "$AMD64_PLAYWRIGHT_RUNNER_NAME" && -n "$AMD64_DOCKERHUB_RUNNER_NAME" ]]
+          [[ -n "$ARM64_PLAYWRIGHT_RUNNER_NAME" && -n "$ARM64_DOCKERHUB_RUNNER_NAME" ]]
+          [[ "$AMD64_PLAYWRIGHT_RUNNER_NAME" != "$AMD64_DOCKERHUB_RUNNER_NAME" ]]
+          [[ "$ARM64_PLAYWRIGHT_RUNNER_NAME" != "$ARM64_DOCKERHUB_RUNNER_NAME" ]]
           candidate_catalog_manifest="$(oras resolve "$CANDIDATE_CATALOG_REFERENCE")"
           [[ "$candidate_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
           go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$CANDIDATE_CATALOG_REFERENCE" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
@@ -1187,18 +1189,19 @@ jobs:
           jq -n \
             --arg digest "$CANDIDATE_DIGEST" --arg acceptedAt "$accepted_at" --arg reviewer "$GITHUB_ACTOR" \
             --arg amd64Receipt "$AMD64_RECEIPT_SHA256" --arg arm64Receipt "$ARM64_RECEIPT_SHA256" \
-            --arg amd64Runner "$AMD64_RUNNER_NAME" --arg arm64Runner "$ARM64_RUNNER_NAME" \
+            --arg amd64PlaywrightRunner "$AMD64_PLAYWRIGHT_RUNNER_NAME" --arg amd64DockerHubRunner "$AMD64_DOCKERHUB_RUNNER_NAME" \
+            --arg arm64PlaywrightRunner "$ARM64_PLAYWRIGHT_RUNNER_NAME" --arg arm64DockerHubRunner "$ARM64_DOCKERHUB_RUNNER_NAME" \
             --arg amd64Label "epar-prebuilt-act-${digest_prefix}-amd64" --arg arm64Label "epar-prebuilt-act-${digest_prefix}-arm64" \
             --argjson amd64Playwright "$AMD64_PLAYWRIGHT_RUN_ID" --argjson amd64DockerHub "$AMD64_DOCKERHUB_RUN_ID" \
             --argjson arm64Playwright "$ARM64_PLAYWRIGHT_RUN_ID" --argjson arm64DockerHub "$ARM64_DOCKERHUB_RUN_ID" \
             '[
-              {schemaVersion:1,packageIndexDigest:$digest,platform:"linux/amd64",runnerGroup:"epar-dev-test",runnerLabel:$amd64Label,runnerName:$amd64Runner,receiptSha256:$amd64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
-                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$amd64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64Playwright|tostring)),conclusion:"success"},
-                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$amd64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64DockerHub|tostring)),conclusion:"success"}
+              {schemaVersion:2,packageIndexDigest:$digest,platform:"linux/amd64",runnerGroup:"epar-dev-test",runnerLabel:$amd64Label,receiptSha256:$amd64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$amd64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64Playwright|tostring)),conclusion:"success",runnerName:$amd64PlaywrightRunner},
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$amd64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64DockerHub|tostring)),conclusion:"success",runnerName:$amd64DockerHubRunner}
               ]},
-              {schemaVersion:1,packageIndexDigest:$digest,platform:"linux/arm64",runnerGroup:"epar-dev-test",runnerLabel:$arm64Label,runnerName:$arm64Runner,receiptSha256:$arm64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
-                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$arm64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64Playwright|tostring)),conclusion:"success"},
-                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$arm64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64DockerHub|tostring)),conclusion:"success"}
+              {schemaVersion:2,packageIndexDigest:$digest,platform:"linux/arm64",runnerGroup:"epar-dev-test",runnerLabel:$arm64Label,receiptSha256:$arm64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$arm64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64Playwright|tostring)),conclusion:"success",runnerName:$arm64PlaywrightRunner},
+                {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$arm64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64DockerHub|tostring)),conclusion:"success",runnerName:$arm64DockerHubRunner}
               ]}
             ]' > "$RUNNER_TEMP/manual-acceptance.json"
           go run ./cmd/epar-prebuilt-publisher accept --catalog "$catalog" --input "$RUNNER_TEMP/manual-acceptance.json"

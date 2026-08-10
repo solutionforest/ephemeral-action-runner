@@ -8,7 +8,7 @@ Act (`act-latest`) is the initial supported profile. Full (`full-latest`) remain
 
 ## Workflow triggers and hosted build gates
 
-`.github/workflows/docker-sandboxes-images.yml` polls every six hours at minute 37, supports manual dispatch, and runs for recipe-related changes on configured branches. GitHub executes the cron only from the default branch, so the same workflow file existing on `develop` does not create a second scheduled run. The temporary `feature/prebuilt_img` push trigger exists only for the pilot and must be removed before merging to `main`.
+`.github/workflows/docker-sandboxes-images.yml` polls every six hours at minute 37, supports manual dispatch, and runs for recipe-related changes on configured branches. GitHub executes the cron only from the default branch, so the same workflow file existing on `develop` does not create a second scheduled run. Feature branches do not publish packages unless an explicit temporary trigger is deliberately added for an isolated pilot.
 
 The amd64 build runs on GitHub-hosted `ubuntu-latest`; the arm64 build runs on GitHub-hosted `ubuntu-24.04-arm`. The workflow has no persistent self-hosted runner dependency and no `EPAR_PREBUILT_LIVE` switch. Hosted jobs resolve the GHCR source descriptor, build from its immutable digest, inspect both platform images, assemble the exact two-platform index, run package smoke checks, generate SLSA/SPDX evidence, verify referrers, and publish an immutable signed candidate catalog.
 
@@ -104,13 +104,13 @@ Dispatch `docker-sandboxes-images.yml` on `main` with:
 - `promote_candidate: true`;
 - `profile: act`;
 - the exact `candidate_digest` and `candidate_catalog_reference`;
-- `acceptance_evidence_json` containing the four reviewed workflow run IDs, two EPAR receipt SHA-256 values, and exact amd64/arm64 runner names;
+- `acceptance_evidence_json` containing the four reviewed workflow run IDs, two EPAR receipt SHA-256 values, and the exact ephemeral runner name used by every workflow run;
 - `promotion_confirmation: PROMOTE`.
 
 The evidence input is one JSON object so the workflow remains below GitHub's ten-input limit:
 
 ```json
-{"amd64PlaywrightRunId":123,"amd64DockerHubRunId":124,"amd64ReceiptSha256":"sha256:<64 hex>","amd64RunnerName":"<exact generated name>","arm64PlaywrightRunId":125,"arm64DockerHubRunId":126,"arm64ReceiptSha256":"sha256:<64 hex>","arm64RunnerName":"<exact generated name>"}
+{"amd64PlaywrightRunId":123,"amd64PlaywrightRunnerName":"<exact generated name>","amd64DockerHubRunId":124,"amd64DockerHubRunnerName":"<different exact generated name>","amd64ReceiptSha256":"sha256:<64 hex>","arm64PlaywrightRunId":125,"arm64PlaywrightRunnerName":"<exact generated name>","arm64DockerHubRunId":126,"arm64DockerHubRunnerName":"<different exact generated name>","arm64ReceiptSha256":"sha256:<64 hex>"}
 ```
 
 The `epar-prebuilt-promotion` environment must require an authorized reviewer. The workflow verifies the immutable main catalog and package evidence, rechecks the upstream source, appends two platform acceptance records, requires exactly the two approved workflows per platform, and performs protected catalog compare-and-swap. It then signs and verifies the promoted catalog, moves `catalog-v1`, and moves `act-latest` last. Incomplete, failed, misrouted, single-platform, wrong-workflow, alias-raced, or source-raced evidence cannot promote.

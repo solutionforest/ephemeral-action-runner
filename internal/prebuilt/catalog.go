@@ -307,7 +307,10 @@ type StatusTransition struct {
 	At                 time.Time `json:"at"`
 }
 
-const AcceptanceRecordSchemaVersion = 1
+const (
+	legacyAcceptanceRecordSchemaVersion = 1
+	AcceptanceRecordSchemaVersion       = 2
+)
 
 // WorkflowRunEvidence is human-reviewed evidence from the private EPAR test
 // repository. The publisher intentionally has no cross-repository credential;
@@ -319,6 +322,7 @@ type WorkflowRunEvidence struct {
 	RunID      int64  `json:"runId"`
 	URL        string `json:"url"`
 	Conclusion string `json:"conclusion"`
+	RunnerName string `json:"runnerName,omitempty"`
 }
 
 // PlatformAcceptance records one real Docker-Sandboxes acceptance performed
@@ -330,7 +334,7 @@ type PlatformAcceptance struct {
 	Platform           string                `json:"platform"`
 	RunnerGroup        string                `json:"runnerGroup"`
 	RunnerLabel        string                `json:"runnerLabel"`
-	RunnerName         string                `json:"runnerName"`
+	RunnerName         string                `json:"runnerName,omitempty"`
 	ReceiptSHA256      string                `json:"receiptSha256"`
 	ImportReadback     bool                  `json:"importReadback"`
 	RuntimeValidated   bool                  `json:"runtimeValidated"`
@@ -734,7 +738,7 @@ func validTransition(from, to string) bool {
 }
 
 func (a PlatformAcceptance) Validate() error {
-	if a.SchemaVersion != AcceptanceRecordSchemaVersion {
+	if a.SchemaVersion != legacyAcceptanceRecordSchemaVersion && a.SchemaVersion != AcceptanceRecordSchemaVersion {
 		return fmt.Errorf("unsupported acceptance schema %d", a.SchemaVersion)
 	}
 	if _, err := NormalizeDigest(a.PackageIndexDigest); err != nil {
@@ -747,15 +751,19 @@ func (a PlatformAcceptance) Validate() error {
 	if a.Platform != platform {
 		return fmt.Errorf("acceptance platform is not normalized: %q", a.Platform)
 	}
-	if a.RunnerGroup != "epar-dev-test" || strings.TrimSpace(a.RunnerName) == "" {
-		return errors.New("acceptance requires epar-dev-test runner group and exact runner name")
+	if a.RunnerGroup != "epar-dev-test" {
+		return errors.New("acceptance requires epar-dev-test runner group")
 	}
 	wantLabel := "epar-prebuilt-act-" + strings.TrimPrefix(a.PackageIndexDigest, "sha256:")[:12] + "-" + strings.TrimPrefix(platform, "linux/")
 	if a.RunnerLabel != wantLabel {
 		return fmt.Errorf("acceptance runner label must be %s", wantLabel)
 	}
-	if !strings.HasPrefix(a.RunnerName, wantLabel+"-") {
-		return fmt.Errorf("acceptance runner name must be generated from pool prefix %s", wantLabel)
+	if a.SchemaVersion == legacyAcceptanceRecordSchemaVersion {
+		if !strings.HasPrefix(a.RunnerName, wantLabel+"-") {
+			return fmt.Errorf("acceptance runner name must be generated from pool prefix %s", wantLabel)
+		}
+	} else if strings.TrimSpace(a.RunnerName) != "" {
+		return errors.New("acceptance schema 2 records runner names on individual workflow runs")
 	}
 	if _, err := NormalizeDigest(a.ReceiptSHA256); err != nil {
 		return fmt.Errorf("acceptance receipt digest: %w", err)
@@ -767,6 +775,7 @@ func (a PlatformAcceptance) Validate() error {
 		return errors.New("acceptance reviewer and timestamp are required")
 	}
 	wantWorkflows := map[string]bool{"playwright-docker.yml": false, "dockerhub-private-pull.yml": false}
+	runnerNames := make(map[string]struct{}, len(wantWorkflows))
 	if len(a.WorkflowRuns) != len(wantWorkflows) {
 		return errors.New("acceptance must contain exactly the Playwright and private Docker Hub workflow runs")
 	}
@@ -780,6 +789,15 @@ func (a PlatformAcceptance) Validate() error {
 		wantURL := fmt.Sprintf("https://github.com/%s/actions/runs/%d", run.Repository, run.RunID)
 		if run.URL != wantURL {
 			return fmt.Errorf("acceptance workflow URL must be %s", wantURL)
+		}
+		if a.SchemaVersion == AcceptanceRecordSchemaVersion {
+			if !strings.HasPrefix(run.RunnerName, wantLabel+"-") {
+				return fmt.Errorf("acceptance workflow runner name must be generated from pool prefix %s", wantLabel)
+			}
+			if _, duplicate := runnerNames[run.RunnerName]; duplicate {
+				return errors.New("acceptance workflows must run on distinct ephemeral runner names")
+			}
+			runnerNames[run.RunnerName] = struct{}{}
 		}
 		wantWorkflows[run.Workflow] = true
 	}
