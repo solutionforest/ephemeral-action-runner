@@ -207,7 +207,13 @@ foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.
     }
 }
 $guestText = ($guestScripts | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
-if ($guestText -match '(?im)apt-get\s+update|(?im)(^|[;&|]\s*)dockerd(?:\s|$)|(?im)-----BEGIN .*PRIVATE KEY-----|(?im)AKIA[0-9A-Z]{16}') {
+$quiesceApt = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'quiesce-apt.sh')
+$dockerSandboxesBootstrapCommand = "docker_sandboxes_bootstrap_command='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'"
+if ([regex]::Matches($quiesceApt, [regex]::Escape($dockerSandboxesBootstrapCommand)).Count -ne 1) {
+    throw 'quiesce-apt.sh must identify the exact Docker Sandboxes bootstrap apt command once'
+}
+$guestTextWithoutBootstrapIdentity = $guestText.Replace($dockerSandboxesBootstrapCommand, '')
+if ($guestTextWithoutBootstrapIdentity -match '(?im)apt-get\s+update|(?im)(^|[;&|]\s*)dockerd(?:\s|$)|(?im)-----BEGIN .*PRIVATE KEY-----|(?im)AKIA[0-9A-Z]{16}') {
     throw 'Guest helpers contain a boot-time package update, dockerd start, or credential pattern'
 }
 $configureRunner = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'configure-runner.sh')

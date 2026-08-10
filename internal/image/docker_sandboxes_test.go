@@ -289,9 +289,27 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			}
 		}
 		quiesce := readTemplateFile(t, filepath.Join("guest", "quiesce-apt.sh"))
-		for _, required := range []string{"systemctl stop apt-daily.timer", "pgrep -x apt-get", "pgrep -f -x '/usr/lib/apt/apt.systemd.daily.*'", "timed out waiting for boot-time apt processes"} {
+		for _, required := range []string{
+			"systemctl stop apt-daily.timer",
+			"docker_sandboxes_bootstrap_command='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'",
+			"read_process_arguments",
+			"is_docker_sandboxes_bootstrap_parent",
+			"is_docker_sandboxes_bootstrap_apt",
+			"pgrep -P",
+			`readlink -f "/proc/${pid}/exe"`,
+			`kill -TERM "${validated_refresh_pids[@]}"`,
+			`kill -KILL "${remaining_pids[@]}"`,
+			"pgrep -x apt-get",
+			"pgrep -f -x '/usr/lib/apt/apt.systemd.daily.*'",
+			"timed out waiting for unexpected package-manager processes",
+		} {
 			if !strings.Contains(quiesce, required) {
 				t.Fatalf("Docker Sandboxes apt quiescence omitted %q", required)
+			}
+		}
+		for _, forbidden := range []string{"pkill -f", "killall", "pkill apt"} {
+			if strings.Contains(quiesce, forbidden) {
+				t.Fatalf("Docker Sandboxes apt quiescence uses unsafe broad process termination %q", forbidden)
 			}
 		}
 		entrypoint := readTemplateFile(t, filepath.Join("guest", "template-entrypoint.sh"))

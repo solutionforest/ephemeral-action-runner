@@ -9,7 +9,7 @@ e912446ff3b08f1095f1d3f3935835030c62ba893e438ec88b5f02f07e8b4cb9  ./enable-archi
 3f5287360d723eedb3a18cd152ae6d1e6ce2217c4796166f850d6ec23de003c8  ./install-trusted-ca-certificates.sh
 eeb1bbb3561e7aa2c9e68b0823d35a5039618673c16598a08052b5e91a129fa2  ./prepare-job-start.sh
 5e9bffcf0192d74f65b26f2a5b4b520fe54754bfe16fed6864a366bcc89dbbd0  ./prepare-template.sh
-f4ef26d7170e1daae4ed6fdda92ff05d51ef48c3bf18e5daab848bef52aa3d15  ./quiesce-apt.sh
+9e151afd07b7f642f8aaae0dbe97486723a8fe160b1e98fb263629cc9e3c766a  ./quiesce-apt.sh
 e777e1bca301f950315cf5752b2be2981f1c679be113696686e98d0735e38e82  ./run-runner.sh
 5db2e7267e66d5bc5460a49cc1c6e55b8c0f97071165c15dc3fb2da7dc6e71c8  ./scrub-docker-auth.sh
 11e32d7da2f18f61fb88f7ebfb817c10d36de72a4cf176d8c601ef3431ecdede  ./template-entrypoint.sh
