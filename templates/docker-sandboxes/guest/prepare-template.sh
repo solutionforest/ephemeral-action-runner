@@ -84,6 +84,9 @@ rm -f /etc/sudoers.d/epar-proxy
 chmod 0440 /etc/sudoers.d/epar-agent
 printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' 'APT::Periodic::Unattended-Upgrade "0";' > /etc/apt/apt.conf.d/99epar-disable-periodic
 rm -f /etc/systemd/system/timers.target.wants/apt-daily.timer /etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer
+for apt_unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+  ln -sfn /dev/null "/etc/systemd/system/${apt_unit}"
+done
 
 # Docker Sandboxes supplies one private daemon and mounts its dedicated block
 # volume here. Never preserve or preload a daemon data-root in the template.

@@ -281,6 +281,29 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 		}
 	})
 
+	t.Run("package manager quiescence before registration", func(t *testing.T) {
+		prepare := readTemplateFile(t, filepath.Join("guest", "prepare-template.sh"))
+		for _, unit := range []string{"apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service", "apt-daily-upgrade.service", "unattended-upgrades.service"} {
+			if !strings.Contains(prepare, unit) {
+				t.Fatalf("Docker Sandboxes template preparation does not mask %s", unit)
+			}
+		}
+		quiesce := readTemplateFile(t, filepath.Join("guest", "quiesce-apt.sh"))
+		for _, required := range []string{"systemctl stop apt-daily.timer", "pgrep -x apt-get", "pgrep -f -x '/usr/lib/apt/apt.systemd.daily.*'", "timed out waiting for boot-time apt processes"} {
+			if !strings.Contains(quiesce, required) {
+				t.Fatalf("Docker Sandboxes apt quiescence omitted %q", required)
+			}
+		}
+		entrypoint := readTemplateFile(t, filepath.Join("guest", "template-entrypoint.sh"))
+		if !strings.Contains(entrypoint, "sudo -n /opt/epar/quiesce-apt.sh") {
+			t.Fatal("Docker Sandboxes entrypoint does not quiesce boot-time apt before readiness")
+		}
+		configure := readTemplateFile(t, filepath.Join("guest", "configure-runner.sh"))
+		if !strings.Contains(configure, "/opt/epar/quiesce-apt.sh") {
+			t.Fatal("Docker Sandboxes runner registration does not recheck apt quiescence")
+		}
+	})
+
 	t.Run("source credential scrubbing", func(t *testing.T) {
 		prepare := readTemplateFile(t, filepath.Join("guest", "prepare-template.sh"))
 		scrubber := readTemplateFile(t, filepath.Join("guest", "scrub-docker-auth.sh"))

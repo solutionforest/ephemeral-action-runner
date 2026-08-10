@@ -86,6 +86,8 @@ The initial wizard keeps `distribution: local-build` as the default and offers `
 
 The temporary candidate-acceptance mode is not a wizard choice. It is an operator-only, exact-digest configuration used to validate an immutable signed candidate on short-lived EPAR pools before stable alias promotion. It requires an immutable candidate catalog and evidence branch, uses manual update policy, and routes only through the restricted `epar-dev-test` runner group with a digest-bound label. See [Docker Sandboxes prebuilt image publication and acceptance](../development/docker-sandboxes-prebuilt.md) for the two approved workflows and four-run procedure.
 
+The reusable template disables and masks Ubuntu's periodic apt units. Sandbox startup also stops any boot-time apt service already activated and waits for apt/dpkg processes to finish before GitHub runner registration. This keeps a warm replacement runner from reaching its first package-installing workflow step while `/var/lib/apt/lists/lock` is still owned by the guest's background refresh; ordinary workflow-initiated package commands remain available afterward.
+
 `networkBaseline: open` adds EPAR-owned sandbox-scoped public egress plus deny-wins guardrails for host aliases; it does not change the host-global Docker Sandboxes policy. Use `balanced` with `additionalAllow` for default-deny public egress. Additional allow/deny entries are exact hostnames or `*.domain[:port]`; they cannot override the Open host-alias denies.
 
 ## Cross-Architecture Containers
