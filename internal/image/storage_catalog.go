@@ -1591,14 +1591,32 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 		}
 		return os.Remove(absolute)
 	case catalogPrebuiltPackageArchiveKind:
-		absolute, err := filepath.Abs(resource.Locator)
-		if err != nil {
-			return err
-		}
 		acquisitionRoot, err := filepath.Abs(filepath.Join(m.ProjectRoot, ".local", "state", "image"))
 		if err != nil {
 			return err
 		}
+		rootTarget, err := storage.SnapshotFilesystemTarget(acquisitionRoot)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if rootTarget.Kind != storage.TargetDirectory {
+			return errors.New("prebuilt acquisition root is not a directory")
+		}
+		archiveTarget, err := storage.SnapshotFilesystemTarget(resource.Locator)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if archiveTarget.Kind != storage.TargetDirectory {
+			return errors.New("prebuilt acquisition is not a directory")
+		}
+		absolute := archiveTarget.Locator
+		acquisitionRoot = rootTarget.Locator
 		relative, err := filepath.Rel(acquisitionRoot, absolute)
 		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return errors.New("prebuilt acquisition belongs to another project or lies outside the exact acquisition root")
