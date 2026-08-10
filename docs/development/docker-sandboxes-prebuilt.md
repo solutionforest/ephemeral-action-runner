@@ -8,11 +8,11 @@ Act (`act-latest`) is the initial supported profile. Full (`full-latest`) remain
 
 ## Workflow triggers and hosted build gates
 
-`.github/workflows/docker-sandboxes-images.yml` polls every six hours at minute 37, supports manual dispatch, and runs for recipe-related changes on configured branches. GitHub executes the cron only from the default branch, so the same workflow file existing on `develop` does not create a second scheduled run. Feature branches do not publish packages unless an explicit temporary trigger is deliberately added for an isolated pilot.
+`.github/workflows/docker-sandboxes-images.yml` polls every six hours at minute 37, supports manual dispatch, and publishes for recipe-related pushes only on `main`. GitHub executes the cron only from the default branch. Pull requests to `develop` or `main` that change a publisher, recipe, or committed-asset path run publisher, signed-evidence, and asset validation without logging in to GHCR, building a package, or pushing any manifest. This prevents a normal `develop` to `main` promotion from publishing the same source change twice.
 
-The amd64 build runs on GitHub-hosted `ubuntu-latest`; the arm64 build runs on GitHub-hosted `ubuntu-24.04-arm`. The workflow has no persistent self-hosted runner dependency and no `EPAR_PREBUILT_LIVE` switch. Hosted jobs resolve the GHCR source descriptor, build from its immutable digest, inspect both platform images, assemble the exact two-platform index, run package smoke checks, generate SLSA/SPDX evidence, verify referrers, and publish an immutable signed candidate catalog.
+The amd64 build runs on GitHub-hosted `ubuntu-latest`; the arm64 build runs on GitHub-hosted `ubuntu-24.04-arm`. The workflow has no persistent self-hosted runner dependency and no `EPAR_PREBUILT_LIVE` switch. Hosted jobs resolve the GHCR source descriptor, build from its immutable digest, inspect both runnable platform manifests by digest, assemble an index from those exact digests, require exactly two descriptors, run package smoke checks, generate and sign one index-level SLSA provenance statement and one index-level SPDX SBOM, verify their referrers, and publish an immutable signed candidate catalog. Platform builds disable BuildKit's additional per-platform SBOM/provenance indexes because EPAR's trust decision uses the separately signed index-level evidence and catalog. The index-level SPDX document records the package, recipe, and exact platform identities rather than reproducing BuildKit's more detailed component inventory; this deliberate narrower audit scope avoids four additional per-publication GHCR version rows without weakening the evidence enforced by EPAR.
 
-The workflow grants `contents: read`, `packages: write`, `attestations: write`, and `id-token: write`. Third-party actions are pinned to full commit SHAs. Publication is serialized by one non-cancelling concurrency group.
+The workflow grants `contents: read`, `packages: write`, `attestations: write`, and `id-token: write` to publication jobs, while pull-request validation overrides permissions to `contents: read`. Third-party actions are pinned to full commit SHAs. Publication is serialized by one non-cancelling concurrency group; validation uses one group per pull request and cancels only a superseded validation run for that same pull request.
 
 ## Candidate publication contract
 
@@ -24,6 +24,10 @@ Every new package is first recorded as `candidate`. Before manual acceptance, pu
 - an immutable catalog object and canonical tag such as `catalog-v1-pkg-<64 hex catalog digest>`.
 
 Candidate publication does not move `catalog-v1` or `act-latest`. This permits first-catalog bootstrap: a candidate can be acquired through its exact signed immutable catalog even when no moving catalog exists yet.
+
+### GHCR version graph
+
+GitHub Packages displays every OCI manifest as a package version, so one logical candidate appears as several rows. The expected retained graph contains the final multi-platform package index, its amd64 and arm64 runnable manifests, signed SLSA and SPDX referrer manifests and their discovery index, the immutable catalog manifest, and the catalog signature and discovery index. Tags named `act-latest-pkg-<digest>` and `catalog-v1-pkg-<digest>` are write-once audit identities. Run-specific `candidate-<profile>-<run>-<attempt>` tags are staging and diagnostic aliases, while `sha256-<subject digest>` tags are attestation-discovery indexes used by the verifier; neither is an end-user image channel. An untagged child manifest can still be required by a retained index and must not be deleted merely because the GitHub Packages page calls it untagged.
 
 Production builds always use the resolved immutable upstream digest. The upstream tag is re-resolved before publication. If it moves during the build, the package remains an immutable candidate and no moving alias advances.
 
@@ -78,7 +82,7 @@ provider:
 
 For the Mac config, change `sourcePlatform` and `provider.platform` to `linux/arm64`, use a distinct `pool.namePrefix`, and change the unique label suffix to `-arm64`. The organization runner group `epar-dev-test` must allow only `solutionforest/ephemeral-action-runner-test` and must not allow public repositories. The host machines run EPAR normally; they are not registered directly as persistent GitHub Actions runners.
 
-Run `./start image build --config <candidate-config>` first. Successful acquisition verifies the immutable catalog and package evidence, materializes/imports the selected platform, performs exact `sbx template ls` readback, and writes `.local/state/image/<config-id>/docker-sandboxes/active.json`. A missing, mismatched, unsigned, revoked, or wrong-ref candidate fails closed without a local Catthehacker build or provider fallback.
+Run `./start --config <candidate-config>` to provision and start the temporary acceptance pool; it automatically performs the required image acquisition before creating a Sandbox. An explicit `./start image build --config <candidate-config>` is optional when an operator wants to provision and inspect the template without starting the pool. Successful acquisition verifies the immutable catalog and package evidence, materializes/imports the selected platform, performs exact `sbx template ls` readback, and writes `.local/state/image/<config-id>/docker-sandboxes/active.json`. A missing, mismatched, unsigned, revoked, or wrong-ref candidate fails closed without a local Catthehacker build or provider fallback.
 
 ## Four-run acceptance suite
 
@@ -132,6 +136,6 @@ go run ./cmd/epar-prebuilt-publisher verify-package --reference ghcr.io/solution
 
 ## Retention and revocation
 
-Immutable package and catalog objects are retained for audit and rollback. The workflow performs no broad deletion. Revocation appends `revoked` or `critical-revoked` status to a newly signed catalog; it does not delete the immutable package. Candidate acquisition rejects a revoked status in its exact signed catalog. Normal stable consumers enforce the current signed moving-catalog status, with `critical-revoked` blocking new Sandbox admissions.
+Immutable accepted, active, superseded rollback, and revoked package and catalog objects are retained for audit and recovery. The workflow performs no broad deletion. Unaccepted CI candidates may be removed only by future reachability-aware maintenance after a documented retention window; that maintenance must preserve every object referenced by a retained package index, attestation-discovery index, signed catalog, active receipt, or rollback identity. Manual deletion of individual untagged GitHub Packages rows is unsafe. Revocation appends `revoked` or `critical-revoked` status to a newly signed catalog; it does not delete the immutable package. Candidate acquisition rejects a revoked status in its exact signed catalog. Normal stable consumers enforce the current signed moving-catalog status, with `critical-revoked` blocking new Sandbox admissions.
 
 The public base contains no workstation CA, enterprise credential, proxy endpoint, `NO_PROXY`, forward-bypass configuration, pool data, or custom install script. Host trust is a runtime overlay. Custom scripts create a local derivative from the already verified package digest and use BuildKit secret mounts for private build trust; no script or CA change silently redownloads the unchanged public base.

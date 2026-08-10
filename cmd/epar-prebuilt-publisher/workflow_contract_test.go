@@ -70,6 +70,31 @@ func TestWorkflowUsesHostedBuildsAndExternalEPARAcceptance(t *testing.T) {
 	}
 }
 
+func TestWorkflowPublishesOnlyFromMainAndValidatesPullRequestsWithoutPublishing(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	for _, required := range []string{
+		"push:\n    branches:\n      - main",
+		"pull_request:\n    branches:\n      - develop\n      - main",
+		"name: Validate prebuilt publication contract without publishing",
+		"if: github.event_name == 'pull_request'",
+		"permissions:\n      contents: read",
+		"go test ./internal/prebuilt ./cmd/epar-prebuilt-publisher -count=1",
+		"if: github.event_name != 'pull_request' && inputs.promote_candidate != true",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("workflow branch/publication isolation is missing %q", required)
+		}
+	}
+	pushStart := strings.Index(workflow, "  push:\n")
+	pullRequestStart := strings.Index(workflow, "  pull_request:\n")
+	if pushStart < 0 || pullRequestStart < 0 || pushStart >= pullRequestStart {
+		t.Fatalf("cannot isolate push trigger: push=%d pull_request=%d", pushStart, pullRequestStart)
+	}
+	if strings.Contains(workflow[pushStart:pullRequestStart], "      - develop\n") {
+		t.Fatal("develop pushes must not publish GHCR candidates")
+	}
+}
+
 func TestWorkflowPublicationCannotMutateGitOrSourceReleaseState(t *testing.T) {
 	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
 	if !strings.Contains(workflow, "permissions:\n  contents: read") {
@@ -90,17 +115,34 @@ func TestWorkflowAllowsAbsoluteCatalogPathsForORASPush(t *testing.T) {
 	}
 }
 
-func TestWorkflowRecordsRunnablePlatformManifestFromAttestedCandidateIndex(t *testing.T) {
+func TestWorkflowRecordsRunnablePlatformManifestWithoutDuplicatePlatformEvidence(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{
-		`docker buildx imagetools inspect "$CANDIDATE_REFERENCE" --raw`,
+		`platform_candidate_ref="${PACKAGE_REPOSITORY}@${CANDIDATE_DESCRIPTOR_DIGEST}"`,
+		`docker buildx imagetools inspect "$platform_candidate_ref" --raw`,
+		`provenance: false`,
+		`sbom: false`,
+		`application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json`,
+		`package_manifest_digest="$CANDIDATE_DESCRIPTOR_DIGEST"`,
 		`select(.platform.os == "linux" and .platform.architecture == $architecture)`,
 		`if length == 1 then .[0].digest else error("expected exactly one runnable platform manifest") end`,
-		`packageManifestDigest:$digest,candidateIndexDigest:$candidateIndexDigest`,
+		`packageManifestDigest:$digest,candidateDescriptorDigest:$candidateDescriptorDigest`,
+		`"${PACKAGE_REPOSITORY}@${amd64_digest}"`,
+		`"${PACKAGE_REPOSITORY}@${arm64_digest}"`,
+		`($manifests | length) == 2`,
 	} {
 		if !strings.Contains(workflow, required) {
-			t.Fatalf("workflow no longer records an exact runnable platform manifest from the attested candidate index: missing %q", required)
+			t.Fatalf("workflow no longer records an exact runnable platform manifest without duplicate platform evidence: missing %q", required)
 		}
+	}
+	if strings.Contains(workflow, "provenance: mode=max") || strings.Contains(workflow, "sbom: true") {
+		t.Fatal("platform builds must not recreate evidence already signed for the completed multi-platform index")
+	}
+	if got := strings.Count(workflow, "Generate signed index SLSA referrer"); got != 1 {
+		t.Fatalf("completed package index must retain exactly one signed SLSA referrer step: got %d", got)
+	}
+	if got := strings.Count(workflow, "Generate signed index SPDX SBOM referrer"); got != 1 {
+		t.Fatalf("completed package index must retain exactly one signed SPDX referrer step: got %d", got)
 	}
 }
 
