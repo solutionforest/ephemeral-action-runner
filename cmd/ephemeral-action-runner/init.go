@@ -97,17 +97,8 @@ type initDockerSandboxesTemplate struct {
 }
 
 type dockerSandboxesSourceLock struct {
-	SchemaVersion int                                   `json:"schemaVersion"`
-	Profiles      map[string]dockerSandboxesLockProfile `json:"profiles"`
-}
-
-type dockerSandboxesLockProfile struct {
-	ObservedTagReference string                                        `json:"observedTagReference"`
-	Platforms            map[string]dockerSandboxesLockProfilePlatform `json:"platforms"`
-}
-
-type dockerSandboxesLockProfilePlatform struct {
-	TemplateTag string `json:"templateTag"`
+	SchemaVersion   int    `json:"schemaVersion"`
+	SourceAuthority string `json:"sourceAuthority"`
 }
 
 type dockerSandboxesActiveProfile struct {
@@ -142,7 +133,11 @@ type initDockerImageProfile struct {
 	Provider          string
 	HostPlatform      sandboxpromotion.Platform
 	GuestPlatform     string
+	Distribution      string
 	SourceImage       string
+	PrebuiltReference string
+	PrebuiltDigest    string
+	PrebuiltPreview   bool
 	CustomScripts     []string
 	PolicyFingerprint string
 	RootDisk          string
@@ -937,8 +932,22 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		fmt.Fprintf(out, "  %s. Another catthehacker/ubuntu tag, such as go-24.04\n", customChoice)
 	}
 	fmt.Fprintln(out, "  0. Back")
+	if len(descriptor.WizardArtifactSources) > 0 {
+		for _, artifact := range descriptor.WizardArtifactSources {
+			previewLabel := ""
+			if artifact.Preview {
+				previewLabel = " (preview)"
+			}
+			fmt.Fprintf(out, "  P. %s%s\n", artifact.Label, previewLabel)
+			if artifact.Description != "" {
+				fmt.Fprintf(out, "     %s\n", artifact.Description)
+			}
+		}
+		fmt.Fprintln(out, "     Local Catthehacker builds remain the default; choose P only when the verified prebuilt Act path is intentional.")
+	}
 
 	var source imageartifact.ResolvedDockerSource
+	var prebuilt *provider.WizardArtifactSource
 	for {
 		choiceResult, hitEOF, promptErr := promptWizardDefault(out, reader, "Runner base image", "1")
 		if promptErr != nil {
@@ -950,6 +959,17 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		choice := choiceResult.Value
 		if choice == "0" {
 			return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
+		}
+		if strings.EqualFold(choice, "p") || strings.EqualFold(choice, "prebuilt") {
+			if len(descriptor.WizardArtifactSources) == 0 {
+				fmt.Fprintln(out, "  A prebuilt artifact is not registered for this provider.")
+				if hitEOF {
+					return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("prebuilt artifact is unavailable for %s", providerType)
+				}
+				continue
+			}
+			prebuilt = &descriptor.WizardArtifactSources[0]
+			break
 		}
 		normalizedChoice := strings.ToLower(choice)
 		input := ""
@@ -993,6 +1013,29 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 			return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("resolve runner source image: %w", err)
 		}
 	}
+	if prebuilt != nil {
+		policyFingerprint := ""
+		if providerType == "docker-sandboxes" {
+			policyFingerprint, err = initDockerSandboxesPolicyFingerprint(ctx)
+			if err != nil {
+				return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
+			}
+		}
+		fmt.Fprintln(out, "  Selected verified prebuilt Act. The immutable digest and GitHub/Sigstore attestation are verified before activation; first-use Docker Sandboxes materialization remains local.")
+		profile := &initDockerSandboxesProfile{
+			Provider:          providerType,
+			HostPlatform:      hostPlatform,
+			GuestPlatform:     guestPlatform,
+			Distribution:      config.ImageDistributionPrebuilt,
+			SourceImage:       "ghcr.io/catthehacker/ubuntu:act-latest",
+			PrebuiltReference: prebuilt.Reference,
+			PrebuiltPreview:   prebuilt.Preview,
+			PolicyFingerprint: policyFingerprint,
+			RootDisk:          config.DockerSandboxesAutomaticRootDisk,
+			DockerDisk:        config.DockerSandboxesDefaultDockerDisk,
+		}
+		return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardNext, Value: profile}, nil, nil
+	}
 
 	policyFingerprint := ""
 	if providerType == "docker-sandboxes" {
@@ -1027,6 +1070,7 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		Provider:          providerType,
 		HostPlatform:      hostPlatform,
 		GuestPlatform:     guestPlatform,
+		Distribution:      config.ImageDistributionLocalBuild,
 		SourceImage:       source.Reference,
 		PolicyFingerprint: policyFingerprint,
 		RootDisk:          config.DockerSandboxesAutomaticRootDisk,
@@ -1331,54 +1375,32 @@ func readDockerSandboxesActiveProfiles(projectRoot, guestPlatform string) ([]doc
 	if err := json.Unmarshal(contents, &lock); err != nil {
 		return nil, fmt.Errorf("parse Docker Sandboxes source lock %q: %w", lockPath, err)
 	}
-	if lock.SchemaVersion != 2 {
+	if lock.SchemaVersion != 4 {
 		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: unsupported schemaVersion %d", lockPath, lock.SchemaVersion)
 	}
-	if len(lock.Profiles) == 0 {
-		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: no active profiles", lockPath)
+	if lock.SourceAuthority != "registry-catalog" {
+		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: unsupported sourceAuthority %q", lockPath, lock.SourceAuthority)
 	}
-	profileOrder := []string{"full", "act-22.04"}
-	expectedSourceChannels := map[string]string{
-		"full":      "ghcr.io/catthehacker/ubuntu:full-latest",
-		"act-22.04": "ghcr.io/catthehacker/ubuntu:act-22.04",
+	// Profile source observations, package digests, validation state, and
+	// revocations live in the signed registry catalog. The lock retains only
+	// static build tooling; these references are moving selectors resolved by
+	// the catalog consumer at publication/runtime time.
+	if guestPlatform != "linux/amd64" && guestPlatform != "linux/arm64" {
+		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: unsupported guest platform %q", lockPath, guestPlatform)
 	}
-	profiles := make([]dockerSandboxesActiveProfile, 0, len(profileOrder))
-	for _, name := range profileOrder {
-		profile, found := lock.Profiles[name]
-		if !found {
-			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q is missing", lockPath, name)
-		}
-		platform, found := profile.Platforms[guestPlatform]
-		if !found || platform.TemplateTag == "" {
-			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q has no templateTag for %s", lockPath, name, guestPlatform)
-		}
-		reference, err := canonicalDockerSandboxesTemplateReference(platform.TemplateTag)
-		if err != nil {
-			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q has invalid templateTag: %w", lockPath, name, err)
-		}
-		if profile.ObservedTagReference != expectedSourceChannels[name] {
-			return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profile %q has unexpected observedTagReference %q", lockPath, name, profile.ObservedTagReference)
-		}
-		label := "Catthehacker Ubuntu Act 22.04"
-		if name == "full" {
-			label = "Catthehacker Ubuntu Full"
-		}
-		profiles = append(profiles, dockerSandboxesActiveProfile{
-			Name:              name,
-			ObservedTag:       profile.ObservedTagReference,
-			TemplateReference: reference,
-			DisplayLabel:      label,
-		})
-	}
-	if len(lock.Profiles) != len(profiles) {
-		return nil, fmt.Errorf("read Docker Sandboxes source lock %q: active profiles must be exactly full and act-22.04", lockPath)
-	}
-	profiles[0].DisplayLabel += " (recommended)"
-	profiles[1].DisplayLabel += " (current lean profile)"
-	return profiles, nil
+	return []dockerSandboxesActiveProfile{
+		{Name: "full", ObservedTag: "ghcr.io/catthehacker/ubuntu:full-latest", TemplateReference: "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:full-latest", DisplayLabel: "Catthehacker Ubuntu Full (catalog-gated)"},
+		{Name: "act", ObservedTag: "ghcr.io/catthehacker/ubuntu:act-latest", TemplateReference: "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest", DisplayLabel: "Catthehacker Ubuntu Act (recommended)"},
+	}, nil
 }
 
 func canonicalDockerSandboxesTemplateReference(reference string) (string, error) {
+	if strings.HasPrefix(reference, "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:") {
+		if strings.ContainsAny(reference, "@/ \t\r\n") || !strings.HasSuffix(reference, ":act-latest") && !strings.HasSuffix(reference, ":full-latest") {
+			return "", fmt.Errorf("must be an approved catalog profile reference, got %q", reference)
+		}
+		return reference, nil
+	}
 	if strings.HasPrefix(reference, "docker.io/library/") {
 		reference = strings.TrimPrefix(reference, "docker.io/library/")
 	}
@@ -1948,7 +1970,7 @@ func defaultDockerSandboxesConfig(appID int64, organization, privateKeyPath stri
   webBaseUrl: https://github.com
 
 image:
-  sourceType: docker-image
+%s  sourceType: docker-image
   sourceImage: %s
   sourcePlatform: %s
   runnerVersion: latest
@@ -2029,7 +2051,28 @@ timeouts:
   bootSeconds: 180
   githubOnlineSeconds: 180
   commandSeconds: 900
-`, appID, organization, privateKeyPath, profile.SourceImage, guestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, architectureEmulation, profile.RootDisk, profile.DockerDisk)
+`, appID, organization, privateKeyPath, renderInitDockerSandboxesImageDistribution(profile), profile.SourceImage, guestPlatform, updatePolicy.Frequency, updatePolicy.Time, renderInitCustomInstallScripts(profile.CustomScripts), hostTrustMode, strings.Join(hostTrustScopes, ", "), poolNamePrefix, strconv.Quote(runnerGroup.Group.Name), runnerArchitectureLabel, runnerGroup.Policy.Enforcement, runnerGroup.Policy.RequireExplicitGroup, runnerGroup.Policy.RequireNonDefaultGroup, runnerGroup.Policy.RequiredRepositoryAccess, runnerGroup.Policy.RequirePublicRepositoriesDisabled, guestPlatform, profile.PolicyFingerprint, architectureEmulation, profile.RootDisk, profile.DockerDisk)
+}
+
+func initProfileDistribution(profile initDockerSandboxesProfile) string {
+	if strings.TrimSpace(profile.Distribution) == "" {
+		return config.ImageDistributionLocalBuild
+	}
+	return strings.TrimSpace(profile.Distribution)
+}
+
+func renderInitDockerSandboxesImageDistribution(profile initDockerSandboxesProfile) string {
+	if initProfileDistribution(profile) != config.ImageDistributionPrebuilt {
+		return ""
+	}
+	lines := []string{
+		"  distribution: " + config.ImageDistributionPrebuilt,
+		"  prebuiltReference: " + strings.TrimSpace(profile.PrebuiltReference),
+	}
+	if digest := strings.TrimSpace(profile.PrebuiltDigest); digest != "" {
+		lines = append(lines, "  prebuiltDigest: "+digest)
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func renderInitCustomInstallScripts(paths []string) string {

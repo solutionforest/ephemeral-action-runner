@@ -104,6 +104,9 @@ image:
 
 func TestImageUpdatePolicyDefaults(t *testing.T) {
 	cfg := Default()
+	if got, want := cfg.Image.Distribution, ImageDistributionLocalBuild; got != want {
+		t.Fatalf("Image.Distribution = %q, want %q", got, want)
+	}
 	if got, want := cfg.Image.UpdateFrequency, ImageUpdateFrequencyWeekly; got != want {
 		t.Fatalf("Image.UpdateFrequency = %q, want %q", got, want)
 	}
@@ -112,6 +115,163 @@ func TestImageUpdatePolicyDefaults(t *testing.T) {
 	}
 	if err := ValidateImageUpdatePolicy(cfg.Image); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLoadPrebuiltDockerSandboxesConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-sandboxes
+image:
+  distribution: prebuilt
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  prebuiltReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest
+  prebuiltDigest: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+security:
+  runnerGroup:
+    enforcement: enforce
+dockerSandboxes:
+  policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.Distribution, ImageDistributionPrebuilt; got != want {
+		t.Fatalf("image.distribution = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.PrebuiltReference, DockerSandboxesPrebuiltActReference; got != want {
+		t.Fatalf("image.prebuiltReference = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrebuiltImageDistributionValidation(t *testing.T) {
+	base := Default()
+	base.Provider.Type = "docker-sandboxes"
+	base.Provider.Platform = "linux/amd64"
+	base.Provider.SourceImage = ""
+	base.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-docker-sandboxes"}
+	base.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
+	base.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+	base.Image.Distribution = ImageDistributionPrebuilt
+	base.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:act-latest"
+	base.Image.PrebuiltReference = DockerSandboxesPrebuiltActReference
+
+	if err := Validate(base); err != nil {
+		t.Fatalf("valid prebuilt configuration rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{name: "missing reference", edit: func(cfg *Config) { cfg.Image.PrebuiltReference = "" }, want: "prebuiltReference"},
+		{name: "invalid digest", edit: func(cfg *Config) { cfg.Image.PrebuiltDigest = "sha256:ABC" }, want: "lowercase"},
+		{name: "untrusted reference", edit: func(cfg *Config) {
+			cfg.Image.PrebuiltReference = "ghcr.io/example/ephemeral-action-runner/docker-sandboxes-act:preview"
+		}, want: "arbitrary GHCR packages"},
+		{name: "full profile", edit: func(cfg *Config) { cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest" }, want: "Act profile"},
+		{name: "pinned runner", edit: func(cfg *Config) { cfg.Image.RunnerVersion = "2.333.0" }, want: "not supported"},
+		{name: "wrong provider", edit: func(cfg *Config) { cfg.Provider.Type = "docker-container"; cfg.Provider.SourceImage = "epar-image" }, want: "supported only with provider.type=docker-sandboxes"},
+		{name: "local fields", edit: func(cfg *Config) { cfg.Image.Distribution = ImageDistributionLocalBuild }, want: "require image.distribution=prebuilt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrebuiltCandidateAcceptanceValidation(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	base := Default()
+	base.Provider.Type = "docker-sandboxes"
+	base.Provider.Platform = "linux/amd64"
+	base.Image.Distribution = ImageDistributionPrebuilt
+	base.Image.SourceType = ImageSourceDockerImage
+	base.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:act-latest"
+	base.Image.SourcePlatform = "linux/amd64"
+	base.Image.PrebuiltReference = DockerSandboxesPrebuiltActReference
+	base.Image.PrebuiltDigest = digest
+	base.Image.PrebuiltAcceptance = true
+	base.Image.PrebuiltCatalogReference = "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-" + strings.Repeat("b", 64)
+	base.Image.PrebuiltEvidenceRef = "refs/heads/feature/prebuilt_img"
+	base.Image.UpdateFrequency = ImageUpdateFrequencyManual
+	base.Image.HostTrustMode = HostTrustModeOverlay
+	base.Image.HostTrustScopes = []string{"system"}
+	base.Pool.Instances = 1
+	base.Pool.NamePrefix = "epar-prebuilt-act-" + strings.Repeat("a", 12) + "-amd64"
+	base.Runner.Ephemeral = true
+	base.Runner.Group = "epar-dev-test"
+	base.Runner.Labels = []string{"epar-prebuilt-act-" + strings.Repeat("a", 12) + "-amd64"}
+	base.Runner.IncludeHostLabel = false
+	base.Runner.NoDefaultLabels = true
+	base.Security.RunnerGroup = RunnerGroupSecurityConfig{Enforcement: RunnerGroupEnforcementEnforce, RequireExplicitGroup: true, RequireNonDefaultGroup: true, RequiredRepositoryAccess: RunnerGroupRepositoryAccessSelected, RequirePublicRepositoriesDisabled: true}
+	base.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("c", 64)
+
+	if err := Validate(base); err != nil {
+		t.Fatalf("valid candidate acceptance configuration rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{name: "digest required", edit: func(cfg *Config) { cfg.Image.PrebuiltDigest = "" }, want: "prebuiltDigest is required"},
+		{name: "immutable catalog required", edit: func(cfg *Config) { cfg.Image.PrebuiltCatalogReference = DockerSandboxesPrebuiltActReference }, want: "immutable official catalog"},
+		{name: "evidence ref required", edit: func(cfg *Config) { cfg.Image.PrebuiltEvidenceRef = "main" }, want: "refs/heads"},
+		{name: "manual updates required", edit: func(cfg *Config) { cfg.Image.UpdateFrequency = ImageUpdateFrequencyWeekly }, want: "updateFrequency must be manual"},
+		{name: "one runner required", edit: func(cfg *Config) { cfg.Pool.Instances = 2 }, want: "pool.instances must be 1"},
+		{name: "test group required", edit: func(cfg *Config) { cfg.Runner.Group = "Default" }, want: "runner.group must be epar-dev-test"},
+		{name: "digest label required", edit: func(cfg *Config) { cfg.Runner.Labels = []string{"self-hosted"} }, want: "candidate acceptance requires only runner.labels"},
+		{name: "default labels rejected", edit: func(cfg *Config) { cfg.Runner.NoDefaultLabels = false }, want: "noDefaultLabels"},
+		{name: "host label rejected", edit: func(cfg *Config) { cfg.Runner.IncludeHostLabel = true }, want: "includeHostLabel"},
+		{name: "pool prefix required", edit: func(cfg *Config) { cfg.Pool.NamePrefix = "epar-prebuilt-amd64" }, want: "pool.namePrefix"},
+		{name: "derivative rejected", edit: func(cfg *Config) { cfg.Image.CustomInstallScripts = []string{"install.sh"} }, want: "without a local derivative"},
+		{name: "trust mode required", edit: func(cfg *Config) { cfg.Image.HostTrustMode = HostTrustModeDisabled }, want: "hostTrustMode must be overlay"},
+		{name: "selected private group policy required", edit: func(cfg *Config) { cfg.Security.RunnerGroup.RequiredRepositoryAccess = RunnerGroupRepositoryAccessAll }, want: "selected-repository"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadPrebuiltCandidateAcceptanceFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate.yml")
+	content := `image:
+  prebuiltAcceptance: true
+  prebuiltCatalogReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  prebuiltEvidenceRef: refs/heads/feature/prebuilt_img
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Image.PrebuiltAcceptance || cfg.Image.PrebuiltCatalogReference != "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-"+strings.Repeat("b", 64) || cfg.Image.PrebuiltEvidenceRef != "refs/heads/feature/prebuilt_img" {
+		t.Fatalf("candidate acceptance fields = %+v", cfg.Image)
 	}
 }
 

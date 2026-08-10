@@ -52,6 +52,7 @@ var entries = []entry{
 			ImageMode:              provider.ImageModeTemplate,
 			GuidedArtifacts:        true,
 			WizardImageProfiles:    dockerSandboxesProfiles(),
+			WizardArtifactSources:  dockerSandboxesArtifactSources(),
 			WizardPrerequisite:     provider.WizardPrerequisiteDockerSandboxes,
 			WizardOnboarding:       provider.WizardOnboardingCatthehackerDocker,
 			WizardHostTrust:        provider.WizardHostTrustOverlay,
@@ -104,12 +105,25 @@ func dockerSandboxesProfiles() []provider.WizardImageProfile {
 	}
 }
 
+func dockerSandboxesArtifactSources() []provider.WizardArtifactSource {
+	return []provider.WizardArtifactSource{{
+		Distribution: config.ImageDistributionPrebuilt,
+		Profile:      "act",
+		Reference:    config.DockerSandboxesPrebuiltActReference,
+		Label:        "EPAR verified prebuilt Act",
+		Description:  "Preview: built from Catthehacker Ubuntu Act and verified by immutable digest plus GitHub/Sigstore attestation. Host and enterprise CAs are applied at runtime where safe; custom scripts create only a small local derivative.",
+		Preview:      true,
+		Default:      false,
+	}}
+}
+
 func Descriptors() []provider.Descriptor {
 	result := make([]provider.Descriptor, 0, len(entries))
 	for _, registered := range entries {
 		descriptor := registered.descriptor
 		descriptor.WizardAliases = append([]string(nil), descriptor.WizardAliases...)
 		descriptor.WizardImageProfiles = append([]provider.WizardImageProfile(nil), descriptor.WizardImageProfiles...)
+		descriptor.WizardArtifactSources = append([]provider.WizardArtifactSource(nil), descriptor.WizardArtifactSources...)
 		result = append(result, descriptor)
 	}
 	return result
@@ -121,6 +135,7 @@ func DescriptorFor(providerType string) (provider.Descriptor, bool) {
 			descriptor := registered.descriptor
 			descriptor.WizardAliases = append([]string(nil), descriptor.WizardAliases...)
 			descriptor.WizardImageProfiles = append([]provider.WizardImageProfile(nil), descriptor.WizardImageProfiles...)
+			descriptor.WizardArtifactSources = append([]provider.WizardArtifactSource(nil), descriptor.WizardArtifactSources...)
 			return descriptor, true
 		}
 	}

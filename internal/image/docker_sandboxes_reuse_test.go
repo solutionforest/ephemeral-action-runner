@@ -19,6 +19,7 @@ import (
 
 type reusableTemplateRuntime struct {
 	want        provider.TemplateArtifact
+	active      provider.TemplateArtifact
 	verified    int
 	activated   int
 	imported    int
@@ -32,6 +33,7 @@ type publicationRaceRuntime struct {
 	activationStarted      chan struct{}
 	releaseFirstActivation chan struct{}
 	imports                int
+	active                 provider.TemplateArtifact
 }
 
 type generationImportEnvironment struct {
@@ -87,6 +89,22 @@ func (runtime *generationImportRuntime) ActivateTemplate(artifact provider.Templ
 	return nil
 }
 
+func (runtime *generationImportRuntime) WithTemplateActivation(operation func() error) error {
+	return operation()
+}
+
+func (runtime *generationImportRuntime) ActiveTemplate() (provider.TemplateArtifact, bool) {
+	return runtime.activated, runtime.activated.Reference != ""
+}
+
+func (runtime *generationImportRuntime) ClearActiveTemplate(expected provider.TemplateArtifact) error {
+	if runtime.activated != expected {
+		return fmt.Errorf("active template changed")
+	}
+	runtime.activated = provider.TemplateArtifact{}
+	return nil
+}
+
 func (runtime *publicationRaceRuntime) ImportTemplate(context.Context, string) error {
 	runtime.mu.Lock()
 	runtime.imports++
@@ -112,6 +130,29 @@ func (runtime *publicationRaceRuntime) ActivateTemplate(artifact provider.Templa
 		close(runtime.activationStarted)
 		<-runtime.releaseFirstActivation
 	})
+	runtime.mu.Lock()
+	runtime.active = artifact
+	runtime.mu.Unlock()
+	return nil
+}
+
+func (runtime *publicationRaceRuntime) WithTemplateActivation(operation func() error) error {
+	return operation()
+}
+
+func (runtime *publicationRaceRuntime) ActiveTemplate() (provider.TemplateArtifact, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.active, runtime.active.Reference != ""
+}
+
+func (runtime *publicationRaceRuntime) ClearActiveTemplate(expected provider.TemplateArtifact) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.active != expected {
+		return fmt.Errorf("active template changed")
+	}
+	runtime.active = provider.TemplateArtifact{}
 	return nil
 }
 
@@ -133,6 +174,23 @@ func (runtime *reusableTemplateRuntime) ActivateTemplate(artifact provider.Templ
 		return provider.ErrTemplateNotFound
 	}
 	runtime.activated++
+	runtime.active = artifact
+	return nil
+}
+
+func (runtime *reusableTemplateRuntime) WithTemplateActivation(operation func() error) error {
+	return operation()
+}
+
+func (runtime *reusableTemplateRuntime) ActiveTemplate() (provider.TemplateArtifact, bool) {
+	return runtime.active, runtime.active.Reference != ""
+}
+
+func (runtime *reusableTemplateRuntime) ClearActiveTemplate(expected provider.TemplateArtifact) error {
+	if runtime.active != expected {
+		return fmt.Errorf("active template changed")
+	}
+	runtime.active = provider.TemplateArtifact{}
 	return nil
 }
 
@@ -237,7 +295,7 @@ func TestAdoptReusableDockerSandboxesTemplatePublishesExactSecondConfigReceipt(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !adopted || runtime.verified != 1 || runtime.activated != 1 || runtime.imported != 0 {
+	if !adopted || runtime.verified != 3 || runtime.activated != 1 || runtime.imported != 0 {
 		t.Fatalf("adopted=%t verified=%d activated=%d imported=%d", adopted, runtime.verified, runtime.activated, runtime.imported)
 	}
 	secondReceiptPath, err := DockerSandboxesReceiptPathForConfig(projectRoot, secondConfig)
@@ -253,6 +311,26 @@ func TestAdoptReusableDockerSandboxesTemplatePublishesExactSecondConfigReceipt(t
 	}
 	if err := validateDockerSandboxesReceiptEvidence(secondReceiptPath, secondReceipt); err != nil {
 		t.Fatal(err)
+	}
+	thirdConfig := filepath.Join(projectRoot, ".local", "config.third.yml")
+	if err := os.WriteFile(thirdConfig, []byte("provider:\n  type: docker-sandboxes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staleRuntime := &reusableTemplateRuntime{want: artifact, verifyError: provider.ErrTemplateNotFound}
+	third := &Coordinator{ProjectRoot: projectRoot, ConfigPath: thirdConfig, Clock: func() time.Time { return activatedAt.Add(2 * time.Minute) }}
+	adopted, err = third.adoptReusableDockerSandboxesTemplateLocked(context.Background(), manifest, source, manifestHash, artifact.RootDisk, staleRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted || staleRuntime.verified != 1 || staleRuntime.activated != 0 || staleRuntime.imported != 0 {
+		t.Fatalf("stale adopted=%t verified=%d activated=%d imported=%d", adopted, staleRuntime.verified, staleRuntime.activated, staleRuntime.imported)
+	}
+	thirdReceiptPath, err := DockerSandboxesReceiptPathForConfig(projectRoot, thirdConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(thirdReceiptPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale reusable receipt was cloned before cache preflight: %v", err)
 	}
 
 	store, err := storagecatalog.Open(stateRoot)

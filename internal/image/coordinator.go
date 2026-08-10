@@ -9,6 +9,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
@@ -59,17 +60,32 @@ type Coordinator struct {
 	ConfigPath  string
 	DryRun      bool
 	Clock       func() time.Time
-	environment Environment
+	// PrebuiltResolver is the fail-closed trust boundary for Docker Sandboxes
+	// prebuilt packages. Production wiring must provide a concrete catalog and
+	// evidence verifier before prebuilt distribution can be selected.
+	PrebuiltResolver DockerSandboxesPrebuiltResolver
+	// DockerSourceDescriptorResolver is a test seam for registry-provided OCI
+	// descriptors. Production leaves it nil and uses anonymous registry HTTP.
+	DockerSourceDescriptorResolver prebuilt.DescriptorResolver
+	// dockerSandboxesPrebuiltImageFetcher is a test seam for counting exact
+	// immutable platform acquisitions. Production leaves it nil and uses the
+	// anonymous registry client after catalog and evidence verification.
+	dockerSandboxesPrebuiltImageFetcher dockerSandboxesPrebuiltImageFetcher
+	// DockerSandboxesActivationFault is a test-only fault-injection hook. A
+	// production coordinator leaves it nil.
+	DockerSandboxesActivationFault func(phase string) error
+	environment                    Environment
 }
 
 func NewCoordinator(cfg config.Config, legacy provider.Provider, lifecycle provider.Lifecycle, projectRoot string, dryRun bool, environment Environment) *Coordinator {
 	return &Coordinator{
-		Config:      cfg,
-		Provider:    legacy,
-		Lifecycle:   lifecycle,
-		ProjectRoot: projectRoot,
-		DryRun:      dryRun,
-		environment: environment,
+		Config:           cfg,
+		Provider:         legacy,
+		Lifecycle:        lifecycle,
+		ProjectRoot:      projectRoot,
+		DryRun:           dryRun,
+		PrebuiltResolver: newProductionDockerSandboxesPrebuiltResolver(),
+		environment:      environment,
 	}
 }
 

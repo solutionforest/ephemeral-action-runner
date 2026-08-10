@@ -470,6 +470,24 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 			return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q review requires an image profile", draft.ProviderType)
 		}
 		fmt.Fprintf(out, "  Runner image: %s\n", draft.Profile.SourceImage)
+		if initProfileDistribution(*draft.Profile) == config.ImageDistributionPrebuilt {
+			label := "EPAR verified prebuilt Act"
+			if draft.Profile.PrebuiltPreview {
+				label += " (preview)"
+			}
+			fmt.Fprintf(out, "  Runner artifact: %s\n", label)
+			fmt.Fprintf(out, "  Prebuilt reference: %s\n", draft.Profile.PrebuiltReference)
+			if strings.TrimSpace(draft.Profile.PrebuiltDigest) == "" {
+				fmt.Fprintln(out, "  Prebuilt digest: resolved and pinned at startup")
+			} else {
+				fmt.Fprintf(out, "  Prebuilt digest: %s\n", draft.Profile.PrebuiltDigest)
+			}
+			fmt.Fprintln(out, "  Attestation: GitHub/Sigstore verification is required before activation")
+			fmt.Fprintln(out, "  Runtime trust: explicit and host enterprise CAs are overlaid where safe")
+			fmt.Fprintln(out, "  First-use materialization: local Docker Sandboxes runtime")
+			fmt.Fprintln(out, "  Custom scripts: empty base image; configured scripts create only a small local derivative")
+			fmt.Fprintln(out, "  Prebuilt acquisition estimate: resolved during startup; this review does not claim the local Buildx footprint")
+		}
 		if draft.ProviderType == "docker-sandboxes" {
 			architectureEmulation := initDockerSandboxesArchitectureEmulation()
 			fmt.Fprintf(out, "  Architecture emulation: %s\n", architectureEmulation)

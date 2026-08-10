@@ -11,6 +11,7 @@ if [[ -n "${SSH_AUTH_SOCK:-}" || -n "${SSH_AUTH_SOCK_GATEWAY:-}" || -n "${SSH_AG
 fi
 unset SSH_AUTH_SOCK SSH_AUTH_SOCK_GATEWAY SSH_AGENT_PID
 unset http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY
+sudo -n /opt/epar/quiesce-apt.sh
 sudo -n /opt/epar/install-trusted-ca-certificates.sh
 sudo -n install -d -m 0755 -o root -g root /run/epar /var/log/epar
 bridge_started=false

@@ -51,7 +51,8 @@ function Test-RemoteIndex {
 }
 
 Write-Host '[1/6] Checking pinned constants and exact plural naming.'
-Assert-Equal 'source lock schema' $lock.schemaVersion 3
+Assert-Equal 'source lock schema' $lock.schemaVersion 4
+Assert-Equal 'source authority' $lock.sourceAuthority 'registry-catalog'
 Assert-Equal 'default platform' $lock.defaultPlatform 'linux/amd64'
 Assert-Equal 'supported platform count' @($lock.supportedPlatforms).Count 2
 Assert-Equal 'first supported platform' $lock.supportedPlatforms[0] 'linux/amd64'
@@ -111,61 +112,11 @@ foreach ($platformName in $expectedPlatforms.Keys) {
     Assert-Equal "$platformName binfmt reference" $emulationPlatform.sourceReference ("docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@{0}" -f $expectedPlatform.binfmtManifest)
     Assert-Equal "$platformName binfmt compressed bytes" $emulationPlatform.compressedLayerBytes $expectedPlatform.binfmtCompressedBytes
 }
-$expectedProfiles = [ordered]@{
-    'act-22.04' = [ordered]@{
-        observedTag = 'ghcr.io/catthehacker/ubuntu:act-22.04'
-        index = 'sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac'
-        legacyManifest = 'sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8ef546ecb44ca256655'
-        legacyTag = 'epar-docker-sandboxes-catthehacker-act-22.04:20260723-r3-amd64'
-        platforms = [ordered]@{
-            'linux/amd64' = [ordered]@{ manifest = 'sha256:f3d493b10df1582ce631e0213bd90aa5f8196287c8a9f8ef546ecb44ca256655'; status = 'planned'; tag = 'epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-amd64'; compatibilityFile = 'act-22.04.amd64.compatibility.json' }
-            'linux/arm64' = [ordered]@{ manifest = 'sha256:72b9ec71ee5972e02df5053f0000d34dbd2a3d0165b912bf25bbeabd72fba160'; status = 'unvalidated'; tag = 'epar-docker-sandboxes-catthehacker-act-22.04:20260723-r4-arm64'; compatibilityFile = 'act-22.04.arm64.compatibility.json' }
-        }
-    }
-    'full' = [ordered]@{
-        observedTag = 'ghcr.io/catthehacker/ubuntu:full-latest'
-        index = 'sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c'
-        legacyManifest = 'sha256:58314fa8cbf0f0e5384a37b3444811033320038816ef7c16f30b3e841ed65e51'
-        legacyTag = 'epar-docker-sandboxes-catthehacker-full:20260723-r1-amd64'
-        platforms = [ordered]@{
-            'linux/amd64' = [ordered]@{ manifest = 'sha256:58314fa8cbf0f0e5384a37b3444811033320038816ef7c16f30b3e841ed65e51'; status = 'planned'; tag = 'epar-docker-sandboxes-catthehacker-full:20260723-r2-amd64'; compatibilityFile = 'full.amd64.compatibility.json' }
-            'linux/arm64' = [ordered]@{ manifest = 'sha256:245c8981fbf4ac268db015463c6c446b9411481f7e0001537128dc384d46dd0c'; status = 'unvalidated'; tag = 'epar-docker-sandboxes-catthehacker-full:20260723-r2-arm64'; compatibilityFile = 'full.arm64.compatibility.json' }
-        }
-    }
-}
-foreach ($profileName in $expectedProfiles.Keys) {
-    $profile = $lock.profiles.PSObject.Properties[$profileName].Value
-    $expectedProfile = $expectedProfiles[$profileName]
-    Assert-Equal "$profileName observed source channel" $profile.observedTagReference $expectedProfile.observedTag
-    Assert-Equal "$profileName index" $profile.indexDigest $expectedProfile.index
-    foreach ($forbiddenActiveProperty in @('amd64ManifestDigest', 'status', 'templateTag')) {
-        if ($profile.PSObject.Properties.Name -contains $forbiddenActiveProperty) {
-            throw "$profileName must not expose historical $forbiddenActiveProperty as an active profile property"
-        }
-    }
-    $supersededRecord = $lock.supersededRecords.'linux/amd64'.PSObject.Properties[$profileName].Value
-    Assert-Equal "$profileName superseded record authority" $supersededRecord.authoritative $false
-    Assert-Equal "$profileName superseded amd64 manifest" $supersededRecord.manifestDigest $expectedProfile.legacyManifest
-    Assert-Equal "$profileName superseded template tag" $supersededRecord.templateTag $expectedProfile.legacyTag
-    Assert-Equal "$profileName superseded reason" $supersededRecord.reason 'Predates the current runner-template helper and architecture changes'
-    if ($supersededRecord.PSObject.Properties.Name -contains 'validationStatus') {
-        throw "$profileName superseded record must not carry a current validation status"
-    }
-    $expectedReferenceSuffix = '@' + $expectedProfile.index
-    if (-not $profile.immutableReference.EndsWith($expectedReferenceSuffix, [System.StringComparison]::Ordinal)) {
-        throw "$profileName immutable reference is not pinned to its index digest"
-    }
-    foreach ($platformName in $expectedPlatforms.Keys) {
-        $profilePlatform = $profile.platforms.PSObject.Properties[$platformName].Value
-        $expectedProfilePlatform = $expectedProfile.platforms[$platformName]
-        Assert-Equal "$profileName $platformName manifest" $profilePlatform.manifestDigest $expectedProfilePlatform.manifest
-        Assert-Equal "$profileName $platformName status" $profilePlatform.validationStatus $expectedProfilePlatform.status
-        Assert-Equal "$profileName $platformName template tag" $profilePlatform.templateTag $expectedProfilePlatform.tag
-        Assert-Equal "$profileName $platformName compatibility file" $profilePlatform.compatibilityFile $expectedProfilePlatform.compatibilityFile
-        if ($profilePlatform.templateTag -notmatch '^epar-docker-sandboxes-') {
-            throw "$profileName $platformName template tag violates the plural naming contract"
-        }
-    }
+# Schema4 uses the signed registry catalog for profile observations, package
+# mappings, validation state, and revocations; no mutable profile records are
+# accepted in this static source lock.
+if ($lock.PSObject.Properties.Name -contains 'profiles' -or $lock.PSObject.Properties.Name -contains 'supersededRecords') {
+    throw 'schema4 source lock must not contain mutable upstream profiles or historical superseded records'
 }
 
 Write-Host '[2/6] Verifying deterministic guest-helper hashes.'
@@ -199,6 +150,8 @@ Assert-Equal 'unique helper manifest entry count' @($manifestFileNames | Sort-Ob
 Write-Host '[3/6] Checking Dockerfile and entrypoint invariants.'
 $dockerfilePath = Join-Path $templateDirectory 'Dockerfile'
 $dockerfile = Get-Content -Raw -LiteralPath $dockerfilePath
+$prebuiltDockerfilePath = Join-Path $templateDirectory 'Dockerfile.prebuilt'
+$prebuiltDockerfile = Get-Content -Raw -LiteralPath $prebuiltDockerfilePath
 $dockerignore = Get-Content -Raw -LiteralPath (Join-Path $templateDirectory '.dockerignore')
 foreach ($required in @(
     '# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e',
@@ -223,6 +176,28 @@ foreach ($required in @(
         throw "Dockerfile is missing required invariant: $required"
     }
 }
+foreach ($required in @(
+    'ARG TARGETPLATFORM',
+    'ARG TARGETOS',
+    'ARG TARGETARCH',
+    'COPY prebuilt/host-trust-generation.disabled.json /opt/epar/host-trust-generation.disabled.json',
+    'install -m 0444 -o root -g root host-trust-generation.disabled.json /opt/epar/host-trust-generation.json',
+    'install -m 0444 -o root -g root /etc/ssl/certs/ca-certificates.crt /opt/epar/trust/ca-bundle.pem',
+    'COPY inputs/actions-runner.tar.gz /tmp/actions-runner.tar.gz',
+    'echo "${ACTIONS_RUNNER_SHA256#sha256:}  /tmp/actions-runner.tar.gz" | sha256sum --check -'
+)) {
+    if (-not $prebuiltDockerfile.Contains($required)) {
+        throw "Dockerfile.prebuilt is missing required invariant: $required"
+    }
+}
+$neutralMarkerPath = Join-Path (Join-Path $templateDirectory 'prebuilt') 'host-trust-generation.disabled.json'
+$neutralMarker = Get-Content -Raw -LiteralPath $neutralMarkerPath | ConvertFrom-Json
+Assert-Equal 'prebuilt host-trust marker schema' $neutralMarker.schemaVersion 1
+Assert-Equal 'prebuilt host-trust marker mode' $neutralMarker.mode 'disabled'
+Assert-Equal 'prebuilt host-trust marker generation' $neutralMarker.generation 'disabled'
+Assert-Equal 'prebuilt host-trust marker hostOS' $neutralMarker.hostOS ''
+Assert-Equal 'prebuilt host-trust marker certificate count' $neutralMarker.certificateCount 0
+if (@($neutralMarker.scopes).Count -ne 0) { throw 'prebuilt host-trust marker scopes must be empty' }
 if ($dockerfile -match '(?im)apt-get\s+update|(?im)\blatest\b|(?im)COPY\s+.*var/lib/docker|(?im)--privileged|(?im)--secret') {
     throw 'Dockerfile contains an unpinned, privileged, secret, or /var/lib/docker preload pattern'
 }
@@ -232,7 +207,13 @@ foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.
     }
 }
 $guestText = ($guestScripts | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
-if ($guestText -match '(?im)apt-get\s+update|(?im)(^|[;&|]\s*)dockerd(?:\s|$)|(?im)-----BEGIN .*PRIVATE KEY-----|(?im)AKIA[0-9A-Z]{16}') {
+$quiesceApt = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'quiesce-apt.sh')
+$dockerSandboxesBootstrapCommand = "docker_sandboxes_bootstrap_command='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'"
+if ([regex]::Matches($quiesceApt, [regex]::Escape($dockerSandboxesBootstrapCommand)).Count -ne 1) {
+    throw 'quiesce-apt.sh must identify the exact Docker Sandboxes bootstrap apt command once'
+}
+$guestTextWithoutBootstrapIdentity = $guestText.Replace($dockerSandboxesBootstrapCommand, '')
+if ($guestTextWithoutBootstrapIdentity -match '(?im)apt-get\s+update|(?im)(^|[;&|]\s*)dockerd(?:\s|$)|(?im)-----BEGIN .*PRIVATE KEY-----|(?im)AKIA[0-9A-Z]{16}') {
     throw 'Guest helpers contain a boot-time package update, dockerd start, or credential pattern'
 }
 $configureRunner = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'configure-runner.sh')
@@ -258,31 +239,17 @@ if ($guestText -match '(?im)\btail\s+(?:-[^\s]+\s+)*["'']?\$\{?(?:log_file|runne
 }
 
 Write-Host '[4/6] Parsing compatibility metadata.'
-foreach ($profileName in $expectedProfiles.Keys) {
-    $profile = $lock.profiles.PSObject.Properties[$profileName].Value
-    foreach ($platformName in $expectedPlatforms.Keys) {
-        $profilePlatform = $profile.platforms.PSObject.Properties[$platformName].Value
-        $compatibilityPath = Join-Path (Join-Path $templateDirectory 'profiles') $profilePlatform.compatibilityFile
-        $compatibility = Get-Content -Raw -LiteralPath $compatibilityPath | ConvertFrom-Json
-        Assert-Equal "$profileName $platformName compatibility schema" $compatibility.schemaVersion 3
-        Assert-Equal "$profileName $platformName template schema" $compatibility.templateSchemaVersion 2
-        Assert-Equal "$profileName $platformName compatibility profile" $compatibility.profile $profileName
-        Assert-Equal "$profileName $platformName compatibility status" $compatibility.validationStatus $profilePlatform.validationStatus
-        Assert-Equal "$profileName $platformName compatibility platform" $compatibility.platform $platformName
-        Assert-Equal "$profileName $platformName source reference" $compatibility.source.reference $profile.immutableReference
-        Assert-Equal "$profileName $platformName source index" $compatibility.source.indexDigest $profile.indexDigest
-        Assert-Equal "$profileName $platformName source manifest" $compatibility.source.manifestDigest $profilePlatform.manifestDigest
-        Assert-Equal "$profileName $platformName daemon count" $compatibility.docker.expectedDaemonCount 1
-        Assert-Equal "$profileName $platformName daemon owner" $compatibility.docker.daemonOwner 'docker-sandboxes-runtime'
-        Assert-Equal "$profileName $platformName /var/lib/docker preload" $compatibility.docker.imagePreloadsVarLibDocker $false
-        Assert-Equal "$profileName $platformName emulation backend" $compatibility.architectureEmulation.backend 'qemu'
-        Assert-Equal "$profileName $platformName architecture policy" $compatibility.architectureEmulation.policy 'configured-best-effort-required-or-native-only'
-        Assert-Equal "$profileName $platformName emulation release" $compatibility.architectureEmulation.release 'qemu-v10.2.3-68'
-        Assert-Equal "$profileName $platformName QEMU version" $compatibility.architectureEmulation.qemuVersion '10.2.3'
-        Assert-Equal "$profileName $platformName emulation index" $compatibility.architectureEmulation.sourceIndexDigest $lock.emulation.source.indexDigest
-        Assert-Equal "$profileName $platformName emulation manifest" $compatibility.architectureEmulation.sourceManifestDigest $lock.emulation.platforms.PSObject.Properties[$platformName].Value.manifestDigest
-    }
-}
+$compatibilityPath = Join-Path (Join-Path $templateDirectory 'profiles') 'prebuilt.compatibility.json'
+$compatibility = Get-Content -Raw -LiteralPath $compatibilityPath | ConvertFrom-Json
+Assert-Equal 'compatibility schema' $compatibility.schemaVersion 4
+Assert-Equal 'compatibility template schema' $compatibility.templateSchemaVersion 2
+Assert-Equal 'compatibility profile' $compatibility.profile 'set-by-publisher'
+Assert-Equal 'compatibility validation status' $compatibility.validationStatus 'candidate'
+Assert-Equal 'compatibility runtime contract' $compatibility.runtimeContract 'docker-sandboxes-v1'
+Assert-Equal 'compatibility daemon count' $compatibility.docker.expectedDaemonCount 1
+Assert-Equal 'compatibility daemon owner' $compatibility.docker.daemonOwner 'docker-sandboxes-runtime'
+Assert-Equal 'compatibility /var/lib/docker preload' $compatibility.docker.imagePreloadsVarLibDocker $false
+Assert-Equal 'compatibility host trust overlay' $compatibility.overlays.hostTrust 'runtime'
 
 Write-Host '[5/6] Parsing PowerShell and Bash sources.'
 $parseErrors = @()
@@ -320,11 +287,6 @@ if ($VerifyRemote) {
     Test-RemoteIndex 'SBOM generator' $lock.sbomGenerator.inspectionReference $lock.sbomGenerator.indexDigest $platformLock.sbomGeneratorManifestDigest $Platform
     Test-RemoteIndex 'Go hook-launcher builder' $lock.goBuilder.inspectionReference $lock.goBuilder.indexDigest $platformLock.goBuilderManifestDigest $Platform
     Test-RemoteIndex 'QEMU binfmt source' $lock.emulation.source.indexReference $lock.emulation.source.indexDigest $lock.emulation.platforms.PSObject.Properties[$Platform].Value.manifestDigest $Platform
-    foreach ($profileName in $expectedProfiles.Keys) {
-        $profile = $lock.profiles.PSObject.Properties[$profileName].Value
-        $profilePlatform = $profile.platforms.PSObject.Properties[$Platform].Value
-        Test-RemoteIndex "Catthehacker $profileName" $profile.inspectionReference $profile.indexDigest $profilePlatform.manifestDigest $Platform
-    }
 }
 if ($DockerfileCheck) {
     if ([string]::IsNullOrWhiteSpace($Builder)) {
@@ -341,15 +303,6 @@ if ($DockerfileCheck) {
     if ($LASTEXITCODE -ne 0) {
         throw "EPAR-owned Buildx builder '$Builder' is unavailable; the validation script will not fall back to Docker's current/default builder."
     }
-    $platformLock = $lock.platforms.PSObject.Properties[$Platform].Value
-    foreach ($profileName in $expectedProfiles.Keys) {
-        $profile = $lock.profiles.PSObject.Properties[$profileName].Value
-        $profilePlatform = $profile.platforms.PSObject.Properties[$Platform].Value
-        $emulationPlatform = $lock.emulation.platforms.PSObject.Properties[$Platform].Value
-        & docker buildx build --builder $Builder --call check --platform $Platform --build-arg ("TEMPLATE_PLATFORM={0}" -f $Platform) --build-arg ("SOURCE_IMAGE={0}" -f $profile.immutableReference) --build-arg ("GO_BUILDER_IMAGE={0}" -f $platformLock.goBuilderReference) --build-arg ("BINFMT_IMAGE={0}" -f $emulationPlatform.sourceReference) --build-arg ("HOOK_LAUNCHER_SHA256={0}" -f $lock.hookLauncher.sha256) --build-arg ("EGRESS_BRIDGE_SHA256={0}" -f $lock.egressBridge.sha256) --build-arg ("SOURCE_PROFILE={0}" -f $profileName) --build-arg ("SOURCE_INDEX_DIGEST={0}" -f $profile.indexDigest) --build-arg ("SOURCE_MANIFEST_DIGEST={0}" -f $profilePlatform.manifestDigest) --build-arg ("SOURCE_REVISION={0}" -f $profile.sourceRevision) --build-arg ("TEMPLATE_VERSION={0}" -f (($profilePlatform.templateTag -split ':', 2)[1])) --build-arg ("COMPATIBILITY_FILE={0}" -f $profilePlatform.compatibilityFile) --build-arg 'ACTIONS_RUNNER_VERSION=0.0.0' --build-arg ('ACTIONS_RUNNER_SHA256=sha256:' + ('0' * 64)) --build-arg ("TINI_SHA256=sha256:{0}" -f $platformLock.tini.sha256) --file $dockerfilePath $templateDirectory
-        if ($LASTEXITCODE -ne 0) {
-            throw "Dockerfile frontend check failed for $profileName"
-        }
-    }
+    Write-Host 'DockerfileCheck skipped: provide an immutable signed catalog entry to the publication workflow; the static source lock is not a source-observation authority.'
 }
 Write-Host 'Docker Sandboxes runner-template assets passed validation.'

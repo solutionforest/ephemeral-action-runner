@@ -139,6 +139,33 @@ type TemplateArtifactRuntime interface {
 	ActivateTemplate(artifact TemplateArtifact) error
 }
 
+// TemplateArtifactCacheResolver exposes the provider-assigned opaque cache ID
+// for one exact template reference. The cache ID is not a content digest; the
+// shared image receipt retains both identities and verifies them independently.
+type TemplateArtifactCacheResolver interface {
+	ResolveTemplateCacheID(ctx context.Context, reference string) (cacheID string, found bool, err error)
+}
+
+// TemplateArtifactActivationController serializes reusable-artifact activation
+// against new instance admission and exposes exact in-process readback for the
+// shared image coordinator's activation journal. ClearActiveTemplate is
+// intentionally compare-and-clear so rollback cannot deactivate a generation
+// selected by another transaction.
+type TemplateArtifactActivationController interface {
+	WithTemplateActivation(operation func() error) error
+	ActiveTemplate() (TemplateArtifact, bool)
+	ClearActiveTemplate(expected TemplateArtifact) error
+}
+
+// TemplateAdmissionController blocks new admissions while a critical
+// reusable-artifact revocation is unresolved. Existing instances are not
+// destroyed by this signal and remain owned by the common pool lifecycle.
+type TemplateAdmissionController interface {
+	SetTemplateAdmissionBlock(reason string)
+	ClearTemplateAdmissionBlock()
+	TemplateAdmissionBlock() (string, bool)
+}
+
 // TemplateArtifactCleaner is an optional exact cleanup capability for
 // template-backed providers. The shared image/storage lifecycle calls it only
 // for an immutable cache identity backed by EPAR ownership evidence.

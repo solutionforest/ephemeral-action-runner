@@ -68,3 +68,38 @@ func TestProviderOnboardingTiersAndRuntimeOnlyTart(t *testing.T) {
 		}
 	}
 }
+
+func TestDockerSandboxesRegistersPreviewPrebuiltActSource(t *testing.T) {
+	descriptor, found := DescriptorFor("docker-sandboxes")
+	if !found {
+		t.Fatal("docker-sandboxes descriptor not found")
+	}
+	if len(descriptor.WizardArtifactSources) != 1 {
+		t.Fatalf("WizardArtifactSources = %d, want 1", len(descriptor.WizardArtifactSources))
+	}
+	source := descriptor.WizardArtifactSources[0]
+	if source.Distribution != "prebuilt" || source.Profile != "act" {
+		t.Fatalf("artifact source = %#v, want prebuilt Act", source)
+	}
+	if source.Reference != "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest" {
+		t.Fatalf("artifact reference = %q, want official EPAR Act reference", source.Reference)
+	}
+	if !source.Preview || source.Default {
+		t.Fatalf("artifact source preview/default = %t/%t, want true/false", source.Preview, source.Default)
+	}
+	if source.Label == "" || source.Description == "" {
+		t.Fatalf("artifact source is missing user-facing label/description: %#v", source)
+	}
+}
+
+func TestCompatibilityProvidersDoNotAdvertisePrebuiltSources(t *testing.T) {
+	for _, providerType := range []string{"docker-container", "wsl"} {
+		descriptor, found := DescriptorFor(providerType)
+		if !found {
+			t.Fatalf("%s descriptor not found", providerType)
+		}
+		if len(descriptor.WizardArtifactSources) != 0 {
+			t.Fatalf("%s advertises prebuilt sources: %#v", providerType, descriptor.WizardArtifactSources)
+		}
+	}
+}

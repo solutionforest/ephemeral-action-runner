@@ -62,6 +62,30 @@ func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
 	}
 }
 
+func TestCriticalTemplateAdmissionBlockFailsBeforeProviderSideEffects(t *testing.T) {
+	p := New("sbx")
+	called := false
+	p.runCommand = func(context.Context, commandRequest) (provider.ExecResult, error) {
+		called = true
+		return provider.ExecResult{}, nil
+	}
+	p.SetTemplateAdmissionBlock("critical-revoked sha256:deadbeef")
+	if reason, blocked := p.TemplateAdmissionBlock(); !blocked || !strings.Contains(reason, "critical-revoked") {
+		t.Fatalf("admission block = %q, %t", reason, blocked)
+	}
+	_, err := p.Create(context.Background(), provider.CreateRequest{Name: testName})
+	if err == nil || !strings.Contains(err.Error(), "critical-revoked") {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if called {
+		t.Fatal("blocked admission invoked a provider command")
+	}
+	p.ClearTemplateAdmissionBlock()
+	if _, blocked := p.TemplateAdmissionBlock(); blocked {
+		t.Fatal("admission block was not cleared")
+	}
+}
+
 func TestStartDaemonUsesExactDetachedCommand(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"daemon", "start", "--detach"}},
@@ -107,6 +131,42 @@ func TestObserveTemplateRequiresExactReferenceAndCacheID(t *testing.T) {
 	exists, err := p.ObserveTemplate(context.Background(), artifact)
 	if err != nil || !exists {
 		t.Fatalf("ObserveTemplate() = %t, %v, want true", exists, err)
+	}
+	done()
+}
+
+func TestVerifyImportedTemplateAcceptsProviderAssignedOpaqueCacheID(t *testing.T) {
+	artifact := provider.TemplateArtifact{
+		Reference: "docker.io/library/epar-template:opaque",
+		Digest:    "sha256:" + strings.Repeat("5", 64),
+		CacheID:   "ec2006fea720",
+	}
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024}]}`}},
+	)
+	if err := p.VerifyImportedTemplate(context.Background(), artifact); err != nil {
+		t.Fatal(err)
+	}
+	done()
+}
+
+func TestResolveTemplateCacheIDUsesAuthoritativeReferenceReadback(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024}]}`}},
+	)
+	cacheID, found, err := p.ResolveTemplateCacheID(context.Background(), "docker.io/library/epar-template:opaque")
+	if err != nil || !found || cacheID != "ec2006fea720" {
+		t.Fatalf("ResolveTemplateCacheID() = %q, %t, %v", cacheID, found, err)
+	}
+	done()
+}
+
+func TestResolveTemplateCacheIDRejectsAmbiguousReference(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024},{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:01:00Z","size":1024}]}`}},
+	)
+	if _, _, err := p.ResolveTemplateCacheID(context.Background(), "docker.io/library/epar-template:opaque"); err == nil || !strings.Contains(err.Error(), "duplicate image reference") {
+		t.Fatalf("ResolveTemplateCacheID() error = %v", err)
 	}
 	done()
 }
@@ -649,6 +709,32 @@ func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T)
 		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
 	)
 	if _, err := p.Create(context.Background(), validCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	done()
+}
+
+func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
+	opaqueTemplateList := strings.Replace(templateListJSON, "39cf20eca861", "ec2006fea720", 1)
+	opaqueInspection := strings.Replace(inspectionJSON, testDigest, "sha256:ec2006fea720"+strings.Repeat("9", 52), 1)
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: opaqueTemplateList}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: opaqueInspection}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+	)
+	active := provider.TemplateArtifact{Reference: testTemplate, Digest: testDigest, CacheID: "ec2006fea720", Platform: "linux/amd64", RootDisk: "20GiB"}
+	if err := p.ActivateTemplate(active); err != nil {
+		t.Fatal(err)
+	}
+	request := validCreateRequest()
+	request.Template = ""
+	request.TemplateDigest = ""
+	if _, err := p.Create(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	done()

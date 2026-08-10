@@ -21,6 +21,7 @@ type Descriptor struct {
 	ImageMode              string
 	GuidedArtifacts        bool
 	WizardImageProfiles    []WizardImageProfile
+	WizardArtifactSources  []WizardArtifactSource
 	WizardCustomImageTags  bool
 	WizardPrerequisite     WizardPrerequisiteKind
 	WizardOnboarding       WizardOnboardingKind
@@ -31,6 +32,20 @@ type Descriptor struct {
 type WizardImageProfile struct {
 	Name string
 	Tag  string
+}
+
+// WizardArtifactSource describes an optional reusable runner artifact offered
+// during onboarding. Local builds remain the implicit baseline; providers can
+// advertise a prebuilt source without changing that default until promotion
+// gates have passed.
+type WizardArtifactSource struct {
+	Distribution string
+	Profile      string
+	Reference    string
+	Label        string
+	Description  string
+	Preview      bool
+	Default      bool
 }
 
 const (

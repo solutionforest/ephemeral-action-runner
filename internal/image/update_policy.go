@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
 	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
@@ -21,22 +22,24 @@ const updatePolicyStateSchemaVersion = 1
 // LocalInputHash and are never allowed to become stale merely because a remote
 // check is not due.
 type UpdatePolicyState struct {
-	SchemaVersion         int                   `json:"schemaVersion"`
-	LocalInputHash        string                `json:"localInputHash"`
-	LastAttemptAt         time.Time             `json:"lastAttemptAt,omitempty"`
-	LastSuccessfulCheckAt time.Time             `json:"lastSuccessfulCheckAt,omitempty"`
-	NextEligibleAt        time.Time             `json:"nextEligibleAt,omitempty"`
-	NextRetryAt           time.Time             `json:"nextRetryAt,omitempty"`
-	ConsecutiveFailures   int                   `json:"consecutiveFailures,omitempty"`
-	TimeZone              string                `json:"timeZone,omitempty"`
-	PolicyFrequency       string                `json:"policyFrequency,omitempty"`
-	PolicyTime            string                `json:"policyTime,omitempty"`
-	LastResolvedManifest  *Manifest             `json:"lastResolvedManifest,omitempty"`
-	LastResolvedSource    *ResolvedDockerSource `json:"lastResolvedSource,omitempty"`
-	PendingManifest       *Manifest             `json:"pendingManifest,omitempty"`
-	PendingSource         *ResolvedDockerSource `json:"pendingSource,omitempty"`
-	DeferredReason        string                `json:"deferredReason,omitempty"`
-	LastError             string                `json:"lastError,omitempty"`
+	SchemaVersion          int                   `json:"schemaVersion"`
+	LocalInputHash         string                `json:"localInputHash"`
+	LastAttemptAt          time.Time             `json:"lastAttemptAt,omitempty"`
+	LastSuccessfulCheckAt  time.Time             `json:"lastSuccessfulCheckAt,omitempty"`
+	NextEligibleAt         time.Time             `json:"nextEligibleAt,omitempty"`
+	NextRetryAt            time.Time             `json:"nextRetryAt,omitempty"`
+	ConsecutiveFailures    int                   `json:"consecutiveFailures,omitempty"`
+	TimeZone               string                `json:"timeZone,omitempty"`
+	PolicyFrequency        string                `json:"policyFrequency,omitempty"`
+	PolicyTime             string                `json:"policyTime,omitempty"`
+	LastResolvedManifest   *Manifest             `json:"lastResolvedManifest,omitempty"`
+	LastResolvedSource     *ResolvedDockerSource `json:"lastResolvedSource,omitempty"`
+	PendingManifest        *Manifest             `json:"pendingManifest,omitempty"`
+	PendingSource          *ResolvedDockerSource `json:"pendingSource,omitempty"`
+	DeferredReason         string                `json:"deferredReason,omitempty"`
+	LastError              string                `json:"lastError,omitempty"`
+	AdmissionBlockedDigest string                `json:"admissionBlockedDigest,omitempty"`
+	AdmissionBlockedReason string                `json:"admissionBlockedReason,omitempty"`
 }
 
 // UpdatePolicyStatus is safe to expose through status and console output.
@@ -203,17 +206,42 @@ func (m *Coordinator) CheckRemoteUpdate(ctx context.Context, now time.Time) (Rem
 			NextRetryAt:     state.NextRetryAt,
 		}, nil
 	}
+	if m.Config.Provider.Type == "docker-sandboxes" && m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt && state.LastResolvedManifest != nil && state.LastResolvedManifest.Prebuilt != nil {
+		statusResolver, ok := m.PrebuiltResolver.(dockerSandboxesPrebuiltStatusResolver)
+		if !ok {
+			return RemoteUpdateCheck{Due: true}, errors.New("prebuilt verifier cannot inspect the signed status of the active package digest")
+		}
+		status, statusErr := statusResolver.ResolveStatus(ctx, state.LastResolvedManifest.Prebuilt.PackageIndexDigest)
+		if statusErr != nil {
+			scheduleUpdateFailure(&state, now, statusErr)
+			_ = m.writeUpdatePolicyState(state)
+			return RemoteUpdateCheck{Due: true, NextRetryAt: state.NextRetryAt}, statusErr
+		}
+		if status.EffectiveStatus == prebuilt.StatusCriticalRevoked {
+			m.recordDockerSandboxesPrebuiltResolutionFailure(&state, &DockerSandboxesPrebuiltStatusError{Digest: status.PackageDigest, Status: status.EffectiveStatus, Reason: status.Entry.RevocationReason})
+			_ = m.writeUpdatePolicyState(state)
+		}
+	}
 	var (
 		localManifest Manifest
 		manifest      Manifest
 		source        *ResolvedDockerSource
 	)
 	if m.Config.Provider.Type == "docker-sandboxes" {
-		localManifest, err = m.dockerSandboxesLocalManifest(ctx)
-		if err == nil {
-			var resolved ResolvedDockerSource
-			manifest, resolved, err = m.dockerSandboxesDesiredManifest(ctx)
-			source = &resolved
+		if m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt {
+			localManifest, err = m.dockerSandboxesPrebuiltLocalManifest()
+			if err == nil {
+				var resolved ResolvedDockerSource
+				manifest, resolved, _, err = m.dockerSandboxesPrebuiltDesiredManifest(ctx)
+				source = &resolved
+			}
+		} else {
+			localManifest, err = m.dockerSandboxesLocalManifest(ctx)
+			if err == nil {
+				var resolved ResolvedDockerSource
+				manifest, resolved, err = m.dockerSandboxesDesiredManifest(ctx)
+				source = &resolved
+			}
 		}
 	} else {
 		localManifest, err = m.desiredLocalImageManifest(ctx)
@@ -222,6 +250,9 @@ func (m *Coordinator) CheckRemoteUpdate(ctx context.Context, now time.Time) (Rem
 		}
 	}
 	if err != nil {
+		if m.Config.Provider.Type == "docker-sandboxes" && m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt {
+			m.recordDockerSandboxesPrebuiltResolutionFailure(&state, err)
+		}
 		scheduleUpdateFailure(&state, now, err)
 		_ = m.writeUpdatePolicyState(state)
 		return RemoteUpdateCheck{Due: true, NextRetryAt: state.NextRetryAt}, err
@@ -250,6 +281,9 @@ func (m *Coordinator) CheckRemoteUpdate(ctx context.Context, now time.Time) (Rem
 		}
 		state.PendingManifest = nil
 		state.PendingSource = nil
+		if m.Config.Provider.Type == "docker-sandboxes" && m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt {
+			m.clearDockerSandboxesPrebuiltAdmissionBlock(&state)
+		}
 		if err := m.writeUpdatePolicyState(state); err != nil {
 			return RemoteUpdateCheck{}, err
 		}
@@ -290,7 +324,24 @@ func (m *Coordinator) ApplyPendingUpdate(ctx context.Context, now time.Time) err
 		if state.PendingSource == nil {
 			return fmt.Errorf("pending Docker Sandboxes update is missing its immutable source observation")
 		}
-		err = m.ensureDockerSandboxesTemplateResolved(ctx, false, manifest, *state.PendingSource)
+		if m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt {
+			resolvedManifest, resolvedSource, verified, resolveErr := m.dockerSandboxesPrebuiltDesiredManifest(ctx)
+			if resolveErr != nil {
+				err = resolveErr
+			} else {
+				pendingHash, hashErr := ManifestHash(manifest)
+				resolvedHash, resolvedHashErr := ManifestHash(resolvedManifest)
+				if hashErr != nil || resolvedHashErr != nil {
+					err = errors.Join(hashErr, resolvedHashErr)
+				} else if pendingHash != resolvedHash || resolvedSource != *state.PendingSource {
+					err = fmt.Errorf("verified prebuilt package changed after the maintenance drain was selected")
+				} else {
+					err = m.ensureDockerSandboxesPrebuiltResolved(ctx, false, resolvedManifest, resolvedSource, verified)
+				}
+			}
+		} else {
+			err = m.ensureDockerSandboxesTemplateResolved(ctx, false, manifest, *state.PendingSource)
+		}
 	} else {
 		err = m.buildResolvedImage(ctx, manifest)
 		if err == nil {
@@ -303,6 +354,9 @@ func (m *Coordinator) ApplyPendingUpdate(ctx context.Context, now time.Time) err
 		}
 	}
 	if err != nil {
+		if m.Config.Provider.Type == "docker-sandboxes" && m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt {
+			m.recordDockerSandboxesPrebuiltResolutionFailure(&state, err)
+		}
 		scheduleUpdateFailure(&state, now, err)
 		state.DeferredReason = "scheduled build failed; the previous verified generation remains active"
 		_ = m.writeUpdatePolicyState(state)
@@ -312,6 +366,9 @@ func (m *Coordinator) ApplyPendingUpdate(ctx context.Context, now time.Time) err
 	state.LastResolvedSource = state.PendingSource
 	state.PendingManifest = nil
 	state.PendingSource = nil
+	if m.Config.Provider.Type == "docker-sandboxes" && m.dockerSandboxesDistribution() == dockerSandboxesDistributionPrebuilt {
+		m.clearDockerSandboxesPrebuiltAdmissionBlock(&state)
+	}
 	if err := scheduleNextSuccess(&state, m.Config.Image, now); err != nil {
 		return err
 	}
@@ -444,6 +501,11 @@ func scheduleNextSuccess(state *UpdatePolicyState, image config.ImageConfig, now
 }
 
 func manifestHasMutableRemoteInputs(manifest Manifest) bool {
+	if manifest.Distribution == dockerSandboxesDistributionPrebuilt {
+		// Exact pins disable alias adoption in ResolveAndVerify, but signed
+		// revocation status for the pinned digest remains a scheduled input.
+		return true
+	}
 	if normalizedRunnerSelector(manifest.RunnerSelector) == "latest" {
 		return true
 	}

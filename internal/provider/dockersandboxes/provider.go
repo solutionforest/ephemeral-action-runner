@@ -62,6 +62,8 @@ type Provider struct {
 	Binary string
 
 	runCommand            runCommandFunc
+	activationMu          sync.RWMutex
+	admissionBlockReason  string
 	activeMu              sync.RWMutex
 	activeTemplate        provider.TemplateArtifact
 	dryRun                bool
@@ -193,10 +195,15 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 	if p.dryRun {
 		return provider.Instance{}, fmt.Errorf("docker-sandboxes does not support dry-run instance creation because exact sandbox and template-cache readback is required")
 	}
+	p.activationMu.RLock()
+	defer p.activationMu.RUnlock()
+	if p.admissionBlockReason != "" {
+		return provider.Instance{}, fmt.Errorf("Docker Sandboxes admission is blocked: %s", p.admissionBlockReason)
+	}
+	p.activeMu.RLock()
+	active := p.activeTemplate
+	p.activeMu.RUnlock()
 	if request.Template == "" && request.TemplateDigest == "" {
-		p.activeMu.RLock()
-		active := p.activeTemplate
-		p.activeMu.RUnlock()
 		request.Template = active.Reference
 		request.TemplateDigest = active.Digest
 		if request.RootDisk == "auto" {
@@ -209,7 +216,11 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 	if err := p.VerifyAdmission(ctx); err != nil {
 		return provider.Instance{}, err
 	}
-	if err := p.verifyImportedTemplate(ctx, request.Template, request.TemplateDigest); err != nil {
+	cacheID := strings.TrimPrefix(request.TemplateDigest, "sha256:")[:12]
+	if request.Template == active.Reference && request.TemplateDigest == active.Digest && validTemplateCacheID(active.CacheID) {
+		cacheID = active.CacheID
+	}
+	if err := p.verifyImportedTemplate(ctx, request.Template, cacheID); err != nil {
 		return provider.Instance{}, err
 	}
 	items, err := p.inventoryVerified(ctx)
@@ -284,7 +295,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			if err := p.verifyNoPublishedPorts(ctx, item.Instance); err != nil {
 				return instance, err
 			}
-			if err := p.verifyInspection(ctx, item.Instance, &request); err != nil {
+			if err := p.verifyInspection(ctx, item.Instance, &request, cacheID); err != nil {
 				return instance, err
 			}
 			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
@@ -359,18 +370,18 @@ func (p *Provider) VerifyImportedTemplate(ctx context.Context, artifact provider
 	if artifact.Reference == "" || !validFullTemplateDigest(artifact.Digest) {
 		return fmt.Errorf("Docker Sandboxes template reference and digest are required")
 	}
-	if artifact.CacheID != strings.TrimPrefix(artifact.Digest, "sha256:")[:12] {
-		return fmt.Errorf("Docker Sandboxes template cache ID does not match its full digest")
+	if !validTemplateCacheID(artifact.CacheID) {
+		return fmt.Errorf("Docker Sandboxes template cache ID must be exactly 12 lowercase hexadecimal characters")
 	}
-	return p.verifyImportedTemplate(ctx, artifact.Reference, artifact.Digest)
+	return p.verifyImportedTemplate(ctx, artifact.Reference, artifact.CacheID)
 }
 
 func (p *Provider) ActivateTemplate(artifact provider.TemplateArtifact) error {
 	if artifact.Reference == "" || !validFullTemplateDigest(artifact.Digest) {
 		return fmt.Errorf("cannot activate an invalid Docker Sandboxes template identity")
 	}
-	if artifact.CacheID != strings.TrimPrefix(artifact.Digest, "sha256:")[:12] {
-		return fmt.Errorf("cannot activate a Docker Sandboxes template with a mismatched cache ID")
+	if !validTemplateCacheID(artifact.CacheID) {
+		return fmt.Errorf("cannot activate a Docker Sandboxes template without an exact cache ID")
 	}
 	if artifact.Platform != "linux/amd64" && artifact.Platform != "linux/arm64" {
 		return fmt.Errorf("cannot activate a Docker Sandboxes template for unsupported platform %q", artifact.Platform)
@@ -381,6 +392,57 @@ func (p *Provider) ActivateTemplate(artifact provider.TemplateArtifact) error {
 	p.activeMu.Lock()
 	p.activeTemplate = artifact
 	p.activeMu.Unlock()
+	return nil
+}
+
+// WithTemplateActivation blocks new Create calls while the shared image
+// coordinator activates and durably commits one exact template generation.
+// Existing instances are unaffected; scheduled updates already drain them in
+// the common pool before entering this transaction.
+func (p *Provider) WithTemplateActivation(operation func() error) error {
+	if operation == nil {
+		return fmt.Errorf("Docker Sandboxes template activation operation is required")
+	}
+	p.activationMu.Lock()
+	defer p.activationMu.Unlock()
+	return operation()
+}
+
+func (p *Provider) SetTemplateAdmissionBlock(reason string) {
+	p.activationMu.Lock()
+	defer p.activationMu.Unlock()
+	p.admissionBlockReason = strings.TrimSpace(reason)
+}
+
+func (p *Provider) ClearTemplateAdmissionBlock() {
+	p.activationMu.Lock()
+	defer p.activationMu.Unlock()
+	p.admissionBlockReason = ""
+}
+
+func (p *Provider) TemplateAdmissionBlock() (string, bool) {
+	p.activationMu.RLock()
+	defer p.activationMu.RUnlock()
+	return p.admissionBlockReason, p.admissionBlockReason != ""
+}
+
+// ActiveTemplate returns the exact in-process generation used when Create
+// requests omit an explicit template identity.
+func (p *Provider) ActiveTemplate() (provider.TemplateArtifact, bool) {
+	p.activeMu.RLock()
+	defer p.activeMu.RUnlock()
+	return p.activeTemplate, p.activeTemplate.Reference != ""
+}
+
+// ClearActiveTemplate removes only the expected uncommitted generation. It is
+// used when first activation fails and there is no previous receipt to restore.
+func (p *Provider) ClearActiveTemplate(expected provider.TemplateArtifact) error {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	if p.activeTemplate != expected {
+		return fmt.Errorf("cannot clear Docker Sandboxes template because the active identity changed")
+	}
+	p.activeTemplate = provider.TemplateArtifact{}
 	return nil
 }
 
@@ -457,6 +519,35 @@ func (p *Provider) ObserveTemplate(ctx context.Context, artifact provider.Templa
 	return false, nil
 }
 
+func (p *Provider) ResolveTemplateCacheID(ctx context.Context, reference string) (string, bool, error) {
+	repository, tag, err := splitTemplateReference(reference)
+	if err != nil {
+		return "", false, err
+	}
+	templates, err := p.CachedTemplates(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	cacheID := ""
+	for _, item := range templates {
+		itemRepository, itemTag, splitErr := splitTemplateReference(item.Reference)
+		if splitErr != nil {
+			return "", false, splitErr
+		}
+		if itemRepository != repository || itemTag != tag {
+			continue
+		}
+		if cacheID != "" && cacheID != item.CacheID {
+			return "", false, fmt.Errorf("Docker Sandboxes template reference %s has multiple cache identities", reference)
+		}
+		cacheID = item.CacheID
+	}
+	if cacheID == "" {
+		return "", false, nil
+	}
+	return cacheID, true, nil
+}
+
 // VerifyAdmission checks only host-level Docker Sandboxes readiness. Capability
 // checks that are specific to an EPAR-managed sandbox are performed by
 // VerifyInstanceAdmission after that exact sandbox has been created.
@@ -476,7 +567,7 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	if err := p.verifyNoPublishedPorts(ctx, instance); err != nil {
 		return err
 	}
-	if err := p.verifyInspection(ctx, instance, nil); err != nil {
+	if err := p.verifyInspection(ctx, instance, nil, ""); err != nil {
 		return err
 	}
 	if p.architectureEmulation == nil {
@@ -490,7 +581,7 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	return nil
 }
 
-func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest) error {
+func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest, expectedCacheID string) error {
 	result, err := p.run(ctx, commandRequest{
 		args:        []string{"inspect", "--json", instance.Name},
 		operation:   "verify docker sandbox attached capabilities",
@@ -506,8 +597,15 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
-	if expected != nil && (stringValue(inspection["image"]) != expected.Template || stringValue(inspection["image_digest"]) != expected.TemplateDigest || stringValue(inspection["workspace"]) != expected.StagingPath) {
-		return fmt.Errorf("docker sandbox inspection did not bind the exact template identity and staging path")
+	if expected != nil {
+		inspectionDigest := stringValue(inspection["image_digest"])
+		runtimeCacheID := ""
+		if validFullTemplateDigest(inspectionDigest) {
+			runtimeCacheID = strings.TrimPrefix(inspectionDigest, "sha256:")[:12]
+		}
+		if stringValue(inspection["image"]) != expected.Template || runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
+			return fmt.Errorf("docker sandbox inspection did not bind the exact template reference, cache identity, and staging path")
+		}
 	}
 	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
 		value, ok := inspection[field]
@@ -899,7 +997,7 @@ func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error
 	return templates, nil
 }
 
-func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, digest string) error {
+func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, cacheID string) error {
 	result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: "verify cached docker sandbox template"})
 	if err != nil {
 		return err
@@ -912,16 +1010,27 @@ func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, digest
 	if err != nil {
 		return err
 	}
-	wantCacheID := strings.TrimPrefix(digest, "sha256:")[:12]
 	for _, image := range images {
 		if image.Repository == repository && image.Tag == tag {
-			if image.ID != wantCacheID {
-				return fmt.Errorf("cached Docker Sandbox template ID %s does not match imported archive identity %s", image.ID, wantCacheID)
+			if image.ID != cacheID {
+				return fmt.Errorf("cached Docker Sandbox template ID %s does not match recorded cache identity %s", image.ID, cacheID)
 			}
 			return nil
 		}
 	}
 	return fmt.Errorf("%w: configured Docker Sandbox template was not present in the authoritative Sandbox cache", provider.ErrTemplateNotFound)
+}
+
+func validTemplateCacheID(value string) bool {
+	if len(value) != 12 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func validFullTemplateDigest(value string) bool {
@@ -1151,5 +1260,7 @@ var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)
 var _ provider.TemplateArtifactRuntime = (*Provider)(nil)
+var _ provider.TemplateArtifactActivationController = (*Provider)(nil)
+var _ provider.TemplateAdmissionController = (*Provider)(nil)
 var _ provider.TemplateArtifactCleaner = (*Provider)(nil)
 var _ provider.TemplateArtifactObserver = (*Provider)(nil)

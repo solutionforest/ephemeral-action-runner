@@ -18,6 +18,8 @@ runner_dir="${EPAR_ACTIONS_RUNNER_DIR:-/opt/actions-runner}"
 sandbox_forward_proxy="http://gateway.docker.internal:3128"
 [[ -s /opt/epar/trust/ca-bundle.pem && ! -L /opt/epar/trust/ca-bundle.pem ]]
 
+/opt/epar/quiesce-apt.sh
+
 # Docker Sandboxes may inject a host-authenticated client configuration while
 # creating the sandbox. Scrub only the authentication files immediately before
 # registration; preserve .docker/sandbox/locks and any other runtime state.

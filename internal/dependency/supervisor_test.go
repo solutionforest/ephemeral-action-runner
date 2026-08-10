@@ -95,9 +95,11 @@ func TestBackoffHonorsServerHintBeyondCapAndDeadline(t *testing.T) {
 
 func TestSupervisorPersistsOriginalIncidentAcrossRestartAndExhaustsWithoutAnotherRequest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "external-outage.json")
+	now := time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
 	policy := NewPolicy(PolicyBounded, 80*time.Millisecond)
 	settings := BackoffSettings{Initial: time.Second, Maximum: time.Second, Multiplier: 2, Minimum: time.Second, Random: func() float64 { return 0.5 }}
-	supervisor, err := NewSupervisor(SupervisorOptions{Policy: policy, Backoff: settings, Path: path, PID: os.Getpid()})
+	supervisor, err := NewSupervisor(SupervisorOptions{Policy: policy, Backoff: settings, Path: path, Now: clock, PID: os.Getpid()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,18 +126,19 @@ func TestSupervisorPersistsOriginalIncidentAcrossRestartAndExhaustsWithoutAnothe
 	}
 
 	shorter := NewPolicy(PolicyBounded, 30*time.Millisecond)
-	restarted, err := NewSupervisor(SupervisorOptions{Policy: shorter, Backoff: settings, Path: path, PID: os.Getpid()})
+	now = persisted.IncidentStartedAt.Add(shorter.Duration)
+	restarted, err := NewSupervisor(SupervisorOptions{Policy: shorter, Backoff: settings, Path: path, Now: clock, PID: os.Getpid()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitStarted := time.Now()
 	err = restarted.WaitUntilReady(context.Background())
 	var exhausted *ExhaustedError
 	if !errors.As(err, &exhausted) {
 		t.Fatalf("WaitUntilReady() error = %v, want exhausted", err)
 	}
-	if elapsed := time.Since(waitStarted); elapsed > 100*time.Millisecond {
-		t.Fatalf("restart waited %s; bounded policy did not apply to original incident start", elapsed)
+	wantDeadline := persisted.IncidentStartedAt.Add(shorter.Duration)
+	if !exhausted.State.Deadline.Equal(wantDeadline) {
+		t.Fatalf("restart deadline = %s, want original incident deadline %s", exhausted.State.Deadline, wantDeadline)
 	}
 	finalState, err := ReadIncidentState(path)
 	if err != nil {
@@ -144,23 +147,22 @@ func TestSupervisorPersistsOriginalIncidentAcrossRestartAndExhaustsWithoutAnothe
 	if finalState.Active || finalState.Outcome != "exhausted" || finalState.ExhaustedAt.IsZero() {
 		t.Fatalf("final state = %#v", finalState)
 	}
-	latched, err := NewSupervisor(SupervisorOptions{Policy: shorter, Backoff: settings, Path: path, PID: os.Getpid()})
+	latched, err := NewSupervisor(SupervisorOptions{Policy: shorter, Backoff: settings, Path: path, Now: clock, PID: os.Getpid()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitStarted = time.Now()
 	err = latched.WaitUntilReady(context.Background())
-	if !errors.As(err, &exhausted) || time.Since(waitStarted) > 20*time.Millisecond {
-		t.Fatalf("persisted exhausted deadline was not immediate: err=%v elapsed=%s", err, time.Since(waitStarted))
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("persisted exhausted deadline was not latched: err=%v", err)
 	}
-	off, err := NewSupervisor(SupervisorOptions{Policy: NewPolicy(PolicyOff, 0), Backoff: settings, Path: path, PID: os.Getpid()})
+	off, err := NewSupervisor(SupervisorOptions{Policy: NewPolicy(PolicyOff, 0), Backoff: settings, Path: path, Now: clock, PID: os.Getpid()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := off.MarkRecovered(); err != nil {
 		t.Fatal(err)
 	}
-	fresh, err := NewSupervisor(SupervisorOptions{Policy: shorter, Backoff: settings, Path: path, PID: os.Getpid()})
+	fresh, err := NewSupervisor(SupervisorOptions{Policy: shorter, Backoff: settings, Path: path, Now: clock, PID: os.Getpid()})
 	if err != nil {
 		t.Fatal(err)
 	}
