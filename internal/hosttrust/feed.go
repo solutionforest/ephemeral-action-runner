@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
@@ -35,7 +34,7 @@ type FeedCertificate struct {
 // ReadFeed reads and verifies an external feed before converting its CA
 // certificates into a snapshot fragment.
 func ReadFeed(path, expectedSHA256 string, now time.Time) (Snapshot, error) {
-	content, err := os.ReadFile(path)
+	content, err := readFeedFile(path)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("read host trust feed %s: %w", path, err)
 	}

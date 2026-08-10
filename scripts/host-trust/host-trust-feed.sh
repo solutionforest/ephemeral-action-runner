@@ -143,6 +143,7 @@ feed_root="$cache_root/$config_id"
 lock_dir="$feed_root.lock"
 
 cleanup_lock() {
+  rm -f "$lock_dir/ready" 2>/dev/null || true
   rm -f "$lock_dir/pid" 2>/dev/null || true
   rmdir "$lock_dir" 2>/dev/null || true
 }
@@ -157,6 +158,7 @@ acquire_lock() {
   local owner=""
   owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
   if [[ "$owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+    rm -f "$lock_dir/ready"
     rm -f "$lock_dir/pid"
     rmdir "$lock_dir"
     mkdir "$lock_dir"
@@ -167,6 +169,10 @@ acquire_lock() {
   fi
   echo "host trust watcher already owns config feed $config_id" >&2
   return 1
+}
+
+publish_ready_marker() {
+  printf '%s\n' "$$" >"$lock_dir/ready"
 }
 
 write_pem_blocks() {
@@ -327,9 +333,9 @@ collect_certificates() {
 }
 
 publish_once() {
-  local work raw cert generation generation_dir current_tmp count cert_file cert_hash snapshot scopes_json generated_at expires_at
+  local work raw cert generation generation_dir generation_tmp="" current_tmp="" count cert_file cert_hash snapshot scopes_json generated_at expires_at
   work="$(mktemp -d "$cache_root/.host-trust-work.XXXXXX")"
-  trap 'rm -rf "$work"' RETURN
+  trap '[[ -z "${current_tmp:-}" ]] || rm -f -- "$current_tmp"; [[ -z "${generation_tmp:-}" ]] || rm -rf -- "$generation_tmp"; [[ -z "${work:-}" ]] || rm -rf -- "$work"' RETURN
   raw="$work/raw"
   cert="$work/certs"
   mkdir -p "$cert"
@@ -382,19 +388,34 @@ publish_once() {
   generation_dir="$feed_root/generations/$generation"
   mkdir -p "$feed_root/generations"
   if [[ ! -d "$generation_dir" ]]; then
-    local generation_tmp="$feed_root/generations/.$generation.$$"
+    generation_tmp="$feed_root/generations/.$generation.$$"
     mkdir -p "$generation_tmp"
-    cp "$snapshot" "$generation_tmp/snapshot.json"
+    if ! cp "$snapshot" "$generation_tmp/snapshot.json"; then
+      echo "host trust generation temporary copy failed" >&2
+      return 1
+    fi
     if ! mv "$generation_tmp" "$generation_dir" 2>/dev/null; then
-      [[ -d "$generation_dir" ]] || return 1
+      if [[ ! -d "$generation_dir" ]]; then
+        echo "host trust generation temporary publication failed" >&2
+        return 1
+      fi
       rm -rf "$generation_tmp"
     fi
+    generation_tmp=""
   fi
   current_tmp="$feed_root/.current.$$.json"
-  cp "$snapshot" "$current_tmp"
-  mv -f "$current_tmp" "$feed_root/current.json"
+  if ! cp "$snapshot" "$current_tmp"; then
+    echo "host trust current temporary copy failed" >&2
+    return 1
+  fi
+  if ! mv -f "$current_tmp" "$feed_root/current.json"; then
+    echo "host trust current publication failed" >&2
+    return 1
+  fi
+  current_tmp=""
   printf '%s\n' "$feed_root/current.json"
   rm -rf "$work"
+  work=""
   trap - RETURN
 }
 
@@ -403,6 +424,7 @@ case "$command_name" in
   sync) publish_once ;;
   watch)
     publish_once
+    publish_ready_marker
     while :; do
       sleep "$interval"
       publish_once || echo "host trust snapshot refresh failed; retaining the last published generation" >&2

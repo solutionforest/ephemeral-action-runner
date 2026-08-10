@@ -138,6 +138,83 @@ function Test-DerCertificateSerialNumberNonnegative {
     return (($Bytes[$serialNumber.ContentOffset] -band 0x80) -eq 0)
 }
 
+function Test-EparTransientCurrentPublicationError {
+    param([Parameter(Mandatory = $true)][System.Exception] $Exception)
+
+    for ($current = $Exception; $null -ne $current; $current = $current.InnerException) {
+        if ($current -is [System.IO.FileNotFoundException] -or $current -is [System.IO.DirectoryNotFoundException]) { return $true }
+        if ($current -is [System.IO.IOException] -and (($current.HResult -band 0xffff) -in @(2, 3, 32, 33))) { return $true }
+    }
+    return $false
+}
+
+function Remove-EparPublicationArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [switch] $Recurse,
+        [ValidateRange(1, 60000)][int] $TimeoutMilliseconds = 5000
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ([System.IO.File]::Exists($Path) -or [System.IO.Directory]::Exists($Path)) {
+        try {
+            if ($Recurse) {
+                Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            } else {
+                [System.IO.File]::Delete($Path)
+            }
+            return
+        } catch {
+            if ($_.Exception -is [System.IO.FileNotFoundException] -or $_.Exception -is [System.IO.DirectoryNotFoundException]) { return }
+            if (-not (Test-EparTransientCurrentPublicationError -Exception $_.Exception)) { throw }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw [System.IO.IOException]::new("timed out cleaning host trust publication artifact $Path after transient file errors: $($_.Exception.Message)", $_.Exception)
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    }
+}
+
+function Publish-EparCurrentFeed {
+    param(
+        [Parameter(Mandatory = $true)][string] $TemporaryPath,
+        [Parameter(Mandatory = $true)][string] $CurrentPath
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    $replacedPath = $TemporaryPath + '.replaced'
+    try {
+        while ($true) {
+            try {
+                if ([System.IO.File]::Exists($CurrentPath)) {
+                    [System.IO.File]::Replace($TemporaryPath, $CurrentPath, $replacedPath)
+                } else {
+                    [System.IO.File]::Move($TemporaryPath, $CurrentPath)
+                }
+                return
+            } catch {
+                if (-not (Test-EparTransientCurrentPublicationError -Exception $_.Exception)) { throw }
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    throw [System.IO.IOException]::new("timed out publishing host trust current.json after transient file replacement failures: $($_.Exception.Message)", $_.Exception)
+                }
+                Start-Sleep -Milliseconds 25
+            }
+        }
+    } finally {
+        $cleanupFailure = $null
+        foreach ($artifact in @($TemporaryPath, $replacedPath)) {
+            try { Remove-EparPublicationArtifact -Path $artifact } catch { if ($null -eq $cleanupFailure) { $cleanupFailure = $_ } }
+        }
+        if ($null -ne $cleanupFailure) { throw $cleanupFailure }
+    }
+}
+
+function Publish-EparWatcherReady {
+    param([Parameter(Mandatory = $true)][string] $LockDir)
+
+    [System.IO.File]::WriteAllText((Join-Path $LockDir 'ready'), "$PID`r`n", [System.Text.Encoding]::ASCII)
+}
+
 function Write-Feed {
     param([string] $FeedRoot, [System.Collections.Generic.List[string]] $Scopes)
     $raw = @{}
@@ -196,24 +273,21 @@ function Write-Feed {
     New-Item -ItemType Directory -Force -Path $generations | Out-Null
     if (-not (Test-Path -LiteralPath $generationDir -PathType Container)) {
         $temporary = Join-Path $generations ('.' + $generation + '.' + [guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $temporary | Out-Null
-        [System.IO.File]::WriteAllText((Join-Path $temporary 'snapshot.json'), $snapshotJson, [System.Text.UTF8Encoding]::new($false))
-        try { Move-Item -LiteralPath $temporary -Destination $generationDir -ErrorAction Stop } catch {
-            if (-not (Test-Path -LiteralPath $generationDir -PathType Container)) { throw }
-            Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
+        try {
+            New-Item -ItemType Directory -Path $temporary | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $temporary 'snapshot.json'), $snapshotJson, [System.Text.UTF8Encoding]::new($false))
+            try { Move-Item -LiteralPath $temporary -Destination $generationDir -ErrorAction Stop } catch {
+                if (-not (Test-Path -LiteralPath $generationDir -PathType Container)) { throw }
+            }
+        } finally {
+            Remove-EparPublicationArtifact -Path $temporary -Recurse
         }
     }
     $temporaryCurrent = Join-Path $FeedRoot ('.current.' + [guid]::NewGuid().ToString('N') + '.json')
     [System.IO.File]::WriteAllText($temporaryCurrent, $snapshotJson, [System.Text.UTF8Encoding]::new($false))
     $currentPath = Join-Path $FeedRoot 'current.json'
-    if (Test-Path -LiteralPath $currentPath) {
-        $backupPath = $currentPath + '.previous'
-        [System.IO.File]::Replace($temporaryCurrent, $currentPath, $backupPath)
-        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-    } else {
-        [System.IO.File]::Move($temporaryCurrent, $currentPath)
-    }
-    return (Join-Path $FeedRoot 'current.json')
+    Publish-EparCurrentFeed -TemporaryPath $temporaryCurrent -CurrentPath $currentPath
+    return $currentPath
 }
 
 $ProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
@@ -252,6 +326,7 @@ function Acquire-EparSharedLock {
         if ($owner -gt 0 -and (Get-Process -Id $owner -ErrorAction SilentlyContinue)) {
             throw "host trust watcher already owns config feed $configId"
         }
+        Remove-Item -LiteralPath (Join-Path $lockDir 'ready') -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $lockDir 'pid') -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $lockDir -Force -ErrorAction SilentlyContinue
     }
@@ -264,7 +339,8 @@ try {
         Write-Output (Write-Feed $feedRoot $settings.Scopes)
         exit 0
     }
-    Write-Output (Write-Feed $feedRoot $settings.Scopes)
+    [void](Write-Feed $feedRoot $settings.Scopes)
+    Publish-EparWatcherReady -LockDir $lockDir
     while ($true) {
         Start-Sleep -Seconds $Interval
         try { [void](Write-Feed $feedRoot $settings.Scopes) }
@@ -272,6 +348,7 @@ try {
     }
 }
 finally {
+    Remove-Item -LiteralPath (Join-Path $lockDir 'ready') -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $lockDir 'pid') -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $lockDir -Force -ErrorAction SilentlyContinue
 }

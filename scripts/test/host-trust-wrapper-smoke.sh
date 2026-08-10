@@ -196,6 +196,24 @@ EPAR_HOST_TRUST_HELPER="$helper"
 # shellcheck disable=SC1091
 . "$project_root/scripts/host-trust/wrapper-lib.sh"
 
+diagnostic_current="$($helper sync --project-root "$project_root" --config "$config")"
+diagnostic_feed_dir="$temporary/diagnostic-feed"
+mkdir -p "$diagnostic_feed_dir" "${diagnostic_feed_dir}.lock"
+cp "$diagnostic_current" "$diagnostic_feed_dir/current.json"
+(sleep 5) &
+diagnostic_pid="$!"
+printf '%s\n' "$diagnostic_pid" >"${diagnostic_feed_dir}.lock/pid"
+diagnostic_output="$temporary/watcher-startup-diagnostic.log"
+if epar_host_trust_wait_for_watcher "$diagnostic_pid" "$diagnostic_feed_dir" diagnostic "$temporary/watcher.log" 1 >"$diagnostic_output" 2>&1; then
+  echo "valid preflight feed unexpectedly masked missing watcher readiness" >&2
+  exit 1
+fi
+kill "$diagnostic_pid" 2>/dev/null || true
+wait "$diagnostic_pid" 2>/dev/null || true
+rm -rf "${diagnostic_feed_dir}.lock" "$diagnostic_feed_dir"
+grep -Eq 'observed lock owner [0-9]+ and ready marker missing or invalid; current.json is valid' "$diagnostic_output"
+grep -Fq "$temporary/watcher.log" "$diagnostic_output"
+
 missing_config="$temporary/missing-project/.local/config.yml"
 missing_output="$("$helper" sync --project-root "$project_root" --config "$missing_config")"
 [[ -z "$missing_output" ]] || { echo "missing config unexpectedly produced a host-trust feed" >&2; exit 1; }
@@ -236,17 +254,76 @@ epar_host_trust_prepare "$project_root" pool pool status --config "$config"
 epar_host_trust_prepare "$project_root" pool pool up --config "$config"
 watch_pid="$EPAR_HOST_TRUST_WATCH_PID"
 [[ -n "$watch_pid" ]] && kill -0 "$watch_pid"
+watch_feed_dirs=("$EPAR_BUILD_TRUST_FEED_DIR" "$EPAR_RUNNER_TRUST_FEED_DIR")
+[[ "${#EPAR_TRUST_WATCH_PIDS[@]}" == 2 ]] || { echo "expected build and runner trust watchers" >&2; exit 1; }
+for index in "${!EPAR_TRUST_WATCH_PIDS[@]}"; do
+  owner="$(cat "${watch_feed_dirs[$index]}.lock/pid")"
+  [[ "$owner" == "${EPAR_TRUST_WATCH_PIDS[$index]}" ]] || { echo "watcher lock owner $owner did not match process ${EPAR_TRUST_WATCH_PIDS[$index]}" >&2; exit 1; }
+  ready_owner="$(cat "${watch_feed_dirs[$index]}.lock/ready")"
+  [[ "$ready_owner" == "${EPAR_TRUST_WATCH_PIDS[$index]}" ]] || { echo "watcher ready marker $ready_owner did not match process ${EPAR_TRUST_WATCH_PIDS[$index]}" >&2; exit 1; }
+  epar_host_trust_current_feed_valid "${watch_feed_dirs[$index]}/current.json" || { echo "wrapper returned before current.json was valid and fresh" >&2; exit 1; }
+done
+published_feed="$EPAR_RUNNER_TRUST_FEED_DIR/current.json"
+first_published_at="$(epar_host_trust_feed_string_field "$published_feed" generatedAt)"
+[[ -n "$first_published_at" ]] || { echo "runner trust feed omitted generatedAt" >&2; exit 1; }
 if "$helper" sync --project-root "$project_root" --config "$config" >/dev/null 2>&1; then
   echo "second controller unexpectedly acquired the live wrapper lock" >&2
   exit 1
 fi
+refresh_deadline=$((SECONDS + 15))
+refreshed_published_at="$first_published_at"
+while [[ "$refreshed_published_at" == "$first_published_at" && $SECONDS -lt $refresh_deadline ]]; do
+  refreshed_published_at="$(epar_host_trust_feed_string_field "$published_feed" generatedAt 2>/dev/null || true)"
+  if [[ "$refreshed_published_at" == "$first_published_at" ]]; then sleep 0.05; fi
+done
+[[ -n "$refreshed_published_at" && "$refreshed_published_at" != "$first_published_at" ]] || { echo "Unix host-trust watcher did not refresh its published feed" >&2; exit 1; }
+epar_host_trust_current_feed_valid "$published_feed" || { echo "refreshed Unix host-trust feed was invalid or stale" >&2; exit 1; }
 epar_host_trust_cleanup
 watch_pid=""
+for feed_dir in "${watch_feed_dirs[@]}"; do
+  [[ ! -e "${feed_dir}.lock" ]] || { echo "Unix wrapper shutdown left a singleton lock behind" >&2; exit 1; }
+done
+
+fake_cp_dir="$temporary/fake-publication-cp"
+mkdir -p "$fake_cp_dir"
+real_cp="$(command -v cp)"
+cat >"$fake_cp_dir/cp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+destination="${!#}"
+case "${EPAR_FAIL_CP_KIND:-}:$destination" in
+  current:*/.current.*.json|generation:*/generations/.*/snapshot.json)
+    printf 'partial\n' >"$destination"
+    exit 17
+    ;;
+esac
+exec "${EPAR_REAL_CP:?}" "$@"
+SH
+chmod +x "$fake_cp_dir/cp"
+if PATH="$fake_cp_dir:$PATH" EPAR_REAL_CP="$real_cp" EPAR_FAIL_CP_KIND=current "$helper" sync --project-root "$project_root" --config "$config" >/dev/null 2>&1; then
+  echo "Unix current temporary copy failure unexpectedly succeeded" >&2
+  exit 1
+fi
+if find "$XDG_CACHE_HOME/ephemeral-action-runner/host-trust" -maxdepth 2 -type f -name '.current.*.json' -print -quit | grep -q .; then
+  echo "Unix current publication failure left a temporary file" >&2
+  exit 1
+fi
+cleanup_config="$temporary/cleanup-generation.yml"
+cp "$config" "$cleanup_config"
+if PATH="$fake_cp_dir:$PATH" EPAR_REAL_CP="$real_cp" EPAR_FAIL_CP_KIND=generation "$helper" sync --project-root "$project_root" --config "$cleanup_config" >/dev/null 2>&1; then
+  echo "Unix generation temporary copy failure unexpectedly succeeded" >&2
+  exit 1
+fi
+if find "$XDG_CACHE_HOME/ephemeral-action-runner/host-trust" -type d -path '*/generations/.*' -print -quit | grep -q .; then
+  echo "Unix generation publication failure left a temporary directory" >&2
+  exit 1
+fi
 
 current="$($helper sync --project-root "$project_root" --config "$config")"
 lock_dir="$(dirname "$current").lock"
 mkdir "$lock_dir"
 printf '%s\n' 2147483647 >"$lock_dir/pid"
+printf '%s\n' 2147483647 >"$lock_dir/ready"
 current="$($helper sync --project-root "$project_root" --config "$config")"
 [[ -s "$current" && ! -e "$lock_dir" ]]
 

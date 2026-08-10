@@ -64,6 +64,75 @@ function ConvertTo-EparPowerShellLiteral {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
+function Test-EparHostTrustCurrentFeed {
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    try {
+        $document = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop
+        if ($document.schemaVersion -ne 1 -or $document.hostOS -ne 'windows') { return $false }
+        if (@($document.scopes).Count -eq 0 -or @($document.certificates).Count -eq 0) { return $false }
+        $generatedAt = if ($document.generatedAt -is [DateTime]) { [DateTimeOffset]::new($document.generatedAt.ToUniversalTime()) } else { [DateTimeOffset]::Parse([string]$document.generatedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+        $expiresAt = if ($document.expiresAt -is [DateTime]) { [DateTimeOffset]::new($document.expiresAt.ToUniversalTime()) } else { [DateTimeOffset]::Parse([string]$document.expiresAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+        $now = [DateTimeOffset]::UtcNow
+        if ($expiresAt -le $generatedAt -or $generatedAt -gt $now.AddSeconds(5) -or ($now - $generatedAt).TotalSeconds -gt 30 -or $now -gt $expiresAt) { return $false }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-EparHostTrustLockOwner {
+    param([Parameter(Mandatory = $true)][string] $FeedDir)
+
+    $owner = 0
+    try {
+        [void][int]::TryParse([System.IO.File]::ReadAllText((Join-Path ($FeedDir + '.lock') 'pid')).Trim(), [ref]$owner)
+    } catch {
+        $owner = 0
+    }
+    return $owner
+}
+
+function Get-EparHostTrustReadyOwner {
+    param([Parameter(Mandatory = $true)][string] $FeedDir)
+
+    $owner = 0
+    try {
+        [void][int]::TryParse([System.IO.File]::ReadAllText((Join-Path ($FeedDir + '.lock') 'ready')).Trim(), [ref]$owner)
+    } catch {
+        $owner = 0
+    }
+    return $owner
+}
+
+function Wait-EparHostTrustWatcherReady {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)][string] $FeedDir,
+        [Parameter(Mandatory = $true)][string] $Purpose,
+        [Parameter(Mandatory = $true)][string] $Diagnostics,
+        [ValidateRange(1, 60000)][int] $TimeoutMilliseconds = 5000
+    )
+
+    $currentPath = Join-Path $FeedDir 'current.json'
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ($true) {
+        if ($Process.HasExited) {
+            throw "$Purpose trust watcher exited during startup with exit code $($Process.ExitCode) before owning its lock, publishing its ready marker, and publishing a valid current.json. Diagnostics: $Diagnostics"
+        }
+        $owner = Get-EparHostTrustLockOwner -FeedDir $FeedDir
+        $readyOwner = Get-EparHostTrustReadyOwner -FeedDir $FeedDir
+        if ($owner -eq $Process.Id -and $readyOwner -eq $Process.Id -and (Test-EparHostTrustCurrentFeed -Path $currentPath)) { return }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $ownerDescription = if ($owner -gt 0) { [string]$owner } else { 'missing or invalid' }
+            $readyDescription = if ($readyOwner -gt 0) { [string]$readyOwner } else { 'missing or invalid' }
+            $feedDescription = if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) { 'missing' } elseif (Test-EparHostTrustCurrentFeed -Path $currentPath) { 'valid' } else { 'invalid or stale' }
+            throw "$Purpose trust watcher did not become ready within $TimeoutMilliseconds ms: expected PID $($Process.Id), observed lock owner $ownerDescription and ready marker $readyDescription; current.json is $feedDescription. Diagnostics: $Diagnostics"
+        }
+        Start-Sleep -Milliseconds 25
+    }
+}
+
 function Get-EparHostTrustInitArguments {
     param([string[]] $Arguments)
 
@@ -108,43 +177,37 @@ function Start-EparHostTrustBridge {
     $powershell = (Get-Process -Id $PID).Path
     $watchers = [System.Collections.Generic.List[object]]::new()
     $feedDirectories = @{}
-    foreach ($purpose in @('build', 'runner')) {
-        $feedLines = @(& $helper sync -ProjectRoot $ProjectRoot -Config $config -Purpose $purpose 2>&1)
-        if ($LASTEXITCODE -ne 0) {
-            throw "$purpose trust preflight failed: $($feedLines -join [Environment]::NewLine)"
+    try {
+        foreach ($purpose in @('build', 'runner')) {
+            $feedLines = @(& $helper sync -ProjectRoot $ProjectRoot -Config $config -Purpose $purpose 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "$purpose trust preflight failed: $($feedLines -join [Environment]::NewLine)"
+            }
+            $feedPath = ($feedLines | Where-Object { $_ -is [string] -and $_.Trim() } | Select-Object -Last 1)
+            if (-not $feedPath) {
+                $feedDirectories[$purpose] = $null
+                continue
+            }
+            $feedDir = Split-Path -Parent $feedPath.Trim()
+            $feedDirectories[$purpose] = $feedDir
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $powershell
+            $startInfo.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $helper + '" watch -ProjectRoot "' + $ProjectRoot + '" -Config "' + $config + '" -Purpose ' + $purpose + ' -Interval 10'
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $watch = [System.Diagnostics.Process]::Start($startInfo)
+            [void]$watchers.Add([pscustomobject]@{ Process = $watch; FeedDir = $feedDir })
+            Wait-EparHostTrustWatcherReady -Process $watch -FeedDir $feedDir -Purpose $purpose -Diagnostics 'watcher errors are emitted to the controller console'
         }
-        $feedPath = ($feedLines | Where-Object { $_ -is [string] -and $_.Trim() } | Select-Object -Last 1)
-        if (-not $feedPath) {
-            $feedDirectories[$purpose] = $null
-            continue
-        }
-        $feedDir = Split-Path -Parent $feedPath.Trim()
-        $feedDirectories[$purpose] = $feedDir
-        $watchOut = Join-Path $feedDir "watcher.log"
-        $watchErr = Join-Path $feedDir "watcher-error.log"
-        $watchCommand = '& ' + (ConvertTo-EparPowerShellLiteral $helper) +
-            ' watch -ProjectRoot ' + (ConvertTo-EparPowerShellLiteral $ProjectRoot) +
-            ' -Config ' + (ConvertTo-EparPowerShellLiteral $config) +
-            ' -Purpose ' + (ConvertTo-EparPowerShellLiteral $purpose) +
-            ' -Interval 10 >> ' + (ConvertTo-EparPowerShellLiteral $watchOut) +
-            ' 2>> ' + (ConvertTo-EparPowerShellLiteral $watchErr)
-        $encodedWatchCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchCommand))
-        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = $powershell
-        $startInfo.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedWatchCommand"
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-        $watch = [System.Diagnostics.Process]::Start($startInfo)
-        Start-Sleep -Milliseconds 150
-        if ($watch.HasExited) {
-            throw "$purpose trust watcher exited during startup. See $watchErr"
-        }
-        [void]$watchers.Add([pscustomobject]@{ Process = $watch; FeedDir = $feedDir })
+    } catch {
+        $startupError = $_
+        Stop-EparHostTrustBridge -Bridge ([pscustomobject]@{ WatchProcesses = @($watchers); WatchProcess = $null; FeedDir = $null })
+        throw $startupError
     }
     $runnerFeedDir = $feedDirectories['runner']
     $buildFeedDir = $feedDirectories['build']
-    $firstWatcher = if ($watchers.Count -gt 0) { $watchers[0].Process } else { $null }
-    return [pscustomobject]@{ FeedDir = $runnerFeedDir; BuildFeedDir = $buildFeedDir; RunnerFeedDir = $runnerFeedDir; WatchProcess = $firstWatcher; WatchProcesses = @($watchers); Config = $config; PostInit = $false }
+    $finalWatcher = if ($watchers.Count -gt 0) { $watchers[$watchers.Count - 1].Process } else { $null }
+    return [pscustomobject]@{ FeedDir = $runnerFeedDir; BuildFeedDir = $buildFeedDir; RunnerFeedDir = $runnerFeedDir; WatchProcess = $finalWatcher; WatchProcesses = @($watchers); Config = $config; PostInit = $false }
 }
 
 function Complete-EparHostTrustInit {
@@ -185,6 +248,7 @@ function Stop-EparHostTrustBridge {
         $owner = 0
         [void][int]::TryParse((Get-Content -LiteralPath $ownerPath -ErrorAction SilentlyContinue | Select-Object -First 1), [ref]$owner)
         if ($owner -eq $entry.Process.Id) {
+            Remove-Item -LiteralPath (Join-Path $lockDir 'ready') -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $ownerPath -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $lockDir -Force -ErrorAction SilentlyContinue
         }
