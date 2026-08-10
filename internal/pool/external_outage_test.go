@@ -510,24 +510,49 @@ func TestPartialInitialCapacitySurvivesRegistrationOutageWithoutCapacitySurge(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 1600*time.Millisecond)
-	defer cancel()
-	if err := manager.RunPool(ctx, RunOptions{Instances: 2, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 100 * time.Millisecond, PoolLockHeld: true, ExternalOutageRetry: policy}); err != nil {
+	statePath, err := dependency.ExternalOutageStatePath(manager.ProjectRoot, manager.ConfigPath)
+	if err != nil {
 		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.RunPool(ctx, RunOptions{Instances: 2, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 100 * time.Millisecond, PoolLockHeld: true, ExternalOutageRetry: policy})
+	}()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	var state dependency.IncidentState
+	for state.Active || state.Outcome != "recovered" || atomic.LoadInt32(&g.registrationCalls) < 3 {
+		select {
+		case runErr := <-done:
+			if runErr != nil {
+				t.Fatal(runErr)
+			}
+			t.Fatal("pool stopped before supervised registration recovery completed")
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for supervised registration recovery: %v", ctx.Err())
+		case <-ticker.C:
+			state, err = dependency.ReadIncidentState(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cancel()
+	select {
+	case runErr := <-done:
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pool did not stop after acceptance condition was satisfied")
 	}
 	if got := atomic.LoadInt32(&g.registrationCalls); got < 3 {
 		t.Fatalf("registration token calls = %d, want success, outage, and supervised retry", got)
 	}
 	if got := atomic.LoadInt32(&p.maxInventory); got > 2 {
 		t.Fatalf("maximum physical inventory = %d, exceeded pool.instances=2", got)
-	}
-	statePath, err := dependency.ExternalOutageStatePath(manager.ProjectRoot, manager.ConfigPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := dependency.ReadIncidentState(statePath)
-	if err != nil {
-		t.Fatal(err)
 	}
 	if state.Active || state.Outcome != "recovered" {
 		t.Fatalf("incident state = %#v, want recovered after desired capacity", state)
