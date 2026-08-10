@@ -13,12 +13,13 @@ func TestPathHelpersAndRecognition(t *testing.T) {
 		path     string
 		category Category
 	}{
-		{mustPath(InstancePath(root, "runner-1", "docker-dind")), CategoryInstances},
+		{mustPath(InstancePath(root, "runner-1", "docker-container")), CategoryInstances},
+		{mustPath(InstancePath(root, "runner-1", "docker-sandboxes")), CategoryInstances},
 		{mustPath(InstancePath(root, "runner-1", "guest")), CategoryInstances},
 		{mustPath(BuildPath(root, "ubuntu-24.04", "docker-build")), CategoryBuilds},
 		{mustPath(BuildPath(root, "ubuntu-24.04", "guest")), CategoryBuilds},
 		{ErrorPath(root, timestamp), CategoryErrors},
-		{mustPath(BenchmarkPath(root, timestamp, "docker-dind")), CategoryBenchmarks},
+		{mustPath(BenchmarkPath(root, timestamp, "docker-container")), CategoryBenchmarks},
 	}
 	for _, test := range tests {
 		recognized, ok := recognizePath(root, test.path)
@@ -56,11 +57,11 @@ func TestLegacyFlatRecognitionIsConstrained(t *testing.T) {
 		category Category
 	}{
 		{"epar-pool-20260715-010203-007.guest.log", CategoryInstances},
-		{"epar-pool-20260715-010203-007.docker-dind.log", CategoryInstances},
+		{"epar-pool-20260715-010203-007.docker-container.log", CategoryInstances},
 		{"ubuntu.docker-build.log", CategoryBuilds},
 		{"ubuntu.source.log", CategoryBuilds},
 		{"epar-20260715-010203-error.log", CategoryErrors},
-		{"20260715T010203.000000123Z-docker-dind.jsonl", CategoryBenchmarks},
+		{"20260715T010203.000000123Z-docker-container.jsonl", CategoryBenchmarks},
 		{"epar-2026-07-15T01-02-03.004.log.gz", CategoryManager},
 	}
 	for _, test := range tests {

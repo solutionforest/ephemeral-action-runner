@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 4,
+  "sourceAuthority": "registry-catalog",
+  "defaultPlatform": "linux/amd64",
+  "supportedPlatforms": ["linux/amd64", "linux/arm64"],
+  "dockerfileFrontend": {
+    "inspectionReference": "docker.io/docker/dockerfile@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+    "reference": "docker.io/docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e",
+    "indexDigest": "sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+  },
+  "sbomGenerator": {
+    "inspectionReference": "docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68",
+    "indexDigest": "sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
+  },
+  "goBuilder": {
+    "version": "1.25.12",
+    "inspectionReference": "docker.io/library/golang@sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980",
+    "indexDigest": "sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980"
+  },
+  "hookLauncher": {"sha256": "75c25e1cb5c458840f35e1df5232550f32d90987d32ebc4f2c093ac7268ef799"},
+  "egressBridge": {"sha256": "9b25461c671d8edef8abe046d167516c127e86d65046af6953507ae03bfd4918"},
+  "tini": {"version": "0.19.0"},
+  "emulation": {
+    "schemaVersion": 1,
+    "backend": "qemu",
+    "source": {
+      "repository": "docker.io/tonistiigi/binfmt",
+      "release": "qemu-v10.2.3-68",
+      "revision": "e29e7d72c9672c8c8bf846655ab149b50e1a62bd",
+      "qemuVersion": "10.2.3",
+      "indexReference": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+      "indexDigest": "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+      "licenses": [
+        {"name": "tonistiigi-binfmt-MIT.txt", "url": "https://raw.githubusercontent.com/tonistiigi/binfmt/e29e7d72c9672c8c8bf846655ab149b50e1a62bd/LICENSE", "sha256": "bba3332a1e2ec03031b587452cd9254bd7ab6ec701aef20b12e642f47f423dd6"},
+        {"name": "qemu-COPYING.txt", "url": "https://raw.githubusercontent.com/qemu/qemu/v10.2.3/COPYING", "sha256": "dd3ce02338c3a48abb6ba59b48809f7108a8bd242cb0cc8be90daafa30707c28"}
+      ]
+    },
+    "platforms": {
+      "linux/amd64": {"manifestDigest": "sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705", "sourceReference": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705", "compressedLayerBytes": 32675086},
+      "linux/arm64": {"manifestDigest": "sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd", "sourceReference": "docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd", "compressedLayerBytes": 31024752}
+    }
+  },
+  "platforms": {
+    "linux/amd64": {"architecture": "amd64", "dockerfileFrontendManifestDigest": "sha256:b5f3b260a9678e1d83d2fce86eeddf79420b79147eaba2a25986f47133d73720", "goBuilderManifestDigest": "sha256:12e171e33ce7ade87ac8ab2bbe65cea9371527285bdab43ca02780a9e6ac60e5", "goBuilderReference": "docker.io/library/golang@sha256:12e171e33ce7ade87ac8ab2bbe65cea9371527285bdab43ca02780a9e6ac60e5", "sbomGeneratorManifestDigest": "sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7", "sbomGeneratorReference": "docker.io/docker/buildkit-syft-scanner@sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7", "tini": {"url": "https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64", "sha256": "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c"}},
+    "linux/arm64": {"architecture": "arm64", "dockerfileFrontendManifestDigest": "sha256:c8678869a83fab70232869ba24acc1c0be661f4d65135c0eeacb6a8e78420fdd", "goBuilderManifestDigest": "sha256:afe53a4752b49f57ddebc97501a99394e2f7715236b4241efa830d54efb44434", "goBuilderReference": "docker.io/library/golang@sha256:afe53a4752b49f57ddebc97501a99394e2f7715236b4241efa830d54efb44434", "sbomGeneratorManifestDigest": "sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d", "sbomGeneratorReference": "docker.io/docker/buildkit-syft-scanner@sha256:860305b3d1667c35142f11f6e9485e322c1c6173702a0831dc68739a34847f2d", "tini": {"url": "https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm64", "sha256": "07952557df20bfd2a95f9bef198b445e006171969499a1d361bd9e6f8e5e0e81"}}
+  },
+  "publication": {
+    "packageRepository": "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template",
+    "movingCatalogTag": "catalog-v1",
+    "profiles": {
+      "act": {"sourceTag": "act-latest", "enabled": true, "autoAdvance": true},
+      "full": {"sourceTag": "full-latest", "enabled": false, "autoAdvance": false}
+    }
+  }
+}

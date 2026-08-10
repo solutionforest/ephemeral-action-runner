@@ -7,7 +7,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: host-trust-feed.sh sync|watch --project-root <path> --config <path> [--interval <seconds>]
+Usage: host-trust-feed.sh sync|watch --project-root <path> --config <path> [--purpose runner|build] [--interval <seconds>] [--ready-from-current]
 
 The config must opt in with:
   image:
@@ -20,6 +20,8 @@ shift || true
 project_root=""
 config_path=""
 interval=10
+purpose="runner"
+ready_from_current=false
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 while (($#)); do
@@ -27,12 +29,18 @@ while (($#)); do
     --project-root) project_root="${2:?missing value for --project-root}"; shift 2 ;;
     --config) config_path="${2:?missing value for --config}"; shift 2 ;;
     --interval) interval="${2:?missing value for --interval}"; shift 2 ;;
+    --purpose) purpose="${2:?missing value for --purpose}"; shift 2 ;;
+    --ready-from-current) ready_from_current=true; shift ;;
     *) usage; exit 2 ;;
   esac
 done
 
 if [[ "$command_name" != "sync" && "$command_name" != "watch" ]] || [[ -z "$project_root" || -z "$config_path" ]]; then
   usage
+  exit 2
+fi
+if [[ "$purpose" != "runner" && "$purpose" != "build" ]]; then
+  echo "trust feed purpose must be runner or build" >&2
   exit 2
 fi
 if [[ ! "$interval" =~ ^[1-9][0-9]*$ ]]; then
@@ -45,13 +53,15 @@ if [[ "$config_path" != /* ]]; then
   config_path="$project_root/$config_path"
 fi
 if [[ ! -f "$config_path" ]]; then
-  # The first `start` can create config interactively. Treat missing config as
-  # disabled: native controller code will re-evaluate after init.
-  exit 0
-fi
-config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
-if command -v realpath >/dev/null 2>&1; then
-  config_path="$(realpath "$config_path")"
+  # A first `start` still needs operational system trust to compile the native
+  # controller before the wizard can create a config. Runner inheritance
+  # remains disabled until an existing config explicitly enables it.
+  if [[ "$purpose" != "build" ]]; then exit 0; fi
+else
+  config_path="$(cd "$(dirname "$config_path")" && pwd -P)/$(basename "$config_path")"
+  if command -v realpath >/dev/null 2>&1; then
+    config_path="$(realpath "$config_path")"
+  fi
 fi
 
 sha256_text() {
@@ -63,6 +73,7 @@ sha256_text() {
 }
 
 config_values() {
+  [[ -f "$config_path" ]] || return 0
   # Supported deliberately-small YAML subset: EPAR's own parser is flat in
   # each section and supports inline or block lists. Emit mode followed by
   # one scope per line.
@@ -98,7 +109,13 @@ while IFS= read -r value; do
     scope=*) scopes+=("$(printf '%s' "${value#scope=}" | tr '[:upper:]' '[:lower:]')") ;;
   esac
 done < <(config_values)
-if [[ "$mode" != "overlay" ]]; then
+if [[ "$purpose" == "build" ]]; then
+  build_scopes=(system)
+  if [[ "$mode" == "overlay" ]] && printf '%s\n' "${scopes[@]}" | grep -Fxq user; then
+    build_scopes+=(user)
+  fi
+  scopes=("${build_scopes[@]}")
+elif [[ "$mode" != "overlay" ]]; then
   exit 0
 fi
 
@@ -123,11 +140,12 @@ for scope in "${scopes[@]}"; do
   fi
 done
 
-config_id="$(printf '%s' "$config_path" | sha256_text | cut -c1-32)"
+config_id="$(printf '%s\0%s' "$purpose" "$config_path" | sha256_text | cut -c1-32)"
 feed_root="$cache_root/$config_id"
 lock_dir="$feed_root.lock"
 
 cleanup_lock() {
+  rm -f "$lock_dir/ready" 2>/dev/null || true
   rm -f "$lock_dir/pid" 2>/dev/null || true
   rmdir "$lock_dir" 2>/dev/null || true
 }
@@ -142,6 +160,7 @@ acquire_lock() {
   local owner=""
   owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
   if [[ "$owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+    rm -f "$lock_dir/ready"
     rm -f "$lock_dir/pid"
     rmdir "$lock_dir"
     mkdir "$lock_dir"
@@ -152,6 +171,10 @@ acquire_lock() {
   fi
   echo "host trust watcher already owns config feed $config_id" >&2
   return 1
+}
+
+publish_ready_marker() {
+  printf '%s\n' "$$" >"$lock_dir/ready"
 }
 
 write_pem_blocks() {
@@ -312,9 +335,9 @@ collect_certificates() {
 }
 
 publish_once() {
-  local work raw cert generation generation_dir current_tmp count cert_file cert_hash snapshot scopes_json generated_at expires_at
+  local work raw cert generation generation_dir generation_tmp="" current_tmp="" count cert_file cert_hash snapshot scopes_json generated_at expires_at
   work="$(mktemp -d "$cache_root/.host-trust-work.XXXXXX")"
-  trap 'rm -rf "$work"' RETURN
+  trap '[[ -z "${current_tmp:-}" ]] || rm -f -- "$current_tmp"; [[ -z "${generation_tmp:-}" ]] || rm -rf -- "$generation_tmp"; [[ -z "${work:-}" ]] || rm -rf -- "$work"' RETURN
   raw="$work/raw"
   cert="$work/certs"
   mkdir -p "$cert"
@@ -367,19 +390,34 @@ publish_once() {
   generation_dir="$feed_root/generations/$generation"
   mkdir -p "$feed_root/generations"
   if [[ ! -d "$generation_dir" ]]; then
-    local generation_tmp="$feed_root/generations/.$generation.$$"
+    generation_tmp="$feed_root/generations/.$generation.$$"
     mkdir -p "$generation_tmp"
-    cp "$snapshot" "$generation_tmp/snapshot.json"
+    if ! cp "$snapshot" "$generation_tmp/snapshot.json"; then
+      echo "host trust generation temporary copy failed" >&2
+      return 1
+    fi
     if ! mv "$generation_tmp" "$generation_dir" 2>/dev/null; then
-      [[ -d "$generation_dir" ]] || return 1
+      if [[ ! -d "$generation_dir" ]]; then
+        echo "host trust generation temporary publication failed" >&2
+        return 1
+      fi
       rm -rf "$generation_tmp"
     fi
+    generation_tmp=""
   fi
   current_tmp="$feed_root/.current.$$.json"
-  cp "$snapshot" "$current_tmp"
-  mv -f "$current_tmp" "$feed_root/current.json"
+  if ! cp "$snapshot" "$current_tmp"; then
+    echo "host trust current temporary copy failed" >&2
+    return 1
+  fi
+  if ! mv -f "$current_tmp" "$feed_root/current.json"; then
+    echo "host trust current publication failed" >&2
+    return 1
+  fi
+  current_tmp=""
   printf '%s\n' "$feed_root/current.json"
   rm -rf "$work"
+  work=""
   trap - RETURN
 }
 
@@ -387,7 +425,15 @@ acquire_lock
 case "$command_name" in
   sync) publish_once ;;
   watch)
-    publish_once
+    if [[ "$ready_from_current" == true ]]; then
+      [[ -f "$feed_root/current.json" && -s "$feed_root/current.json" ]] || { echo "host trust watcher cannot reuse missing preflight feed $feed_root/current.json" >&2; exit 1; }
+    else
+      publish_once
+    fi
+    publish_ready_marker
+    if [[ "$ready_from_current" == true ]]; then
+      publish_once || echo "host trust snapshot refresh failed; retaining the last published generation" >&2
+    fi
     while :; do
       sleep "$interval"
       publish_once || echo "host trust snapshot refresh failed; retaining the last published generation" >&2

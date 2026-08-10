@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 3,
+  "templateSchemaVersion": 2,
+  "profile": "full",
+  "validationStatus": "unvalidated",
+  "platform": "linux/arm64",
+  "source": {
+    "reference": "ghcr.io/catthehacker/ubuntu@sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+    "indexDigest": "sha256:76581ac3f31aa1ad7cb558b47c3e836b9cbcd82dc08fc69349f77e3967bea50c",
+    "manifestDigest": "sha256:245c8981fbf4ac268db015463c6c446b9411481f7e0001537128dc384d46dd0c"
+  },
+  "runner": {
+    "execution": "direct-actions-listener",
+    "version": "2.332.0",
+    "user": "agent",
+    "uid": 1000,
+    "gid": 1000,
+    "home": "/home/agent",
+    "directory": "/opt/actions-runner"
+  },
+  "docker": {
+    "daemonOwner": "docker-sandboxes-runtime",
+    "expectedDaemonCount": 1,
+    "imagePreloadsVarLibDocker": false,
+    "buildRequiresPrivilegedBuildkit": false
+  },
+  "architectureEmulation": {
+    "backend": "qemu",
+    "policy": "configured-best-effort-required-or-native-only",
+    "release": "qemu-v10.2.3-68",
+    "sourceIndexDigest": "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0",
+    "sourceManifestDigest": "sha256:b4c6a09270133b3c5b4dff94f83067df4dd27eced195fc6a1dbad102999e24dd",
+    "qemuVersion": "10.2.3"
+  }
+}

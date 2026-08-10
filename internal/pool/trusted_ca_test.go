@@ -18,7 +18,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 )
 
-func TestDockerDindBuildContextInstallsTrustedCABeforeNetworkSteps(t *testing.T) {
+func TestDockerContainerBuildContextInstallsTrustedCABeforeNetworkSteps(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "scripts", "guest", "ubuntu"),
@@ -38,7 +38,7 @@ func TestDockerDindBuildContextInstallsTrustedCABeforeNetworkSteps(t *testing.T)
 		ProjectRoot: root,
 	}
 	buildContext := t.TempDir()
-	if err := manager.prepareDockerDindBuildContext(buildContext, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
+	if err := manager.prepareDockerContainerBuildContext(buildContext, t.TempDir(), `{"hash":"test"}`+"\n"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -148,6 +148,29 @@ func TestTrustedCACertificateAcceptsDERAndNormalizesToPEM(t *testing.T) {
 	}
 }
 
+func TestPrebuiltDockerSandboxesExplicitCAUsesRuntimeOverlayWhenHostTrustDisabled(t *testing.T) {
+	root := t.TempDir()
+	certificatePath := filepath.Join(root, "enterprise-root.pem")
+	writeTestCACertificate(t, certificatePath, "Prebuilt Runtime Root")
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{Type: "docker-sandboxes"},
+			Image:    config.ImageConfig{Distribution: config.ImageDistributionPrebuilt, HostTrustMode: config.HostTrustModeDisabled, TrustedCACertificatePaths: []string{"enterprise-root.pem"}},
+		},
+		ProjectRoot: root,
+	}
+	if !manager.hostTrustEnabled() {
+		t.Fatal("prebuilt explicit CA did not enable the runtime trust overlay")
+	}
+	snapshot, err := manager.resolveHostTrust(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Certificates) != 1 || snapshot.Generation == "" || len(snapshot.Scopes) != 1 || snapshot.Scopes[0] != "explicit-ca" {
+		t.Fatalf("runtime trust snapshot = %+v", snapshot)
+	}
+}
+
 func TestTrustedCACertificateDigestInvalidatesImageManifest(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "scripts", "guest", "ubuntu"), 0755); err != nil {
@@ -172,7 +195,7 @@ func TestTrustedCACertificateDigestInvalidatesImageManifest(t *testing.T) {
 		},
 		ProjectRoot: root,
 	}
-	manifest, err := manager.desiredImageManifest(context.Background())
+	manifest, err := manager.desiredLocalImageManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +207,7 @@ func TestTrustedCACertificateDigestInvalidatesImageManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeTestCACertificate(t, certificatePath, "Enterprise Root Two")
-	manifest, err = manager.desiredImageManifest(context.Background())
+	manifest, err = manager.desiredLocalImageManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

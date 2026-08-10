@@ -248,6 +248,8 @@ image:
   upstreamDir: third_party/runner-images
   upstreamLock: third_party/runner-images.lock
   runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
   customInstallScripts:
 EOF
 if [[ -n "${EPAR_TRUSTED_CA_CERTIFICATE_PATH:-}" ]]; then
@@ -287,8 +289,18 @@ runner:
   includeHostLabel: false
   ephemeral: true
 
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    # This public project uses a protected trusted-workflow canary. Public
+    # repository access is the only runner-group safety requirement relaxed.
+    requirePublicRepositoriesDisabled: false
+
 provider:
-  type: docker-dind
+  type: docker-container
   sourceImage: ${EPAR_OUTPUT_IMAGE}
   platform: linux/amd64
   network: default

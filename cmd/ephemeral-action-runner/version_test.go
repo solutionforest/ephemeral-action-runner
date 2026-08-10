@@ -14,6 +14,10 @@ func TestVersionStringDefaults(t *testing.T) {
 		"ephemeral-action-runner dev",
 		"commit: unknown",
 		"buildDate: unknown",
+		"sourceRevision: unknown",
+		"sourceDigest: unknown",
+		"buildDigest: unknown",
+		"controllerSlot: unmanaged",
 		"go: " + runtime.Version(),
 		"platform: " + runtime.GOOS + "/" + runtime.GOARCH,
 	} {
@@ -24,24 +28,37 @@ func TestVersionStringDefaults(t *testing.T) {
 }
 
 func TestVersionStringInjectedMetadata(t *testing.T) {
-	oldVersion, oldCommit, oldBuildDate := version, commit, buildDate
+	oldVersion, oldCommit, oldBuildDate, oldSourceRevision, oldSourceDigest, oldBuildDigest := version, commit, buildDate, sourceRevision, sourceDigest, buildDigest
 	t.Cleanup(func() {
-		version, commit, buildDate = oldVersion, oldCommit, oldBuildDate
+		version, commit, buildDate, sourceRevision, sourceDigest, buildDigest = oldVersion, oldCommit, oldBuildDate, oldSourceRevision, oldSourceDigest, oldBuildDigest
 	})
 
 	version = "v1.2.3-beta.1"
 	commit = "abc1234"
 	buildDate = "2026-07-07T00:00:00Z"
+	sourceRevision = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	sourceDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	buildDigest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 
 	got := versionString()
 	for _, want := range []string{
 		"ephemeral-action-runner v1.2.3-beta.1",
 		"commit: abc1234",
 		"buildDate: 2026-07-07T00:00:00Z",
+		"sourceRevision: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"sourceDigest: sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		"buildDigest: sha256:2222222222222222222222222222222222222222222222222222222222222222",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("versionString() missing %q in:\n%s", want, got)
 		}
+	}
+}
+
+func TestVersionStringControllerSlot(t *testing.T) {
+	t.Setenv("EPAR_CONTROLLER_SLOT", "windows-amd64-old")
+	if got := versionString(); !strings.Contains(got, "controllerSlot: windows-amd64-old") {
+		t.Fatalf("versionString() = %q", got)
 	}
 }
 

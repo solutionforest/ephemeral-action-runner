@@ -4,6 +4,7 @@ package filelock
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
@@ -36,6 +37,29 @@ func Acquire(path string) (*Lock, error) {
 		return nil, fmt.Errorf("lock file %s: %w", path, err)
 	}
 	return &Lock{file: file}, nil
+}
+
+// ReplaceContent atomically with respect to this lock replaces the lock-file
+// payload while retaining ownership of the platform lock. This matters on
+// Windows, where writing the locked byte range through a second file handle
+// can fail even when both handles belong to the same process.
+func (lock *Lock) ReplaceContent(content []byte) error {
+	if lock == nil || lock.file == nil {
+		return errors.New("file lock is not open")
+	}
+	if err := lock.file.Truncate(0); err != nil {
+		return fmt.Errorf("truncate lock file: %w", err)
+	}
+	if _, err := lock.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek lock file: %w", err)
+	}
+	if _, err := lock.file.Write(content); err != nil {
+		return fmt.Errorf("write lock file: %w", err)
+	}
+	if err := lock.file.Sync(); err != nil {
+		return fmt.Errorf("sync lock file: %w", err)
+	}
+	return nil
 }
 
 // Close releases the lock.

@@ -1,6 +1,6 @@
 # Support
 
-Start with the [troubleshooting guide](docs/troubleshooting.md). It provides symptom-first diagnostics for Docker-DinD, WSL, Tart, host trust, image builds, storage, and cross-architecture containers.
+Start with the [troubleshooting guide](docs/troubleshooting.md). It provides symptom-first diagnostics for Docker Sandboxes, compatibility and retired providers, host trust, image builds, storage, and cross-architecture containers.
 
 Before asking for help, search the repository's existing [issues](https://github.com/solutionforest/ephemeral-action-runner/issues) and collect:
 

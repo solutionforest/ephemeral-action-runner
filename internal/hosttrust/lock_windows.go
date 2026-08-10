@@ -6,6 +6,8 @@ import (
 	"os"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -23,6 +25,29 @@ var (
 )
 
 func platformProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err == nil {
+		defer windows.CloseHandle(snapshot)
+		var entry windows.ProcessEntry32
+		entry.Size = uint32(unsafe.Sizeof(entry))
+		if err := windows.Process32First(snapshot, &entry); err == nil {
+			for {
+				if entry.ProcessID == uint32(pid) {
+					return true
+				}
+				if err := windows.Process32Next(snapshot, &entry); err != nil {
+					return false
+				}
+			}
+		}
+	}
+
+	// Enumeration is normally authoritative, including for protected
+	// processes. Retain the conservative OpenProcess fallback only when a
+	// process snapshot cannot be read at all.
 	const synchronize = 0x00100000
 	handle, _, callErr := procOpenProcess.Call(synchronize, 0, uintptr(pid))
 	if handle != 0 {

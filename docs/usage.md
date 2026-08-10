@@ -1,357 +1,143 @@
 # Usage
 
-This page is the operational walkthrough. Start with the supported host you already have:
-
-- Docker-DinD on a Docker-capable host
-- WSL2 on Windows
-- Tart on Apple Silicon macOS
+Use this page for normal EPAR tasks. Docker Sandboxes is the primary provider on Linux, macOS, and Windows hosts when its capability checks pass; the [documentation hub](README.md) links to compatibility and provider-specific guides.
 
 ## Prerequisites
 
-Install the host tools you need:
-
-| Required for | Tool |
+| Task | Required tool or access |
 | --- | --- |
-| Source archive quick start | Go 1.25 or newer, or Docker (see [no-Go-install](advanced/no-go-install.md)) |
-| Updating the pinned `actions/runner-images` checkout | Git |
-| macOS provider | Tart |
-| Windows provider | WSL2 |
-| Windows WSL2 default image build | Docker Desktop, Docker Engine, or another working Docker daemon for the one-time Docker image export |
-| Docker-DinD provider | Docker Engine, OrbStack, or Docker Desktop with privileged container support |
-| Optional Docker registry mirrors | A running mirror service on the host, LAN, intranet, or cloud registry cache |
-| Runner registration | GitHub App with organization self-hosted runner read/write permission |
+| Run a source archive | Go 1.25 or newer, or Docker for the no-Go controller builder |
+| Register or inspect GitHub runners | A GitHub App with organization self-hosted runner read/write permission |
+| Docker Sandboxes (primary) | Docker and the `sbx` CLI with at least one diagnostic pass and zero failures; the wizard builds and imports the selected EPAR template |
+| Docker Container (compatibility) | Docker with privileged Linux-container support; reveal it in the wizard with `C. Show compatibility providers` |
+| WSL2 (compatibility) | Native Windows, WSL2, and Docker when preparing the default WSL image; reveal it in the wizard with `C. Show compatibility providers` |
+| Tart (retired) | Existing configurations only; runtime and exact cleanup compatibility remain available without onboarding |
 
-Packer, GitHub CLI, and sshpass are not required.
+Get the source from the [EPAR releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), extract the source archive, and work from that folder. You do not need Packer, GitHub CLI, or `sshpass`.
 
-Set up the GitHub App before registering runners. The image build command can run without GitHub credentials, but `pool verify --register-only`, `pool up`, `status`, and GitHub cleanup need the app settings. See [GitHub App Setup](github-app.md).
+EPAR works with a Docker installation that supports the selected provider. Docker Sandboxes is the default path; compatibility providers are explicit choices and EPAR never silently changes a configured provider.
 
-## Get The Source
+## Start a pool
 
-For normal use, open the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases), select the release you want, and download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)**. Extract the source archive and open a terminal in the extracted folder:
+On macOS, Linux, Git Bash, or native Windows PowerShell, run:
 
-```bash
-cd path/to/ephemeral-action-runner-<tag>
-go run ./cmd/ephemeral-action-runner version
-```
-
-The examples below use `go run ./cmd/ephemeral-action-runner` for the public source-first path.
-
-Don't want to install Go at all? See [Running EPAR Without Installing Go](advanced/no-go-install.md) for running the source archive in a container.
-
-## One-Command Start
-
-For the default Docker-DinD setup, run EPAR from the source folder. On macOS, Linux, WSL, or Git Bash, use the `./start` wrapper; on native Windows PowerShell/cmd, use `.\start.ps1` or `start.cmd`. Either uses Go if installed, and otherwise runs EPAR from source with a containerized Go toolchain automatically, without creating a standalone EPAR executable (see [Running EPAR Without Installing Go](advanced/no-go-install.md)):
-
-```bash
+```text
 ./start
 ```
 
-Equivalent without the wrapper:
+PowerShell resolves `./start` to EPAR's internal Windows wrapper. Do not use bare `start` in PowerShell because that name is the `Start-Process` alias. The wrapper uses local Go when available, otherwise it uses Docker, to build a native controller under `.local/bin/<os>-<arch>/`; it then executes that project-local controller directly. See [Running EPAR Without Installing Go](advanced/no-go-install.md) for the fallback details.
+
+When `.local/config.yml` is absent and the terminal is interactive, `./start` launches the same first-run wizard as `init`. It asks for the GitHub App and an explicit runner group. The runner-group list orders GitHub's Default group first, hides blocked groups and policy details initially, and lets you reveal either from the menu. Four provider identities remain accepted at runtime, while three are onboarding-capable: `1. Docker Sandboxes — recommended (default)` is visible first; choose `C. Show compatibility providers` to reveal `2. Docker Container` and `3. WSL2`; Tart remains a retired runtime/configuration identity with no onboarding option. Docker Sandboxes remains the default even when its prerequisite status is unavailable. Pressing Enter or choosing `1` while it is unavailable displays its status and remediation, then keeps the menu open so you can make an explicit available choice; choose `R` to refresh prerequisites. Storage does not make a provider unavailable. Docker Container, Docker Sandboxes, and WSL share the Catthehacker image-selection and estimate flow, and all three present `full-latest` and `act-latest` as the built-in choices. Docker Container and WSL additionally offer another validated Catthehacker tag, while Docker Sandboxes limits source selection to the two built-in profiles proven to include its required private Docker daemon and runtime closure. The wizard writes empty custom-install scripts, weekly updates at 07:00 local time, and host-trust overlay for applicable providers; edit the generated config afterward to change those advanced settings. Later option lists use `0` to go back, text prompts use `/back`, and a final provider-neutral review shows the applicable artifact estimate before one creation decision. Running `./start init` exits after writing, while an embedded first run continues through the ordinary image/template provisioning and pool startup path. When `sbx` is installed, the wizard runs `sbx daemon start --detach` before Docker Sandboxes diagnostics so a stopped daemon does not require a manual retry.
+
+See [Docker Sandboxes](providers/docker-sandboxes.md) for source profiles, capacity, local receipts, and platform validation status.
+
+## Create or choose configuration
+
+Create configuration without starting runners:
 
 ```bash
-go run ./cmd/ephemeral-action-runner
+./start init
 ```
 
-If no config exists, EPAR starts the initializer, asks for the GitHub App ID, organization, and private key path, then writes `.local/config.yml`. Docker-DinD is the default. For a new Docker-DinD config, the wizard asks whether to inherit the controller host's trusted TLS roots and defaults to yes; existing configs remain disabled unless they explicitly set `image.hostTrustMode: overlay`. On native Windows, when `wsl.exe --status` successfully confirms default version 2, the wizard also offers a WSL2 config. On macOS, when `tart --version` succeeds, it offers an experimental Tart config. Press Enter to retain Docker-DinD. The Docker preflight applies to Docker-DinD and the default WSL image, which uses Docker for its one-time rootfs export, but not to Tart. EPAR then checks the configured image, builds or replaces it when the image is missing or no longer matches the config, and starts the configured number of runners. The default config uses `pool.instances: 1`.
-
-Pass flags through `./start` to choose a config or runner count:
+Pass a config path and an instance count through the wrapper:
 
 ```bash
-./start --config .local/config.yml --instances 2
+./start --config .local/ci.yml --instances 2
 ```
 
-Equivalent without the wrapper:
+For an unattended controller that should remain alive through transient external-service outages, opt in explicitly:
 
 ```bash
-go run ./cmd/ephemeral-action-runner start --config .local/config.yml --instances 2
+./start --config .local/ci.yml --external-outage-retry=continuous
+./start --config .local/ci.yml --external-outage-retry=4h
 ```
 
-On Windows PowerShell:
+The accepted values are `off`, `continuous`, or a positive Go duration. Omission is `off`, so ordinary interactive starts keep their existing fail-fast startup behavior. The flag applies only to the configured `start` lifecycle; it does not retry the first-run wizard, wrapper controller builds, `pool up`, or maintenance commands.
+
+On Windows PowerShell, backslash paths may be clearer while the command remains the same:
 
 ```powershell
-.\start.ps1 --config .local\wsl.yml --instances 2
+./start --config .local\ci.yml --instances 2
 ```
 
-Equivalent without the wrapper:
+If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.instances` from the selected config. EPAR resolves configuration from `--config`, `EPAR_CONFIG`, `.local/config.yml`, then `~/.config/ephemeral-action-runner/config.yml`. Tracked files in `configs/` are examples; keep App values and key paths in an ignored local file. See [Configuration](configuration.md) for every setting and [Runner Group Security](runner-groups.md) before broadening repository access.
 
-```powershell
-go run ./cmd/ephemeral-action-runner start --config .local\wsl.yml --instances 2
-```
+Multiple configs from the same checkout may run concurrently when they use different canonical config paths, unique `pool.namePrefix` values, unique workflow-routing labels, and preferably separate log directories. EPAR rejects a second controller for the same config path or prefix before provisioning or cleanup can mutate provider state. Config-scoped BuildKit builders and transient workspaces keep divergent registry, trust, and cache settings isolated.
 
-Stop the foreground process with Ctrl-C. Cleanup is enabled by default.
+Storage-consuming commands fail before their provider side effects when a measured capacity domain cannot retain `storage.minimumFree` after the operation's largest phase-overlapping allocation. An unavailable capacity measurement is reported as a warning and does not block the command; the checkout filesystem is not assumed to contain provider runtime storage. Inspect the same calculation, including unknown domains and their causes, with `./start storage status --operation <name>`; preserve `--config` and `--project-root` for non-default configurations. The one-invocation `--allow-insufficient-storage` option permits only confirmed insufficient-capacity admission to continue; provider diagnostics, GitHub policy, ownership, lifecycle, cleanup protections, remote Docker-context rejection, and malformed storage topology remain enforced. The option is available on `start`, `pool up`, `pool verify`, `image update`, `image build`, and `image update-upstream`, including the equivalent `./start ...` wrapper forms.
 
-If `--instances` is omitted, `start`, `pool up`, and `pool verify` use `pool.instances` from the config. Passing `--instances N` overrides the config for that run.
+Each normal start also reconciles interrupted exact-owned work and retires unreferenced superseded artifacts after replacement readback. Use `./start storage status` to inspect the result. `./start storage prune --legacy` previews prefix-era resources, which remain manual and require the displayed plan hash before execution.
 
-## Configure Only
+Press `Ctrl-C` once to stop a foreground pool, then wait for cleanup to finish before closing the terminal. Use `--keep-on-exit` only to retain owned resources for deliberate debugging.
 
-Use `init` when you only want to create a config without building an image or starting runners. It creates Docker-DinD by default, with the same conditional native-Windows WSL2 and macOS Tart choices described above:
+## Update runner artifacts
+
+By default, EPAR checks mutable source-image tags and `runnerVersion: latest` weekly at 07:00 local time. The first-run wizard writes this default; edit `image.updateFrequency` and `image.updateTime` afterward to choose daily, every two weeks, monthly, manual, or another local time. Local image settings, script or certificate content, platform, EPAR assets, and missing or corrupt artifacts always apply on the next start without waiting for the schedule.
+
+Force an immediate remote check without forcing a rebuild:
 
 ```bash
-go run ./cmd/ephemeral-action-runner init
+./start image update
 ```
 
-On Windows PowerShell:
+Manual policy means this command triggers remote checks. `./start image build` remains the force-build path. A running ephemeral pool checks when due, drains only after busy jobs finish, activates the verified replacement, and restores pool capacity; persistent runners record the update for the next process start.
 
-```powershell
-go run ./cmd/ephemeral-action-runner init
-```
+## Verify before sending jobs
 
-For other WSL or Tart variants, or for custom labels, copy one example config into `.local/config.yml`, then edit the GitHub App fields and any labels you want to expose to workflows.
-
-| Host and image | Example config |
-| --- | --- |
-| macOS Tart, experimental basic Ubuntu ARM64 image | `configs/tart.example.yml` |
-| macOS Tart, web/E2E with Rosetta amd64 Docker support | `configs/tart.web-e2e.example.yml` |
-| Windows WSL2, default full Catthehacker runner image | `configs/wsl.example.yml` |
-| Windows WSL2, lean runner-only tar | `configs/wsl.lean.example.yml` |
-| Windows WSL2, lean web/E2E tar | `configs/wsl.web-e2e.example.yml` |
-| Docker-DinD, default full Catthehacker runner image | `configs/docker-dind.example.yml` |
-| Docker-DinD, Docker-focused Catthehacker Act image | `configs/docker-dind.act.example.yml` |
-| Docker-DinD, smaller web/E2E custom image | `configs/docker-dind.web-e2e.example.yml` |
-
-Tart is experimental. Its default image is a basic Ubuntu ARM64 OS image with the EPAR runner lifecycle, not the dependency-rich environment described by [`actions/runner-images`](https://github.com/actions/runner-images). If your workflows depend on that environment, adapt the upstream build scripts to create and maintain your own bootable Tart image and point `image.sourceImage` at it; EPAR does not automatically create one.
-
-macOS:
+Verify one disposable runner without GitHub registration:
 
 ```bash
-mkdir -p .local
-cp configs/tart.example.yml .local/config.yml
+./start pool verify --instances 1 --cleanup
 ```
 
-Windows:
-
-```powershell
-New-Item -ItemType Directory -Force .local
-Copy-Item configs/wsl.example.yml .local/config.yml
-```
-
-Default Docker-DinD manually:
+Verify registration and online/idle state:
 
 ```bash
-mkdir -p .local
-cp configs/docker-dind.example.yml .local/config.yml
+./start pool verify --instances 2 --register-only --cleanup
 ```
 
-EPAR looks for config in this order:
+`--cleanup` removes verification resources after the check. Docker Sandboxes uses its exact ownership records; compatibility providers use the configured pool-name boundary, and retired Tart configurations keep their existing exact runtime/cleanup behavior. Use [Operations](operations.md) for the distinction and recovery guidance.
 
-1. `--config <path>`
-2. `EPAR_CONFIG`
-3. `./.local/config.yml`
-4. `~/.config/ephemeral-action-runner/config.yml`
+## Run, inspect, and clean up
 
-Tracked configs are examples only. Keep real app IDs and private key paths in an ignored config file.
+`start` is the normal command because it checks the reusable image or template first. `pool up` is for a pool you have deliberately prepared:
 
-## Optional Docker Registry Mirrors
+```bash
+./start pool up --instances 2
+./start status
+./start cleanup
+```
 
-If repeated jobs spend time pulling the same Docker Hub images into fresh runner Docker daemons, configure mirrors in your ignored local config:
+Use `status --no-github` or `cleanup --no-github` when you intentionally need to skip GitHub runner status or deletion. `pool down` is an alias for cleanup.
+
+For a command-construction preview on compatible providers, add `--dry-run`:
+
+```bash
+./start pool verify --dry-run --instances 1
+```
+
+Docker Sandboxes intentionally does not support dry-run instance creation because EPAR must read back the exact active template-cache identity. Use its admission and template checks instead.
+
+## Target the right runner
+
+GitHub matches every value in `runs-on` against a runner's labels. The smallest workflow selector is:
 
 ```yaml
-docker:
-  registryMirrors:
-    - http://host.docker.internal:5050
+runs-on: [self-hosted]
 ```
 
-This is optional. Without it, EPAR behaves normally and pulls directly from registries. Mirror benefits vary by workflow and mainly affect Docker image pull time; they do not make application startup, volume sync, health checks, browser tests, or CPU-bound work faster.
-
-EPAR only configures runner-side Docker daemons; it does not run or secure the mirror service. Docker Engine, Docker Desktop, or OrbStack can run a local `registry:2` pull-through cache on the EPAR host, or you can use a mirror reachable on the LAN/intranet. For private images, keep using `docker login` inside the workflow unless your mirror is deliberately configured and secured with upstream credentials. See [Docker Registry Mirrors](advanced/docker-registry-mirrors.md).
-
-## Prepare A WSL Source
-
-Skip this section for Tart and Docker-DinD.
-
-The default WSL config starts from `ghcr.io/catthehacker/ubuntu:full-latest`. During `image build`, EPAR runs Docker on the Windows host to pull that image, create a temporary container, export its filesystem into a rootfs tar, and then import that tar into WSL for EPAR's normal runner bootstrap. Docker is needed for this preparation step. Running WSL runner instances afterward does not require Docker Desktop unless your jobs need it.
-
-If you use `configs/wsl.lean.example.yml`, `configs/wsl.web-e2e.example.yml`, or another `image.sourceType: rootfs-tar` config, create the clean Ubuntu 24.04 source tar once:
-
-```powershell
-New-Item -ItemType Directory -Force work/images
-wsl --install -d Ubuntu-24.04 --no-launch
-wsl --export Ubuntu-24.04 work/images/ubuntu-24.04-clean.rootfs.tar
-```
-
-After that, EPAR imports disposable temporary distros for image builds and pool instances.
-
-## Build The Runner Image Manually
-
-The `start` command builds or replaces the configured image automatically. Use this section when developing from source, debugging image builds, or intentionally separating image preparation from runner startup.
-
-Default WSL and Docker-DinD builds and runner-only Tart builds do not need the upstream `actions/runner-images` checkout:
-
-```bash
-go run ./cmd/ephemeral-action-runner image build --replace
-```
-
-If `image.customInstallScripts` includes EPAR's Docker/browser or web/E2E scripts, update the pinned upstream checkout first:
-
-```bash
-go run ./cmd/ephemeral-action-runner image update-upstream
-go run ./cmd/ephemeral-action-runner image build --replace
-```
-
-The Tart web/E2E example sets `provider.rosettaTag: rosetta`. Tart builds with that option start with `tart run --rosetta rosetta`, install Rosetta guest support, and validate that Docker can run a `linux/amd64` Alpine container returning `x86_64`.
-
-Tart output is a local Tart image name, such as `epar-ubuntu-24-arm64`. Confirm it with:
-
-```bash
-tart list
-```
-
-The default WSL output is a rootfs tar path:
-
-```text
-work/images/epar-wsl-catthehacker-ubuntu.tar
-```
-
-When the WSL source is a Docker image, EPAR also writes an intermediate source rootfs tar and env cache next to the output image, for example `work/images/epar-wsl-catthehacker-ubuntu.source.rootfs.tar` and `.env`. Later builds reuse that source cache; delete those files when you intentionally want to reconvert the Docker image.
-
-EPAR also writes image manifests so `start` can tell whether the local image still matches the config. Docker-DinD stores the manifest hash as a Docker image label and stores the manifest at `/opt/epar/image-manifest.json`. WSL stores `/opt/epar/image-manifest.json` inside the exported image and writes a sidecar next to the tar.
-
-Docker-DinD output is a Docker image tag, such as `epar-docker-dind-catthehacker-ubuntu`. Confirm it with:
-
-```bash
-docker image ls epar-docker-dind-catthehacker-ubuntu
-```
-
-Build logs are written under `work/logs/builds` by default. Run `ephemeral-action-runner logs path` to resolve a customized logging root and see [Logging](logging.md) for rotation and retention.
-
-## Customize The Image
-
-WSL and Docker-DinD use the full Catthehacker runner image by default. For Docker-focused jobs, `configs/docker-dind.act.example.yml` uses the smaller Catthehacker Act image, which includes Node and the Docker Engine/CLI/Compose/Buildx stack EPAR needs. It does not guarantee browser dependencies; use `configs/docker-dind.web-e2e.example.yml` for Playwright or other browser tests. Tart and the WSL lean examples are runner-only. Use `image.customInstallScripts` when you want a different image shape, such as the smaller WSL or Docker-DinD web/E2E examples:
+Add a provider or workload label to avoid routing work to the wrong environment:
 
 ```yaml
-image:
-  customInstallScripts:
-    - scripts/guest/ubuntu/install-web-e2e.sh
-    - examples/custom-install/install-extra-apt-tools.sh
+runs-on: [self-hosted, linux, epar-docker-container-catthehacker-ubuntu]
 ```
 
-Scripts run as root during image build, after the GitHub Actions runner is installed and before validation/finalization. See [Image Build](image-build.md) for the full layering model and custom script guidance.
+EPAR adds an `epar-host-<machine>` label by default. Use it only when a job must target one specific host. Give each independent pool in the same organization a unique `pool.namePrefix`; this is also its cleanup boundary.
 
-## Verify Runners
+## Common next tasks
 
-For a local runtime check without GitHub registration:
-
-```bash
-go run ./cmd/ephemeral-action-runner pool verify --instances 1 --cleanup
-```
-
-For a full registration check:
-
-```bash
-go run ./cmd/ephemeral-action-runner pool verify --instances 2 --register-only --cleanup
-```
-
-Healthy output should show each generated instance name moving through:
-
-1. clone
-2. start
-3. runtime validation
-4. GitHub online/idle, when registration is enabled
-5. cleanup
-
-Runtime validation always checks the base runner files and runner user. Images with optional feature markers also validate those features:
-
-- Docker/browser images validate Docker, Compose v2, Buildx, `hello-world`, and a headless browser.
-- Default WSL full images validate Docker, Compose v2, Buildx, and `hello-world`.
-- Docker-DinD images validate the private inner Docker daemon inside each runner container.
-- Tart Rosetta images validate `docker run --platform linux/amd64 alpine:3.20` and expect `uname -m` to return `x86_64`.
-- Web/E2E images also validate `node`, `npm`, `zip`, `unzip`, `tar`, `rsync`, and `mysql`.
-
-When `docker.registryMirrors` is configured, EPAR applies the mirror configuration before runtime validation.
-
-If a Docker-DinD workflow depends on amd64-only images while the host is ARM64, validate host emulation inside a running EPAR instance:
-
-```bash
-docker exec <epar-instance> docker run --rm --platform linux/amd64 alpine:3.20 uname -m
-```
-
-The expected output is `x86_64`.
-
-## Run A Foreground Pool Manually
-
-```bash
-go run ./cmd/ephemeral-action-runner pool up --instances 2
-```
-
-`start` is the recommended public command because it also checks the image before starting runners. `pool up` is the lower-level supervisor command for users who already prepared the image.
-
-`pool up` keeps the requested number of runners online. Each GitHub ephemeral runner exits after one job. EPAR then retires that instance and creates a fresh replacement. The requested count is a strict physical local-instance cap: provisioning, ready, draining, quarantined, and cleanup-pending resources all consume a slot, including old runners during host-trust rotation.
-
-When GitHub registration or readiness has a transient network, `429`, or `5xx` failure during supervised replacement, EPAR pauses allocation and retries with the configured exponential backoff while continuing monitoring and cleanup. It does not create extra candidates while remote state is uncertain; see [Configuration](configuration.md#common-edits) and [Operations](operations.md#capacity-reconciliation-and-outage-recovery) for retry settings and recovery steps.
-
-Stop the supervisor with Ctrl-C. By default, EPAR cleans up active instances and matching GitHub runner records before it exits.
-
-For startup after login, see [Windows Startup](advanced/windows-startup.md) or [macOS Startup](advanced/macos-startup.md).
-
-Use these flags only for debugging:
-
-- `--keep-on-exit`: leave instances running when the supervisor exits.
-- `--replace-completed=false`: do not create replacements after completed jobs.
-
-## Status And Cleanup
-
-```bash
-go run ./cmd/ephemeral-action-runner status
-go run ./cmd/ephemeral-action-runner cleanup
-```
-
-Cleanup only touches local instances and GitHub runners whose names match `pool.namePrefix`.
-
-## Runner Labels
-
-By default, EPAR appends an `epar-host-<machine>` label to the configured labels. The machine name is lowercased, unsafe characters are replaced with `-`, and the final label is kept within GitHub's 256-character label limit. Set `runner.includeHostLabel: false` to disable it.
-
-Use provider-specific labels in workflows. For the Tart web/E2E Rosetta image, target the existing web/E2E label plus the Rosetta label when the job needs amd64 Docker images:
-
-```yaml
-runs-on: [self-hosted, linux, ARM64, epar-tart-ubuntu-24.04-web-e2e, epar-tart-rosetta-amd64]
-```
-
-For the default WSL image, target the default WSL label:
-
-```yaml
-runs-on: [self-hosted, linux, X64, epar-wsl-catthehacker-ubuntu]
-```
-
-For the default Docker-DinD image, target the default Docker-DinD label:
-
-```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu]
-```
-
-For the Docker-focused Act image, target its dedicated label:
-
-```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-act]
-```
-
-For Docker-DinD web/E2E images, target the custom web/E2E label:
-
-```yaml
-runs-on: [self-hosted, linux, epar-docker-dind-catthehacker-ubuntu-web-e2e]
-```
-
-When that Docker-DinD runner is used for amd64-only runtime images, keep the workflow's Docker platform explicit, for example `DOCKER_PLATFORM=linux/amd64` or the equivalent variable used by your compose scripts, and verify the host runtime supports amd64 emulation as described above.
-
-Do not use `ubuntu-latest` for these self-hosted runners.
-
-## Dry Run
-
-Use `--dry-run` to inspect provider command construction without mutating local instances:
-
-```bash
-go run ./cmd/ephemeral-action-runner pool verify --dry-run --instances 2
-```
-
-## Maintainer Source-Only Releases
-
-Releases are manually dispatched from GitHub Actions and contain no uploaded assets. GitHub automatically provides **Source code (zip)** and **Source code (tar.gz)** downloads for each release tag.
-
-```bash
-git tag -a v0.1.0-beta.1 -m "v0.1.0-beta.1"
-git push origin v0.1.0-beta.1
-```
-
-Before dispatching, a repository administrator must enable immutable releases in the repository. In **Actions → Release → Run workflow**, supply an existing remote tag that matches `[v]MAJOR.MINOR.PATCH` or `[v]MAJOR.MINOR.PATCH-(alpha|beta|rc).N`, then type `publish source-only release` exactly. The workflow requires annotated tags, verifies the remote tag, confirms its commit is reachable from `origin/main`, checks out and tests that exact commit, and refuses to overwrite an existing release.
-
-Alpha, beta, and RC tags are published as prereleases and are not marked latest. To promote a prerelease to a stable tag without changing the commit, provide the existing prerelease tag in `promotion_from`; the workflow verifies that the tag and its GitHub Release exist, that its normalized `MAJOR.MINOR.PATCH` core matches the stable tag, and that both tags point to the same commit, then creates stable promotion notes instead of a generated delta.
+- [Customize a runner image](image-build.md).
+- [Configure Docker registry mirrors](advanced/docker-registry-mirrors.md).
+- [Start EPAR after login on Windows](advanced/windows-startup.md) or [macOS](advanced/macos-startup.md).
+- [Inspect logs, capacity, cleanup, and recovery](operations.md).
+- [Diagnose a symptom](troubleshooting.md).

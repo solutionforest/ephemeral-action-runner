@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" != "0" ]]; then
+  echo "prepare-template.sh must run as root" >&2
+  exit 1
+fi
+
+for command_name in bash cmp cut docker dockerd dpkg-query find getent grep groupadd groupmod head install jq nohup pgrep ps readlink seq sha256sum sort stat sudo tar tr useradd usermod wc; do
+  command -v "${command_name}" >/dev/null 2>&1 || {
+    echo "pinned source image is missing required command: ${command_name}" >&2
+    exit 1
+  }
+done
+
+agent_uid="$(id -u agent 2>/dev/null || true)"
+uid_1000_user="$(getent passwd 1000 | cut -d: -f1 || true)"
+
+if [[ -n "${agent_uid}" && "${agent_uid}" != "1000" ]]; then
+  echo "pinned source image already has an agent user with unexpected UID ${agent_uid}" >&2
+  exit 1
+fi
+
+if [[ -z "${agent_uid}" ]]; then
+	if [[ -n "${uid_1000_user}" && "${uid_1000_user}" != "ubuntu" && "${uid_1000_user}" != "packer" ]]; then
+		echo "pinned source image assigns UID 1000 to unexpected user ${uid_1000_user}" >&2
+		exit 1
+	fi
+
+	gid_1000_group="$(getent group 1000 | cut -d: -f1 || true)"
+	if [[ -n "${gid_1000_group}" && "${gid_1000_group}" != "ubuntu" && "${gid_1000_group}" != "packer" && "${gid_1000_group}" != "agent" ]]; then
+		echo "pinned source image assigns GID 1000 to unexpected group ${gid_1000_group}" >&2
+		exit 1
+	fi
+	if [[ "${gid_1000_group}" == "ubuntu" || "${gid_1000_group}" == "packer" ]]; then
+		groupmod --new-name agent "${gid_1000_group}"
+	elif [[ -z "${gid_1000_group}" ]]; then
+		groupadd --gid 1000 agent
+	fi
+
+	if [[ "${uid_1000_user}" == "ubuntu" || "${uid_1000_user}" == "packer" ]]; then
+		usermod --login agent "${uid_1000_user}"
+		usermod --home /home/agent --move-home agent
+	else
+    useradd --create-home --uid 1000 --gid 1000 --shell /bin/bash agent
+  fi
+fi
+
+if [[ "$(id -u agent)" != "1000" || "$(id -g agent)" != "1000" ]]; then
+  echo "agent identity must resolve to UID/GID 1000" >&2
+  exit 1
+fi
+if [[ "$(getent passwd agent | cut -d: -f6)" != "/home/agent" ]]; then
+  echo "agent home must resolve to /home/agent" >&2
+  exit 1
+fi
+
+getent group docker >/dev/null 2>&1 || groupadd docker
+getent group sudo >/dev/null 2>&1 || {
+  echo "pinned source image is missing the sudo group" >&2
+  exit 1
+}
+usermod --append --groups docker,sudo agent
+
+# Never carry registry credentials from the pinned source image into a reusable
+# runner template. The same root-owned helper is called again before runner
+# registration because Docker Sandboxes may inject fresh auth at boot.
+/opt/epar/scrub-docker-auth.sh --build
+
+install -d -m 0755 -o agent -g agent /home/agent
+install -d -m 0700 -o agent -g agent \
+  /home/agent/.docker \
+  /home/agent/.docker/sandbox \
+  /home/agent/.docker/sandbox/locks \
+  /home/agent/.config \
+  /home/agent/.cache \
+  /home/agent/.local \
+  /home/agent/.local/share \
+  /home/agent/.local/state \
+  /run/user/1000
+install -d -m 0755 /etc/sudoers.d /etc/apt/apt.conf.d
+printf '%s\n' 'agent ALL=(ALL:ALL) NOPASSWD:ALL' > /etc/sudoers.d/epar-agent
+rm -f /etc/sudoers.d/epar-proxy
+chmod 0440 /etc/sudoers.d/epar-agent
+printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' 'APT::Periodic::Unattended-Upgrade "0";' > /etc/apt/apt.conf.d/99epar-disable-periodic
+rm -f /etc/systemd/system/timers.target.wants/apt-daily.timer /etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer
+for apt_unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
+  ln -sfn /dev/null "/etc/systemd/system/${apt_unit}"
+done
+
+# Docker Sandboxes supplies one private daemon and mounts its dedicated block
+# volume here. Never preserve or preload a daemon data-root in the template.
+rm -rf /var/lib/docker
+install -d -m 0711 /var/lib/docker
+if [[ -n "$(find /var/lib/docker -mindepth 1 -print -quit)" ]]; then
+  echo "/var/lib/docker must be empty in the template" >&2
+  exit 1
+fi
+
+sudo -u agent -H true
+
+# Docker Sandboxes' forward proxy can replace registry Authorization headers
+# with a host credential. Keep the sandbox-private daemon's registry traffic on
+# the transparent, policy-enforced path so workflow-scoped Docker credentials
+# remain authoritative. Registration and the listener receive the canonical
+# gateway proxy explicitly; prepare-job-start.sh clears it before workflow
+# steps, while preserving the daemon's no-proxy=* contract.
+install -d -m 0755 -o root -g root /etc/docker
+if [[ -e /etc/docker/daemon.json || -L /etc/docker/daemon.json ]]; then
+  echo "pinned source image unexpectedly supplies /etc/docker/daemon.json" >&2
+  exit 1
+fi
+install -m 0644 -o root -g root /opt/epar/docker-daemon.json /etc/docker/daemon.json
+cmp -s /opt/epar/docker-daemon.json /etc/docker/daemon.json

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 4,
+  "templateSchemaVersion": 2,
+  "runtimeContract": "docker-sandboxes-v1",
+  "artifactKind": "docker-sandboxes-template-base",
+  "profile": "set-by-publisher",
+  "validationStatus": "candidate",
+  "platform": "set-by-publisher",
+  "source": {
+    "reference": "set-by-publisher",
+    "indexDigest": "set-by-publisher",
+    "manifestDigest": "set-by-publisher"
+  },
+  "runner": {
+    "execution": "direct-actions-listener",
+    "selector": "set-by-publisher",
+    "version": "set-by-publisher",
+    "assetDigest": "set-by-publisher",
+    "overlayRequired": false
+  },
+  "docker": {
+    "daemonOwner": "docker-sandboxes-runtime",
+    "expectedDaemonCount": 1,
+    "imagePreloadsVarLibDocker": false,
+    "buildRequiresPrivilegedBuildkit": false
+  },
+  "architectureEmulation": {
+    "backend": "qemu",
+    "policy": "configured-best-effort-required-or-native-only",
+    "release": "set-by-source-lock",
+    "sourceIndexDigest": "set-by-source-lock",
+    "sourceManifestDigest": "set-by-source-lock",
+    "qemuVersion": "set-by-source-lock"
+  },
+  "overlays": {
+    "hostTrust": "runtime",
+    "explicitCa": "runtime",
+    "customInstall": "local-derivative",
+    "networkPolicy": "runtime"
+  }
+}

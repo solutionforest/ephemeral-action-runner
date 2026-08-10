@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
+	sandboxpromotion "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/promotion"
 )
 
 func TestNoArgsRoutesToStart(t *testing.T) {
@@ -55,12 +58,13 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	}
 	fake := &fakeStarterManager{}
 	var gotPath string
+	var out bytes.Buffer
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
 		ConfigPath:  "custom.yml",
 		Instances:   3,
-		Out:         &bytes.Buffer{},
+		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			gotPath = path
 			return fake, nil
@@ -75,11 +79,64 @@ func TestStartPropagatesConfigAndInstances(t *testing.T) {
 	if fake.runOptions.Instances != 3 {
 		t.Fatalf("instances = %d, want 3", fake.runOptions.Instances)
 	}
+	if !strings.Contains(out.String(), "Press Ctrl-C once to stop, then wait for cleanup to finish before closing this window.") {
+		t.Fatalf("start guidance = %q", out.String())
+	}
+	if strings.Contains(out.String(), "Start runners now?") {
+		t.Fatalf("existing config unexpectedly triggered the new-config start prompt:\n%s", out.String())
+	}
+}
+
+func TestStartConfiguresOneInvocationStorageOverride(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeStarterManager{}
+	err := runStartWithOptions(startOptions{
+		Context:                  context.Background(),
+		ProjectRoot:              dir,
+		ConfigPath:               configPath,
+		AllowInsufficientStorage: true,
+		StorageOverrideCommand:   "./start --allow-insufficient-storage",
+		Out:                      &bytes.Buffer{},
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			return fake, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fake.allowStorage || fake.overrideHint != "./start --allow-insufficient-storage" {
+		t.Fatalf("storage override = allow %t hint %q", fake.allowStorage, fake.overrideHint)
+	}
+}
+
+func TestMatchingStartCommandPreservesWrapperEntryPoint(t *testing.T) {
+	t.Setenv("EPAR_INVOCATION", "start")
+	if got, want := matchingStartCommand([]string{"--allow-insufficient-storage"}), "./start --allow-insufficient-storage"; got != want {
+		t.Fatalf("matchingStartCommand() = %q, want %q", got, want)
+	}
+}
+
+func assertSingleFinalInitReview(t *testing.T, output string) {
+	t.Helper()
+	if got := strings.Count(output, "Configuration review:"); got != 1 {
+		t.Fatalf("configuration review count = %d, want exactly one:\n%s", got, output)
+	}
+	if !strings.Contains(output, "1. Looks good, proceed to create configuration (default)") {
+		t.Fatalf("configuration review omitted the forward action:\n%s", output)
+	}
+	if strings.Contains(output, "Create this configuration?") {
+		t.Fatalf("provider setup retained an early creation decision:\n%s", output)
+	}
 }
 
 func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	stubNoWSL2(t)
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
 	oldResolveHostTrust := initResolveHostTrust
@@ -94,13 +151,14 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 		return hosttrust.Snapshot{}, nil
 	}
 
-	fake := &fakeStarterManager{}
+	fake := &lockingFakeStarterManager{fakeStarterManager: &fakeStarterManager{}}
 	var out bytes.Buffer
 	err := runStartWithOptions(startOptions{
-		Context:     context.Background(),
-		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n"),
-		Out:         &out,
+		Context:             context.Background(),
+		ProjectRoot:         dir,
+		ExternalOutageRetry: "continuous",
+		In:                  strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\n\n\n"),
+		Out:                 &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
 				t.Fatalf("config path = %q", path)
@@ -114,11 +172,63 @@ func TestStartInteractiveMissingConfigRunsInitAndContinues(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, ".local", "config.yml")); err != nil {
 		t.Fatalf("config was not created: %v", err)
 	}
-	if !strings.Contains(out.String(), "Continuing with") {
-		t.Fatalf("output missing continuation message:\n%s", out.String())
+	for _, want := range []string{"Start runners now?", "Continuing with"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
 	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
+	}
+	if fake.externalOutagePolicy.IsOff() {
+		t.Fatal("external outage retry was not activated after the wizard created the config")
+	}
+}
+
+func TestStartInteractiveMissingConfigCanExitToReview(t *testing.T) {
+	dir := t.TempDir()
+	stubNoWSL2(t)
+	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
+	oldInteractive := stdinIsInteractive
+	oldDocker := dockerAvailable
+	oldResolveHostTrust := initResolveHostTrust
+	t.Cleanup(func() {
+		stdinIsInteractive = oldInteractive
+		dockerAvailable = oldDocker
+		initResolveHostTrust = oldResolveHostTrust
+	})
+	stdinIsInteractive = func() bool { return true }
+	dockerAvailable = func(context.Context) error { return nil }
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, nil
+	}
+
+	var out bytes.Buffer
+	err := runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n2\n\n\n\nn\n"),
+		Out:         &out,
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			t.Fatal("manager factory should not run after choosing to review the new config")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, ".local", "config.yml")
+	if _, err := os.Stat(configPath); err != nil {
+		t.Fatalf("config was not created: %v", err)
+	}
+	for _, want := range []string{"Start runners now?", "Config saved at " + configPath, "Exiting before runner startup", "Review the config"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("review exit output omitted %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "Continuing with") {
+		t.Fatalf("review exit unexpectedly continued startup:\n%s", out.String())
 	}
 }
 
@@ -140,7 +250,7 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\nc\n3\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -162,25 +272,39 @@ func TestStartInteractiveMissingConfigCanSelectWSL2(t *testing.T) {
 	if !strings.Contains(out.String(), "Continuing with") {
 		t.Fatalf("output missing continuation message:\n%s", out.String())
 	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
 	}
 }
 
-func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
+func TestStartInteractiveMissingConfigCanSelectDockerSandboxes(t *testing.T) {
 	dir := t.TempDir()
 	stubInitHostAndRandom(t, "Build Box 01", []byte{0xa4, 0xf9, 0xc2})
-	stubTartAvailable(t)
+	stubNoWSL2(t)
+	policyFingerprint := "sha256:" + strings.Repeat("b", 64)
+	stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
+		Templates: []initDockerSandboxesTemplate{{
+			Reference: "docker.io/library/epar-docker-sandboxes-catthehacker-full:preview",
+			Digest:    "sha256:" + strings.Repeat("a", 64),
+			CacheID:   strings.Repeat("a", 12),
+			Platform:  "linux/amd64",
+			Size:      8 << 30,
+		}},
+		PolicyFingerprint: policyFingerprint,
+	}, nil)
 	oldInteractive := stdinIsInteractive
 	oldDocker := dockerAvailable
+	oldResolveHostTrust := initResolveHostTrust
 	t.Cleanup(func() {
 		stdinIsInteractive = oldInteractive
 		dockerAvailable = oldDocker
+		initResolveHostTrust = oldResolveHostTrust
 	})
 	stdinIsInteractive = func() bool { return true }
-	dockerAvailable = func(context.Context) error {
-		t.Fatal("Docker availability should not be checked for Tart")
-		return nil
+	dockerAvailable = func(context.Context) error { return nil }
+	initResolveHostTrust = func(context.Context, hosttrust.Options) (hosttrust.Snapshot, error) {
+		return hosttrust.Snapshot{}, nil
 	}
 
 	fake := &fakeStarterManager{}
@@ -188,7 +312,7 @@ func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	err := runStartWithOptions(startOptions{
 		Context:     context.Background(),
 		ProjectRoot: dir,
-		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n2\n\n"),
+		In:          strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n\n"),
 		Out:         &out,
 		ManagerFactory: func(path, _ string, _ bool, _ bool) (starterManager, error) {
 			if path != filepath.Join(dir, ".local", "config.yml") {
@@ -204,12 +328,16 @@ func TestStartInteractiveMissingConfigCanSelectTartWithoutDocker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := cfg.Provider.Type, "tart"; got != want {
+	if got, want := cfg.Provider.Type, "docker-sandboxes"; got != want {
 		t.Fatalf("provider.type = %q, want %q", got, want)
 	}
-	if !strings.Contains(out.String(), "Continuing with") {
-		t.Fatalf("output missing continuation message:\n%s", out.String())
+	if got, want := cfg.DockerSandboxes.PolicyGeneration, policyFingerprint; got != want {
+		t.Fatalf("dockerSandboxes.policyGeneration = %q, want %q", got, want)
 	}
+	if !strings.Contains(out.String(), "Docker Sandboxes — recommended") || !strings.Contains(out.String(), "Continuing with") {
+		t.Fatalf("output did not include capability-ready Docker Sandboxes selection and start continuation:\n%s", out.String())
+	}
+	assertSingleFinalInitReview(t, out.String())
 	if fake.ensureCalls != 1 || fake.runCalls != 1 {
 		t.Fatalf("ensure/run calls = %d/%d, want 1/1", fake.ensureCalls, fake.runCalls)
 	}
@@ -244,18 +372,194 @@ func TestStartRejectsNonPositiveInstancesOverride(t *testing.T) {
 	}
 }
 
+func TestStartRejectsInvalidExternalOutageRetryBeforeManager(t *testing.T) {
+	for _, value := range []string{"0", "0s", "-1s", "bounded", "later"} {
+		t.Run(value, func(t *testing.T) {
+			err := runStartWithOptions(startOptions{
+				Context:             context.Background(),
+				ProjectRoot:         t.TempDir(),
+				ExternalOutageRetry: value,
+				Out:                 &bytes.Buffer{},
+				ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+					t.Fatal("manager factory ran for an invalid external outage retry policy")
+					return nil, nil
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "external-outage-retry") {
+				t.Fatalf("error = %v, want external-outage-retry validation error", err)
+			}
+		})
+	}
+}
+
+func TestStartConfiguresExternalOutageRetryAfterConfigResolution(t *testing.T) {
+	for _, value := range []string{"continuous", "4h"} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yml")
+			if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			fake := &lockingFakeStarterManager{fakeStarterManager: &fakeStarterManager{}}
+			err := runStartWithOptions(startOptions{
+				Context:             context.Background(),
+				ProjectRoot:         dir,
+				ConfigPath:          configPath,
+				ExternalOutageRetry: value,
+				Out:                 &bytes.Buffer{},
+				ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+					return fake, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fake.externalOutagePolicy.IsOff() {
+				t.Fatalf("policy for %q was not enabled", value)
+			}
+			if got := strings.Join(fake.externalStages, ","); got != "required-image-assurance" {
+				t.Fatalf("external stages = %q, want required-image-assurance", got)
+			}
+		})
+	}
+}
+
+func TestStartPreflightsBeforeImageAndPool(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeStarterManager{}
+	err := runStartWithOptions(startOptions{
+		Context:     context.Background(),
+		ProjectRoot: dir,
+		ConfigPath:  configPath,
+		Register:    true,
+		Out:         &bytes.Buffer{},
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			return fake, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "preflight,image,pool" {
+		t.Fatalf("call order = %q, want preflight,image,pool", got)
+	}
+
+	fake = &fakeStarterManager{preflightErr: errors.New("unsafe group")}
+	err = runStartWithOptions(startOptions{
+		Context:                  context.Background(),
+		ProjectRoot:              dir,
+		ConfigPath:               configPath,
+		Register:                 true,
+		AllowInsufficientStorage: true,
+		Out:                      &bytes.Buffer{},
+		ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+			return fake, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe group") {
+		t.Fatalf("start error = %v, want preflight failure", err)
+	}
+	if got := strings.Join(fake.calls, ","); got != "preflight" {
+		t.Fatalf("call order after rejection = %q, want preflight only", got)
+	}
+	if !fake.allowStorage {
+		t.Fatal("storage override was not configured before the non-storage safety check")
+	}
+}
+
+func TestExternalOutageRetryAcquiresPoolLockBeforeDurableSupervision(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(configPath, []byte("config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		policy string
+		want   string
+	}{
+		{policy: "off", want: "preflight,pool-lock,image,pool"},
+		{policy: "continuous", want: "pool-lock,preflight,image,pool"},
+	} {
+		t.Run(test.policy, func(t *testing.T) {
+			fake := &lockingFakeStarterManager{fakeStarterManager: &fakeStarterManager{}}
+			err := runStartWithOptions(startOptions{
+				Context:             context.Background(),
+				ProjectRoot:         dir,
+				ConfigPath:          configPath,
+				Register:            true,
+				ExternalOutageRetry: test.policy,
+				Out:                 &bytes.Buffer{},
+				ManagerFactory: func(string, string, bool, bool) (starterManager, error) {
+					return fake, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(fake.calls, ","); got != test.want {
+				t.Fatalf("call order = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 type fakeStarterManager struct {
-	ensureCalls int
-	runCalls    int
-	runOptions  pool.RunOptions
+	preflightErr         error
+	ensureCalls          int
+	runCalls             int
+	runOptions           pool.RunOptions
+	calls                []string
+	allowStorage         bool
+	overrideHint         string
+	externalOutagePolicy pool.ExternalOutageRetryPolicy
+	externalStages       []string
+}
+
+type lockingFakeStarterManager struct {
+	*fakeStarterManager
+}
+
+type fakeStarterCloser struct{}
+
+func (fakeStarterCloser) Close() error { return nil }
+
+func (m *lockingFakeStarterManager) AcquirePoolControllerLock() (io.Closer, error) {
+	m.calls = append(m.calls, "pool-lock")
+	return fakeStarterCloser{}, nil
+}
+
+func (m *fakeStarterManager) ConfigureStorageAdmissionOverride(allow bool, command string) {
+	m.allowStorage = allow
+	m.overrideHint = command
+}
+
+func (m *fakeStarterManager) ConfigureExternalOutageRetry(policy pool.ExternalOutageRetryPolicy) error {
+	m.externalOutagePolicy = policy
+	return nil
+}
+
+func (m *fakeStarterManager) RunExternalOutageStage(ctx context.Context, stage string, operation func(context.Context) error) error {
+	m.externalStages = append(m.externalStages, stage)
+	return operation(ctx)
+}
+
+func (m *fakeStarterManager) PreflightRunnerGroup(context.Context) error {
+	m.calls = append(m.calls, "preflight")
+	return m.preflightErr
 }
 
 func (m *fakeStarterManager) EnsureImage(context.Context) error {
+	m.calls = append(m.calls, "image")
 	m.ensureCalls++
 	return nil
 }
 
 func (m *fakeStarterManager) RunPool(_ context.Context, opts pool.RunOptions) error {
+	m.calls = append(m.calls, "pool")
 	m.runCalls++
 	m.runOptions = opts
 	return nil

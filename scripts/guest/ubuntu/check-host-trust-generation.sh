@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-marker="${EPAR_HOST_TRUST_MARKER:-/opt/epar/host-trust-generation.json}"
-lease="${EPAR_HOST_TRUST_LEASE:-/run/epar/host-trust-lease.json}"
+if [[ "$#" -eq 0 ]]; then
+  marker="/opt/epar/host-trust-generation.json"
+  lease="/run/epar/host-trust-lease.json"
+elif [[ "$#" -eq 2 ]]; then
+  marker="$1"
+  lease="$2"
+else
+  echo "EPAR host-trust gate: invalid invocation" >&2
+  exit 1
+fi
 
 if [[ ! -s "${marker}" ]]; then
   echo "EPAR host-trust gate: image generation marker is missing" >&2
@@ -12,12 +20,12 @@ if [[ ! -s "${lease}" ]]; then
   echo "EPAR host-trust gate: controller lease is missing" >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
+if [[ ! -x /usr/bin/python3 ]]; then
   echo "EPAR host-trust gate: python3 is required" >&2
   exit 1
 fi
 
-python3 - "${marker}" "${lease}" <<'PY'
+/usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3 -I -S - "${marker}" "${lease}" <<'PY'
 import datetime
 import json
 import sys
@@ -44,8 +52,10 @@ for key in ("generation", "hostOS", "mode", "scopes"):
             f"(image={marker.get(key)!r}, lease={lease.get(key)!r})"
         )
 
-if marker.get("mode") != "overlay" or not marker.get("generation"):
+if marker.get("mode") not in ("overlay", "disabled") or not marker.get("generation"):
     raise SystemExit("EPAR host-trust gate: invalid image trust policy")
+if marker.get("mode") == "disabled" and marker.get("scopes") != []:
+    raise SystemExit("EPAR host-trust gate: disabled trust mode must not carry scopes")
 
 expires = lease.get("expiresAt")
 if not isinstance(expires, str) or not expires:

@@ -4,24 +4,28 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
+	"github.com/solutionforest/ephemeral-action-runner/internal/invocation"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
 	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
-	dockerdindprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockerdind"
-	tartprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/tart"
-	wslprovider "github.com/solutionforest/ephemeral-action-runner/internal/provider/wsl"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/registry"
+	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
 const binaryName = "ephemeral-action-runner"
+
+var imageUpdateDefaultNotice sync.Once
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -113,6 +117,8 @@ func run(args []string) error {
 		return runStatus(args[1:])
 	case "logs":
 		return runLogs(args[1:])
+	case "storage":
+		return runStorage(args[1:])
 	case "version":
 		printVersion(os.Stdout)
 		return nil
@@ -218,12 +224,13 @@ func retentionPolicy(cfg config.LoggingConfig) logging.RetentionPolicy {
 
 func runImage(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("image requires subcommand: update-upstream or build")
+		return fmt.Errorf("image requires subcommand: update, update-upstream, build, or refresh-scripts")
 	}
 	switch args[0] {
-	case "update-upstream":
-		fs := flag.NewFlagSet("image update-upstream", flag.ExitOnError)
+	case "update":
+		fs := flag.NewFlagSet("image update", flag.ExitOnError)
 		common := addCommonFlags(fs)
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -232,6 +239,37 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"image", "update"}, appendStorageOverride(args[1:])...)...))
+		ctx := interruptContext()
+		poolControllerLock, err := m.AcquirePoolControllerLock()
+		if err != nil {
+			return err
+		}
+		defer poolControllerLock.Close()
+		hostTrustControllerLock, err := m.AcquireHostTrustControllerLock()
+		if err != nil {
+			return err
+		}
+		if hostTrustControllerLock != nil {
+			defer hostTrustControllerLock.Close()
+		}
+		return m.UpdateImage(ctx)
+	case "update-upstream":
+		fs := flag.NewFlagSet("image update-upstream", flag.ExitOnError)
+		common := addCommonFlags(fs)
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		m, err := newManager(*common.configPath, *common.projectRoot, *common.dryRun, false)
+		if err != nil {
+			return err
+		}
+		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"image", "update-upstream"}, appendStorageOverride(args[1:])...)...))
+		if err := rejectDockerSandboxesImageCommand(m, "image update-upstream"); err != nil {
+			return err
+		}
 		controllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
 			return err
@@ -244,6 +282,7 @@ func runImage(args []string) error {
 		replace := fs.Bool("replace", false, "delete an existing output image before building")
 		update := fs.Bool("update-upstream", false, "refresh runner-images before building")
 		skipUpstream := fs.Bool("skip-upstream-check", false, "skip checking the runner-images checkout")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -252,6 +291,7 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"image", "build"}, appendStorageOverride(args[1:])...)...))
 		ctx := interruptContext()
 		poolControllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
@@ -282,6 +322,9 @@ func runImage(args []string) error {
 			return err
 		}
 		defer m.Close()
+		if err := rejectDockerSandboxesImageCommand(m, "image refresh-scripts"); err != nil {
+			return err
+		}
 		controllerLock, err := m.AcquirePoolControllerLock()
 		if err != nil {
 			return err
@@ -303,7 +346,8 @@ func runPool(args []string) error {
 		common := addCommonFlags(fs)
 		instances := fs.Int("instances", 0, "number of concurrent instances to verify; overrides pool.instances")
 		registerOnly := fs.Bool("register-only", false, "register runners and verify online/idle without dispatching a job")
-		cleanup := fs.Bool("cleanup", false, "clean up prefixed instances and GitHub runners after verification")
+		cleanup := fs.Bool("cleanup", false, "clean up verification resources; legacy providers use the configured pool prefix, while Docker Sandboxes uses exact owned records")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -315,6 +359,7 @@ func runPool(args []string) error {
 			return err
 		}
 		defer m.Close()
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"pool", "verify"}, appendStorageOverride(args[1:])...)...))
 		return m.Verify(interruptContext(), pool.VerifyOptions{Instances: *instances, RegisterOnly: *registerOnly, Cleanup: *cleanup})
 	case "up":
 		fs := flag.NewFlagSet("pool up", flag.ExitOnError)
@@ -324,6 +369,7 @@ func runPool(args []string) error {
 		keepOnExit := fs.Bool("keep-on-exit", false, "leave prefixed instances and GitHub runners running when interrupted")
 		replaceCompleted := fs.Bool("replace-completed", true, "replace an instance when its ephemeral runner exits after a job")
 		monitorInterval := fs.Duration("monitor-interval", 15*time.Second, "interval for runner liveness checks")
+		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -334,6 +380,7 @@ func runPool(args []string) error {
 		if err != nil {
 			return err
 		}
+		m.ConfigureStorageAdmissionOverride(*allowInsufficientStorage, invocation.Command(append([]string{"pool", "up"}, appendStorageOverride(args[1:])...)...))
 		return m.RunPool(interruptContext(), pool.RunOptions{
 			Instances:        *instances,
 			Register:         *register,
@@ -352,6 +399,7 @@ func runCleanup(args []string) error {
 	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
 	common := addCommonFlags(fs)
 	noGitHub := fs.Bool("no-github", false, "skip GitHub runner deletion")
+	acknowledgeFailedDiagnostics := fs.Bool("acknowledge-failed-diagnostics", false, "allow exact cleanup of retained sandboxes after failed diagnostics evidence has been reviewed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -360,6 +408,7 @@ func runCleanup(args []string) error {
 		return err
 	}
 	defer m.Close()
+	m.AcknowledgeFailedDiagnostics = *acknowledgeFailedDiagnostics
 	return m.Cleanup(context.Background())
 }
 
@@ -376,10 +425,12 @@ func runStatus(args []string) error {
 	}
 	defer m.Close()
 	status, err := m.Status(context.Background())
+	if status != "" {
+		fmt.Print(status)
+	}
 	if err != nil {
 		return err
 	}
-	fmt.Print(status)
 	return nil
 }
 
@@ -409,6 +460,14 @@ func flagPassed(fs *flag.FlagSet, name string) bool {
 }
 
 func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool) (*pool.Manager, error) {
+	return newManagerWithLifecycleState(configPath, projectRoot, dryRun, githubEnabled, true)
+}
+
+func newImageProvisioningManager(configPath, projectRoot string) (*pool.Manager, error) {
+	return newManagerWithLifecycleState(configPath, projectRoot, false, false, false)
+}
+
+func newManagerWithLifecycleState(configPath, projectRoot string, dryRun bool, githubEnabled bool, openLifecycleState bool) (*pool.Manager, error) {
 	projectRoot, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return nil, err
@@ -428,6 +487,18 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 	if err := config.Validate(cfg); err != nil {
 		return nil, err
 	}
+	if !dryRun {
+		if err := importNativeBootstrapAcquisition(projectRoot, resolvedConfigPath, time.Now().UTC()); err != nil {
+			return nil, err
+		}
+	}
+	providerRuntime, err := registry.New(cfg, projectRoot, dryRun)
+	if err != nil {
+		return nil, err
+	}
+	if providerRuntime.Lifecycle == nil || providerRuntime.Storage == nil {
+		return nil, fmt.Errorf("provider %q registry entry is missing required lifecycle or storage behavior", cfg.Provider.Type)
+	}
 	var client pool.GitHubClient
 	if githubEnabled && !dryRun {
 		if err := config.ValidateGitHub(cfg); err != nil {
@@ -435,12 +506,9 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		}
 		client = gh.New(cfg.GitHub)
 	}
-	provider, err := newProvider(cfg, projectRoot, dryRun)
-	if err != nil {
-		return nil, err
-	}
 	runtime, err := logging.NewRuntime(logging.Options{
 		Directory:                   config.ProjectPath(projectRoot, cfg.Logging.Directory),
+		Level:                       managerLogLevel(cfg.Logging.Level),
 		ManagerSinks:                loggingSinks(cfg.Logging.ManagerSinks),
 		ManagerConsoleFormat:        logging.Format(cfg.Logging.ManagerConsoleFormat),
 		ManagerConsoleTextFormat:    cfg.Logging.ManagerConsoleTextFormat,
@@ -458,13 +526,21 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		return nil, err
 	}
 	manager := &pool.Manager{
-		Config:      cfg,
-		Provider:    provider,
-		GitHub:      client,
-		ProjectRoot: projectRoot,
-		ConfigPath:  resolvedConfigPath,
-		DryRun:      dryRun,
-		Logging:     runtime,
+		Config:                  cfg,
+		Provider:                providerRuntime.Legacy,
+		Lifecycle:               providerRuntime.Lifecycle,
+		PolicyManager:           providerRuntime.PolicyManager,
+		Storage:                 providerRuntime.Storage,
+		LifecycleStateEnabled:   !dryRun && openLifecycleState,
+		GitHub:                  client,
+		ProjectRoot:             projectRoot,
+		ConfigPath:              resolvedConfigPath,
+		DryRun:                  dryRun,
+		Logging:                 runtime,
+		AutomaticImageLifecycle: true,
+	}
+	if loggerAware, ok := manager.Lifecycle.(interface{ SetLogger(*slog.Logger) }); ok {
+		loggerAware.SetLogger(runtime.Logger())
 	}
 	if cfg.Logging.RetentionEnabled {
 		report, pruneErr := manager.PruneLogs(false)
@@ -477,6 +553,127 @@ func newManager(configPath, projectRoot string, dryRun bool, githubEnabled bool)
 		}
 	}
 	return manager, nil
+}
+
+func preflightControllerStorage(configPath, projectRoot string, cfg config.Config, contributions ...provider.StorageContribution) error {
+	minimumFree, err := config.EffectiveMinimumFreeBytes(cfg)
+	if err != nil {
+		return err
+	}
+	operationPlan := storage.OperationPlan{
+		ID:               "controller-bootstrap",
+		Provider:         cfg.Provider.Type,
+		MinimumFreeBytes: minimumFree,
+		Phases: []storage.OperationPhase{{
+			ID: "controller-bootstrap",
+			Allocations: []storage.Allocation{{
+				ID: "project-controller-bootstrap", Role: storage.StorageRoleProject,
+			}},
+		}},
+	}
+	statusCommand := invocation.ScopedCommand(configPath, projectRoot, "storage", "status", "--operation", operationPlan.ID, "--provider", cfg.Provider.Type)
+	pruneCommand := invocation.ScopedCommand(configPath, projectRoot, "storage", "prune", "--provider", cfg.Provider.Type)
+	if len(contributions) != 0 && contributions[0] != nil {
+		snapshot, err := contributions[0].StorageSnapshot(context.Background(), provider.StorageRequest{
+			OperationPlan: operationPlan,
+			Now:           time.Now(),
+		})
+		if err != nil {
+			return fmt.Errorf("resolve provider storage topology before controller bootstrap: %w\n\nInspect the same operation with:\n  %s", err, statusCommand)
+		}
+		evaluation, err := storage.EvaluateOperationPlan(operationPlan, snapshot.Surfaces, snapshot.Domains)
+		if err != nil {
+			return fmt.Errorf("resolve controller bootstrap storage: %w", err)
+		}
+		for _, check := range evaluation.CapacityChecks {
+			switch check.Status {
+			case storage.CapacityReady:
+				continue
+			case storage.CapacityUnknown:
+				warnControllerUnknownStorage(operationPlan.ID, check, evaluation.Allocations, statusCommand)
+				continue
+			case storage.CapacityInsufficient:
+				return operationCapacityAdmissionError("initialize the EPAR controller", snapshot.Domains, check, cfg.Provider.Type, pruneCommand)
+			default:
+				return fmt.Errorf("controller storage capacity check returned unsupported status %q", check.Status)
+			}
+		}
+		return nil
+	}
+	domain, err := storage.ProbeFilesystemCapacityDomain(projectRoot, time.Now())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n*** STORAGE CAPACITY UNKNOWN ***\noperation=%s domain=project roles=%s estimatedBytes=0 requiredBytes=%d reason=%v\nEPAR will continue because capacity could not be measured. Confirmed insufficient capacity remains enforced.\n\nInspect the same operation with:\n  %s\n\n", operationPlan.ID, storage.StorageRoleProject, operationPlan.MinimumFreeBytes, err, statusCommand)
+		return nil
+	}
+	domain.ID = "project-domain"
+	surface := storage.Surface{ID: "project", Provider: cfg.Provider.Type, Role: storage.StorageRoleProject, Kind: storage.SurfaceHostFilesystem, DomainID: domain.ID, Path: projectRoot, Location: projectRoot, Provenance: domain.Provenance, Confidence: domain.Confidence, AdmissionAuthoritative: true, Capacity: domain.Capacity}
+	evaluation, err := storage.EvaluateOperationPlan(operationPlan, []storage.Surface{surface}, []storage.CapacityDomain{domain})
+	if err != nil {
+		return fmt.Errorf("evaluate controller storage capacity: %w", err)
+	}
+	for _, check := range evaluation.CapacityChecks {
+		switch check.Status {
+		case storage.CapacityReady:
+			continue
+		case storage.CapacityUnknown:
+			warnControllerUnknownStorage(operationPlan.ID, check, evaluation.Allocations, statusCommand)
+			continue
+		case storage.CapacityInsufficient:
+			return operationCapacityAdmissionError("initialize the EPAR controller", []storage.CapacityDomain{domain}, check, cfg.Provider.Type, pruneCommand)
+		default:
+			return fmt.Errorf("controller storage capacity check returned unsupported status %q", check.Status)
+		}
+	}
+	return nil
+}
+
+func warnControllerUnknownStorage(operation string, check storage.CapacityCheck, allocations []storage.ResolvedAllocation, statusCommand string) {
+	domainID := check.Requirement.SurfaceID
+	if check.DomainRequirement != nil {
+		domainID = check.DomainRequirement.DomainID
+	}
+	roles := make([]string, 0)
+	seen := make(map[storage.StorageRole]struct{})
+	for _, allocation := range allocations {
+		if allocation.DomainID != domainID || allocation.Role == "" {
+			continue
+		}
+		if _, exists := seen[allocation.Role]; exists {
+			continue
+		}
+		seen[allocation.Role] = struct{}{}
+		roles = append(roles, string(allocation.Role))
+	}
+	if len(roles) == 0 {
+		roles = append(roles, "unknown")
+	}
+	estimatedBytes := check.Requirement.PeakBytes
+	if check.DomainRequirement != nil {
+		estimatedBytes = check.DomainRequirement.PeakBytes
+	}
+	fmt.Fprintf(os.Stderr, "\n*** STORAGE CAPACITY UNKNOWN ***\noperation=%s domain=%s roles=%s estimatedBytes=%d requiredBytes=%d reason=%s\nEPAR will continue because capacity could not be measured. Confirmed insufficient capacity remains enforced.\n\nInspect the same operation with:\n  %s\n\n", operation, domainID, strings.Join(roles, ","), estimatedBytes, check.RequiredAvailableBytes, check.Reason, statusCommand)
+}
+
+func operationCapacityAdmissionError(action string, domains []storage.CapacityDomain, check storage.CapacityCheck, providerType, pruneCommand string) error {
+	if check.DomainRequirement == nil {
+		return fmt.Errorf("storage capacity check for %s did not identify a capacity domain", action)
+	}
+	for _, domain := range domains {
+		if domain.ID != check.DomainRequirement.DomainID {
+			continue
+		}
+		surface := storage.Surface{ID: domain.ID, Provider: providerType, Kind: domain.Kind, DomainID: domain.ID, Path: domain.Path, Location: domain.Path, Provenance: domain.Provenance, Confidence: domain.Confidence, Capacity: domain.Capacity}
+		requirement := storage.Requirement{ID: check.DomainRequirement.OperationID + "-" + domain.ID, Provider: providerType, SurfaceID: domain.ID, PeakBytes: check.DomainRequirement.PeakBytes, MinimumFreeBytes: check.DomainRequirement.MinimumFreeBytes}
+		return storage.CapacityAdmissionError(action, surface, requirement, check, pruneCommand)
+	}
+	return fmt.Errorf("storage capacity check for %s references unknown domain %q", action, check.DomainRequirement.DomainID)
+}
+
+func rejectDockerSandboxesImageCommand(manager *pool.Manager, command string) error {
+	if manager.Config.Provider.Type != "docker-sandboxes" {
+		return nil
+	}
+	return fmt.Errorf("%s is not applicable to docker-sandboxes; edit image.sourceImage or image.customInstallScripts, then run %s", command, invocation.Command("image", "build"))
 }
 
 func loggingSinks(values []string) logging.Sinks {
@@ -492,8 +689,27 @@ func loggingSinks(values []string) logging.Sinks {
 	return sinks
 }
 
+func managerLogLevel(value string) slog.Level {
+	switch value {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 func printConfigWarnings(cfg config.Config) {
 	for _, warning := range cfg.Warnings() {
+		if strings.Contains(warning, "image update policy is not configured") {
+			imageUpdateDefaultNotice.Do(func() {
+				fmt.Fprintln(os.Stderr, "warning:", warning)
+			})
+			continue
+		}
 		fmt.Fprintln(os.Stderr, "warning:", warning)
 	}
 }
@@ -522,25 +738,6 @@ func resolveConfigPath(projectRoot, explicit string) (string, error) {
 	return "", nil
 }
 
-func newProvider(cfg config.Config, projectRoot string, dryRun bool) (provider.Provider, error) {
-	switch cfg.Provider.Type {
-	case "tart":
-		return tartprovider.New("", dryRun), nil
-	case "wsl":
-		return wslprovider.New("", config.ProjectPath(projectRoot, cfg.Provider.InstallRoot), projectRoot, dryRun), nil
-	case "docker-dind":
-		hostGateway := config.DockerConfigNeedsHostGateway(cfg.Docker)
-		environment := map[string]string{
-			"HTTP_PROXY":  cfg.Docker.HTTPProxy,
-			"HTTPS_PROXY": cfg.Docker.HTTPSProxy,
-			"NO_PROXY":    cfg.Docker.NoProxy,
-		}
-		return dockerdindprovider.NewWithOptions("", cfg.Provider.Platform, hostGateway, environment, dryRun), nil
-	default:
-		return nil, provider.UnsupportedTypeError(cfg.Provider.Type)
-	}
-}
-
 func interruptContext() context.Context {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -557,6 +754,7 @@ Commands:
   ephemeral-action-runner
   ephemeral-action-runner start [--instances N] [--config .local/config.yml]
   ephemeral-action-runner init
+  ephemeral-action-runner image update [--config .local/config.yml]
   ephemeral-action-runner image update-upstream [--config .local/config.yml]
   ephemeral-action-runner image build [--replace] [--update-upstream]
   ephemeral-action-runner image refresh-scripts
@@ -568,6 +766,8 @@ Commands:
   ephemeral-action-runner logs path
   ephemeral-action-runner logs list
   ephemeral-action-runner logs prune [--dry-run]
+  ephemeral-action-runner storage status [--operation NAME] [--provider NAME] [--json]
+  ephemeral-action-runner storage prune [--provider NAME] [--json] [--execute]
   ephemeral-action-runner version
 `)
 }

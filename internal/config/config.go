@@ -10,18 +10,22 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	GitHub   GitHubConfig
-	Image    ImageConfig
-	Pool     PoolConfig
-	Logging  LoggingConfig
-	Runner   RunnerConfig
-	Provider ProviderConfig
-	Docker   DockerConfig
-	Timeouts TimeoutConfig
-	warnings []string
+	GitHub          GitHubConfig
+	Image           ImageConfig
+	Pool            PoolConfig
+	Storage         StorageConfig
+	Logging         LoggingConfig
+	Runner          RunnerConfig
+	Security        SecurityConfig
+	Provider        ProviderConfig
+	Docker          DockerConfig
+	DockerSandboxes DockerSandboxesConfig
+	Timeouts        TimeoutConfig
+	warnings        []string
 }
 
 // Warnings returns non-fatal configuration migration notices discovered while loading.
@@ -38,13 +42,21 @@ type GitHubConfig struct {
 }
 
 type ImageConfig struct {
+	Distribution              string
 	SourceImage               string
 	SourceType                string
 	SourcePlatform            string
 	OutputImage               string
+	PrebuiltReference         string
+	PrebuiltDigest            string
+	PrebuiltAcceptance        bool
+	PrebuiltCatalogReference  string
+	PrebuiltEvidenceRef       string
 	UpstreamDir               string
 	UpstreamLock              string
 	RunnerVersion             string
+	UpdateFrequency           string
+	UpdateTime                string
 	CustomInstallScripts      []string
 	TrustedCACertificatePaths []string
 	HostTrustMode             string
@@ -57,6 +69,17 @@ const (
 
 	HostTrustScopeSystem = "system"
 	HostTrustScopeUser   = "user"
+
+	ImageUpdateFrequencyDaily    = "daily"
+	ImageUpdateFrequencyWeekly   = "weekly"
+	ImageUpdateFrequencyBiweekly = "biweekly"
+	ImageUpdateFrequencyMonthly  = "monthly"
+	ImageUpdateFrequencyManual   = "manual"
+	DefaultImageUpdateTime       = "07:00"
+
+	ImageDistributionLocalBuild         = "local-build"
+	ImageDistributionPrebuilt           = "prebuilt"
+	DockerSandboxesPrebuiltActReference = "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest"
 )
 
 type PoolConfig struct {
@@ -68,8 +91,26 @@ type PoolConfig struct {
 	ReplacementRetryJitterPercent  int
 }
 
+// StorageConfig controls provider-neutral capacity admission and conservative
+// retention. String byte sizes keep the YAML readable and are validated before
+// any provider or cleanup operation is constructed.
+type StorageConfig struct {
+	MinimumFree           string
+	GracePeriod           string
+	KeepPrevious          int
+	AutomaticHousekeeping string
+	BuildCacheLimit       string
+	GoCacheLimit          string
+}
+
+const (
+	StorageHousekeepingConservative = "conservative"
+	StorageHousekeepingDisabled     = "disabled"
+)
+
 type LoggingConfig struct {
 	Directory                   string
+	Level                       string
 	ManagerSinks                []string
 	ManagerConsoleFormat        string
 	ManagerConsoleTextFormat    string
@@ -98,6 +139,27 @@ type RunnerConfig struct {
 	NoDefaultLabels  bool
 }
 
+type SecurityConfig struct {
+	RunnerGroup RunnerGroupSecurityConfig
+}
+
+type RunnerGroupSecurityConfig struct {
+	Enforcement                       string
+	RequireExplicitGroup              bool
+	RequireNonDefaultGroup            bool
+	RequiredRepositoryAccess          string
+	RequirePublicRepositoriesDisabled bool
+}
+
+const (
+	RunnerGroupEnforcementEnforce = "enforce"
+	RunnerGroupEnforcementWarn    = "warn"
+
+	RunnerGroupRepositoryAccessSelected = "selected"
+	RunnerGroupRepositoryAccessPrivate  = "private"
+	RunnerGroupRepositoryAccessAll      = "all"
+)
+
 type ProviderConfig struct {
 	Type        string
 	SourceImage string
@@ -113,6 +175,54 @@ type DockerConfig struct {
 	HTTPSProxy      string
 	NoProxy         string
 }
+
+// DockerSandboxesConfig configures host/runtime behavior for the
+// docker-sandboxes provider. The desired source belongs to ImageConfig, while
+// the exact imported template identity is stored in EPAR's local artifact
+// receipt rather than user configuration.
+type DockerSandboxesConfig struct {
+	PolicyGeneration      string
+	NetworkBaseline       string
+	ArchitectureEmulation string
+	AdditionalAllow       []string
+	AdditionalDeny        []string
+	StagingRoot           string
+	CPUs                  int
+	Memory                string
+	RootDisk              string
+	DockerDisk            string
+	MaxConcurrentCreates  int
+}
+
+const (
+	DockerSandboxesNetworkBaselineOpen             = "open"
+	DockerSandboxesNetworkBaselineBalanced         = "balanced"
+	DockerSandboxesArchitectureEmulationBestEffort = "best-effort"
+	DockerSandboxesArchitectureEmulationRequired   = "required"
+	DockerSandboxesArchitectureEmulationNativeOnly = "native-only"
+)
+
+var dockerSandboxesOpenDefaultDenyResources = []string{
+	"host.docker.internal",
+	"gateway.docker.internal",
+	"kubernetes.docker.internal",
+	"host.containers.internal",
+}
+
+// DockerSandboxesOpenDefaultDenyResources returns host aliases that EPAR denies
+// in every sandbox-scoped Open policy. Docker Sandboxes can proxy an allowed
+// host.docker.internal request to a native-host loopback service, so
+// public egress must not implicitly enable these host-service aliases.
+func DockerSandboxesOpenDefaultDenyResources() []string {
+	return append([]string(nil), dockerSandboxesOpenDefaultDenyResources...)
+}
+
+const (
+	DockerSandboxesAutomaticRootDisk            = "auto"
+	DockerSandboxesMinimumRootDiskBytes   int64 = 20 << 30
+	DockerSandboxesMinimumDockerDiskBytes int64 = 1 << 30
+	DockerSandboxesDefaultDockerDisk            = "50GiB"
+)
 
 type TimeoutConfig struct {
 	BootSeconds         int
@@ -134,12 +244,13 @@ func Default() Config {
 			WebBaseURL: "https://github.com",
 		},
 		Image: ImageConfig{
-			SourceImage:   "ghcr.io/cirruslabs/ubuntu:latest",
-			OutputImage:   "epar-ubuntu-24-arm64",
-			UpstreamDir:   "third_party/runner-images",
-			UpstreamLock:  "third_party/runner-images.lock",
-			RunnerVersion: "latest",
-			HostTrustMode: HostTrustModeDisabled,
+			Distribution:    ImageDistributionLocalBuild,
+			UpstreamDir:     "third_party/runner-images",
+			UpstreamLock:    "third_party/runner-images.lock",
+			RunnerVersion:   "latest",
+			UpdateFrequency: ImageUpdateFrequencyWeekly,
+			UpdateTime:      DefaultImageUpdateTime,
+			HostTrustMode:   HostTrustModeDisabled,
 			HostTrustScopes: []string{
 				HostTrustScopeSystem,
 			},
@@ -152,8 +263,17 @@ func Default() Config {
 			ReplacementRetryMultiplier:     2,
 			ReplacementRetryJitterPercent:  20,
 		},
+		Storage: StorageConfig{
+			MinimumFree:           "1GiB",
+			GracePeriod:           "168h",
+			KeepPrevious:          0,
+			AutomaticHousekeeping: StorageHousekeepingConservative,
+			BuildCacheLimit:       "20GiB",
+			GoCacheLimit:          "10GiB",
+		},
 		Logging: LoggingConfig{
 			Directory:                "work/logs",
+			Level:                    "info",
 			ManagerSinks:             []string{"console"},
 			ManagerConsoleFormat:     "text",
 			ManagerFileFormat:        "json",
@@ -172,15 +292,27 @@ func Default() Config {
 			RetentionIntervalMinutes: 60,
 		},
 		Runner: RunnerConfig{
-			Labels:           []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"},
 			IncludeHostLabel: true,
 			Ephemeral:        true,
 		},
-		Provider: ProviderConfig{
-			Type:        "tart",
-			SourceImage: "epar-ubuntu-24-arm64",
-			Network:     "default",
-			InstallRoot: "work/wsl",
+		Security: SecurityConfig{
+			RunnerGroup: RunnerGroupSecurityConfig{
+				Enforcement:                       RunnerGroupEnforcementWarn,
+				RequireExplicitGroup:              true,
+				RequireNonDefaultGroup:            true,
+				RequiredRepositoryAccess:          RunnerGroupRepositoryAccessSelected,
+				RequirePublicRepositoriesDisabled: true,
+			},
+		},
+		DockerSandboxes: DockerSandboxesConfig{
+			NetworkBaseline:       DockerSandboxesNetworkBaselineOpen,
+			ArchitectureEmulation: DockerSandboxesArchitectureEmulationBestEffort,
+			StagingRoot:           ".local/docker-sandboxes-staging",
+			CPUs:                  4,
+			Memory:                "8GiB",
+			RootDisk:              DockerSandboxesAutomaticRootDisk,
+			DockerDisk:            DockerSandboxesDefaultDockerDisk,
+			MaxConcurrentCreates:  2,
 		},
 		Timeouts: TimeoutConfig{
 			BootSeconds:         180,
@@ -203,6 +335,8 @@ func Load(path string) (Config, error) {
 	defer file.Close()
 
 	section := ""
+	subsection := ""
+	subsectionIndent := 0
 	scanner := bufio.NewScanner(file)
 	lineNo := 0
 	var pendingList *pendingListKey
@@ -241,6 +375,8 @@ func Load(path string) (Config, error) {
 				return cfg, fmt.Errorf("%s:%d: unknown section %q", path, lineNo, key)
 			}
 			section = key
+			subsection = ""
+			subsectionIndent = 0
 			continue
 		}
 		if indent == 0 {
@@ -249,24 +385,42 @@ func Load(path string) (Config, error) {
 		if section == "" {
 			return cfg, fmt.Errorf("%s:%d: key %q must be under a section", path, lineNo, key)
 		}
-		if section == "pool" && key == "logDir" {
+		if section == "security" && value == "" {
+			if key != "runnerGroup" {
+				return cfg, fmt.Errorf("%s:%d: unknown subsection security.%s", path, lineNo, key)
+			}
+			subsection = key
+			subsectionIndent = indent
+			continue
+		}
+		effectiveSection := section
+		if section == "security" {
+			if subsection == "" {
+				return cfg, fmt.Errorf("%s:%d: key %q must be under security.runnerGroup", path, lineNo, key)
+			}
+			if indent <= subsectionIndent {
+				return cfg, fmt.Errorf("%s:%d: key %q must be nested under security.%s", path, lineNo, key, subsection)
+			}
+			effectiveSection = section + "." + subsection
+		}
+		if effectiveSection == "pool" && key == "logDir" {
 			legacyLogDir = trimQuotes(value)
 			legacyLogDirLine = lineNo
 			explicit["pool.logDir"] = true
 			continue
 		}
-		if value == "" && isListKey(section, key) {
-			if err := setListValue(&cfg, section, key, nil); err != nil {
+		if value == "" && isListKey(effectiveSection, key) {
+			if err := setListValue(&cfg, effectiveSection, key, nil); err != nil {
 				return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 			}
-			explicit[section+"."+key] = true
-			pendingList = &pendingListKey{section: section, key: key, indent: indent}
+			explicit[effectiveSection+"."+key] = true
+			pendingList = &pendingListKey{section: effectiveSection, key: key, indent: indent}
 			continue
 		}
-		if err := apply(&cfg, section, key, value); err != nil {
+		if err := apply(&cfg, effectiveSection, key, value); err != nil {
 			return cfg, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 		}
-		explicit[section+"."+key] = true
+		explicit[effectiveSection+"."+key] = true
 	}
 	if err := scanner.Err(); err != nil {
 		return cfg, err
@@ -278,7 +432,20 @@ func Load(path string) (Config, error) {
 		cfg.Logging.Directory = legacyLogDir
 		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s:%d: pool.logDir is deprecated; using its value as logging.directory (move it to the top-level logging section)", path, legacyLogDirLine))
 	}
+	if !explicit["security.runnerGroup.enforcement"] &&
+		!explicit["security.runnerGroup.requireExplicitGroup"] &&
+		!explicit["security.runnerGroup.requireNonDefaultGroup"] &&
+		!explicit["security.runnerGroup.requiredRepositoryAccess"] &&
+		!explicit["security.runnerGroup.requirePublicRepositoriesDisabled"] {
+		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s: runner-group security policy is not configured; using strict recommended checks in warn mode (add security.runnerGroup.enforcement: enforce after reviewing the policy)", path))
+	}
+	if !explicit["image.updateFrequency"] && !explicit["image.updateTime"] {
+		cfg.warnings = append(cfg.warnings, fmt.Sprintf("%s: image update policy is not configured; using weekly checks at 07:00 local time", path))
+	}
 	applyProviderDefaults(&cfg, explicit)
+	if strings.TrimSpace(cfg.Image.Distribution) == "" {
+		cfg.Image.Distribution = ImageDistributionLocalBuild
+	}
 	applyRunnerHostLabel(&cfg)
 	cfg.GitHub.PrivateKeyPath = expandHome(cfg.GitHub.PrivateKeyPath)
 	for i, path := range cfg.Image.TrustedCACertificatePaths {
@@ -317,6 +484,8 @@ func apply(cfg *Config, section, key, value string) error {
 		}
 	case "image":
 		switch key {
+		case "distribution":
+			cfg.Image.Distribution = strings.ToLower(strings.TrimSpace(value))
 		case "sourceImage":
 			cfg.Image.SourceImage = value
 		case "sourceType":
@@ -325,12 +494,30 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.Image.SourcePlatform = value
 		case "outputImage":
 			cfg.Image.OutputImage = value
+		case "prebuiltReference":
+			cfg.Image.PrebuiltReference = value
+		case "prebuiltDigest":
+			cfg.Image.PrebuiltDigest = value
+		case "prebuiltAcceptance":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid image.prebuiltAcceptance: %w", err)
+			}
+			cfg.Image.PrebuiltAcceptance = v
+		case "prebuiltCatalogReference":
+			cfg.Image.PrebuiltCatalogReference = value
+		case "prebuiltEvidenceRef":
+			cfg.Image.PrebuiltEvidenceRef = value
 		case "upstreamDir":
 			cfg.Image.UpstreamDir = value
 		case "upstreamLock":
 			cfg.Image.UpstreamLock = value
 		case "runnerVersion":
 			cfg.Image.RunnerVersion = value
+		case "updateFrequency":
+			cfg.Image.UpdateFrequency = strings.ToLower(value)
+		case "updateTime":
+			cfg.Image.UpdateTime = value
 		case "profile":
 			return fmt.Errorf("image.profile is not supported; use image.customInstallScripts")
 		case "customInstallScripts":
@@ -387,6 +574,8 @@ func apply(cfg *Config, section, key, value string) error {
 		switch key {
 		case "directory":
 			cfg.Logging.Directory = value
+		case "level":
+			cfg.Logging.Level = strings.ToLower(value)
 		case "managerSinks", "transcriptSinks":
 			return setListValue(cfg, section, key, parseList(value))
 		case "managerConsoleFormat":
@@ -451,6 +640,27 @@ func apply(cfg *Config, section, key, value string) error {
 		default:
 			return unknownKey(section, key)
 		}
+	case "storage":
+		switch key {
+		case "minimumFree":
+			cfg.Storage.MinimumFree = value
+		case "gracePeriod":
+			cfg.Storage.GracePeriod = value
+		case "keepPrevious":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid storage.keepPrevious: %w", err)
+			}
+			cfg.Storage.KeepPrevious = v
+		case "automaticHousekeeping":
+			cfg.Storage.AutomaticHousekeeping = strings.ToLower(value)
+		case "buildCacheLimit":
+			cfg.Storage.BuildCacheLimit = value
+		case "goCacheLimit":
+			cfg.Storage.GoCacheLimit = value
+		default:
+			return unknownKey(section, key)
+		}
 	case "runner":
 		switch key {
 		case "labels":
@@ -475,6 +685,33 @@ func apply(cfg *Config, section, key, value string) error {
 				return fmt.Errorf("invalid runner.noDefaultLabels: %w", err)
 			}
 			cfg.Runner.NoDefaultLabels = v
+		default:
+			return unknownKey(section, key)
+		}
+	case "security.runnerGroup":
+		switch key {
+		case "enforcement":
+			cfg.Security.RunnerGroup.Enforcement = strings.ToLower(value)
+		case "requireExplicitGroup":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid security.runnerGroup.requireExplicitGroup: %w", err)
+			}
+			cfg.Security.RunnerGroup.RequireExplicitGroup = v
+		case "requireNonDefaultGroup":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid security.runnerGroup.requireNonDefaultGroup: %w", err)
+			}
+			cfg.Security.RunnerGroup.RequireNonDefaultGroup = v
+		case "requiredRepositoryAccess":
+			cfg.Security.RunnerGroup.RequiredRepositoryAccess = strings.ToLower(value)
+		case "requirePublicRepositoriesDisabled":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("invalid security.runnerGroup.requirePublicRepositoriesDisabled: %w", err)
+			}
+			cfg.Security.RunnerGroup.RequirePublicRepositoriesDisabled = v
 		default:
 			return unknownKey(section, key)
 		}
@@ -508,6 +745,48 @@ func apply(cfg *Config, section, key, value string) error {
 		default:
 			return unknownKey(section, key)
 		}
+	case "dockerSandboxes":
+		switch key {
+		case "template":
+			return fmt.Errorf("dockerSandboxes.template is no longer supported; remove generated template identities and rerun ./start to provision a Docker Sandboxes runner template")
+		case "templateDigest":
+			return fmt.Errorf("dockerSandboxes.templateDigest is no longer supported; remove generated template identities and rerun ./start to provision a Docker Sandboxes runner template")
+		case "policyGeneration":
+			cfg.DockerSandboxes.PolicyGeneration = value
+		case "networkBaseline":
+			cfg.DockerSandboxes.NetworkBaseline = strings.ToLower(value)
+		case "architectureEmulation":
+			cfg.DockerSandboxes.ArchitectureEmulation = value
+		case "additionalAllow", "additionalDeny":
+			return setListValue(cfg, section, key, parseList(value))
+		case "stagingRoot":
+			cfg.DockerSandboxes.StagingRoot = value
+		case "cpus":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid dockerSandboxes.cpus: %w", err)
+			}
+			cfg.DockerSandboxes.CPUs = v
+		case "memory", "rootDisk", "dockerDisk":
+			switch key {
+			case "memory":
+				cfg.DockerSandboxes.Memory = value
+			case "rootDisk":
+				cfg.DockerSandboxes.RootDisk = value
+			case "dockerDisk":
+				cfg.DockerSandboxes.DockerDisk = value
+			}
+		case "minHostFreeSpace":
+			return fmt.Errorf("dockerSandboxes.minHostFreeSpace is no longer supported; remove it and configure the provider-neutral storage.minimumFree value instead")
+		case "maxConcurrentCreates":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid dockerSandboxes.maxConcurrentCreates: %w", err)
+			}
+			cfg.DockerSandboxes.MaxConcurrentCreates = v
+		default:
+			return unknownKey(section, key)
+		}
 	case "timeouts":
 		v, err := strconv.Atoi(value)
 		if err != nil {
@@ -535,7 +814,7 @@ func unknownKey(section, key string) error {
 
 func isKnownSection(section string) bool {
 	switch section {
-	case "github", "image", "pool", "logging", "runner", "provider", "docker", "timeouts":
+	case "github", "image", "pool", "storage", "logging", "runner", "security", "provider", "docker", "dockerSandboxes", "timeouts":
 		return true
 	default:
 		return false
@@ -544,7 +823,26 @@ func isKnownSection(section string) bool {
 
 func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 	switch cfg.Provider.Type {
+	case "tart":
+		if !explicit["image.sourceImage"] {
+			cfg.Image.SourceImage = "ghcr.io/cirruslabs/ubuntu:latest"
+		}
+		if !explicit["image.outputImage"] {
+			cfg.Image.OutputImage = "epar-ubuntu-24-arm64"
+		}
+		if !explicit["provider.sourceImage"] {
+			cfg.Provider.SourceImage = cfg.Image.OutputImage
+		}
+		if !explicit["provider.network"] {
+			cfg.Provider.Network = "default"
+		}
+		if !explicit["runner.labels"] {
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}
+		}
 	case "wsl":
+		if !explicit["provider.installRoot"] {
+			cfg.Provider.InstallRoot = "work/wsl"
+		}
 		sourceType := cfg.Image.SourceType
 		if !explicit["image.sourceType"] {
 			sourceType = ImageSourceDockerImage
@@ -583,7 +881,7 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
 			cfg.Pool.NamePrefix = "epar-wsl"
 		}
-	case "docker-dind":
+	case "docker-container":
 		if !explicit["image.sourceType"] {
 			cfg.Image.SourceType = ImageSourceDockerImage
 		}
@@ -591,16 +889,45 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 			cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
 		}
 		if !explicit["image.outputImage"] {
-			cfg.Image.OutputImage = "epar-docker-dind-catthehacker-ubuntu"
+			cfg.Image.OutputImage = "epar-docker-container-catthehacker-ubuntu"
 		}
 		if !explicit["provider.sourceImage"] {
 			cfg.Provider.SourceImage = cfg.Image.OutputImage
 		}
 		if !explicit["runner.labels"] {
-			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-dind-catthehacker-ubuntu"}
+			cfg.Runner.Labels = []string{"self-hosted", "linux", "epar-docker-container-catthehacker-ubuntu"}
 		}
 		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
-			cfg.Pool.NamePrefix = "epar-dind"
+			cfg.Pool.NamePrefix = "epar-docker-container"
+		}
+	case "docker-sandboxes":
+		if !explicit["provider.sourceImage"] {
+			cfg.Provider.SourceImage = ""
+		}
+		if !explicit["provider.platform"] {
+			cfg.Provider.Platform = "linux/amd64"
+		}
+		if !explicit["image.sourceType"] {
+			cfg.Image.SourceType = ImageSourceDockerImage
+		}
+		if !explicit["image.sourceImage"] {
+			cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
+		}
+		if !explicit["image.sourcePlatform"] {
+			cfg.Image.SourcePlatform = cfg.Provider.Platform
+		}
+		if !explicit["image.outputImage"] {
+			cfg.Image.OutputImage = ""
+		}
+		if !explicit["runner.labels"] {
+			architecture := "X64"
+			if cfg.Provider.Platform == "linux/arm64" {
+				architecture = "ARM64"
+			}
+			cfg.Runner.Labels = []string{"self-hosted", "linux", architecture, "epar-docker-sandboxes"}
+		}
+		if !explicit["pool.namePrefix"] && !explicit["pool.vmPrefix"] {
+			cfg.Pool.NamePrefix = "epar-docker-sandboxes"
 		}
 	}
 }
@@ -701,6 +1028,8 @@ func isListKey(section, key string) bool {
 		return key == "labels"
 	case "docker":
 		return key == "registryMirrors"
+	case "dockerSandboxes":
+		return key == "additionalAllow" || key == "additionalDeny"
 	case "logging":
 		return key == "managerSinks" || key == "transcriptSinks"
 	default:
@@ -730,6 +1059,15 @@ func setListValue(cfg *Config, section, key string, values []string) error {
 	case "docker":
 		if key == "registryMirrors" {
 			cfg.Docker.RegistryMirrors = values
+			return nil
+		}
+	case "dockerSandboxes":
+		switch key {
+		case "additionalAllow":
+			cfg.DockerSandboxes.AdditionalAllow = values
+			return nil
+		case "additionalDeny":
+			cfg.DockerSandboxes.AdditionalDeny = values
 			return nil
 		}
 	case "logging":
@@ -773,6 +1111,15 @@ func appendListValue(cfg *Config, section, key, value string) error {
 			cfg.Docker.RegistryMirrors = append(cfg.Docker.RegistryMirrors, item)
 			return nil
 		}
+	case "dockerSandboxes":
+		switch key {
+		case "additionalAllow":
+			cfg.DockerSandboxes.AdditionalAllow = append(cfg.DockerSandboxes.AdditionalAllow, item)
+			return nil
+		case "additionalDeny":
+			cfg.DockerSandboxes.AdditionalDeny = append(cfg.DockerSandboxes.AdditionalDeny, item)
+			return nil
+		}
 	case "logging":
 		switch key {
 		case "managerSinks":
@@ -787,21 +1134,76 @@ func appendListValue(cfg *Config, section, key, value string) error {
 }
 
 func Validate(cfg Config) error {
+	if err := ValidateRunnerGroupSecurity(cfg.Security.RunnerGroup); err != nil {
+		return err
+	}
 	if err := ValidateLogging(cfg.Logging); err != nil {
+		return err
+	}
+	if err := ValidateStorage(cfg.Storage); err != nil {
 		return err
 	}
 	if cfg.Provider.Type == "" {
 		return fmt.Errorf("provider.type is required")
 	}
 	switch cfg.Provider.Type {
-	case "tart", "wsl", "docker-dind":
+	case "tart", "wsl", "docker-container", "docker-sandboxes":
 	case "docker-socket":
-		return fmt.Errorf("provider.type docker-socket is intentionally unsupported; use provider.type=docker-dind for a private Docker daemon")
+		return fmt.Errorf("provider.type docker-socket is intentionally unsupported; use provider.type=docker-container for a private Docker daemon")
 	default:
 		return fmt.Errorf("unsupported provider.type %q", cfg.Provider.Type)
 	}
-	if cfg.Provider.SourceImage == "" {
+	if cfg.Provider.Type != "docker-sandboxes" && cfg.Provider.SourceImage == "" {
 		return fmt.Errorf("provider.sourceImage is required")
+	}
+	if cfg.Provider.Type == "docker-sandboxes" {
+		if cfg.Provider.SourceImage != "" {
+			return fmt.Errorf("provider.sourceImage is not supported with provider.type=docker-sandboxes; use image.sourceImage")
+		}
+		if cfg.Provider.Platform != "linux/amd64" && cfg.Provider.Platform != "linux/arm64" {
+			return fmt.Errorf("provider.platform must be linux/amd64 or linux/arm64 with provider.type=docker-sandboxes")
+		}
+		if cfg.Image.SourceType != "" && cfg.Image.SourceType != ImageSourceDockerImage {
+			return fmt.Errorf("image.sourceType must be docker-image with provider.type=docker-sandboxes")
+		}
+		if cfg.Image.SourceType != "" && !validDockerSandboxesSourceImage(cfg.Image.SourceImage) {
+			return fmt.Errorf("image.sourceImage with provider.type=docker-sandboxes must be ghcr.io/catthehacker/ubuntu:full-latest or ghcr.io/catthehacker/ubuntu:act-latest; specialized and custom tags do not satisfy the private dockerd template contract")
+		}
+		if cfg.Image.SourcePlatform != "" && cfg.Image.SourcePlatform != cfg.Provider.Platform {
+			return fmt.Errorf("image.sourcePlatform must match provider.platform with provider.type=docker-sandboxes")
+		}
+		if err := validateDockerSandboxesImageDistribution(cfg.Image); err != nil {
+			return err
+		}
+		if cfg.Image.PrebuiltAcceptance {
+			if cfg.Pool.Instances != 1 {
+				return fmt.Errorf("pool.instances must be 1 when image.prebuiltAcceptance=true")
+			}
+			if cfg.Runner.Group != "epar-dev-test" {
+				return fmt.Errorf("runner.group must be epar-dev-test when image.prebuiltAcceptance=true")
+			}
+			policy := cfg.Security.RunnerGroup
+			if policy.Enforcement != RunnerGroupEnforcementEnforce || !policy.RequireExplicitGroup || !policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessSelected || !policy.RequirePublicRepositoriesDisabled {
+				return fmt.Errorf("candidate acceptance requires enforced explicit non-default selected-repository runner-group access with public repositories disabled")
+			}
+			wantLabelPrefix := "epar-prebuilt-act-" + strings.TrimPrefix(cfg.Image.PrebuiltDigest, "sha256:")[:12] + "-"
+			wantLabel := wantLabelPrefix + strings.TrimPrefix(cfg.Provider.Platform, "linux/")
+			if len(cfg.Runner.Labels) != 1 || cfg.Runner.Labels[0] != wantLabel || !cfg.Runner.NoDefaultLabels || cfg.Runner.IncludeHostLabel {
+				return fmt.Errorf("candidate acceptance requires only runner.labels: [%s], runner.noDefaultLabels: true, and runner.includeHostLabel: false", wantLabel)
+			}
+			if cfg.Pool.NamePrefix != wantLabel {
+				return fmt.Errorf("pool.namePrefix must be the digest-bound acceptance name %s", wantLabel)
+			}
+		}
+		if !cfg.Runner.Ephemeral {
+			return fmt.Errorf("runner.ephemeral must be true with provider.type=docker-sandboxes")
+		}
+		if cfg.Security.RunnerGroup.Enforcement != RunnerGroupEnforcementEnforce {
+			return fmt.Errorf("security.runnerGroup.enforcement must be enforce with provider.type=docker-sandboxes")
+		}
+		if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err != nil {
+			return err
+		}
 	}
 	if cfg.Provider.RosettaTag != "" {
 		if cfg.Provider.Type != "tart" {
@@ -812,8 +1214,8 @@ func Validate(cfg Config) error {
 		}
 	}
 	if cfg.Provider.Platform != "" {
-		if cfg.Provider.Type != "docker-dind" {
-			return fmt.Errorf("provider.platform is only supported with provider.type=docker-dind")
+		if cfg.Provider.Type != "docker-container" && cfg.Provider.Type != "docker-sandboxes" {
+			return fmt.Errorf("provider.platform is only supported with provider.type=docker-container or docker-sandboxes")
 		}
 		if err := ValidateDockerPlatform(cfg.Provider.Platform); err != nil {
 			return err
@@ -829,7 +1231,13 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("image.trustedCaCertificatePaths must not contain empty paths")
 		}
 	}
+	if err := validateImageDistributionFields(cfg.Image, cfg.Provider.Type); err != nil {
+		return err
+	}
 	if err := ValidateHostTrust(cfg.Image, cfg.Provider, cfg.Runner); err != nil {
+		return err
+	}
+	if err := ValidateImageUpdatePolicy(cfg.Image); err != nil {
 		return err
 	}
 	switch cfg.Image.SourceType {
@@ -863,6 +1271,13 @@ func Validate(cfg Config) error {
 	if err := ValidatePrefix(cfg.Pool.NamePrefix); err != nil {
 		return err
 	}
+	if cfg.Provider.Type == "docker-sandboxes" {
+		for _, r := range cfg.Pool.NamePrefix {
+			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '.') {
+				return fmt.Errorf("pool.namePrefix for docker-sandboxes must contain only lowercase letters, digits, hyphens, and periods")
+			}
+		}
+	}
 	if len(cfg.Runner.Labels) == 0 {
 		return fmt.Errorf("runner.labels must not be empty")
 	}
@@ -888,9 +1303,394 @@ func Validate(cfg Config) error {
 	return nil
 }
 
+// ValidateImageUpdatePolicy keeps remote freshness scheduling predictable while
+// allowing manual mode to retain an otherwise valid update time for later use.
+func ValidateImageUpdatePolicy(image ImageConfig) error {
+	switch image.UpdateFrequency {
+	case ImageUpdateFrequencyDaily, ImageUpdateFrequencyWeekly, ImageUpdateFrequencyBiweekly, ImageUpdateFrequencyMonthly, ImageUpdateFrequencyManual:
+	default:
+		return fmt.Errorf("unsupported image.updateFrequency %q; supported values are daily, weekly, biweekly, monthly, and manual", image.UpdateFrequency)
+	}
+	if image.UpdateFrequency == ImageUpdateFrequencyManual {
+		return nil
+	}
+	if _, err := time.Parse("15:04", image.UpdateTime); err != nil {
+		return fmt.Errorf("invalid image.updateTime %q; use 24-hour HH:MM local time", image.UpdateTime)
+	}
+	return nil
+}
+
+// ValidateStorage rejects policies that would silently disable capacity or
+// leave a supposedly bounded cache without a usable limit.
+func ValidateStorage(storage StorageConfig) error {
+	for key, value := range map[string]string{
+		"minimumFree":     storage.MinimumFree,
+		"buildCacheLimit": storage.BuildCacheLimit,
+		"goCacheLimit":    storage.GoCacheLimit,
+	} {
+		if _, err := ParseByteSize(value); err != nil {
+			return fmt.Errorf("invalid storage.%s: %w", key, err)
+		}
+	}
+	grace, err := time.ParseDuration(storage.GracePeriod)
+	if err != nil {
+		return fmt.Errorf("invalid storage.gracePeriod: %w", err)
+	}
+	if grace <= 0 {
+		return fmt.Errorf("storage.gracePeriod must be greater than zero")
+	}
+	if storage.KeepPrevious < 0 {
+		return fmt.Errorf("storage.keepPrevious must be zero or greater")
+	}
+	switch storage.AutomaticHousekeeping {
+	case StorageHousekeepingConservative, StorageHousekeepingDisabled:
+	default:
+		return fmt.Errorf("unsupported storage.automaticHousekeeping %q; supported values are conservative and disabled", storage.AutomaticHousekeeping)
+	}
+	return nil
+}
+
+// ValidateDockerSandboxes validates provider settings independently so
+// callers constructing Config values programmatically receive the same checks as
+// YAML-loaded configuration.
+func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
+	if err := validateSHA256Fingerprint("dockerSandboxes.policyGeneration", sandboxes.PolicyGeneration); err != nil {
+		return err
+	}
+	if sandboxes.NetworkBaseline != DockerSandboxesNetworkBaselineOpen && sandboxes.NetworkBaseline != DockerSandboxesNetworkBaselineBalanced {
+		return fmt.Errorf("unsupported dockerSandboxes.networkBaseline %q; supported values are open and balanced", sandboxes.NetworkBaseline)
+	}
+	if sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationBestEffort && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationRequired && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationNativeOnly {
+		return fmt.Errorf("unsupported dockerSandboxes.architectureEmulation %q; supported values are best-effort, required, and native-only", sandboxes.ArchitectureEmulation)
+	}
+	if err := validateDockerSandboxHostnameList("additionalAllow", sandboxes.AdditionalAllow); err != nil {
+		return err
+	}
+	if err := validateDockerSandboxHostnameList("additionalDeny", sandboxes.AdditionalDeny); err != nil {
+		return err
+	}
+	allowSet := make(map[string]struct{}, len(sandboxes.AdditionalAllow))
+	for _, resource := range sandboxes.AdditionalAllow {
+		allowSet[resource] = struct{}{}
+	}
+	if sandboxes.NetworkBaseline == DockerSandboxesNetworkBaselineOpen {
+		for _, resource := range DockerSandboxesOpenDefaultDenyResources() {
+			if _, exists := allowSet[resource]; exists {
+				return fmt.Errorf("dockerSandboxes.additionalAllow must not override the Open host-boundary deny for %q", resource)
+			}
+		}
+	}
+	for _, resource := range sandboxes.AdditionalDeny {
+		if _, exists := allowSet[resource]; exists {
+			return fmt.Errorf("dockerSandboxes.additionalAllow and dockerSandboxes.additionalDeny must not both contain %q", resource)
+		}
+	}
+	if err := validateDockerSandboxesStagingRoot(sandboxes.StagingRoot); err != nil {
+		return err
+	}
+	if sandboxes.CPUs <= 0 {
+		return fmt.Errorf("dockerSandboxes.cpus must be greater than zero")
+	}
+	parsedSizes := make(map[string]int64, 2)
+	for key, value := range map[string]string{
+		"memory":     sandboxes.Memory,
+		"dockerDisk": sandboxes.DockerDisk,
+	} {
+		parsed, err := ParseByteSize(value)
+		if err != nil {
+			return fmt.Errorf("invalid dockerSandboxes.%s: %w", key, err)
+		}
+		parsedSizes[key] = parsed
+	}
+	if sandboxes.RootDisk != DockerSandboxesAutomaticRootDisk {
+		rootDisk, err := ParseByteSize(sandboxes.RootDisk)
+		if err != nil {
+			return fmt.Errorf("invalid dockerSandboxes.rootDisk: %w", err)
+		}
+		if rootDisk < DockerSandboxesMinimumRootDiskBytes {
+			return fmt.Errorf("dockerSandboxes.rootDisk must be auto or at least 20GiB")
+		}
+	}
+	if parsedSizes["dockerDisk"] < DockerSandboxesMinimumDockerDiskBytes {
+		return fmt.Errorf("dockerSandboxes.dockerDisk must be at least 1GiB")
+	}
+	if sandboxes.MaxConcurrentCreates <= 0 {
+		return fmt.Errorf("dockerSandboxes.maxConcurrentCreates must be greater than zero")
+	}
+	return nil
+}
+
+func validDockerSandboxesSourceImage(value string) bool {
+	switch value {
+	case "ghcr.io/catthehacker/ubuntu:full-latest", "ghcr.io/catthehacker/ubuntu:act-latest":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateDockerSandboxesImageDistribution(image ImageConfig) error {
+	distribution := strings.TrimSpace(image.Distribution)
+	if distribution == "" {
+		distribution = ImageDistributionLocalBuild
+	}
+	switch distribution {
+	case ImageDistributionLocalBuild:
+		return nil
+	case ImageDistributionPrebuilt:
+		if strings.TrimSpace(image.SourceImage) != "ghcr.io/catthehacker/ubuntu:act-latest" {
+			return fmt.Errorf("image.distribution=prebuilt currently supports only the Catthehacker Act profile ghcr.io/catthehacker/ubuntu:act-latest")
+		}
+		if err := validatePrebuiltReference(image.PrebuiltReference); err != nil {
+			return fmt.Errorf("image.prebuiltReference: %w", err)
+		}
+		if strings.TrimSpace(image.RunnerVersion) != "" && strings.TrimSpace(image.RunnerVersion) != "latest" {
+			return fmt.Errorf("image.runnerVersion=%q is not supported with image.distribution=prebuilt; use latest because the published package carries its catalog-pinned runner identity", image.RunnerVersion)
+		}
+		if digest := strings.TrimSpace(image.PrebuiltDigest); digest != "" {
+			if err := validateSHA256Fingerprint("image.prebuiltDigest", digest); err != nil {
+				return err
+			}
+		}
+		if image.PrebuiltAcceptance {
+			if strings.TrimSpace(image.PrebuiltDigest) == "" {
+				return fmt.Errorf("image.prebuiltDigest is required when image.prebuiltAcceptance=true")
+			}
+			if err := validatePrebuiltCatalogReference(image.PrebuiltCatalogReference); err != nil {
+				return fmt.Errorf("image.prebuiltCatalogReference: %w", err)
+			}
+			if err := validatePrebuiltEvidenceRef(image.PrebuiltEvidenceRef); err != nil {
+				return fmt.Errorf("image.prebuiltEvidenceRef: %w", err)
+			}
+			if image.UpdateFrequency != ImageUpdateFrequencyManual {
+				return fmt.Errorf("image.updateFrequency must be manual when image.prebuiltAcceptance=true")
+			}
+			if len(image.CustomInstallScripts) != 0 || len(image.TrustedCACertificatePaths) != 0 {
+				return fmt.Errorf("candidate acceptance requires empty image.customInstallScripts and image.trustedCaCertificatePaths so the published package is tested without a local derivative")
+			}
+			if image.HostTrustMode != HostTrustModeOverlay {
+				return fmt.Errorf("image.hostTrustMode must be overlay when image.prebuiltAcceptance=true")
+			}
+		} else if strings.TrimSpace(image.PrebuiltCatalogReference) != "" || strings.TrimSpace(image.PrebuiltEvidenceRef) != "" {
+			return fmt.Errorf("image.prebuiltCatalogReference and image.prebuiltEvidenceRef require image.prebuiltAcceptance=true")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported image.distribution %q; supported values are %s and %s", image.Distribution, ImageDistributionLocalBuild, ImageDistributionPrebuilt)
+	}
+}
+
+func validateImageDistributionFields(image ImageConfig, providerType string) error {
+	distribution := strings.TrimSpace(image.Distribution)
+	if distribution == "" {
+		distribution = ImageDistributionLocalBuild
+	}
+	if distribution != ImageDistributionPrebuilt && (strings.TrimSpace(image.PrebuiltReference) != "" || strings.TrimSpace(image.PrebuiltDigest) != "" || image.PrebuiltAcceptance || strings.TrimSpace(image.PrebuiltCatalogReference) != "" || strings.TrimSpace(image.PrebuiltEvidenceRef) != "") {
+		return fmt.Errorf("image prebuilt fields require image.distribution=%s", ImageDistributionPrebuilt)
+	}
+	if distribution == ImageDistributionPrebuilt && providerType != "docker-sandboxes" {
+		return fmt.Errorf("image.distribution=prebuilt is supported only with provider.type=docker-sandboxes")
+	}
+	return nil
+}
+
+func validatePrebuiltCatalogReference(value string) error {
+	value = strings.TrimSpace(value)
+	prefix := strings.TrimSuffix(DockerSandboxesPrebuiltActReference, ":act-latest")
+	if strings.HasPrefix(value, prefix+":catalog-v1-pkg-") {
+		digest := strings.TrimPrefix(value, prefix+":catalog-v1-pkg-")
+		if err := validateSHA256Fingerprint("catalog digest", "sha256:"+digest); err == nil {
+			return nil
+		}
+	}
+	if strings.HasPrefix(value, prefix+"@") {
+		if err := validateSHA256Fingerprint("catalog digest", strings.TrimPrefix(value, prefix+"@")); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("must be an immutable official catalog-v1-pkg tag or repository@sha256 digest")
+}
+
+func validatePrebuiltEvidenceRef(value string) error {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "refs/heads/") || len(value) <= len("refs/heads/") || strings.ContainsAny(value, " \t\r\n~^:?*[\\") || strings.Contains(value, "..") || strings.HasSuffix(value, "/") {
+		return fmt.Errorf("must be an exact canonical refs/heads/<branch> value")
+	}
+	return nil
+}
+
+func validatePrebuiltReference(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("must be %s", DockerSandboxesPrebuiltActReference)
+	}
+	if value != DockerSandboxesPrebuiltActReference {
+		return fmt.Errorf("must be the official EPAR reference %s; arbitrary GHCR packages are not accepted", DockerSandboxesPrebuiltActReference)
+	}
+	return nil
+}
+
+func validateDockerSandboxesStagingRoot(value string) error {
+	if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\x00\r\n:") {
+		return fmt.Errorf("dockerSandboxes.stagingRoot must be a canonical project-relative path under .local")
+	}
+	normalizedInput := strings.ReplaceAll(value, `\`, "/")
+	native := filepath.FromSlash(normalizedInput)
+	if filepath.IsAbs(native) || filepath.VolumeName(native) != "" {
+		return fmt.Errorf("dockerSandboxes.stagingRoot must not select an absolute host path")
+	}
+	clean := filepath.ToSlash(filepath.Clean(native))
+	if clean != normalizedInput || clean == ".local" || !strings.HasPrefix(clean, ".local/") {
+		return fmt.Errorf("dockerSandboxes.stagingRoot must be a canonical project-relative path under .local")
+	}
+	for _, reserved := range []string{".local/bin", ".local/state"} {
+		if clean == reserved || strings.HasPrefix(clean, reserved+"/") {
+			return fmt.Errorf("dockerSandboxes.stagingRoot must not overlap reserved EPAR path %s", reserved)
+		}
+	}
+	return nil
+}
+
+func validateSHA256Fingerprint(key, value string) error {
+	const prefix = "sha256:"
+	if len(value) != len(prefix)+64 || !strings.HasPrefix(value, prefix) {
+		return fmt.Errorf("%s must be a lowercase sha256:<64-hex> fingerprint", key)
+	}
+	for _, r := range value[len(prefix):] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return fmt.Errorf("%s must be a lowercase sha256:<64-hex> fingerprint", key)
+		}
+	}
+	return nil
+}
+
+func validateDockerSandboxHostnameList(key string, resources []string) error {
+	seen := make(map[string]struct{}, len(resources))
+	for _, resource := range resources {
+		if err := ValidateDockerSandboxHostname(resource); err != nil {
+			return fmt.Errorf("invalid dockerSandboxes.%s value %q: %w", key, resource, err)
+		}
+		if _, exists := seen[resource]; exists {
+			return fmt.Errorf("dockerSandboxes.%s must not contain duplicate value %q", key, resource)
+		}
+		seen[resource] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateDockerSandboxHostname accepts an exact DNS hostname or a wildcard
+// constrained to the left-most label (for example, *.githubusercontent.com),
+// with an optional numeric port.
+func ValidateDockerSandboxHostname(resource string) error {
+	if resource == "" || resource != strings.TrimSpace(resource) || strings.ContainsAny(resource, "\\/@?#[]") || strings.ContainsAny(resource, "\t\r\n") {
+		return fmt.Errorf("must be an exact hostname or *.domain with an optional port")
+	}
+	host := resource
+	if strings.Contains(resource, ":") {
+		parsedHost, port, err := net.SplitHostPort(resource)
+		if err != nil || parsedHost == "" || port == "" {
+			return fmt.Errorf("must be an exact hostname or *.domain with an optional port")
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return fmt.Errorf("port must be between 1 and 65535")
+		}
+		host = parsedHost
+	}
+	if strings.HasPrefix(host, "*.") {
+		host = strings.TrimPrefix(host, "*.")
+		if !strings.Contains(host, ".") {
+			return fmt.Errorf("wildcards must be followed by a domain")
+		}
+	} else if strings.Contains(host, "*") {
+		return fmt.Errorf("wildcards are only supported as the left-most label")
+	}
+	if net.ParseIP(host) != nil || len(host) > 253 || host == "" {
+		return fmt.Errorf("must be an exact hostname or *.domain with an optional port")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("must be an exact hostname or *.domain with an optional port")
+		}
+		for _, r := range label {
+			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
+				return fmt.Errorf("must be an exact hostname or *.domain with an optional port")
+			}
+		}
+	}
+	return nil
+}
+
+// ParseByteSize parses a positive byte count with an explicit binary unit. The
+// original configuration string is retained because the sandbox command surface
+// consumes these values verbatim.
+func ParseByteSize(value string) (int64, error) {
+	if value == "" || value != strings.TrimSpace(value) {
+		return 0, fmt.Errorf("must be a positive byte size such as 4GiB")
+	}
+	units := []struct {
+		suffix     string
+		multiplier int64
+	}{
+		{suffix: "TiB", multiplier: 1 << 40},
+		{suffix: "GiB", multiplier: 1 << 30},
+		{suffix: "MiB", multiplier: 1 << 20},
+		{suffix: "KiB", multiplier: 1 << 10},
+		{suffix: "B", multiplier: 1},
+	}
+	for _, unit := range units {
+		if !strings.HasSuffix(value, unit.suffix) {
+			continue
+		}
+		number := strings.TrimSuffix(value, unit.suffix)
+		if number == "" {
+			break
+		}
+		parsed, err := strconv.ParseInt(number, 10, 64)
+		if err != nil || parsed <= 0 || parsed > math.MaxInt64/unit.multiplier {
+			return 0, fmt.Errorf("must be a positive byte size such as 4GiB")
+		}
+		return parsed * unit.multiplier, nil
+	}
+	return 0, fmt.Errorf("must be a positive byte size such as 4GiB")
+}
+
+// EffectiveMinimumFreeBytes returns the single provider-neutral free-space
+// reserve used by every storage-consuming provider operation.
+func EffectiveMinimumFreeBytes(cfg Config) (uint64, error) {
+	value := cfg.Storage.MinimumFree
+	if value == "" {
+		value = Default().Storage.MinimumFree
+	}
+	minimum, err := ParseByteSize(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse storage minimum free reserve: %w", err)
+	}
+	return uint64(minimum), nil
+}
+
+func ValidateRunnerGroupSecurity(policy RunnerGroupSecurityConfig) error {
+	switch policy.Enforcement {
+	case RunnerGroupEnforcementEnforce, RunnerGroupEnforcementWarn:
+	default:
+		return fmt.Errorf("unsupported security.runnerGroup.enforcement %q; supported values are enforce and warn", policy.Enforcement)
+	}
+	switch policy.RequiredRepositoryAccess {
+	case RunnerGroupRepositoryAccessSelected, RunnerGroupRepositoryAccessPrivate, RunnerGroupRepositoryAccessAll:
+	default:
+		return fmt.Errorf("unsupported security.runnerGroup.requiredRepositoryAccess %q; supported values are selected, private, and all", policy.RequiredRepositoryAccess)
+	}
+	return nil
+}
+
 func ValidateLogging(logging LoggingConfig) error {
 	if strings.TrimSpace(logging.Directory) == "" {
 		return fmt.Errorf("logging.directory is required")
+	}
+	switch logging.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("unsupported logging.level %q; supported values are debug, info, warn, and error", logging.Level)
 	}
 	if err := validateLoggingSinks("managerSinks", logging.ManagerSinks); err != nil {
 		return err
@@ -1007,17 +1807,14 @@ func validateConsoleTextFormat(key, template, outputFormat string, allowed []str
 	return nil
 }
 
-// ValidateHostTrust keeps host trust inheritance deliberately limited to the
-// ephemeral Docker-in-Docker image path. Other providers do not have a
-// portable, unambiguous host trust boundary.
-func ValidateHostTrust(image ImageConfig, provider ProviderConfig, runner RunnerConfig) error {
+// ValidateHostTrust applies the provider-neutral ephemeral-runner trust
+// contract. The common pool installs and validates the resolved trust snapshot
+// in an unregistered guest before requesting a registration token.
+func ValidateHostTrust(image ImageConfig, _ ProviderConfig, runner RunnerConfig) error {
 	switch image.HostTrustMode {
 	case "", HostTrustModeDisabled:
 		return nil
 	case HostTrustModeOverlay:
-		if provider.Type != "docker-dind" {
-			return fmt.Errorf("image.hostTrustMode %q is only supported with provider.type=docker-dind", HostTrustModeOverlay)
-		}
 		if !runner.Ephemeral {
 			return fmt.Errorf("image.hostTrustMode %q requires runner.ephemeral=true", HostTrustModeOverlay)
 		}
@@ -1164,6 +1961,20 @@ func ValidateDockerNoProxy(value string) error {
 	return nil
 }
 
+func DockerSandboxesGuestPlatform(hostOS, hostArch string) (string, error) {
+	if strings.TrimSpace(hostOS) == "" {
+		return "", fmt.Errorf("docker-sandboxes controller host operating system is empty")
+	}
+	switch hostArch {
+	case "amd64":
+		return "linux/amd64", nil
+	case "arm64":
+		return "linux/arm64", nil
+	default:
+		return "", fmt.Errorf("docker-sandboxes has no EPAR template for controller architecture %s on %s", hostArch, hostOS)
+	}
+}
+
 func ValidateDockerPlatform(platform string) error {
 	if strings.TrimSpace(platform) != platform || platform == "" {
 		return fmt.Errorf("provider.platform must be a non-empty Docker platform")
@@ -1284,7 +2095,12 @@ func stripComment(s string) string {
 func trimQuotes(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) >= 2 {
-		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+		if s[0] == '"' && s[len(s)-1] == '"' {
+			if value, err := strconv.Unquote(s); err == nil {
+				return value
+			}
+		}
+		if s[0] == '\'' && s[len(s)-1] == '\'' {
 			return s[1 : len(s)-1]
 		}
 	}

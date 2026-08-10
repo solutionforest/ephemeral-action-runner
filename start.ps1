@@ -3,62 +3,60 @@ param(
     [string[]] $EparArgs
 )
 
-# One-command start: .\start.ps1 or .\start.ps1 --config .local\config.yml --instances 2
-#
-# Uses local Go if present and actually runnable. Otherwise runs EPAR from
-# source inside a containerized Go toolchain via `go run` (no local Go
-# install needed, and no binary is built or left on disk). The containerized
-# fallback requires Docker. See docs/advanced/no-go-install.md.
-
-$ErrorActionPreference = "Stop"
+# EPAR's user-facing Windows entry point is ./start. PowerShell resolves that
+# extensionless path to this implementation; do not invoke this file directly
+# from operator documentation.
+$ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $Root
-. (Join-Path $Root "scripts\host-trust\wrapper-lib.ps1")
 
-$GoBin = if ($env:EPAR_GO_BIN) { $env:EPAR_GO_BIN } else { "go" }
-$UseDockerRun = if ($env:EPAR_USE_DOCKER_RUN) { $env:EPAR_USE_DOCKER_RUN } else { "auto" }
-$StartArgs = @("start")
-if ($null -ne $EparArgs -and $EparArgs.Count -gt 0) {
-    $StartArgs += $EparArgs
+$OriginalInvocationExists = Test-Path Env:EPAR_INVOCATION
+$OriginalInvocation = $env:EPAR_INVOCATION
+$env:EPAR_INVOCATION = 'start'
+
+$GoBin = if ($env:EPAR_GO_BIN) { $env:EPAR_GO_BIN } else { 'go' }
+$UseDockerRun = if ($env:EPAR_USE_DOCKER_RUN) { $env:EPAR_USE_DOCKER_RUN } else { 'auto' }
+[string[]] $ControllerArgs = if ($null -eq $EparArgs) { @() } else { [string[]] @($EparArgs) }
+
+$UseOld = $false
+if ($ControllerArgs.Count -gt 0 -and $ControllerArgs[0] -ceq '--use-old') {
+    $UseOld = $true
+    if ($ControllerArgs.Count -eq 1) { $ControllerArgs = @() } else { $ControllerArgs = @($ControllerArgs[1..($ControllerArgs.Count - 1)]) }
+}
+if ($ControllerArgs -contains '--use-old') {
+    throw '--use-old is a wrapper option and must be the first argument: ./start --use-old <command> [arguments...]'
+}
+if ($ControllerArgs.Count -eq 0 -or $ControllerArgs[0].StartsWith('-')) {
+    $ControllerArgs = @('start') + $ControllerArgs
 }
 
 function Test-GoUsable {
-    param([string]$GoBin)
-    if (-not (Get-Command $GoBin -ErrorAction SilentlyContinue)) { return $false }
+    param([Parameter(Mandatory = $true)][string] $Candidate)
+    if (-not (Get-Command $Candidate -ErrorAction SilentlyContinue)) { return $false }
     try {
-        & $GoBin version *> $null
-        return ($LASTEXITCODE -eq 0)
+        & $Candidate version *> $null
+        return $LASTEXITCODE -eq 0
     } catch {
         return $false
     }
 }
 
-$goUsable = Test-GoUsable -GoBin $GoBin
-
-if ($UseDockerRun -eq "1" -or ($UseDockerRun -eq "auto" -and -not $goUsable)) {
-    Write-Warning "Go not found or not runnable (or EPAR_USE_DOCKER_RUN=1); running with a containerized Go toolchain instead..."
-    & (Join-Path $Root "scripts\run-with-docker.ps1") @StartArgs
-    exit $LASTEXITCODE
+if ($UseDockerRun -notin @('auto', '0', '1')) {
+    throw "EPAR_USE_DOCKER_RUN must be auto, 0, or 1; got '$UseDockerRun'."
+}
+$goUsable = Test-GoUsable -Candidate $GoBin
+if ($UseDockerRun -eq '0' -and -not $goUsable) {
+    throw "Go not found or not runnable: $GoBin`nInstall Go, set EPAR_GO_BIN, or set EPAR_USE_DOCKER_RUN=1 to use the Docker compiler."
+}
+$Backend = if ($UseDockerRun -eq '1' -or ($UseDockerRun -eq 'auto' -and -not $goUsable)) { 'docker' } else { 'local-go' }
+if ($Backend -eq 'docker') {
+    Write-Warning 'Using the Docker toolchain when a validated project-local controller rebuild is required.'
 }
 
-if (-not $goUsable) {
-    Write-Error "Go not found or not runnable: $GoBin`nInstall Go, set EPAR_GO_BIN, or set EPAR_USE_DOCKER_RUN=1 to run with a containerized Go toolchain instead.`nSee docs/advanced/no-go-install.md."
-    exit 1
-}
-
-$bridge = Start-EparHostTrustBridge -ProjectRoot $Root -Command "start" -Arguments $EparArgs
-$previousHostOS = $env:EPAR_CONTROLLER_HOST_OS
-$previousFeed = $env:EPAR_HOST_TRUST_FEED
 try {
-    if ($bridge.FeedDir) {
-        $env:EPAR_CONTROLLER_HOST_OS = Get-EparHostTrustHostOS
-        $env:EPAR_HOST_TRUST_FEED = Join-Path $bridge.FeedDir "current.json"
-    }
-    & $GoBin run ./cmd/ephemeral-action-runner @StartArgs
+    & (Join-Path $Root 'scripts\build-native-controller.ps1') -Backend $Backend -GoBin $GoBin -UseOld:$UseOld @ControllerArgs
     $exitCode = $LASTEXITCODE
 } finally {
-    Stop-EparHostTrustBridge -Bridge $bridge
-    if ($null -eq $previousHostOS) { Remove-Item Env:EPAR_CONTROLLER_HOST_OS -ErrorAction SilentlyContinue } else { $env:EPAR_CONTROLLER_HOST_OS = $previousHostOS }
-    if ($null -eq $previousFeed) { Remove-Item Env:EPAR_HOST_TRUST_FEED -ErrorAction SilentlyContinue } else { $env:EPAR_HOST_TRUST_FEED = $previousFeed }
+    if ($OriginalInvocationExists) { $env:EPAR_INVOCATION = $OriginalInvocation } else { Remove-Item Env:EPAR_INVOCATION -ErrorAction SilentlyContinue }
 }
 exit $exitCode

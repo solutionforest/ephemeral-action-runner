@@ -1,62 +1,52 @@
 # Running EPAR Without Installing Go
 
-The standard path is to download GitHub's automatic **Source code (zip)** or **Source code (tar.gz)** from the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases) and run `go run ./cmd/ephemeral-action-runner` from the extracted source folder. If you do not want Go installed on the host, use EPAR's Docker-based source runner instead. The default Docker-DinD provider still needs Docker.
+The standard path is to download GitHub's automatic **Source code (zip)** or **Source code (tar.gz)** from the [EPAR Releases page](https://github.com/solutionforest/ephemeral-action-runner/releases) and run `./start` from the extracted source folder. The wrapper uses local Go when it works; if you do not want Go installed on the host, it uses EPAR's Docker-based native-controller builder instead. Docker remains required for that build toolchain.
 
 ## Run With Docker
 
-Run `./start` at the source folder root on macOS, Linux, WSL, or Git Bash, or `./start.ps1` / `start.cmd` in native Windows PowerShell or cmd. The wrapper uses local Go when it is installed and runnable; otherwise it runs EPAR from the checked-out source with a containerized Go toolchain:
+Run `./start` at the source folder root on every supported shell, including native Windows PowerShell. PowerShell resolves it to EPAR's internal Windows wrapper; bare `start` is PowerShell's `Start-Process` alias. The wrapper uses local Go when it is installed and runnable; otherwise a containerized Go toolchain cross-compiles a CGO-disabled host-native binary into `.local/bin/<os>-<arch>/`. The adjacent `controller.receipt` independently records the source digest, build identity, target, compiler backend, toolchain, and executable SHA-256:
 
 ```bash
 ./start --config .local/config.yml --instances 2
 ```
 
-```powershell
-.\start.ps1 --config .local\config.yml --instances 2
-```
+Under the hood, the wrapper compiles EPAR with `CGO_ENABLED=0` and `-trimpath`, validates the staged receipt and binary, and runs the cached host-native executable directly from the project directory. Docker is only the compiler backend when local Go is unavailable or explicitly disabled. This stays source-based and does not download a separately packaged EPAR executable. Native execution is mandatory for Docker Sandboxes because its management endpoint and host security state are not exposed to the build container.
 
-Under the hood, the wrapper calls `scripts/run-with-docker.sh` (or `scripts/run-with-docker.ps1` on Windows), builds a small local image with the Go toolchain and Docker CLI from `scripts/docker/dev.Dockerfile`, and runs `go run ./cmd/ephemeral-action-runner ...`. This stays source-based; it does not download or use a separately packaged EPAR executable. The Docker CLI in the toolchain image lets EPAR's own Docker operations reach the host daemon through the mounted socket.
+### Host trust
 
-### Host trust bridge
+Before Docker-based compilation, the wrapper publishes a short-lived system-trust feed from the real Windows, macOS, or Linux host, validates its freshness, certificate hashes, CA constraints, and distrust entries in an offline container, and mounts the resulting bundle read-only into the Go toolchain container. This operational trust is automatic even when `image.hostTrustMode` is disabled and is not copied into runners. The resulting native controller reads host trust directly. If bootstrap TLS still fails, the wrapper preserves `work/logs/epar-native-controller-build.log` and prints a certificate diagnostic without disabling verification or retrying insecurely.
 
-When the selected config enables `image.hostTrustMode: overlay`, the controller must inherit trust from the real Windows, macOS, or Linux host, not from the temporary Linux Go-toolchain container. The official wrappers handle this boundary automatically:
-
-1. A native host helper reads the configured host trust scopes.
-2. It rejects an empty collection and publishes a fresh, content-addressed snapshot in the host user's cache.
-3. A watcher refreshes the snapshot every 10 seconds.
-4. The wrapper bind-mounts only that feed read-only at `/run/epar-host-trust` and identifies the real controller host OS.
-5. The containerized controller validates certificate hashes, scopes, host OS, and the 30-second feed expiry before using it.
-
-On a first `start` with no config, the wrapper performs this as two phases: it runs interactive initialization with the real host OS identity, validates and publishes the selected host roots, then starts the controller again with the new feed mounted. A failed collection leaves the generated config disabled and does not start a controller with the toolchain container's trust store.
+On a first `start` with no config, the native controller performs interactive initialization with the real host identity. A failed host-root collection stops initialization rather than using roots from the toolchain container.
 
 On Windows the helper reads local-machine and current-user root stores and excludes Windows-disallowed certificates. On macOS it evaluates the system, administrator, and selected user's native trust settings for TLS server use, with explicit deny taking precedence. On Linux it reads the distribution-generated system CA bundle; set `EPAR_HOST_TRUST_BUNDLE` to a readable generated PEM bundle when the host uses an unsupported layout.
 
-The watcher and controller are tied to the wrapper lifecycle. If the host helper stops, its feed expires and EPAR stops authorizing stale idle runners. The feed is never mounted into the disposable runner containers.
+Do not replace the official wrapper with a bare `docker run`. The legacy controller-in-Docker mode has been removed so every provider follows the same project-local native-controller contract.
 
-Do not replace the official wrapper with a bare `docker run` when overlay mode is enabled. A containerized controller without `EPAR_CONTROLLER_HOST_OS`, a fresh `EPAR_HOST_TRUST_FEED`, and the corresponding read-only mount fails closed; it does not fall back to the toolchain container's CA store.
-
-You can run the Docker wrapper directly instead of through `./start`:
+For wrapper-development diagnostics, you can run the Docker helper directly. Normal manual and automatic operation should continue to use `./start`:
 
 ```bash
 scripts/run-with-docker.sh version
 scripts/run-with-docker.sh start --config .local/config.yml
 ```
 
-Set `EPAR_USE_DOCKER_RUN=1` to force `./start` down this path even when Go is installed, or `=0` to force local `go run` and error instead of falling back. A Docker volume caches Go modules and build output across runs, so repeat starts are fast.
+Set `EPAR_USE_DOCKER_RUN=1` to force `./start` to use the containerized compiler when a build is required even when Go is installed, or `=0` to require local Go and error instead of falling back. Docker volumes cache Go modules and build output. Unchanged source, build identity, and binary digest reuse the current slot without an online freshness check. A mismatch builds a candidate before rotating current to the single `<os>-<arch>-old` recovery slot. If either slot is active, stop that EPAR process before retrying.
 
-The Docker wrapper passes the real host name into the toolchain container as `EPAR_HOST_NAME` so first-run defaults and generated host labels describe the machine running EPAR, not the temporary Go container. Set `EPAR_HOST_NAME` before launching EPAR to override that identity.
+Use `./start --use-old ...` only for explicit recovery. It verifies the old receipt, platform, and executable digest, prints a warning, and runs the old sibling directly without swapping directories or silently falling back. `./start --use-old version` shows the retained build identity.
+
+Before containerized compilation, the wrapper requires 1 GiB free on the source-folder filesystem so bootstrap does not begin when the host is already critically constrained. `EPAR_BOOTSTRAP_MIN_FREE_BYTES` may raise this reserve for managed installations.
+
+The wrapper passes the real host name to the native controller as `EPAR_HOST_NAME` so first-run defaults and generated host labels describe the machine running EPAR. Set `EPAR_HOST_NAME` before launching EPAR to override that identity.
 
 The wrapper also defaults `DOCKER_CLI_HINTS=false` for its Docker calls. This suppresses Docker Desktop hint text that can otherwise appear after a normal Ctrl-C shutdown. Set `DOCKER_CLI_HINTS=true` before launching EPAR if you want Docker CLI hints during wrapper runs.
 
 ### Linux file ownership
 
-The container runs as root because the Go toolchain image requires it to write module and build-cache directories. On Docker Desktop for macOS, bind-mounted files remain owned by your normal user. On native Linux hosts, `scripts/run-with-docker.sh` returns ownership of `.local/` and `work/` to the invoking user after each run; do not rely on the same behavior for other repository directories.
+The compiler container mounts the source read-only and writes only the temporary native binary output plus named Go caches. The controller itself runs as the invoking host user, so its `.local/` and `work/` state is not created by a root controller process.
 
 ### Windows: WSL versus native PowerShell
 
-- From WSL2 or Git Bash, use `./start`. It behaves like the Linux case and needs Docker Desktop's WSL2 integration when run from WSL2.
-- From native PowerShell or cmd, use `./start.ps1` or `start.cmd`, which use `scripts/run-with-docker.ps1` instead of the Bash script.
-
-`start.ps1` and `scripts/run-with-docker.ps1` are less exercised than the Bash/macOS path. If you hit an issue, check whether Docker Desktop file sharing is enabled for the drive that holds the source folder.
+- From WSL2 or Git Bash, use `./start`. It behaves like the Linux case and needs Docker to be available and working in that environment when local Go is unavailable.
+- From native Windows PowerShell, also use `./start`; PowerShell selects the internal Windows implementation, which uses the PowerShell native-controller builder.
 
 ## macOS Login Item Startup
 

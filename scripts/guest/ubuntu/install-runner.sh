@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUNNER_VERSION="${1:-latest}"
+RUNNER_VERSION="${1:-}"
+RUNNER_PACKAGE="${2:-}"
+RUNNER_SHA256="${3:-}"
+if [[ -z "${RUNNER_VERSION}" || -z "${RUNNER_PACKAGE}" || ! -f "${RUNNER_PACKAGE}" || ! "${RUNNER_SHA256}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "Usage: install-runner.sh <exact-version> <verified-package-path> <sha256:digest>" >&2
+  exit 1
+fi
 ARCH="$(uname -m)"
 case "${ARCH}" in
   aarch64|arm64) RUNNER_ARCH="arm64" ;;
@@ -14,21 +20,23 @@ export NEEDRESTART_MODE=l
 export NEEDRESTART_SUSPEND=1
 bash /opt/epar/wait-apt-ready.sh
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl jq sudo tar
-
-if [[ "${RUNNER_VERSION}" == "latest" ]]; then
-  RUNNER_VERSION="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
-fi
+apt-get install -y --no-install-recommends ca-certificates sudo tar
 
 id -u runner >/dev/null 2>&1 || useradd --create-home --shell /bin/bash runner
 usermod -aG docker runner 2>/dev/null || true
 
 install -d -o runner -g runner /opt/actions-runner
 cd /opt/actions-runner
-RUNNER_TGZ="actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
-curl -fL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TGZ}" -o "/tmp/${RUNNER_TGZ}"
-tar xzf "/tmp/${RUNNER_TGZ}"
+echo "${RUNNER_SHA256#sha256:}  ${RUNNER_PACKAGE}" | sha256sum --check -
+tar xzf "${RUNNER_PACKAGE}"
+rm -f "${RUNNER_PACKAGE}"
 chown -R runner:runner /opt/actions-runner
+
+INSTALLED_RUNNER_VERSION="$(sudo -u runner -H ./bin/Runner.Listener --version | tr -d '\r' | tail -n 1)"
+if [[ "${INSTALLED_RUNNER_VERSION}" != "${RUNNER_VERSION}" ]]; then
+  echo "Actions runner package version ${INSTALLED_RUNNER_VERSION:-<empty>} does not match expected version ${RUNNER_VERSION}" >&2
+  exit 1
+fi
 
 ./bin/installdependencies.sh
 

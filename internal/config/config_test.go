@@ -102,6 +102,250 @@ image:
 	}
 }
 
+func TestImageUpdatePolicyDefaults(t *testing.T) {
+	cfg := Default()
+	if got, want := cfg.Image.Distribution, ImageDistributionLocalBuild; got != want {
+		t.Fatalf("Image.Distribution = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.UpdateFrequency, ImageUpdateFrequencyWeekly; got != want {
+		t.Fatalf("Image.UpdateFrequency = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.UpdateTime, DefaultImageUpdateTime; got != want {
+		t.Fatalf("Image.UpdateTime = %q, want %q", got, want)
+	}
+	if err := ValidateImageUpdatePolicy(cfg.Image); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadPrebuiltDockerSandboxesConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-sandboxes
+image:
+  distribution: prebuilt
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  prebuiltReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest
+  prebuiltDigest: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+security:
+  runnerGroup:
+    enforcement: enforce
+dockerSandboxes:
+  policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.Distribution, ImageDistributionPrebuilt; got != want {
+		t.Fatalf("image.distribution = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.PrebuiltReference, DockerSandboxesPrebuiltActReference; got != want {
+		t.Fatalf("image.prebuiltReference = %q, want %q", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrebuiltImageDistributionValidation(t *testing.T) {
+	base := Default()
+	base.Provider.Type = "docker-sandboxes"
+	base.Provider.Platform = "linux/amd64"
+	base.Provider.SourceImage = ""
+	base.Runner.Labels = []string{"self-hosted", "linux", "X64", "epar-docker-sandboxes"}
+	base.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
+	base.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+	base.Image.Distribution = ImageDistributionPrebuilt
+	base.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:act-latest"
+	base.Image.PrebuiltReference = DockerSandboxesPrebuiltActReference
+
+	if err := Validate(base); err != nil {
+		t.Fatalf("valid prebuilt configuration rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{name: "missing reference", edit: func(cfg *Config) { cfg.Image.PrebuiltReference = "" }, want: "prebuiltReference"},
+		{name: "invalid digest", edit: func(cfg *Config) { cfg.Image.PrebuiltDigest = "sha256:ABC" }, want: "lowercase"},
+		{name: "untrusted reference", edit: func(cfg *Config) {
+			cfg.Image.PrebuiltReference = "ghcr.io/example/ephemeral-action-runner/docker-sandboxes-act:preview"
+		}, want: "arbitrary GHCR packages"},
+		{name: "full profile", edit: func(cfg *Config) { cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest" }, want: "Act profile"},
+		{name: "pinned runner", edit: func(cfg *Config) { cfg.Image.RunnerVersion = "2.333.0" }, want: "not supported"},
+		{name: "wrong provider", edit: func(cfg *Config) { cfg.Provider.Type = "docker-container"; cfg.Provider.SourceImage = "epar-image" }, want: "supported only with provider.type=docker-sandboxes"},
+		{name: "local fields", edit: func(cfg *Config) { cfg.Image.Distribution = ImageDistributionLocalBuild }, want: "require image.distribution=prebuilt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPrebuiltCandidateAcceptanceValidation(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	base := Default()
+	base.Provider.Type = "docker-sandboxes"
+	base.Provider.Platform = "linux/amd64"
+	base.Image.Distribution = ImageDistributionPrebuilt
+	base.Image.SourceType = ImageSourceDockerImage
+	base.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:act-latest"
+	base.Image.SourcePlatform = "linux/amd64"
+	base.Image.PrebuiltReference = DockerSandboxesPrebuiltActReference
+	base.Image.PrebuiltDigest = digest
+	base.Image.PrebuiltAcceptance = true
+	base.Image.PrebuiltCatalogReference = "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-" + strings.Repeat("b", 64)
+	base.Image.PrebuiltEvidenceRef = "refs/heads/feature/prebuilt_img"
+	base.Image.UpdateFrequency = ImageUpdateFrequencyManual
+	base.Image.HostTrustMode = HostTrustModeOverlay
+	base.Image.HostTrustScopes = []string{"system"}
+	base.Pool.Instances = 1
+	base.Pool.NamePrefix = "epar-prebuilt-act-" + strings.Repeat("a", 12) + "-amd64"
+	base.Runner.Ephemeral = true
+	base.Runner.Group = "epar-dev-test"
+	base.Runner.Labels = []string{"epar-prebuilt-act-" + strings.Repeat("a", 12) + "-amd64"}
+	base.Runner.IncludeHostLabel = false
+	base.Runner.NoDefaultLabels = true
+	base.Security.RunnerGroup = RunnerGroupSecurityConfig{Enforcement: RunnerGroupEnforcementEnforce, RequireExplicitGroup: true, RequireNonDefaultGroup: true, RequiredRepositoryAccess: RunnerGroupRepositoryAccessSelected, RequirePublicRepositoriesDisabled: true}
+	base.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("c", 64)
+
+	if err := Validate(base); err != nil {
+		t.Fatalf("valid candidate acceptance configuration rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{name: "digest required", edit: func(cfg *Config) { cfg.Image.PrebuiltDigest = "" }, want: "prebuiltDigest is required"},
+		{name: "immutable catalog required", edit: func(cfg *Config) { cfg.Image.PrebuiltCatalogReference = DockerSandboxesPrebuiltActReference }, want: "immutable official catalog"},
+		{name: "evidence ref required", edit: func(cfg *Config) { cfg.Image.PrebuiltEvidenceRef = "main" }, want: "refs/heads"},
+		{name: "manual updates required", edit: func(cfg *Config) { cfg.Image.UpdateFrequency = ImageUpdateFrequencyWeekly }, want: "updateFrequency must be manual"},
+		{name: "one runner required", edit: func(cfg *Config) { cfg.Pool.Instances = 2 }, want: "pool.instances must be 1"},
+		{name: "test group required", edit: func(cfg *Config) { cfg.Runner.Group = "Default" }, want: "runner.group must be epar-dev-test"},
+		{name: "digest label required", edit: func(cfg *Config) { cfg.Runner.Labels = []string{"self-hosted"} }, want: "candidate acceptance requires only runner.labels"},
+		{name: "default labels rejected", edit: func(cfg *Config) { cfg.Runner.NoDefaultLabels = false }, want: "noDefaultLabels"},
+		{name: "host label rejected", edit: func(cfg *Config) { cfg.Runner.IncludeHostLabel = true }, want: "includeHostLabel"},
+		{name: "pool prefix required", edit: func(cfg *Config) { cfg.Pool.NamePrefix = "epar-prebuilt-amd64" }, want: "pool.namePrefix"},
+		{name: "derivative rejected", edit: func(cfg *Config) { cfg.Image.CustomInstallScripts = []string{"install.sh"} }, want: "without a local derivative"},
+		{name: "trust mode required", edit: func(cfg *Config) { cfg.Image.HostTrustMode = HostTrustModeDisabled }, want: "hostTrustMode must be overlay"},
+		{name: "selected private group policy required", edit: func(cfg *Config) { cfg.Security.RunnerGroup.RequiredRepositoryAccess = RunnerGroupRepositoryAccessAll }, want: "selected-repository"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadPrebuiltCandidateAcceptanceFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate.yml")
+	content := `image:
+  prebuiltAcceptance: true
+  prebuiltCatalogReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  prebuiltEvidenceRef: refs/heads/feature/prebuilt_img
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Image.PrebuiltAcceptance || cfg.Image.PrebuiltCatalogReference != "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-"+strings.Repeat("b", 64) || cfg.Image.PrebuiltEvidenceRef != "refs/heads/feature/prebuilt_img" {
+		t.Fatalf("candidate acceptance fields = %+v", cfg.Image)
+	}
+}
+
+func TestLoadImageUpdatePolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "image:\n  updateFrequency: biweekly\n  updateTime: \"06:30\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.UpdateFrequency, ImageUpdateFrequencyBiweekly; got != want {
+		t.Fatalf("Image.UpdateFrequency = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.UpdateTime, "06:30"; got != want {
+		t.Fatalf("Image.UpdateTime = %q, want %q", got, want)
+	}
+	if slices.ContainsFunc(cfg.Warnings(), func(warning string) bool {
+		return strings.Contains(warning, "image update policy is not configured")
+	}) {
+		t.Fatalf("Warnings() = %#v, want no image-policy default notice", cfg.Warnings())
+	}
+}
+
+func TestLoadOmittedImageUpdatePolicyAddsNotice(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("image:\n  runnerVersion: latest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(cfg.Warnings(), func(warning string) bool {
+		return strings.Contains(warning, "using weekly checks at 07:00 local time")
+	}) {
+		t.Fatalf("Warnings() = %#v, want image-policy default notice", cfg.Warnings())
+	}
+}
+
+func TestValidateImageUpdatePolicy(t *testing.T) {
+	for _, frequency := range []string{
+		ImageUpdateFrequencyDaily,
+		ImageUpdateFrequencyWeekly,
+		ImageUpdateFrequencyBiweekly,
+		ImageUpdateFrequencyMonthly,
+		ImageUpdateFrequencyManual,
+	} {
+		image := Default().Image
+		image.UpdateFrequency = frequency
+		if err := ValidateImageUpdatePolicy(image); err != nil {
+			t.Fatalf("ValidateImageUpdatePolicy(%q): %v", frequency, err)
+		}
+	}
+	image := Default().Image
+	image.UpdateFrequency = "hourly"
+	if err := ValidateImageUpdatePolicy(image); err == nil || !strings.Contains(err.Error(), "unsupported image.updateFrequency") {
+		t.Fatalf("invalid frequency error = %v", err)
+	}
+	image = Default().Image
+	image.UpdateTime = "7am"
+	if err := ValidateImageUpdatePolicy(image); err == nil || !strings.Contains(err.Error(), "24-hour HH:MM") {
+		t.Fatalf("invalid time error = %v", err)
+	}
+	image.UpdateFrequency = ImageUpdateFrequencyManual
+	if err := ValidateImageUpdatePolicy(image); err != nil {
+		t.Fatalf("manual mode should ignore image.updateTime: %v", err)
+	}
+}
+
 func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	cfg := Default()
 	if cfg.Runner.Group != "" {
@@ -112,9 +356,155 @@ func TestRunnerRegistrationControlsDefaultToDisabled(t *testing.T) {
 	}
 }
 
+func TestStorageDefaultsAreBoundedAndConservative(t *testing.T) {
+	storage := Default().Storage
+	if storage.MinimumFree != "1GiB" ||
+		storage.GracePeriod != "168h" ||
+		storage.KeepPrevious != 0 ||
+		storage.AutomaticHousekeeping != StorageHousekeepingConservative ||
+		storage.BuildCacheLimit != "20GiB" ||
+		storage.GoCacheLimit != "10GiB" {
+		t.Fatalf("unexpected storage defaults: %+v", storage)
+	}
+	if err := ValidateStorage(storage); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadStoragePolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := "storage:\n  minimumFree: 30GiB\n  gracePeriod: 72h\n  keepPrevious: 1\n  automaticHousekeeping: disabled\n  buildCacheLimit: 80GiB\n  goCacheLimit: 12GiB\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Storage.MinimumFree, "30GiB"; got != want {
+		t.Fatalf("storage.minimumFree = %q, want %q", got, want)
+	}
+	if got, want := cfg.Storage.GracePeriod, "72h"; got != want {
+		t.Fatalf("storage.gracePeriod = %q, want %q", got, want)
+	}
+	if cfg.Storage.KeepPrevious != 1 || cfg.Storage.AutomaticHousekeeping != StorageHousekeepingDisabled {
+		t.Fatalf("unexpected loaded storage policy: %+v", cfg.Storage)
+	}
+	if err := ValidateStorage(cfg.Storage); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateStorageRejectsUnboundedOrUnknownPolicy(t *testing.T) {
+	tests := []func(*StorageConfig){
+		func(storage *StorageConfig) { storage.MinimumFree = "0GiB" },
+		func(storage *StorageConfig) { storage.GracePeriod = "0h" },
+		func(storage *StorageConfig) { storage.KeepPrevious = -1 },
+		func(storage *StorageConfig) { storage.AutomaticHousekeeping = "aggressive" },
+		func(storage *StorageConfig) { storage.BuildCacheLimit = "64GB" },
+		func(storage *StorageConfig) { storage.GoCacheLimit = "" },
+	}
+	for _, mutate := range tests {
+		storage := Default().Storage
+		mutate(&storage)
+		if err := ValidateStorage(storage); err == nil {
+			t.Fatalf("ValidateStorage accepted invalid policy: %+v", storage)
+		}
+	}
+}
+
+func TestRunnerGroupSecurityDefaultsToStrictWarnings(t *testing.T) {
+	policy := Default().Security.RunnerGroup
+	if policy.Enforcement != RunnerGroupEnforcementWarn ||
+		!policy.RequireExplicitGroup ||
+		!policy.RequireNonDefaultGroup ||
+		policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessSelected ||
+		!policy.RequirePublicRepositoriesDisabled {
+		t.Fatalf("unexpected runner-group security defaults: %+v", policy)
+	}
+}
+
+func TestLoadNestedRunnerGroupSecurity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: false
+    requireNonDefaultGroup: false
+    requiredRepositoryAccess: all
+    requirePublicRepositoriesDisabled: false
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := cfg.Security.RunnerGroup
+	if policy.Enforcement != RunnerGroupEnforcementEnforce || policy.RequireExplicitGroup || policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessAll || policy.RequirePublicRepositoriesDisabled {
+		t.Fatalf("unexpected parsed runner-group policy: %+v", policy)
+	}
+	for _, warning := range cfg.Warnings() {
+		if strings.Contains(warning, "runner-group security policy is not configured") {
+			t.Fatalf("unexpected migration warning for configured policy: %q", warning)
+		}
+	}
+}
+
+func TestLoadLegacyConfigWarnsAboutRunnerGroupSecurity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  group: existing-group\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(cfg.Warnings(), func(warning string) bool {
+		return strings.Contains(warning, "runner-group security policy is not configured") && strings.Contains(warning, "warn mode")
+	}) {
+		t.Fatalf("Warnings() = %#v, want runner-group migration warning", cfg.Warnings())
+	}
+}
+
+func TestLoadRejectsInvalidRunnerGroupSecurityNesting(t *testing.T) {
+	for _, content := range []string{
+		"security:\n  unknown:\n    enforcement: enforce\n",
+		"security:\n  enforcement: enforce\n",
+		"security:\n  runnerGroup:\n  enforcement: enforce\n",
+		"security:\n  runnerGroup:\n    unknown: true\n",
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yml")
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("Load(%q) succeeded, want nesting/key error", content)
+		}
+	}
+}
+
+func TestValidateRunnerGroupSecurityRejectsInvalidValues(t *testing.T) {
+	for _, mutate := range []func(*RunnerGroupSecurityConfig){
+		func(policy *RunnerGroupSecurityConfig) { policy.Enforcement = "off" },
+		func(policy *RunnerGroupSecurityConfig) { policy.RequiredRepositoryAccess = "repositories" },
+	} {
+		cfg := Default()
+		mutate(&cfg.Security.RunnerGroup)
+		if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "security.runnerGroup") {
+			t.Fatalf("Validate() error = %v, want runner-group policy error", err)
+		}
+	}
+}
+
 func TestLoggingDefaults(t *testing.T) {
 	got := Default().Logging
-	if got.Directory != "work/logs" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
+	if got.Directory != "work/logs" || got.Level != "info" || !slices.Equal(got.ManagerSinks, []string{"console"}) || got.ManagerConsoleFormat != "text" || got.ManagerFileFormat != "json" || !slices.Equal(got.TranscriptSinks, []string{"file"}) || got.TranscriptConsoleFormat != "text" {
 		t.Fatalf("unexpected logging destination defaults: %+v", got)
 	}
 	if got.MaxFileSizeMiB != 100 || got.MaxBackups != 3 || !got.CompressBackups || !got.RetentionEnabled || got.RetentionMaxTotalMiB != 1024 {
@@ -126,29 +516,44 @@ func TestLoggingDefaults(t *testing.T) {
 }
 
 func TestCheckedInExampleConfigurationsValidate(t *testing.T) {
-	patterns := []string{
-		filepath.Join("..", "..", "configs", "*.yml"),
-		filepath.Join("..", "..", "examples", "observability", "*.yml"),
+	paths, err := filepath.Glob(filepath.Join("..", "..", "configs", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, pattern := range patterns {
-		paths, err := filepath.Glob(pattern)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(paths) == 0 {
-			t.Fatalf("no examples matched %s", pattern)
-		}
-		for _, path := range paths {
-			t.Run(filepath.Base(path), func(t *testing.T) {
-				cfg, err := Load(path)
-				if err != nil {
-					t.Fatalf("Load(%s): %v", path, err)
-				}
-				if err := Validate(cfg); err != nil {
-					t.Fatalf("Validate(%s): %v", path, err)
-				}
-			})
-		}
+	if len(paths) == 0 {
+		t.Fatal("no configuration examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%s): %v", path, err)
+			}
+			if err := Validate(cfg); err != nil {
+				t.Fatalf("Validate(%s): %v", path, err)
+			}
+		})
+	}
+}
+
+func TestObservabilityExamplesRequireAnExplicitProviderType(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", "examples", "observability", "*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no observability examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%s): %v", path, err)
+			}
+			if err := Validate(cfg); err == nil || err.Error() != "provider.type is required" {
+				t.Fatalf("Validate(%s) error = %v, want provider.type is required", path, err)
+			}
+		})
 	}
 }
 
@@ -158,6 +563,7 @@ func TestLoadLoggingConfiguration(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 logging:
   directory: custom/logs
+  level: DEBUG
   managerSinks:
     - console
     - file
@@ -176,6 +582,8 @@ logging:
   errorMaxAgeDays: 10
   benchmarkMaxAgeDays: 11
   retentionIntervalMinutes: 12
+provider:
+  type: tart
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +592,7 @@ logging:
 		t.Fatal(err)
 	}
 	got := cfg.Logging
-	if got.Directory != "custom/logs" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
+	if got.Directory != "custom/logs" || got.Level != "debug" || !slices.Equal(got.ManagerSinks, []string{"console", "file"}) || !slices.Equal(got.TranscriptSinks, []string{"file", "console"}) || got.ManagerConsoleFormat != "json" || got.ManagerFileFormat != "text" || got.TranscriptConsoleFormat != "json" || got.MaxFileSizeMiB != 64 || got.MaxBackups != 5 || got.CompressBackups || got.RetentionEnabled || got.RetentionMaxTotalMiB != 2048 || got.ManagerMaxAgeDays != 7 || got.InstanceMaxAgeDays != 8 || got.BuildMaxAgeDays != 9 || got.ErrorMaxAgeDays != 10 || got.BenchmarkMaxAgeDays != 11 || got.RetentionIntervalMinutes != 12 {
 		t.Fatalf("unexpected logging config: %+v", got)
 	}
 	if err := Validate(cfg); err != nil {
@@ -195,7 +603,7 @@ logging:
 func TestLoadCustomConsoleTextFormats(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\n"
+	content := "logging:\n  managerConsoleFormat: text\n  managerConsoleTextFormat: '[{level}] {message}{attributes}'\n  transcriptConsoleFormat: text\n  transcriptConsoleTextFormat: '{stream} {instance}: {message}'\nprovider:\n  type: tart\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +625,7 @@ func TestLoadCustomConsoleTextFormats(t *testing.T) {
 func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
-	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\n"), 0644); err != nil {
+	if err := os.WriteFile(path, []byte("pool:\n  logDir: custom/logs\nprovider:\n  type: tart\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
@@ -228,7 +636,9 @@ func TestLoadMigratesPoolLogDirInMemoryWithWarning(t *testing.T) {
 		t.Fatalf("logging.directory = %q, want legacy value %q", got, want)
 	}
 	warnings := cfg.Warnings()
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "pool.logDir is deprecated") || !strings.Contains(warnings[0], "logging.directory") {
+	if !slices.ContainsFunc(warnings, func(warning string) bool {
+		return strings.Contains(warning, "pool.logDir is deprecated") && strings.Contains(warning, "logging.directory")
+	}) {
 		t.Fatalf("Warnings() = %#v, want migration warning", warnings)
 	}
 	if err := Validate(cfg); err != nil {
@@ -254,8 +664,10 @@ func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
 		"github:\n  unknown: value\n",
 		"image:\n  unknown: value\n",
 		"pool:\n  unknown: value\n",
+		"storage:\n  unknown: value\n",
 		"logging:\n  unknown: value\n",
 		"runner:\n  unknown: value\n",
+		"security:\n  runnerGroup:\n    unknown: value\n",
 		"provider:\n  unknown: value\n",
 		"docker:\n  unknown: value\n",
 		"timeouts:\n  unknown: 1\n",
@@ -274,6 +686,7 @@ func TestLoadRejectsUnknownSectionsAndKeys(t *testing.T) {
 func TestValidateLoggingRejectsInvalidValues(t *testing.T) {
 	for _, mutate := range []func(*LoggingConfig){
 		func(logging *LoggingConfig) { logging.Directory = " " },
+		func(logging *LoggingConfig) { logging.Level = "trace" },
 		func(logging *LoggingConfig) { logging.ManagerSinks = nil },
 		func(logging *LoggingConfig) { logging.TranscriptSinks = []string{"syslog"} },
 		func(logging *LoggingConfig) { logging.ManagerSinks = []string{"Console"} },
@@ -309,7 +722,7 @@ func TestTrustedCACertificatePathsDefaultToEmpty(t *testing.T) {
 }
 
 func TestValidateRejectsEmptyTrustedCACertificatePath(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Image.TrustedCACertificatePaths = []string{" "}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "image.trustedCaCertificatePaths") {
 		t.Fatalf("Validate() error = %v, want trusted CA path error", err)
@@ -334,7 +747,7 @@ image:
   hostTrustMode: overlay
   hostTrustScopes: [system, user]
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -361,12 +774,11 @@ func TestValidateRejectsInvalidHostTrustConfigurations(t *testing.T) {
 		provider  string
 		ephemeral bool
 	}{
-		{name: "unknown mode", mode: "mirror", scopes: []string{HostTrustScopeSystem}, provider: "docker-dind", ephemeral: true},
-		{name: "wrong provider", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "wsl", ephemeral: true},
-		{name: "non-ephemeral", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "docker-dind"},
-		{name: "empty scopes", mode: HostTrustModeOverlay, provider: "docker-dind", ephemeral: true},
-		{name: "unknown scope", mode: HostTrustModeOverlay, scopes: []string{"global"}, provider: "docker-dind", ephemeral: true},
-		{name: "duplicate scope", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem, HostTrustScopeSystem}, provider: "docker-dind", ephemeral: true},
+		{name: "unknown mode", mode: "mirror", scopes: []string{HostTrustScopeSystem}, provider: "docker-container", ephemeral: true},
+		{name: "non-ephemeral", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem}, provider: "docker-container"},
+		{name: "empty scopes", mode: HostTrustModeOverlay, provider: "docker-container", ephemeral: true},
+		{name: "unknown scope", mode: HostTrustModeOverlay, scopes: []string{"global"}, provider: "docker-container", ephemeral: true},
+		{name: "duplicate scope", mode: HostTrustModeOverlay, scopes: []string{HostTrustScopeSystem, HostTrustScopeSystem}, provider: "docker-container", ephemeral: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := Default()
@@ -382,6 +794,26 @@ func TestValidateRejectsInvalidHostTrustConfigurations(t *testing.T) {
 	}
 }
 
+func TestValidateHostTrustAllowsDockerSandboxesOverlay(t *testing.T) {
+	cfg := validDockerSandboxesConfig()
+	cfg.Image.HostTrustMode = HostTrustModeOverlay
+	cfg.Image.HostTrustScopes = []string{HostTrustScopeSystem}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Docker Sandboxes host trust overlay rejected: %v", err)
+	}
+}
+
+func TestValidateHostTrustAllowsWSLOverlay(t *testing.T) {
+	cfg := defaultWSLConfig()
+	cfg.Provider.SourceImage = "runner-image.tar"
+	cfg.Runner.Ephemeral = true
+	cfg.Image.HostTrustMode = HostTrustModeOverlay
+	cfg.Image.HostTrustScopes = []string{HostTrustScopeSystem}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("WSL host trust overlay rejected: %v", err)
+	}
+}
+
 func TestRunnerHostLabelDefaultsToEnabled(t *testing.T) {
 	oldHostname := osHostname
 	osHostname = func() (string, error) { return "Build Box_01.example", nil }
@@ -392,7 +824,7 @@ func TestRunnerHostLabelDefaultsToEnabled(t *testing.T) {
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +847,7 @@ func TestRunnerHostLabelPrefersHostNameEnv(t *testing.T) {
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +872,7 @@ func TestRunnerHostLabelCanBeDisabled(t *testing.T) {
 runner:
   includeHostLabel: false
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +899,7 @@ func TestRunnerHostLabelDoesNotDuplicateExistingLabel(t *testing.T) {
 runner:
   labels: [self-hosted, linux, epar-host-build-box]
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -517,18 +949,18 @@ func TestSanitizeNamePart(t *testing.T) {
 	}
 }
 
-func TestLoadDockerDindPlatform(t *testing.T) {
+func TestLoadDockerContainerPlatform(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 pool:
   instances: 1
-  namePrefix: epar-dind
+  namePrefix: epar-docker-container
 runner:
-  labels: [self-hosted, linux, ARM64, epar-docker-dind]
+  labels: [self-hosted, linux, ARM64, epar-docker-container]
 provider:
-  type: docker-dind
-  sourceImage: epar-docker-dind-ubuntu-24
+  type: docker-container
+  sourceImage: epar-docker-container-ubuntu-24
   platform: linux/arm64
 docker:
   registryMirrors:
@@ -562,10 +994,10 @@ docker:
 		t.Fatal(err)
 	}
 	if !DockerRegistryMirrorsNeedHostGateway(cfg.Docker.RegistryMirrors) {
-		t.Fatal("host.docker.internal mirror should request docker-dind host gateway")
+		t.Fatal("host.docker.internal mirror should request docker-container host gateway")
 	}
 	if !DockerConfigNeedsHostGateway(cfg.Docker) {
-		t.Fatal("host.docker.internal Docker config should request docker-dind host gateway")
+		t.Fatal("host.docker.internal Docker config should request docker-container host gateway")
 	}
 }
 
@@ -592,6 +1024,63 @@ runner:
 	}
 	if got := len(cfg.Image.CustomInstallScripts); got != 0 {
 		t.Fatalf("custom install scripts = %d, want 0", got)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProviderTypeIsRequiredAndDoesNotApplyProviderDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  includeHostLabel: false\npool:\n  instances: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider, (ProviderConfig{}); got != want {
+		t.Fatalf("provider defaults = %+v, want %+v", got, want)
+	}
+	if got, want := cfg.Image.SourceImage, ""; got != want {
+		t.Fatalf("image.sourceImage = %q, want empty without provider.type", got)
+	}
+	if got, want := cfg.Image.OutputImage, ""; got != want {
+		t.Fatalf("image.outputImage = %q, want empty without provider.type", got)
+	}
+	if got := cfg.Runner.Labels; len(got) != 0 {
+		t.Fatalf("runner.labels = %#v, want no provider-specific defaults", got)
+	}
+	if err := Validate(cfg); err == nil || err.Error() != "provider.type is required" {
+		t.Fatalf("Validate() error = %v, want provider.type is required", err)
+	}
+}
+
+func TestProviderDefaultsForMinimalTartConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(path, []byte("runner:\n  includeHostLabel: false\nprovider:\n  type: tart\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Image.SourceImage, "ghcr.io/cirruslabs/ubuntu:latest"; got != want {
+		t.Fatalf("image.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Image.OutputImage, "epar-ubuntu-24-arm64"; got != want {
+		t.Fatalf("image.outputImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
+		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.Network, "default"; got != want {
+		t.Fatalf("provider.network = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels, []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}; !slices.Equal(got, want) {
+		t.Fatalf("runner.labels = %#v, want %#v", got, want)
 	}
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
@@ -625,6 +1114,9 @@ provider:
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
 		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
+	}
+	if got, want := cfg.Provider.InstallRoot, "work/wsl"; got != want {
+		t.Fatalf("provider.installRoot = %q, want %q", got, want)
 	}
 	if got, want := cfg.Pool.NamePrefix, "epar-wsl"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
@@ -702,12 +1194,12 @@ provider:
 	}
 }
 
-func TestProviderDefaultsForMinimalDockerDindConfig(t *testing.T) {
+func TestProviderDefaultsForMinimalDockerContainerConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(`
 provider:
-  type: docker-dind
+  type: docker-container
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -721,16 +1213,16 @@ provider:
 	if got, want := cfg.Image.SourceImage, "ghcr.io/catthehacker/ubuntu:full-latest"; got != want {
 		t.Fatalf("image.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Image.OutputImage, "epar-docker-dind-catthehacker-ubuntu"; got != want {
+	if got, want := cfg.Image.OutputImage, "epar-docker-container-catthehacker-ubuntu"; got != want {
 		t.Fatalf("image.outputImage = %q, want %q", got, want)
 	}
 	if got, want := cfg.Provider.SourceImage, cfg.Image.OutputImage; got != want {
 		t.Fatalf("provider.sourceImage = %q, want %q", got, want)
 	}
-	if got, want := cfg.Pool.NamePrefix, "epar-dind"; got != want {
+	if got, want := cfg.Pool.NamePrefix, "epar-docker-container"; got != want {
 		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
 	}
-	if got, want := cfg.Runner.Labels[2], "epar-docker-dind-catthehacker-ubuntu"; got != want {
+	if got, want := cfg.Runner.Labels[2], "epar-docker-container-catthehacker-ubuntu"; got != want {
 		t.Fatalf("runner label = %q, want %q", got, want)
 	}
 	if err := Validate(cfg); err != nil {
@@ -765,22 +1257,21 @@ func TestExampleConfigsLoadAndValidate(t *testing.T) {
 }
 
 func TestValidateRosettaTag(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid rosetta tag rejected: %v", err)
 	}
 
 	for _, tag := range []string{"bad tag", "bad/tag", "../rosetta", "-bad"} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Provider.RosettaTag = tag
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("provider.rosettaTag %q accepted", tag)
 		}
 	}
 
-	cfg = Default()
-	cfg.Provider.Type = "wsl"
+	cfg = defaultWSLConfig()
 	cfg.Provider.SourceImage = "image.tar"
 	cfg.Provider.RosettaTag = "rosetta"
 	if err := Validate(cfg); err == nil {
@@ -789,8 +1280,7 @@ func TestValidateRosettaTag(t *testing.T) {
 }
 
 func TestValidateDockerPlatform(t *testing.T) {
-	cfg := Default()
-	cfg.Provider.Type = "docker-dind"
+	cfg := defaultDockerContainerConfig()
 	cfg.Provider.SourceImage = "runner-image"
 	cfg.Provider.Platform = "linux/amd64"
 	if err := Validate(cfg); err != nil {
@@ -798,8 +1288,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 	}
 
 	for _, platform := range []string{"bad platform", "-linux/amd64", "linux/$bad"} {
-		cfg := Default()
-		cfg.Provider.Type = "docker-dind"
+		cfg := defaultDockerContainerConfig()
 		cfg.Provider.SourceImage = "runner-image"
 		cfg.Provider.Platform = platform
 		if err := Validate(cfg); err == nil {
@@ -807,8 +1296,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 		}
 	}
 
-	cfg = Default()
-	cfg.Provider.Type = "tart"
+	cfg = defaultTartConfig()
 	cfg.Provider.Platform = "linux/arm64"
 	if err := Validate(cfg); err == nil {
 		t.Fatal("provider.platform accepted for Tart")
@@ -816,7 +1304,7 @@ func TestValidateDockerPlatform(t *testing.T) {
 }
 
 func TestValidateDockerRegistryMirror(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Docker.RegistryMirrors = []string{"https://mirror.example.test", "http://host.docker.internal:5000/"}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid registry mirrors rejected: %v", err)
@@ -831,7 +1319,7 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 		"https://mirror example.test",
 		" https://mirror.example.test",
 	} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.RegistryMirrors = []string{mirror}
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.registryMirrors %q accepted", mirror)
@@ -840,7 +1328,7 @@ func TestValidateDockerRegistryMirror(t *testing.T) {
 }
 
 func TestValidateDockerDaemonProxy(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Docker.HTTPProxy = "http://proxy.example.test:3128"
 	cfg.Docker.HTTPSProxy = "https://proxy.example.test:8443"
 	cfg.Docker.NoProxy = "localhost,127.0.0.1,.example.test,10.0.0.0/8,*"
@@ -856,7 +1344,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 		"http://proxy.example.test?x=1",
 		" http://proxy.example.test",
 	} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.HTTPProxy = proxyURL
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.httpProxy %q accepted", proxyURL)
@@ -864,7 +1352,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 	}
 
 	for _, noProxy := range []string{"localhost,,example.test", " localhost", "http://example.test", "user@example.test", "10.0.0.0/not-a-prefix"} {
-		cfg := Default()
+		cfg := defaultTartConfig()
 		cfg.Docker.NoProxy = noProxy
 		if err := Validate(cfg); err == nil {
 			t.Fatalf("docker.noProxy %q accepted", noProxy)
@@ -874,7 +1362,7 @@ func TestValidateDockerDaemonProxy(t *testing.T) {
 
 func TestDockerConfigNeedsHostGatewayForProxy(t *testing.T) {
 	if !DockerConfigNeedsHostGateway(DockerConfig{HTTPSProxy: "http://host.docker.internal:3128"}) {
-		t.Fatal("host.docker.internal proxy should request docker-dind host gateway")
+		t.Fatal("host.docker.internal proxy should request docker-container host gateway")
 	}
 	if DockerConfigNeedsHostGateway(DockerConfig{HTTPSProxy: "http://http.docker.internal:3128"}) {
 		t.Fatal("http.docker.internal proxy should not request host.docker.internal mapping")
@@ -889,13 +1377,13 @@ func TestValidateRejectsDockerSocketProvider(t *testing.T) {
 	if err == nil {
 		t.Fatal("docker-socket provider accepted")
 	}
-	if got := err.Error(); got != "provider.type docker-socket is intentionally unsupported; use provider.type=docker-dind for a private Docker daemon" {
+	if got := err.Error(); got != "provider.type docker-socket is intentionally unsupported; use provider.type=docker-container for a private Docker daemon" {
 		t.Fatalf("error = %q", got)
 	}
 }
 
 func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	if err := Validate(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -905,7 +1393,7 @@ func TestValidateDoesNotRequireGitHubForImageCommands(t *testing.T) {
 }
 
 func TestValidateRejectsInvalidPoolInstances(t *testing.T) {
-	cfg := Default()
+	cfg := defaultTartConfig()
 	cfg.Pool.Instances = 0
 	if err := Validate(cfg); err == nil {
 		t.Fatal("pool.instances=0 accepted")
@@ -921,6 +1409,8 @@ pool:
   replacementRetryMaxSeconds: 720
   replacementRetryMultiplier: 1.5
   replacementRetryJitterPercent: 0
+provider:
+  type: tart
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -977,7 +1467,7 @@ func TestValidateRejectsInvalidPoolReplacementRetryConfiguration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cfg := Default()
+			cfg := defaultTartConfig()
 			test.mutate(&cfg)
 			if err := Validate(cfg); err == nil {
 				t.Fatal("Validate accepted invalid replacement retry configuration")
@@ -1046,4 +1536,367 @@ image:
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load accepted image.profile")
 	}
+}
+
+func TestDockerSandboxesRejectsNamePrefixOutsideProviderGrammar(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Provider.Platform = "linux/amd64"
+	cfg.Provider.SourceImage = ""
+	cfg.Pool.NamePrefix = "EPAR_sandbox"
+	cfg.Runner.Ephemeral = true
+	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
+	cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("b", 64)
+	cfg.DockerSandboxes.RootDisk = "120GiB"
+	cfg.DockerSandboxes.DockerDisk = "50GiB"
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "lowercase") {
+		t.Fatalf("Validate() error = %v, want Docker Sandboxes prefix grammar rejection", err)
+	}
+}
+
+func TestLoadDockerSandboxesConfig(t *testing.T) {
+	t.Setenv(HostNameEnv, "sandbox-preview-host")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-sandboxes.yml")
+	if err := os.WriteFile(path, []byte(`
+provider:
+  type: docker-sandboxes
+image:
+  sourceType: docker-image
+  sourceImage: ghcr.io/catthehacker/ubuntu:full-latest
+  sourcePlatform: linux/amd64
+runner:
+  ephemeral: true
+security:
+  runnerGroup:
+    enforcement: enforce
+dockerSandboxes:
+  policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+  networkBaseline: balanced
+  additionalAllow: [api.github.com, '*.githubusercontent.com:443']
+  additionalDeny:
+    - telemetry.example.invalid
+  stagingRoot: .local/docker-sandboxes
+  cpus: 2
+  memory: 4GiB
+  rootDisk: auto
+  dockerDisk: 50GiB
+  maxConcurrentCreates: 1
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Provider.SourceImage, ""; got != want {
+		t.Fatalf("provider.sourceImage = %q, want empty for docker-sandboxes", got)
+	}
+	if got, want := cfg.Provider.Platform, "linux/amd64"; got != want {
+		t.Fatalf("provider.platform = %q, want %q", got, want)
+	}
+	if got, want := cfg.Pool.NamePrefix, "epar-docker-sandboxes"; got != want {
+		t.Fatalf("pool.namePrefix = %q, want %q", got, want)
+	}
+	if got, want := cfg.Runner.Labels, []string{"self-hosted", "linux", "X64", "epar-docker-sandboxes", "epar-host-sandbox-preview-host"}; !slices.Equal(got, want) {
+		t.Fatalf("runner.labels = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
+		t.Fatalf("dockerSandboxes.memory = %q, want %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, DockerSandboxesArchitectureEmulationBestEffort; got != want {
+		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want omitted configuration to default to %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.AdditionalAllow, []string{"api.github.com", "*.githubusercontent.com:443"}; !slices.Equal(got, want) {
+		t.Fatalf("dockerSandboxes.additionalAllow = %#v, want %#v", got, want)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadDockerSandboxesRejectsRemovedHostReserve(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-sandboxes.yml")
+	if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  minHostFreeSpace: 50GiB\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "remove it and configure the provider-neutral storage.minimumFree value instead") {
+		t.Fatalf("Load() error = %v, want exact regeneration guidance", err)
+	}
+}
+
+func TestLoadDockerSandboxesArchitectureEmulation(t *testing.T) {
+	for _, value := range []string{DockerSandboxesArchitectureEmulationBestEffort, DockerSandboxesArchitectureEmulationRequired, DockerSandboxesArchitectureEmulationNativeOnly} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "docker-sandboxes.yml")
+			if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\ndockerSandboxes:\n  architectureEmulation: "+value+"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.DockerSandboxes.ArchitectureEmulation; got != value {
+				t.Fatalf("dockerSandboxes.architectureEmulation = %q, want %q", got, value)
+			}
+			cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+			if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err != nil {
+				t.Fatalf("ValidateDockerSandboxes() rejected %q: %v", value, err)
+			}
+		})
+	}
+}
+
+func TestValidateDockerSandboxesRejectsInvalidArchitectureEmulation(t *testing.T) {
+	for _, value := range []string{"", "disabled", "Required", "native"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := Default()
+			cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+			cfg.DockerSandboxes.ArchitectureEmulation = value
+			if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err == nil || !strings.Contains(err.Error(), "supported values are best-effort, required, and native-only") {
+				t.Fatalf("ValidateDockerSandboxes() error = %v, want unsupported architecture-emulation rejection", err)
+			}
+		})
+	}
+}
+
+func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name:   "source image is unsupported",
+			mutate: func(cfg *Config) { cfg.Provider.SourceImage = "runner-image" },
+		},
+		{
+			name: "specialized source image lacks the private daemon contract",
+			mutate: func(cfg *Config) {
+				cfg.Image.SourceType = ImageSourceDockerImage
+				cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:js-latest"
+			},
+		},
+		{
+			name:   "platform is not a supported sandbox guest",
+			mutate: func(cfg *Config) { cfg.Provider.Platform = "linux/s390x" },
+		},
+		{
+			name:   "runner is persistent",
+			mutate: func(cfg *Config) { cfg.Runner.Ephemeral = false },
+		},
+		{
+			name:   "runner group enforcement is not fail closed",
+			mutate: func(cfg *Config) { cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementWarn },
+		},
+		{
+			name:   "policy generation is not content addressed",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.PolicyGeneration = "verified-balanced-policy-fingerprint" },
+		},
+		{
+			name:   "network baseline is unsupported",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.NetworkBaseline = "locked-down" },
+		},
+		{
+			name:   "allowlist wildcard is unsafe",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalAllow = []string{"**.example.test"} },
+		},
+		{
+			name:   "allowlist contains a URL",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalAllow = []string{"https://example.test"} },
+		},
+		{
+			name:   "allowlist overlaps denylist",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalDeny = []string{"api.github.com"} },
+		},
+		{
+			name:   "open allowlist overrides host boundary",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.AdditionalAllow = []string{"host.docker.internal"} },
+		},
+		{
+			name:   "cpus are not positive",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.CPUs = 0 },
+		},
+		{
+			name:   "memory is not a positive byte size",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.Memory = "0GiB" },
+		},
+		{
+			name:   "root disk is below the hard minimum",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.RootDisk = "19GiB" },
+		},
+		{
+			name:   "docker disk is below the hard minimum",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.DockerDisk = "512MiB" },
+		},
+		{
+			name:   "concurrency is not positive",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.MaxConcurrentCreates = 0 },
+		},
+		{
+			name:   "staging root is an absolute host path",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = `C:\epar-staging` },
+		},
+		{
+			name:   "staging root is an absolute Unix host path",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = "/tmp/epar-staging" },
+		},
+		{
+			name:   "staging root escapes project local state",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = "../epar-staging" },
+		},
+		{
+			name:   "staging root overlaps ledger",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = ".local/state/docker-sandboxes" },
+		},
+		{
+			name:   "staging root overlaps native binary cache",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.StagingRoot = ".local/bin/staging" },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validDockerSandboxesConfig()
+			test.mutate(&cfg)
+			if err := Validate(cfg); err == nil {
+				t.Fatal("Validate accepted invalid docker-sandboxes configuration")
+			}
+		})
+	}
+}
+
+func TestValidateDockerSandboxesAcceptsARM64Configuration(t *testing.T) {
+	cfg := validDockerSandboxesConfig()
+	cfg.Provider.Platform = "linux/arm64"
+	cfg.Image.SourcePlatform = cfg.Provider.Platform
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() rejected linux/arm64 Docker Sandboxes configuration: %v", err)
+	}
+}
+
+func TestDockerSandboxesGuestPlatform(t *testing.T) {
+	tests := []struct {
+		hostOS   string
+		hostArch string
+		want     string
+		wantErr  bool
+	}{
+		{hostOS: "windows", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "linux", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "darwin", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "windows", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "linux", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "darwin", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "futureos", hostArch: "amd64", want: "linux/amd64"},
+		{hostOS: "futureos", hostArch: "arm64", want: "linux/arm64"},
+		{hostOS: "futureos", hostArch: "386", wantErr: true},
+		{hostOS: "", hostArch: "amd64", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.hostOS+"_"+test.hostArch, func(t *testing.T) {
+			got, err := DockerSandboxesGuestPlatform(test.hostOS, test.hostArch)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("DockerSandboxesGuestPlatform(%q, %q) = %q, nil; want error", test.hostOS, test.hostArch, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DockerSandboxesGuestPlatform(%q, %q) error = %v", test.hostOS, test.hostArch, err)
+			}
+			if got != test.want {
+				t.Fatalf("DockerSandboxesGuestPlatform(%q, %q) = %q, want %q", test.hostOS, test.hostArch, got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateDockerSandboxHostname(t *testing.T) {
+	for _, hostname := range []string{"api.github.com", "api.github.com:443", "*.githubusercontent.com", "*.githubusercontent.com:443"} {
+		if err := ValidateDockerSandboxHostname(hostname); err != nil {
+			t.Fatalf("hostname %q rejected: %v", hostname, err)
+		}
+	}
+	for _, hostname := range []string{"**.githubusercontent.com", "api.*.github.com", "https://api.github.com", "api.github.com/path", "api.github.com:0", "api.github.com:65536", "127.0.0.1", "[::1]:443"} {
+		if err := ValidateDockerSandboxHostname(hostname); err == nil {
+			t.Fatalf("hostname %q accepted", hostname)
+		}
+	}
+}
+
+func TestParseByteSize(t *testing.T) {
+	if got, err := ParseByteSize("4GiB"); err != nil || got != 4*(1<<30) {
+		t.Fatalf("ParseByteSize(4GiB) = %d, %v", got, err)
+	}
+	for _, value := range []string{"", " 4GiB", "4GB", "0GiB", "-1GiB", "999999999999999999999TiB"} {
+		if _, err := ParseByteSize(value); err == nil {
+			t.Fatalf("ParseByteSize(%q) accepted invalid value", value)
+		}
+	}
+}
+
+func TestEffectiveMinimumFreeBytesUsesCommonReserve(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Storage.MinimumFree = "20GiB"
+
+	got, err := EffectiveMinimumFreeBytes(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(20 << 30); got != want {
+		t.Fatalf("EffectiveMinimumFreeBytes() = %d, want %d", got, want)
+	}
+}
+
+func TestEffectiveMinimumFreeBytesKeepsStricterCommonReserve(t *testing.T) {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Storage.MinimumFree = "60GiB"
+
+	got, err := EffectiveMinimumFreeBytes(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(60 << 30); got != want {
+		t.Fatalf("EffectiveMinimumFreeBytes() = %d, want %d", got, want)
+	}
+}
+
+func validDockerSandboxesConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.Provider.Platform = "linux/amd64"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true, "provider.platform": true})
+	cfg.Provider.SourceImage = ""
+	cfg.Runner.Ephemeral = true
+	cfg.Security.RunnerGroup.Enforcement = RunnerGroupEnforcementEnforce
+	cfg.DockerSandboxes.PolicyGeneration = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	cfg.DockerSandboxes.AdditionalAllow = []string{"api.github.com"}
+	cfg.DockerSandboxes.RootDisk = "120GiB"
+	cfg.DockerSandboxes.DockerDisk = "50GiB"
+	return cfg
+}
+
+func defaultTartConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "tart"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
+}
+
+func defaultWSLConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "wsl"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
+}
+
+func defaultDockerContainerConfig() Config {
+	cfg := Default()
+	cfg.Provider.Type = "docker-container"
+	applyProviderDefaults(&cfg, map[string]bool{"provider.type": true})
+	return cfg
 }

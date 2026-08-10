@@ -31,6 +31,7 @@ CONFIG_PATH="${EPAR_CONFIG:-${EPAR_ROOT}/.local/config.yml}"
 MIRROR_CONTAINER="${EPAR_MIRROR_CONTAINER:-epar-dockerhub-cache}"
 WAIT_FOR_DOCKER="${EPAR_WAIT_FOR_DOCKER:-1}"
 DOCKER_WAIT_ATTEMPTS="${EPAR_DOCKER_WAIT_ATTEMPTS:-120}"
+EXTERNAL_OUTAGE_RETRY="${EPAR_EXTERNAL_OUTAGE_RETRY:-continuous}"
 
 cd "${EPAR_ROOT}"
 mkdir -p work/state
@@ -58,4 +59,4 @@ fi
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting EPAR..."
 # Go-detection and the containerized-Go fallback live in ./start (single
 # source of truth). Set EPAR_GO_BIN / EPAR_USE_DOCKER_RUN above to override.
-exec "${EPAR_ROOT}/start" --config "${CONFIG_PATH}" "$@"
+exec "${EPAR_ROOT}/start" --config "${CONFIG_PATH}" --external-outage-retry="${EXTERNAL_OUTAGE_RETRY}" "$@"

@@ -1,0 +1,7 @@
+{
+  "proxies": {
+    "http-proxy": "http://gateway.docker.internal:3128",
+    "https-proxy": "http://gateway.docker.internal:3128",
+    "no-proxy": "*"
+  }
+}
