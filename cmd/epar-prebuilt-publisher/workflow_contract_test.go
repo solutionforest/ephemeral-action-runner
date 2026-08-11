@@ -135,15 +135,26 @@ func TestWorkflowFetchesCatalogsByValidatedDescriptorAndPublishesSafeRelativeTit
 	if got := strings.Count(workflow, `oras push "$immutable_ref"`); got != 2 {
 		t.Fatalf("automatic and manual catalog publication must retain exactly two guarded pushes: got %d", got)
 	}
+	if got := strings.Count(workflow, `oras manifest fetch "$immutable_ref" >`); got != 2 {
+		t.Fatalf("automatic and manual catalog readback must inspect two raw OCI manifests: got %d", got)
+	}
+	if strings.Contains(workflow, `oras manifest fetch "$immutable_ref" --format json`) {
+		t.Fatal("catalog readback must not confuse ORAS formatted metadata with the raw OCI manifest")
+	}
+	for _, required := range []string{`(.config.mediaType == $config)`, `((.layers | length) == 1)`, `(.layers[0].mediaType == $layer)`} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("catalog raw-manifest readback is missing %q", required)
+		}
+	}
 }
 
 func TestCatalogFetcherRejectsLayerPathsAndValidatesExactBlob(t *testing.T) {
 	script := readCatalogFetchScript(t)
 	for _, required := range []string{
-		`oras manifest fetch "$reference" --format json`,
+		`oras manifest fetch "$reference" > "$manifest_file"`,
 		`catalog reference must be an exact digest`,
 		`select(.artifactType == $artifact)`,
-		`select((.content.layers | length) == 1)`,
+		`select((.layers | length) == 1)`,
 		`oras blob fetch --output "$catalog_file" "${repository}@${layer_digest}"`,
 		`actual_digest="sha256:$(sha256sum "$catalog_file"`,
 		`(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")`,
@@ -156,6 +167,9 @@ func TestCatalogFetcherRejectsLayerPathsAndValidatesExactBlob(t *testing.T) {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("catalog fetcher contains unsafe path behavior %q", forbidden)
 		}
+	}
+	if strings.Contains(script, "--format json") {
+		t.Fatal("catalog fetcher must validate the raw OCI manifest rather than ORAS formatted metadata")
 	}
 }
 

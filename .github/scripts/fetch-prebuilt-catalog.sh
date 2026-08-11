@@ -44,7 +44,7 @@ trap cleanup EXIT
 
 manifest_file="$work_directory/manifest.json"
 catalog_file="$work_directory/catalog.json"
-oras manifest fetch "$reference" --format json > "$manifest_file"
+oras manifest fetch "$reference" > "$manifest_file"
 
 layer_digest="$({
   jq -er \
@@ -54,10 +54,10 @@ layer_digest="$({
     'select(.schemaVersion == 2)
      | select(.mediaType == "application/vnd.oci.image.manifest.v1+json")
      | select(.artifactType == $artifact)
-     | select(.content.config.mediaType == $config)
-     | select((.content.layers | length) == 1)
-     | select(.content.layers[0].mediaType == $layer)
-     | .content.layers[0].digest
+     | select(.config.mediaType == $config)
+     | select((.layers | length) == 1)
+     | select(.layers[0].mediaType == $layer)
+     | .layers[0].digest
      | select(test("^sha256:[0-9a-f]{64}$"))' \
     "$manifest_file"
 } || true)"
