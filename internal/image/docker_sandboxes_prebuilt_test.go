@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,13 +40,30 @@ func (r *candidateOnlyPrebuiltResolver) ResolveCandidate(context.Context, string
 	return VerifiedDockerSandboxesPrebuilt{}, r.err
 }
 
-type prebuiltAcquisitionEnvironment struct{ Environment }
+type prebuiltAcquisitionEnvironment struct {
+	Environment
+	mu   sync.Mutex
+	info []string
+}
 
 func (*prebuiltAcquisitionEnvironment) ResolveBuildTrust(context.Context) (hosttrust.Snapshot, error) {
 	return hosttrust.Snapshot{}, nil
 }
 
-func (*prebuiltAcquisitionEnvironment) Infof(string, ...any) {}
+func (environment *prebuiltAcquisitionEnvironment) Infof(format string, args ...any) {
+	environment.mu.Lock()
+	defer environment.mu.Unlock()
+	environment.info = append(environment.info, strings.TrimSpace(fmt.Sprintf(format, args...)))
+}
+func (*prebuiltAcquisitionEnvironment) Warnf(string, ...any)       {}
+func (*prebuiltAcquisitionEnvironment) ProgressTerminal() bool     { return false }
+func (*prebuiltAcquisitionEnvironment) ProgressConsole() io.Writer { return io.Discard }
+
+func (environment *prebuiltAcquisitionEnvironment) infoMessages() string {
+	environment.mu.Lock()
+	defer environment.mu.Unlock()
+	return strings.Join(environment.info, "\n")
+}
 
 func TestDockerSandboxesPrebuiltLocalIdentityExcludesRuntimeCAOverlay(t *testing.T) {
 	base := config.Config{
@@ -158,6 +179,19 @@ func TestDockerSandboxesPrebuiltAliasProfileSupportsFullAndActOnly(t *testing.T)
 	}
 }
 
+func TestDockerSandboxesPrebuiltFullStartsMaterializationOverHTTP1(t *testing.T) {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	full, forced := dockerSandboxesPrebuiltInitialMaterializationTransport(prebuilt.ProfileFull, base)
+	fullTransport, ok := full.(*http.Transport)
+	if !forced || !ok || fullTransport.ForceAttemptHTTP2 || fullTransport.TLSNextProto == nil || len(fullTransport.TLSNextProto) != 0 || fullTransport.TLSClientConfig == nil || len(fullTransport.TLSClientConfig.NextProtos) != 1 || fullTransport.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Fatalf("Full materialization transport did not explicitly disable HTTP/2: %#v", full)
+	}
+	act, forced := dockerSandboxesPrebuiltInitialMaterializationTransport(prebuilt.ProfileAct, base)
+	if forced || act != base {
+		t.Fatal("Act materialization unexpectedly disabled HTTP/2")
+	}
+}
+
 func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("EPAR_STATE_HOME", filepath.Join(root, "host-state"))
@@ -176,12 +210,13 @@ func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t
 	verified.CatalogDigest = "sha256:" + strings.Repeat("b", 64)
 
 	fetches := 0
+	environment := &prebuiltAcquisitionEnvironment{}
 	coordinator := &Coordinator{
 		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}},
 		ProjectRoot: root,
 		ConfigPath:  filepath.Join(root, "config.yml"),
 		Clock:       func() time.Time { return time.Unix(100, 0).UTC() },
-		environment: &prebuiltAcquisitionEnvironment{},
+		environment: environment,
 		dockerSandboxesPrebuiltImageFetcher: func(context.Context, name.Digest, http.RoundTripper) (v1.Image, error) {
 			fetches++
 			return fixtureImage, nil
@@ -193,6 +228,12 @@ func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t
 	}
 	if fetches != 1 {
 		t.Fatalf("cold acquisition fetched %d times, want exactly once", fetches)
+	}
+	progressOutput := environment.infoMessages()
+	for _, want := range []string{"archive started", "downloading/materializing (attempt 1/2)", "hashing", "verifying structure and identity", "publishing evidence", "archive acquisition complete"} {
+		if !strings.Contains(progressOutput, want) {
+			t.Fatalf("cold acquisition progress omitted %q: %s", want, progressOutput)
+		}
 	}
 	verified.CatalogDigest = "sha256:" + strings.Repeat("c", 64)
 	reusedPath, reused, err := coordinator.acquireDockerSandboxesPrebuiltArchive(context.Background(), verified)
@@ -214,6 +255,160 @@ func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t
 	}
 	if stored.CatalogDigest != verified.CatalogDigest {
 		t.Fatalf("persisted acquisition catalog digest = %s, want %s", stored.CatalogDigest, verified.CatalogDigest)
+	}
+}
+
+func TestDockerSandboxesPrebuiltAcquisitionRetriesOneTransientMaterializationFailure(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("EPAR_STATE_HOME", filepath.Join(root, "host-state"))
+	verified := dockerSandboxesPrebuiltFixture()
+	fixturePath, _, _ := writeDockerArchiveWithTagAndLabels(t, "fixture:source", dockerSandboxesPrebuiltBaseLabels(verified))
+	fixtureImage, err := tarball.ImageFromPath(fixturePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	platformDigest, err := fixtureImage.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified.Platform.Digest = platformDigest.String()
+	verified.Entry.Platforms[0].PackageManifestDigest = platformDigest.String()
+
+	fetches := 0
+	writes := 0
+	var transports []http.RoundTripper
+	coordinator := &Coordinator{
+		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}},
+		ProjectRoot: root,
+		ConfigPath:  filepath.Join(root, "config.yml"),
+		Clock:       func() time.Time { return time.Unix(100, 0).UTC() },
+		environment: &prebuiltAcquisitionEnvironment{},
+		dockerSandboxesPrebuiltImageFetcher: func(_ context.Context, _ name.Digest, transport http.RoundTripper) (v1.Image, error) {
+			fetches++
+			transports = append(transports, transport)
+			return fixtureImage, nil
+		},
+		dockerSandboxesPrebuiltArchiveWriter: func(path string, tag name.Tag, image v1.Image) error {
+			writes++
+			if writes == 1 {
+				if err := os.WriteFile(path, []byte("incomplete"), 0o600); err != nil {
+					return err
+				}
+				return errors.New("stream error: stream ID 29; PROTOCOL_ERROR; received from peer")
+			}
+			return tarball.WriteToFile(path, tag, image)
+		},
+	}
+	archivePath, _, err := coordinator.acquireDockerSandboxesPrebuiltArchive(context.Background(), verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetches != 2 || writes != 2 {
+		t.Fatalf("fetches/writes = %d/%d, want one exact fresh retry", fetches, writes)
+	}
+	retryTransport, ok := transports[1].(*http.Transport)
+	if !ok || retryTransport.ForceAttemptHTTP2 || retryTransport.TLSNextProto == nil || len(retryTransport.TLSNextProto) != 0 || retryTransport.TLSClientConfig == nil || len(retryTransport.TLSClientConfig.NextProtos) != 1 || retryTransport.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Fatalf("retry transport did not explicitly disable HTTP/2: %#v", transports[1])
+	}
+	if _, err := os.Stat(archivePath + ".partial"); !os.IsNotExist(err) {
+		t.Fatalf("partial archive remained after successful retry: %v", err)
+	}
+}
+
+func TestDockerSandboxesPrebuiltAcquisitionRetriesOneTransientFetchFailure(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("EPAR_STATE_HOME", filepath.Join(root, "host-state"))
+	verified := dockerSandboxesPrebuiltFixture()
+	fixturePath, _, _ := writeDockerArchiveWithTagAndLabels(t, "fixture:source", dockerSandboxesPrebuiltBaseLabels(verified))
+	fixtureImage, err := tarball.ImageFromPath(fixturePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	platformDigest, err := fixtureImage.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified.Platform.Digest = platformDigest.String()
+	verified.Entry.Platforms[0].PackageManifestDigest = platformDigest.String()
+
+	fetches := 0
+	var transports []http.RoundTripper
+	coordinator := &Coordinator{
+		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}},
+		ProjectRoot: root,
+		ConfigPath:  filepath.Join(root, "config.yml"),
+		environment: &prebuiltAcquisitionEnvironment{},
+		dockerSandboxesPrebuiltImageFetcher: func(_ context.Context, _ name.Digest, transport http.RoundTripper) (v1.Image, error) {
+			fetches++
+			transports = append(transports, transport)
+			if fetches == 1 {
+				return nil, io.EOF
+			}
+			return fixtureImage, nil
+		},
+	}
+	archivePath, _, err := coordinator.acquireDockerSandboxesPrebuiltArchive(context.Background(), verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetches != 2 {
+		t.Fatalf("fetches = %d, want one exact fresh retry", fetches)
+	}
+	retryTransport, ok := transports[1].(*http.Transport)
+	if !ok || retryTransport.ForceAttemptHTTP2 || retryTransport.TLSNextProto == nil || len(retryTransport.TLSNextProto) != 0 || retryTransport.TLSClientConfig == nil || len(retryTransport.TLSClientConfig.NextProtos) != 1 || retryTransport.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Fatalf("fetch retry transport did not explicitly disable HTTP/2: %#v", transports[1])
+	}
+	if _, err := os.Stat(archivePath); err != nil {
+		t.Fatalf("archive missing after fetch retry: %v", err)
+	}
+}
+
+func TestDockerSandboxesPrebuiltAcquisitionCleansPartialAfterRepeatedTransientFailure(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("EPAR_STATE_HOME", filepath.Join(root, "host-state"))
+	verified := dockerSandboxesPrebuiltFixture()
+	fixturePath, _, _ := writeDockerArchiveWithTagAndLabels(t, "fixture:source", dockerSandboxesPrebuiltBaseLabels(verified))
+	fixtureImage, err := tarball.ImageFromPath(fixturePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	platformDigest, err := fixtureImage.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified.Platform.Digest = platformDigest.String()
+	verified.Entry.Platforms[0].PackageManifestDigest = platformDigest.String()
+
+	writes := 0
+	coordinator := &Coordinator{
+		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}},
+		ProjectRoot: root,
+		ConfigPath:  filepath.Join(root, "config.yml"),
+		environment: &prebuiltAcquisitionEnvironment{},
+		dockerSandboxesPrebuiltImageFetcher: func(context.Context, name.Digest, http.RoundTripper) (v1.Image, error) {
+			return fixtureImage, nil
+		},
+		dockerSandboxesPrebuiltArchiveWriter: func(path string, _ name.Tag, _ v1.Image) error {
+			writes++
+			if err := os.WriteFile(path, []byte("incomplete"), 0o600); err != nil {
+				return err
+			}
+			return errors.New("stream error: stream ID 29; PROTOCOL_ERROR; received from peer")
+		},
+	}
+	_, _, err = coordinator.acquireDockerSandboxesPrebuiltArchive(context.Background(), verified)
+	if err == nil || !strings.Contains(err.Error(), "materialize verified prebuilt Docker archive") {
+		t.Fatalf("repeated materialization error = %v", err)
+	}
+	if writes != dockerSandboxesPrebuiltMaterializeAttempts {
+		t.Fatalf("materialization writes = %d, want %d", writes, dockerSandboxesPrebuiltMaterializeAttempts)
+	}
+	acquisitionRoot, err := coordinator.dockerSandboxesPrebuiltAcquisitionRoot(verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(acquisitionRoot, "base-template.tar.partial")); !os.IsNotExist(err) {
+		t.Fatalf("partial archive remained after retries exhausted: %v", err)
 	}
 }
 

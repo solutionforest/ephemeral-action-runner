@@ -3,6 +3,7 @@ package image
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,12 +29,40 @@ import (
 	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
 
-const dockerSandboxesPrebuiltDerivativeSchema = 1
+const (
+	dockerSandboxesPrebuiltDerivativeSchema    = 1
+	dockerSandboxesPrebuiltMaterializeAttempts = 2
+)
 
 type dockerSandboxesPrebuiltImageFetcher func(context.Context, name.Digest, http.RoundTripper) (v1.Image, error)
+type dockerSandboxesPrebuiltArchiveWriter func(string, name.Tag, v1.Image) error
 
 func fetchDockerSandboxesPrebuiltImage(ctx context.Context, ref name.Digest, transport http.RoundTripper) (v1.Image, error) {
 	return remote.Image(ref, remote.WithContext(ctx), remote.WithAuth(authn.Anonymous), remote.WithTransport(transport))
+}
+
+func dockerSandboxesPrebuiltHTTP1RetryTransport(base http.RoundTripper) (http.RoundTripper, bool) {
+	transport, ok := base.(*http.Transport)
+	if !ok {
+		return base, false
+	}
+	clone := transport.Clone()
+	clone.ForceAttemptHTTP2 = false
+	clone.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if clone.TLSClientConfig == nil {
+		clone.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
+	} else {
+		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+		clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	}
+	return clone, true
+}
+
+func dockerSandboxesPrebuiltInitialMaterializationTransport(profile string, base http.RoundTripper) (http.RoundTripper, bool) {
+	if profile != prebuilt.ProfileFull {
+		return base, false
+	}
+	return dockerSandboxesPrebuiltHTTP1RetryTransport(base)
 }
 
 // DockerSandboxesPrebuiltResolver is the narrow trust boundary between the
@@ -885,7 +914,15 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 		}
 	}
 	partialPath := archivePath + ".partial"
-	_ = os.Remove(partialPath)
+	if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
+		return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("remove incomplete prebuilt Docker archive: %w", err)
+	}
+	partialPublished := false
+	defer func() {
+		if !partialPublished {
+			_ = os.Remove(partialPath)
+		}
+	}()
 	platformReference := verified.Entry.PackageRepository + "@" + verified.Platform.Digest
 	ref, err := name.NewDigest(platformReference)
 	if err != nil {
@@ -899,31 +936,76 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 	if err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
-	attemptCtx, cancel := boundedImageAttempt(ctx, dockerPullAttemptTimeout)
-	defer cancel()
 	fetch := m.dockerSandboxesPrebuiltImageFetcher
 	if fetch == nil {
 		fetch = fetchDockerSandboxesPrebuiltImage
-	}
-	image, err := fetch(attemptCtx, ref, client.Transport)
-	if err != nil {
-		return "", dockerSandboxesPrebuiltAcquisition{}, classifyImageDependencyFailure(ref.Context().RegistryStr(), "acquire verified prebuilt platform", err)
-	}
-	manifestDigest, err := image.Digest()
-	if err != nil || manifestDigest.String() != verified.Platform.Digest {
-		return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("acquired prebuilt platform digest changed from %s", verified.Platform.Digest)
-	}
-	configDigest, err := image.ConfigName()
-	if err != nil || !validSHA256(configDigest.String()) {
-		return "", dockerSandboxesPrebuiltAcquisition{}, errors.New("acquired prebuilt package omitted an exact image config digest")
 	}
 	tag, err := name.NewTag(localTag)
 	if err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
-	if err := tarball.WriteToFile(partialPath, tag, image); err != nil {
-		return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("materialize verified prebuilt Docker archive: %w", err)
+	writeArchive := m.dockerSandboxesPrebuiltArchiveWriter
+	if writeArchive == nil {
+		writeArchive = func(path string, tag name.Tag, image v1.Image) error {
+			return tarball.WriteToFile(path, tag, image)
+		}
 	}
+	var configDigest v1.Hash
+	materializeTransport := client.Transport
+	if fullTransport, ok := dockerSandboxesPrebuiltInitialMaterializationTransport(verified.Entry.Profile, client.Transport); ok {
+		materializeTransport = fullTransport
+		m.infof("using HTTP/1.1 for the large Docker Sandboxes prebuilt Full archive transfer\n")
+	}
+	progress := m.startDockerSandboxesPrebuiltArchiveProgress(partialPath, archivePath, verified.Entry.Profile, verified.Platform.Platform)
+	defer progress.finish(false)
+	for attempt := 1; attempt <= dockerSandboxesPrebuiltMaterializeAttempts; attempt++ {
+		progress.setPhase(fmt.Sprintf("downloading/materializing (attempt %d/%d)", attempt, dockerSandboxesPrebuiltMaterializeAttempts))
+		attemptCtx, cancel := boundedImageAttempt(ctx, dockerPullAttemptTimeout)
+		image, fetchErr := fetch(attemptCtx, ref, materializeTransport)
+		if fetchErr != nil {
+			cancel()
+			classified := classifyImageDependencyFailure(ref.Context().RegistryStr(), "acquire verified prebuilt platform", fetchErr)
+			if !isTransientImageDependencyError(fetchErr) || attempt == dockerSandboxesPrebuiltMaterializeAttempts {
+				return "", dockerSandboxesPrebuiltAcquisition{}, classified
+			}
+			if fallback, ok := dockerSandboxesPrebuiltHTTP1RetryTransport(client.Transport); ok {
+				materializeTransport = fallback
+				m.warnf("verified Docker Sandboxes prebuilt package fetch hit a transient registry failure; retrying once over HTTP/1.1 from the same immutable platform digest: %v\n", fetchErr)
+			} else {
+				m.warnf("verified Docker Sandboxes prebuilt package fetch hit a transient registry failure; retrying once from the same immutable platform digest: %v\n", fetchErr)
+			}
+			continue
+		}
+		manifestDigest, digestErr := image.Digest()
+		if digestErr != nil || manifestDigest.String() != verified.Platform.Digest {
+			cancel()
+			return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("acquired prebuilt platform digest changed from %s", verified.Platform.Digest)
+		}
+		configDigest, err = image.ConfigName()
+		if err != nil || !validSHA256(configDigest.String()) {
+			cancel()
+			return "", dockerSandboxesPrebuiltAcquisition{}, errors.New("acquired prebuilt package omitted an exact image config digest")
+		}
+		writeErr := writeArchive(partialPath, tag, image)
+		cancel()
+		if writeErr == nil {
+			break
+		}
+		if removeErr := os.Remove(partialPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("clean incomplete prebuilt Docker archive after materialization failure: %w", removeErr)
+		}
+		classified := classifyImageDependencyFailure(ref.Context().RegistryStr(), "materialize verified prebuilt platform", writeErr)
+		if !isTransientImageDependencyError(writeErr) || attempt == dockerSandboxesPrebuiltMaterializeAttempts {
+			return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("materialize verified prebuilt Docker archive: %w", classified)
+		}
+		if fallback, ok := dockerSandboxesPrebuiltHTTP1RetryTransport(client.Transport); ok {
+			materializeTransport = fallback
+			m.warnf("verified Docker Sandboxes prebuilt archive materialization hit a transient registry stream failure; retrying once over HTTP/1.1 from the same immutable platform digest: %v\n", writeErr)
+		} else {
+			m.warnf("verified Docker Sandboxes prebuilt archive materialization hit a transient registry stream failure; retrying once from the same immutable platform digest: %v\n", writeErr)
+		}
+	}
+	progress.setPhase("hashing")
 	archiveSHA, archiveBytes, err := hashFile(partialPath)
 	if err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
@@ -940,18 +1022,22 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 		Platform:              verified.Platform.Platform,
 		AcquiredAt:            m.now().UTC(),
 	}
+	progress.setPhase("verifying structure and identity")
 	if err := m.verifyDockerSandboxesPrebuiltBaseArchive(partialPath, localTag, verified, stored); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
+	progress.setPhase("publishing evidence")
 	if err := os.Rename(partialPath, archivePath); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("publish verified prebuilt archive: %w", err)
 	}
+	partialPublished = true
 	if err := writeJSONFile(metadataPath, stored); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
 	if err := m.recordCurrentPrebuiltArchive(archivePath, verified, stored, m.now().UTC()); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
+	progress.finish(true)
 	return archivePath, stored, nil
 }
 

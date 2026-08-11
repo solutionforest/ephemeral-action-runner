@@ -71,6 +71,10 @@ type Coordinator struct {
 	// immutable platform acquisitions. Production leaves it nil and uses the
 	// anonymous registry client after catalog and evidence verification.
 	dockerSandboxesPrebuiltImageFetcher dockerSandboxesPrebuiltImageFetcher
+	// dockerSandboxesPrebuiltArchiveWriter is a test seam for exercising
+	// bounded materialization retries. Production leaves it nil and writes the
+	// exact verified image through go-containerregistry's Docker tarball path.
+	dockerSandboxesPrebuiltArchiveWriter dockerSandboxesPrebuiltArchiveWriter
 	// DockerSandboxesActivationFault is a test-only fault-injection hook. A
 	// production coordinator leaves it nil.
 	DockerSandboxesActivationFault func(phase string) error

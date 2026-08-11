@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -99,6 +100,9 @@ func isTransientImageDependencyError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
 	var registryErr *registrytransport.Error
 	if errors.As(err, &registryErr) {
 		return registryErr.Temporary() || registryErr.StatusCode == http.StatusRequestTimeout || registryErr.StatusCode == http.StatusTooManyRequests || registryErr.StatusCode >= http.StatusInternalServerError
@@ -107,7 +111,7 @@ func isTransientImageDependencyError(err error) bool {
 	if errors.As(err, &opErr) {
 		return true
 	}
-	for _, transient := range []string{"could not resolve host", "no such host", "temporary failure in name resolution", "connection refused", "connection reset", "connection timed out", "i/o timeout", "unexpected eof", "network is unreachable", "no route to host", "unexpected status code 408", "unexpected status code 429", "too many requests", "rate limit exceeded", "secondary rate limit", "http 408", "http 429", "http 500", "http 502", "http 503", "http 504", "500 internal server error", "502 bad gateway", "503 service unavailable", "504 gateway timeout", "server misbehaving"} {
+	for _, transient := range []string{"could not resolve host", "no such host", "temporary failure in name resolution", "connection refused", "connection reset", "connection timed out", "i/o timeout", "unexpected eof", "stream error", "protocol_error", "network is unreachable", "no route to host", "unexpected status code 408", "unexpected status code 429", "too many requests", "rate limit exceeded", "secondary rate limit", "http 408", "http 429", "http 500", "http 502", "http 503", "http 504", "500 internal server error", "502 bad gateway", "503 service unavailable", "504 gateway timeout", "server misbehaving"} {
 		if strings.Contains(message, transient) {
 			return true
 		}
