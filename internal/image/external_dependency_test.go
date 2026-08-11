@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"testing"
@@ -23,6 +24,8 @@ func TestImageDependencyClassificationIsTypedAndConservative(t *testing.T) {
 		{name: "connection", err: errors.New("dial tcp 192.0.2.1:443: connection refused"), retryable: true},
 		{name: "TLS handshake timeout", err: errors.New("net/http: TLS handshake timeout"), retryable: true},
 		{name: "truncated response", err: errors.New("unexpected EOF"), retryable: true},
+		{name: "EOF response", err: io.EOF, retryable: true},
+		{name: "HTTP2 registry stream reset", err: errors.New("stream error: stream ID 29; PROTOCOL_ERROR; received from peer"), retryable: true},
 		{name: "missing manifest", err: errors.New("manifest unknown: requested image not found"), retryable: false},
 		{name: "authorization", err: errors.New("403 Forbidden: denied: requested access"), retryable: false},
 		{name: "TLS trust", err: x509.UnknownAuthorityError{}, retryable: false},
