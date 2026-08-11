@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,14 +40,30 @@ func (r *candidateOnlyPrebuiltResolver) ResolveCandidate(context.Context, string
 	return VerifiedDockerSandboxesPrebuilt{}, r.err
 }
 
-type prebuiltAcquisitionEnvironment struct{ Environment }
+type prebuiltAcquisitionEnvironment struct {
+	Environment
+	mu   sync.Mutex
+	info []string
+}
 
 func (*prebuiltAcquisitionEnvironment) ResolveBuildTrust(context.Context) (hosttrust.Snapshot, error) {
 	return hosttrust.Snapshot{}, nil
 }
 
-func (*prebuiltAcquisitionEnvironment) Infof(string, ...any) {}
-func (*prebuiltAcquisitionEnvironment) Warnf(string, ...any) {}
+func (environment *prebuiltAcquisitionEnvironment) Infof(format string, args ...any) {
+	environment.mu.Lock()
+	defer environment.mu.Unlock()
+	environment.info = append(environment.info, strings.TrimSpace(fmt.Sprintf(format, args...)))
+}
+func (*prebuiltAcquisitionEnvironment) Warnf(string, ...any)       {}
+func (*prebuiltAcquisitionEnvironment) ProgressTerminal() bool     { return false }
+func (*prebuiltAcquisitionEnvironment) ProgressConsole() io.Writer { return io.Discard }
+
+func (environment *prebuiltAcquisitionEnvironment) infoMessages() string {
+	environment.mu.Lock()
+	defer environment.mu.Unlock()
+	return strings.Join(environment.info, "\n")
+}
 
 func TestDockerSandboxesPrebuiltLocalIdentityExcludesRuntimeCAOverlay(t *testing.T) {
 	base := config.Config{
@@ -192,12 +210,13 @@ func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t
 	verified.CatalogDigest = "sha256:" + strings.Repeat("b", 64)
 
 	fetches := 0
+	environment := &prebuiltAcquisitionEnvironment{}
 	coordinator := &Coordinator{
 		Config:      config.Config{Provider: config.ProviderConfig{Type: "docker-sandboxes", Platform: "linux/amd64"}},
 		ProjectRoot: root,
 		ConfigPath:  filepath.Join(root, "config.yml"),
 		Clock:       func() time.Time { return time.Unix(100, 0).UTC() },
-		environment: &prebuiltAcquisitionEnvironment{},
+		environment: environment,
 		dockerSandboxesPrebuiltImageFetcher: func(context.Context, name.Digest, http.RoundTripper) (v1.Image, error) {
 			fetches++
 			return fixtureImage, nil
@@ -209,6 +228,12 @@ func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t
 	}
 	if fetches != 1 {
 		t.Fatalf("cold acquisition fetched %d times, want exactly once", fetches)
+	}
+	progressOutput := environment.infoMessages()
+	for _, want := range []string{"archive started", "downloading/materializing (attempt 1/2)", "hashing", "verifying structure and identity", "publishing evidence", "archive acquisition complete"} {
+		if !strings.Contains(progressOutput, want) {
+			t.Fatalf("cold acquisition progress omitted %q: %s", want, progressOutput)
+		}
 	}
 	verified.CatalogDigest = "sha256:" + strings.Repeat("c", 64)
 	reusedPath, reused, err := coordinator.acquireDockerSandboxesPrebuiltArchive(context.Background(), verified)

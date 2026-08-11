@@ -956,7 +956,10 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 		materializeTransport = fullTransport
 		m.infof("using HTTP/1.1 for the large Docker Sandboxes prebuilt Full archive transfer\n")
 	}
+	progress := m.startDockerSandboxesPrebuiltArchiveProgress(partialPath, archivePath, verified.Entry.Profile, verified.Platform.Platform)
+	defer progress.finish(false)
 	for attempt := 1; attempt <= dockerSandboxesPrebuiltMaterializeAttempts; attempt++ {
+		progress.setPhase(fmt.Sprintf("downloading/materializing (attempt %d/%d)", attempt, dockerSandboxesPrebuiltMaterializeAttempts))
 		attemptCtx, cancel := boundedImageAttempt(ctx, dockerPullAttemptTimeout)
 		image, fetchErr := fetch(attemptCtx, ref, materializeTransport)
 		if fetchErr != nil {
@@ -1002,6 +1005,7 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 			m.warnf("verified Docker Sandboxes prebuilt archive materialization hit a transient registry stream failure; retrying once from the same immutable platform digest: %v\n", writeErr)
 		}
 	}
+	progress.setPhase("hashing")
 	archiveSHA, archiveBytes, err := hashFile(partialPath)
 	if err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
@@ -1018,9 +1022,11 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 		Platform:              verified.Platform.Platform,
 		AcquiredAt:            m.now().UTC(),
 	}
+	progress.setPhase("verifying structure and identity")
 	if err := m.verifyDockerSandboxesPrebuiltBaseArchive(partialPath, localTag, verified, stored); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
+	progress.setPhase("publishing evidence")
 	if err := os.Rename(partialPath, archivePath); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("publish verified prebuilt archive: %w", err)
 	}
@@ -1031,6 +1037,7 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 	if err := m.recordCurrentPrebuiltArchive(archivePath, verified, stored, m.now().UTC()); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
+	progress.finish(true)
 	return archivePath, stored, nil
 }
 
