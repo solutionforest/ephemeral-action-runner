@@ -57,7 +57,7 @@ func TestWorkflowUsesHostedBuildsAndExternalEPARAcceptance(t *testing.T) {
 		`playwright-docker.yml`,
 		`dockerhub-private-pull.yml`,
 		`runnerGroup:"epar-dev-test"`,
-		`schemaVersion:2`,
+		`schemaVersion:3,profile:$profile`,
 		`runnerName:$amd64PlaywrightRunner`,
 		`runnerName:$amd64DockerHubRunner`,
 		`runnerName:$arm64PlaywrightRunner`,
@@ -80,6 +80,8 @@ func TestWorkflowPublishesOnlyFromMainAndValidatesPullRequestsWithoutPublishing(
 		"permissions:\n      contents: read",
 		"go test ./internal/prebuilt ./cmd/epar-prebuilt-publisher -count=1",
 		"bash -n .github/scripts/fetch-prebuilt-catalog.sh",
+		"scripts/docker-sandboxes/validate-prebuilt.ps1 -Platform linux/amd64",
+		"scripts/docker-sandboxes/validate-prebuilt.ps1 -Platform linux/arm64",
 		"if: github.event_name != 'pull_request' && inputs.promote_candidate != true",
 	} {
 		if !strings.Contains(workflow, required) {
@@ -190,7 +192,7 @@ func TestWorkflowPreparesReviewSummaryBeforeProtectedPromotion(t *testing.T) {
 		"### Candidate identity",
 		"### Human-reviewed acceptance evidence",
 		"### Reviewer checklist",
-		`[[ "$PROFILE" == act ]]`,
+		`[[ "$PROFILE" == act || "$PROFILE" == full ]]`,
 		"playwright-docker.yml run ${amd64_playwright_run_id}",
 		"dockerhub-private-pull.yml run ${amd64_dockerhub_run_id}",
 		"playwright-docker.yml run ${arm64_playwright_run_id}",
@@ -208,6 +210,35 @@ func TestWorkflowPreparesReviewSummaryBeforeProtectedPromotion(t *testing.T) {
 	} {
 		if !strings.Contains(manualJob, required) {
 			t.Fatalf("protected promotion must depend on prepared review: missing %q", required)
+		}
+	}
+}
+
+func TestWorkflowBuildsAndPromotesFullWithoutPersistentNativeRunners(t *testing.T) {
+	workflow := readPublisherWorkflow(t)
+	for _, required := range []string{
+		`- cron: '37 */6 * * *'`,
+		`- cron: '7 1,7,13,19 * * *'`,
+		`'37 */6 * * *') profile=act`,
+		`'7 1,7,13,19 * * *') profile=full`,
+		`act|full) ;;`,
+		`if: needs.resolve.outputs.profile == 'full'`,
+		`Full publication requires at least 40 GiB free`,
+		`fallocate -l 8G`,
+		`max-parallelism = 1`,
+		`--arg profile "$PROFILE"`,
+		`epar-prebuilt-${PROFILE}-${digest_prefix}-amd64`,
+		`epar-prebuilt-${PROFILE}-${digest_prefix}-arm64`,
+		`alias_tag="${PROFILE}-latest"`,
+		`oras tag "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" "$alias_tag"`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("Full publication/acceptance contract is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"live-amd64:", "live-arm64:", "EPAR_PREBUILT_LIVE"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("Full publication reintroduced persistent native gate %q", forbidden)
 		}
 	}
 }

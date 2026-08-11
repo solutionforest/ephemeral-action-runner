@@ -471,7 +471,11 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 		}
 		fmt.Fprintf(out, "  Runner image: %s\n", draft.Profile.SourceImage)
 		if initProfileDistribution(*draft.Profile) == config.ImageDistributionPrebuilt {
-			label := "EPAR verified prebuilt Act"
+			prebuiltProfile := "Act"
+			if draft.Profile.PrebuiltReference == config.DockerSandboxesPrebuiltFullReference {
+				prebuiltProfile = "Full"
+			}
+			label := "EPAR verified prebuilt " + prebuiltProfile
 			if draft.Profile.PrebuiltPreview {
 				label += " (preview)"
 			}

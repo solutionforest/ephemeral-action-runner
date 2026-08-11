@@ -912,44 +912,63 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 	}
 	fmt.Fprintln(out, "")
 	fmt.Fprintf(out, "%s image setup:\n", descriptor.DisplayName)
-	fmt.Fprintln(out, "  Choose the Catthehacker Ubuntu image for this runner. EPAR will provision or update the reusable runner artifact during startup.")
+	fmt.Fprintln(out, "  Choose how EPAR should provision the reusable runner artifact during startup.")
 	if !descriptor.WizardCustomImageTags {
 		fmt.Fprintln(out, "  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.")
 	}
 	fmt.Fprintln(out, "  Image catalog: https://github.com/catthehacker/docker_images#images-available")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Runner base image:")
-	for index, profile := range descriptor.WizardImageProfiles {
+	type imageChoice struct {
+		artifactIndex int
+		profileIndex  int
+	}
+	choices := make([]imageChoice, 0, len(descriptor.WizardArtifactSources)+len(descriptor.WizardImageProfiles))
+	defaultChoice := "1"
+	for index, artifact := range descriptor.WizardArtifactSources {
+		choiceNumber := len(choices) + 1
 		defaultLabel := ""
-		if index == 0 {
+		if artifact.Default {
+			defaultChoice = strconv.Itoa(choiceNumber)
 			defaultLabel = " (default)"
 		}
-		fmt.Fprintf(out, "  %d. %s — %s%s\n", index+1, profile.Name, profile.Tag, defaultLabel)
+		previewLabel := ""
+		if artifact.Preview {
+			previewLabel = " (preview)"
+		}
+		fmt.Fprintf(out, "  %d. %s%s%s\n", choiceNumber, artifact.Label, previewLabel, defaultLabel)
+		if artifact.Description != "" {
+			fmt.Fprintf(out, "     %s\n", artifact.Description)
+		}
+		choices = append(choices, imageChoice{artifactIndex: index, profileIndex: -1})
+	}
+	for index, profile := range descriptor.WizardImageProfiles {
+		choiceNumber := len(choices) + 1
+		label := strings.TrimSpace(profile.Label)
+		if label == "" {
+			label = profile.Name + " — " + profile.Tag
+		}
+		defaultLabel := ""
+		if len(descriptor.WizardArtifactSources) == 0 && index == 0 {
+			defaultLabel = " (default)"
+		}
+		fmt.Fprintf(out, "  %d. %s%s\n", choiceNumber, label, defaultLabel)
+		if profile.Description != "" {
+			fmt.Fprintf(out, "     %s\n", profile.Description)
+		}
+		choices = append(choices, imageChoice{artifactIndex: -1, profileIndex: index})
 	}
 	customChoice := ""
 	if descriptor.WizardCustomImageTags {
-		customChoice = strconv.Itoa(len(descriptor.WizardImageProfiles) + 1)
+		customChoice = strconv.Itoa(len(choices) + 1)
 		fmt.Fprintf(out, "  %s. Another catthehacker/ubuntu tag, such as go-24.04\n", customChoice)
 	}
 	fmt.Fprintln(out, "  0. Back")
-	if len(descriptor.WizardArtifactSources) > 0 {
-		for _, artifact := range descriptor.WizardArtifactSources {
-			previewLabel := ""
-			if artifact.Preview {
-				previewLabel = " (preview)"
-			}
-			fmt.Fprintf(out, "  P. %s%s\n", artifact.Label, previewLabel)
-			if artifact.Description != "" {
-				fmt.Fprintf(out, "     %s\n", artifact.Description)
-			}
-		}
-		fmt.Fprintln(out, "     Local Catthehacker builds remain the default; choose P only when the verified prebuilt Act path is intentional.")
-	}
 
 	var source imageartifact.ResolvedDockerSource
 	var prebuilt *provider.WizardArtifactSource
 	for {
-		choiceResult, hitEOF, promptErr := promptWizardDefault(out, reader, "Runner base image", "1")
+		choiceResult, hitEOF, promptErr := promptWizardDefault(out, reader, "Runner base image", defaultChoice)
 		if promptErr != nil {
 			return initWizardResult[*initDockerSandboxesProfile]{}, nil, promptErr
 		}
@@ -960,23 +979,22 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		if choice == "0" {
 			return initWizardResult[*initDockerSandboxesProfile]{Action: initWizardBack}, nil, nil
 		}
-		if strings.EqualFold(choice, "p") || strings.EqualFold(choice, "prebuilt") {
-			if len(descriptor.WizardArtifactSources) == 0 {
-				fmt.Fprintln(out, "  A prebuilt artifact is not registered for this provider.")
-				if hitEOF {
-					return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("prebuilt artifact is unavailable for %s", providerType)
-				}
-				continue
-			}
-			prebuilt = &descriptor.WizardArtifactSources[0]
-			break
-		}
 		normalizedChoice := strings.ToLower(choice)
 		input := ""
-		for index, profile := range descriptor.WizardImageProfiles {
-			if normalizedChoice == strconv.Itoa(index+1) || normalizedChoice == profile.Name {
-				input = profile.Name
+		if choiceNumber, choiceErr := strconv.Atoi(normalizedChoice); choiceErr == nil && choiceNumber > 0 && choiceNumber <= len(choices) {
+			selected := choices[choiceNumber-1]
+			if selected.artifactIndex >= 0 {
+				artifact := descriptor.WizardArtifactSources[selected.artifactIndex]
+				prebuilt = &artifact
 				break
+			}
+			input = descriptor.WizardImageProfiles[selected.profileIndex].Name
+		} else {
+			for _, profile := range descriptor.WizardImageProfiles {
+				if normalizedChoice == profile.Name {
+					input = profile.Name
+					break
+				}
 			}
 		}
 		if customChoice != "" && normalizedChoice == customChoice {
@@ -992,9 +1010,9 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 		}
 		if input == "" {
 			if customChoice != "" {
-				fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, %s for another catthehacker/ubuntu tag, or 0 to go back.\n", len(descriptor.WizardImageProfiles), customChoice)
+				fmt.Fprintf(out, "  Choose a built-in image from 1 to %d, %s for another catthehacker/ubuntu tag, or 0 to go back.\n", len(choices), customChoice)
 			} else {
-				fmt.Fprintf(out, "  Choose a supported image from 1 to %d or 0 to go back.\n", len(descriptor.WizardImageProfiles))
+				fmt.Fprintf(out, "  Choose a supported image from 1 to %d or 0 to go back.\n", len(choices))
 			}
 			if hitEOF {
 				return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("invalid runner base image %q", choice)
@@ -1021,13 +1039,14 @@ func promptDockerImageProfileWizard(ctx context.Context, projectRoot, providerTy
 				return initWizardResult[*initDockerSandboxesProfile]{}, nil, err
 			}
 		}
-		fmt.Fprintln(out, "  Selected verified prebuilt Act. The immutable digest and GitHub/Sigstore attestation are verified before activation; first-use Docker Sandboxes materialization remains local.")
+		profileLabel := strings.ToUpper(prebuilt.Profile[:1]) + prebuilt.Profile[1:]
+		fmt.Fprintf(out, "  Selected verified prebuilt %s. The immutable digest and GitHub/Sigstore attestation are verified before activation; first-use Docker Sandboxes materialization remains local.\n", profileLabel)
 		profile := &initDockerSandboxesProfile{
 			Provider:          providerType,
 			HostPlatform:      hostPlatform,
 			GuestPlatform:     guestPlatform,
 			Distribution:      config.ImageDistributionPrebuilt,
-			SourceImage:       "ghcr.io/catthehacker/ubuntu:act-latest",
+			SourceImage:       "ghcr.io/catthehacker/ubuntu:" + prebuilt.Profile + "-latest",
 			PrebuiltReference: prebuilt.Reference,
 			PrebuiltPreview:   prebuilt.Preview,
 			PolicyFingerprint: policyFingerprint,

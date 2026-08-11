@@ -77,9 +77,11 @@ const (
 	ImageUpdateFrequencyManual   = "manual"
 	DefaultImageUpdateTime       = "07:00"
 
-	ImageDistributionLocalBuild         = "local-build"
-	ImageDistributionPrebuilt           = "prebuilt"
-	DockerSandboxesPrebuiltActReference = "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest"
+	ImageDistributionLocalBuild          = "local-build"
+	ImageDistributionPrebuilt            = "prebuilt"
+	DockerSandboxesPrebuiltRepository    = "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template"
+	DockerSandboxesPrebuiltActReference  = DockerSandboxesPrebuiltRepository + ":act-latest"
+	DockerSandboxesPrebuiltFullReference = DockerSandboxesPrebuiltRepository + ":full-latest"
 )
 
 type PoolConfig struct {
@@ -1186,7 +1188,11 @@ func Validate(cfg Config) error {
 			if policy.Enforcement != RunnerGroupEnforcementEnforce || !policy.RequireExplicitGroup || !policy.RequireNonDefaultGroup || policy.RequiredRepositoryAccess != RunnerGroupRepositoryAccessSelected || !policy.RequirePublicRepositoriesDisabled {
 				return fmt.Errorf("candidate acceptance requires enforced explicit non-default selected-repository runner-group access with public repositories disabled")
 			}
-			wantLabelPrefix := "epar-prebuilt-act-" + strings.TrimPrefix(cfg.Image.PrebuiltDigest, "sha256:")[:12] + "-"
+			profile, profileErr := dockerSandboxesPrebuiltProfile(cfg.Image.SourceImage, cfg.Image.PrebuiltReference)
+			if profileErr != nil {
+				return profileErr
+			}
+			wantLabelPrefix := "epar-prebuilt-" + profile + "-" + strings.TrimPrefix(cfg.Image.PrebuiltDigest, "sha256:")[:12] + "-"
 			wantLabel := wantLabelPrefix + strings.TrimPrefix(cfg.Provider.Platform, "linux/")
 			if len(cfg.Runner.Labels) != 1 || cfg.Runner.Labels[0] != wantLabel || !cfg.Runner.NoDefaultLabels || cfg.Runner.IncludeHostLabel {
 				return fmt.Errorf("candidate acceptance requires only runner.labels: [%s], runner.noDefaultLabels: true, and runner.includeHostLabel: false", wantLabel)
@@ -1438,10 +1444,7 @@ func validateDockerSandboxesImageDistribution(image ImageConfig) error {
 	case ImageDistributionLocalBuild:
 		return nil
 	case ImageDistributionPrebuilt:
-		if strings.TrimSpace(image.SourceImage) != "ghcr.io/catthehacker/ubuntu:act-latest" {
-			return fmt.Errorf("image.distribution=prebuilt currently supports only the Catthehacker Act profile ghcr.io/catthehacker/ubuntu:act-latest")
-		}
-		if err := validatePrebuiltReference(image.PrebuiltReference); err != nil {
+		if _, err := dockerSandboxesPrebuiltProfile(image.SourceImage, image.PrebuiltReference); err != nil {
 			return fmt.Errorf("image.prebuiltReference: %w", err)
 		}
 		if strings.TrimSpace(image.RunnerVersion) != "" && strings.TrimSpace(image.RunnerVersion) != "latest" {
@@ -1496,7 +1499,7 @@ func validateImageDistributionFields(image ImageConfig, providerType string) err
 
 func validatePrebuiltCatalogReference(value string) error {
 	value = strings.TrimSpace(value)
-	prefix := strings.TrimSuffix(DockerSandboxesPrebuiltActReference, ":act-latest")
+	prefix := DockerSandboxesPrebuiltRepository
 	if strings.HasPrefix(value, prefix+":catalog-v1-pkg-") {
 		digest := strings.TrimPrefix(value, prefix+":catalog-v1-pkg-")
 		if err := validateSHA256Fingerprint("catalog digest", "sha256:"+digest); err == nil {
@@ -1519,15 +1522,26 @@ func validatePrebuiltEvidenceRef(value string) error {
 	return nil
 }
 
-func validatePrebuiltReference(value string) error {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return fmt.Errorf("must be %s", DockerSandboxesPrebuiltActReference)
+func dockerSandboxesPrebuiltProfile(sourceImage, reference string) (string, error) {
+	sourceImage = strings.TrimSpace(sourceImage)
+	reference = strings.TrimSpace(reference)
+	profiles := []struct {
+		name      string
+		source    string
+		reference string
+	}{
+		{name: "full", source: "ghcr.io/catthehacker/ubuntu:full-latest", reference: DockerSandboxesPrebuiltFullReference},
+		{name: "act", source: "ghcr.io/catthehacker/ubuntu:act-latest", reference: DockerSandboxesPrebuiltActReference},
 	}
-	if value != DockerSandboxesPrebuiltActReference {
-		return fmt.Errorf("must be the official EPAR reference %s; arbitrary GHCR packages are not accepted", DockerSandboxesPrebuiltActReference)
+	for _, profile := range profiles {
+		if sourceImage == profile.source && reference == profile.reference {
+			return profile.name, nil
+		}
 	}
-	return nil
+	if reference == "" {
+		return "", fmt.Errorf("must be %s or %s", DockerSandboxesPrebuiltFullReference, DockerSandboxesPrebuiltActReference)
+	}
+	return "", fmt.Errorf("must match the configured Catthehacker Full or Act profile using the official EPAR reference; arbitrary GHCR packages are not accepted")
 }
 
 func validateDockerSandboxesStagingRoot(value string) error {

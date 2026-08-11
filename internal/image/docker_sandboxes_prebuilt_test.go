@@ -140,6 +140,24 @@ func TestDockerSandboxesPrebuiltPinRetainsScheduledSecurityStatusChecks(t *testi
 	}
 }
 
+func TestDockerSandboxesPrebuiltAliasProfileSupportsFullAndActOnly(t *testing.T) {
+	for _, test := range []struct {
+		reference string
+		want      string
+	}{
+		{reference: config.DockerSandboxesPrebuiltFullReference, want: prebuilt.ProfileFull},
+		{reference: config.DockerSandboxesPrebuiltActReference, want: prebuilt.ProfileAct},
+	} {
+		got, err := dockerSandboxesPrebuiltProfileForAlias(test.reference)
+		if err != nil || got != test.want {
+			t.Fatalf("profile for %q = %q, %v; want %q", test.reference, got, err, test.want)
+		}
+	}
+	if _, err := dockerSandboxesPrebuiltProfileForAlias(prebuilt.DefaultPackageRepository + ":full-preview"); err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("unsupported alias error = %v", err)
+	}
+}
+
 func TestDockerSandboxesPrebuiltAcquisitionDownloadsOnceThenReusesExactArchive(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("EPAR_STATE_HOME", filepath.Join(root, "host-state"))
