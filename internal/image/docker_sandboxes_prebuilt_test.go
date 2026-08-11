@@ -413,6 +413,45 @@ func TestDockerSandboxesPrebuiltAcquisitionCleansPartialAfterRepeatedTransientFa
 	}
 }
 
+func TestDockerSandboxesPrebuiltAcquisitionMigratesLegacyStateCache(t *testing.T) {
+	projectRoot := t.TempDir()
+	configPath := filepath.Join(projectRoot, ".local", "config.yml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("provider:\n  type: docker-sandboxes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verified := dockerSandboxesPrebuiltFixture()
+	coordinator := &Coordinator{ProjectRoot: projectRoot, ConfigPath: configPath}
+	legacyRoot, err := coordinator.legacyDockerSandboxesPrebuiltAcquisitionRoot(verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacyRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyRoot, "base-template.tar"), []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := coordinator.dockerSandboxesPrebuiltAcquisitionRoot(verified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(filepath.ToSlash(root), "/.local/cache/image/") {
+		t.Fatalf("new acquisition root = %s", root)
+	}
+	if err := coordinator.migrateLegacyDockerSandboxesPrebuiltAcquisition(root, verified); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "base-template.tar")); err != nil {
+		t.Fatalf("migrated archive missing: %v", err)
+	}
+	if _, err := os.Stat(legacyRoot); !os.IsNotExist(err) {
+		t.Fatalf("legacy cache remains after migration: %v", err)
+	}
+}
+
 func TestDockerSandboxesPrebuiltArchiveRejectsWrongRunnerAndRecipeLabels(t *testing.T) {
 	verified := dockerSandboxesPrebuiltFixture()
 	archivePath, configDigest, _ := writeDockerArchiveWithTagAndLabels(t, dockerSandboxesPrebuiltBaseTag(verified), dockerSandboxesPrebuiltBaseLabels(verified))

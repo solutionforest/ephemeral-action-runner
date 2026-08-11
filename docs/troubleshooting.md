@@ -268,6 +268,25 @@ Inspect the exact classification before removing anything manually:
 
 Use normal `storage prune --execute` only for exact catalog-owned resources. Legacy prefix-era entries require the plan hash printed by `storage prune --legacy`; they are not removed automatically. Do not use broad Docker prune/reset commands or VHDX compaction as a substitute for this review.
 
+## Startup reports a missing Docker Sandboxes receipt or evidence file
+
+### Symptom
+
+After `.local/state`, `.local/cache`, a Docker image, or a Docker Sandboxes template was removed manually, startup reports a missing project-local receipt/evidence path or discovers stale external ownership.
+
+### Diagnosis and remediation
+
+Current EPAR treats a genuinely missing cataloged receipt or compact evidence file as unavailable cache rather than trusted ownership evidence. It skips reuse of that external template and reacquires or rebuilds the configured immutable artifact; malformed JSON, digest disagreement, redirected paths, and non-regular evidence still fail closed as integrity errors.
+
+First stop other controllers for the same configuration and start once more. If recovery remains blocked, preview an exact reset:
+
+```bash
+./start storage status --config .local/config.yml
+./start storage reset --config .local/config.yml
+```
+
+Review every exact target and shared-resource line. Execute only with the new preview hash printed by the command. The config, GitHub App key, certificates, and custom scripts are preserved, while the next start performs a cold acquisition. See [Generated files and recovery](generated-files.md) before deleting project or host data manually.
+
 ## EPAR Buildx builder points to a previous Docker daemon
 
 ### Symptom

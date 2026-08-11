@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/dependency"
+	"github.com/solutionforest/ephemeral-action-runner/internal/projectlayout"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -256,7 +257,7 @@ func (m *Coordinator) acquireActionsRunner(ctx context.Context, manifest Manifes
 		return "", fmt.Errorf("resolved Actions runner identity is incomplete")
 	}
 	digest := strings.TrimPrefix(manifest.RunnerAssetDigest, "sha256:")
-	cachePath := filepath.Join(m.ProjectRoot, ".local", "state", "image", "downloads", "actions-runner", digest, manifest.RunnerAssetName)
+	cachePath := filepath.Join(projectlayout.CacheRoot(m.ProjectRoot), "image", "downloads", "actions-runner", digest, manifest.RunnerAssetName)
 	buildTrust, err := m.resolveBuildTrust(ctx)
 	if err != nil {
 		return "", err

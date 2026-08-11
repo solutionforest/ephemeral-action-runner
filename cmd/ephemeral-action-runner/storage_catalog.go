@@ -162,9 +162,12 @@ func catalogStorageArtifact(value storagecatalog.Catalog, resource storagecatalo
 			artifact.Target = storage.Target{Kind: storage.TargetExternal, Locator: resource.Locator, Identity: resource.Identity, Fingerprint: resource.Fingerprint, Match: storage.MatchExact}
 			artifact.Protections = append(artifact.Protections, storage.Protection{Kind: storage.ProtectionUncertain, Detail: "catalog filesystem target cannot be read exactly"})
 		}
-	case "template-staging-directory":
+	case "template-staging-directory", "prebuilt-package-archive":
 		target, err := storage.SnapshotFilesystemTarget(resource.Locator)
 		artifact.Kind = storage.ArtifactOther
+		if resource.Kind == "prebuilt-package-archive" {
+			artifact.Kind = storage.ArtifactProviderCache
+		}
 		if err == nil {
 			artifact.Target = target
 			if info, statErr := os.Lstat(target.Locator); statErr == nil {
@@ -308,12 +311,28 @@ type hostStorageExecutor struct {
 }
 
 func newHostStorageExecutor(projectRoot string) (*hostStorageExecutor, error) {
-	filesystem, err := storage.NewFilesystemExecutor(
+	candidateRoots := []string{
 		filepath.Join(projectRoot, ".local", "bin"),
+		filepath.Join(projectRoot, ".local", "cache"),
+		filepath.Join(projectRoot, ".local", "state"),
+		filepath.Join(projectRoot, ".local", "storage"),
+		filepath.Join(projectRoot, "work", "images"),
 		filepath.Join(projectRoot, "work", "template-builds", "docker-sandboxes"),
-	)
-	if err != nil {
-		return nil, err
+		filepath.Join(projectRoot, "work", "wsl"),
+	}
+	var existingRoots []string
+	for _, root := range candidateRoots {
+		if info, statErr := os.Lstat(root); statErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			existingRoots = append(existingRoots, root)
+		}
+	}
+	var filesystem storage.ExactExecutor
+	if len(existingRoots) != 0 {
+		var err error
+		filesystem, err = storage.NewFilesystemExecutor(existingRoots...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &hostStorageExecutor{filesystem: filesystem, sandboxes: dockersandboxes.New("")}, nil
 }
@@ -321,6 +340,9 @@ func newHostStorageExecutor(projectRoot string) (*hostStorageExecutor, error) {
 func (e *hostStorageExecutor) ObserveExact(ctx context.Context, target storage.Target) (storage.Observation, error) {
 	switch target.Kind {
 	case storage.TargetFile, storage.TargetDirectory:
+		if e.filesystem == nil {
+			return storage.Observation{}, errors.New("no EPAR generated filesystem root is available for exact observation")
+		}
 		return e.filesystem.ObserveExact(ctx, target)
 	case storage.TargetDockerImageTag:
 		return observeDockerImageTarget(ctx, target)
@@ -361,6 +383,9 @@ func (e *hostStorageExecutor) ObserveExact(ctx context.Context, target storage.T
 func (e *hostStorageExecutor) RemoveExact(ctx context.Context, removal storage.Removal) error {
 	switch removal.Target.Kind {
 	case storage.TargetFile, storage.TargetDirectory:
+		if e.filesystem == nil {
+			return errors.New("no EPAR generated filesystem root is available for exact removal")
+		}
 		return e.filesystem.RemoveExact(ctx, removal)
 	case storage.TargetDockerImageTag:
 		blockers, err := dockerImageContainerBlockers(removal.Target.Identity)
@@ -482,7 +507,7 @@ func removeExecutedCatalogEntries(report storage.ExecutionReport, now time.Time)
 				if runtime.GOOS == "windows" || filepath.IsAbs(resource.Locator) {
 					targetKind = storage.TargetFile
 				}
-			case "template-staging-directory":
+			case "template-staging-directory", "prebuilt-package-archive":
 				targetKind = storage.TargetDirectory
 			}
 			if removed[string(targetKind)+"\x00"+resource.Identity] && len(resource.References) == 0 {

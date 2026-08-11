@@ -50,9 +50,9 @@ func TestPrebuiltArchiveCleanupRemovesOnlyExactAcquisitionDirectory(t *testing.T
 	projectRoot := t.TempDir()
 	coordinator := Coordinator{ProjectRoot: projectRoot}
 	packageDigest := "sha256:" + strings.Repeat("a", 64)
-	makeResource := func(t *testing.T, suffix string, extra bool) storagecatalog.Resource {
+	makeResource := func(t *testing.T, storageClass, suffix string, extra bool) storagecatalog.Resource {
 		t.Helper()
-		root := filepath.Join(projectRoot, ".local", "state", "image", suffix, "prebuilt", strings.TrimPrefix(packageDigest, "sha256:"), "linux-amd64")
+		root := filepath.Join(projectRoot, ".local", storageClass, "image", suffix, "prebuilt", strings.TrimPrefix(packageDigest, "sha256:"), "linux-amd64")
 		if err := os.MkdirAll(root, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +79,7 @@ func TestPrebuiltArchiveCleanupRemovesOnlyExactAcquisitionDirectory(t *testing.T
 		return storagecatalog.Resource{Kind: catalogPrebuiltPackageArchiveKind, Locator: target.Locator, Identity: target.Identity, Fingerprint: target.Fingerprint, ManifestHash: packageDigest}
 	}
 
-	exact := makeResource(t, "exact", false)
+	exact := makeResource(t, "cache", "exact", false)
 	if err := coordinator.removeCatalogResource(context.Background(), exact); err != nil {
 		t.Fatal(err)
 	}
@@ -87,12 +87,20 @@ func TestPrebuiltArchiveCleanupRemovesOnlyExactAcquisitionDirectory(t *testing.T
 		t.Fatalf("exact prebuilt acquisition was not removed: %v", err)
 	}
 
-	changed := makeResource(t, "changed", true)
+	changed := makeResource(t, "cache", "changed", true)
 	if err := coordinator.removeCatalogResource(context.Background(), changed); err == nil || !strings.Contains(err.Error(), "unexpected objects") {
 		t.Fatalf("changed acquisition directory was not refused exactly: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(changed.Locator, "unexpected.txt")); err != nil {
 		t.Fatalf("refused acquisition directory was modified: %v", err)
+	}
+
+	legacy := makeResource(t, "state", "legacy", false)
+	if err := coordinator.removeCatalogResource(context.Background(), legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy.Locator); !os.IsNotExist(err) {
+		t.Fatalf("legacy prebuilt acquisition was not removed: %v", err)
 	}
 }
 

@@ -75,6 +75,8 @@ rewrite_links() {
       "logging.md" => "Logging",
       "docs/storage.md" => "Storage",
       "storage.md" => "Storage",
+      "docs/generated-files.md" => "Generated-Files-and-Recovery",
+      "generated-files.md" => "Generated-Files-and-Recovery",
       "docs/troubleshooting.md" => "Troubleshooting",
       "troubleshooting.md" => "Troubleshooting",
       "docs/security.md" => "Security",
@@ -167,6 +169,7 @@ copy_page "docs/development/principles.md" "Development-Principles"
 copy_page "docs/operations.md" "Operations"
 copy_page "docs/logging.md" "Logging"
 copy_page "docs/storage.md" "Storage"
+copy_page "docs/generated-files.md" "Generated-Files-and-Recovery"
 copy_page "docs/troubleshooting.md" "Troubleshooting"
 copy_page "docs/security.md" "Security"
 copy_page "docs/providers/docker-sandboxes.md" "Docker-Sandboxes-Provider"
@@ -219,6 +222,7 @@ cat > "$out_dir/_Sidebar.md" <<'SIDEBAR'
 - [Logging](Logging)
 - [Observability Examples](Observability-Examples)
 - [Storage](Storage)
+- [Generated files and recovery](Generated-Files-and-Recovery)
 - [Troubleshooting](Troubleshooting)
 - [Security](Security)
 

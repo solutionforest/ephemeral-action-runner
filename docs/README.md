@@ -19,7 +19,7 @@ Four provider identities remain accepted at runtime, while three are onboarding-
 
 - [Operations](operations.md): supervision, capacity, cleanup, recovery, and maintenance.
 - [Troubleshooting](troubleshooting.md): symptom-first diagnostics.
-- [Logging](logging.md) and [Storage](storage.md): retention, capacity, and exact cleanup boundaries.
+- [Logging](logging.md), [Storage](storage.md), and [Generated files and recovery](generated-files.md): retention, capacity, directory ownership, safe deletion, exact reset, and cleanup boundaries.
 - [Image customization](image-build.md): build layers and custom install scripts.
 - [Docker Sandboxes templates](advanced/docker-sandboxes-template.md): build, verify, import, size, and retain exact templates.
 - [Cross-architecture containers](advanced/cross-architecture-containers.md): image platforms, emulation, labels, and verification.

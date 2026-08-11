@@ -660,6 +660,118 @@ func TestReusableDockerSandboxesReceiptRejectsCorruptedEvidence(t *testing.T) {
 	}
 }
 
+func TestReusableDockerSandboxesReceiptSkipsDeletedProjectState(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "host-state")
+	t.Setenv("EPAR_STATE_HOME", stateRoot)
+	projectRoot := t.TempDir()
+	firstConfig := filepath.Join(projectRoot, ".local", "config.first.yml")
+	secondConfig := filepath.Join(projectRoot, ".local", "config.second.yml")
+	for _, path := range []string{firstConfig, secondConfig} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manifest := Manifest{
+		SchemaVersion:        ManifestSchemaVersion,
+		ProviderType:         "docker-sandboxes",
+		ProviderPlatform:     "linux/amd64",
+		SourceType:           "docker-image",
+		SourceImage:          "ghcr.io/catthehacker/ubuntu:act-latest",
+		SourcePlatform:       "linux/amd64",
+		SourceDigest:         "sha256:" + strings.Repeat("a", 64),
+		SourcePlatformDigest: "sha256:" + strings.Repeat("b", 64),
+		RunnerSelector:       "latest",
+		RunnerVersion:        "2.336.0",
+		RunnerAssetName:      "actions-runner-linux-x64-2.336.0.tar.gz",
+		RunnerAssetURL:       "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz",
+		RunnerAssetDigest:    "sha256:" + strings.Repeat("c", 64),
+	}
+	manifestHash, err := ManifestHash(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := ResolvedDockerSource{
+		Reference:          manifest.SourceImage,
+		ImmutableReference: "ghcr.io/catthehacker/ubuntu@" + manifest.SourceDigest,
+		IndexDigest:        manifest.SourceDigest,
+		PlatformDigest:     manifest.SourcePlatformDigest,
+		Platform:           manifest.SourcePlatform,
+	}
+	artifact := provider.TemplateArtifact{
+		Reference: "docker.io/library/epar-docker-sandboxes-catthehacker-act-latest:" + manifestHash[:16] + "-amd64",
+		Digest:    "sha256:" + strings.Repeat("d", 64),
+		CacheID:   strings.Repeat("d", 12),
+		Platform:  manifest.SourcePlatform,
+		RootDisk:  "40GiB",
+	}
+	now := time.Date(2026, time.August, 12, 1, 0, 0, 0, time.UTC)
+	first := &Coordinator{ProjectRoot: projectRoot, ConfigPath: firstConfig, Clock: func() time.Time { return now }}
+	if err := first.recordCurrentSandboxArtifact(context.Background(), artifact, manifestHash, now); err != nil {
+		t.Fatal(err)
+	}
+
+	second := &Coordinator{ProjectRoot: projectRoot, ConfigPath: secondConfig, Clock: func() time.Time { return now.Add(time.Minute) }}
+	_, receiptPath, found, err := second.reusableDockerSandboxesReceipt(manifest, source, manifestHash, artifact.RootDisk)
+	if err != nil {
+		t.Fatalf("missing project-local state blocked reacquisition: %v", err)
+	}
+	if found || receiptPath != "" {
+		t.Fatalf("deleted receipt was treated as reusable: found=%t path=%q", found, receiptPath)
+	}
+}
+
+func TestReusableDockerSandboxesReceiptSkipsDeletedEvidence(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "host-state")
+	t.Setenv("EPAR_STATE_HOME", stateRoot)
+	projectRoot := t.TempDir()
+	firstConfig := filepath.Join(projectRoot, ".local", "config.first.yml")
+	secondConfig := filepath.Join(projectRoot, ".local", "config.second.yml")
+	for _, path := range []string{firstConfig, secondConfig} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("provider:\n  type: docker-sandboxes\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := Manifest{SchemaVersion: ManifestSchemaVersion, ProviderType: "docker-sandboxes", ProviderPlatform: "linux/amd64", SourceType: "docker-image", SourceImage: "ghcr.io/catthehacker/ubuntu:act-latest", SourcePlatform: "linux/amd64", SourceDigest: "sha256:" + strings.Repeat("a", 64), SourcePlatformDigest: "sha256:" + strings.Repeat("b", 64), RunnerSelector: "latest", RunnerVersion: "2.336.0", RunnerAssetName: "actions-runner-linux-x64-2.336.0.tar.gz", RunnerAssetURL: "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz", RunnerAssetDigest: "sha256:" + strings.Repeat("c", 64)}
+	manifestHash, err := ManifestHash(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := ResolvedDockerSource{Reference: manifest.SourceImage, ImmutableReference: "ghcr.io/catthehacker/ubuntu@" + manifest.SourceDigest, IndexDigest: manifest.SourceDigest, PlatformDigest: manifest.SourcePlatformDigest, Platform: manifest.SourcePlatform}
+	artifact := provider.TemplateArtifact{Reference: "docker.io/library/epar-docker-sandboxes-catthehacker-act-latest:" + manifestHash[:16] + "-amd64", Digest: "sha256:" + strings.Repeat("d", 64), CacheID: strings.Repeat("d", 12), Platform: manifest.SourcePlatform, RootDisk: "40GiB"}
+	now := time.Date(2026, time.August, 12, 1, 0, 0, 0, time.UTC)
+	receiptPath, err := DockerSandboxesReceiptPathForConfig(projectRoot, firstConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := writeLegacyDockerSandboxesReceiptEvidence(t, receiptPath, manifestHash)
+	receipt := dockerSandboxesReceipt{SchemaVersion: dockerSandboxesLegacyReceiptSchema, ManifestHash: manifestHash, Manifest: manifest, Source: source, Artifact: artifact, MetadataSHA256: "sha256:" + strings.Repeat("e", 64), ArchiveSHA256: "sha256:" + strings.Repeat("f", 64), ArchiveBytes: 4096, Evidence: evidence, ActivatedAt: now}
+	if err := writeJSONFile(receiptPath, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(filepath.Dir(receiptPath), filepath.FromSlash(evidence["provenance"].Path))); err != nil {
+		t.Fatal(err)
+	}
+	first := &Coordinator{ProjectRoot: projectRoot, ConfigPath: firstConfig, Clock: func() time.Time { return now }}
+	if err := first.recordCurrentSandboxArtifact(context.Background(), artifact, manifestHash, now); err != nil {
+		t.Fatal(err)
+	}
+	second := &Coordinator{ProjectRoot: projectRoot, ConfigPath: secondConfig, Clock: func() time.Time { return now.Add(time.Minute) }}
+	_, candidatePath, found, err := second.reusableDockerSandboxesReceipt(manifest, source, manifestHash, artifact.RootDisk)
+	if err != nil {
+		t.Fatalf("missing receipt evidence blocked reacquisition: %v", err)
+	}
+	if found || candidatePath != "" {
+		t.Fatalf("receipt with deleted evidence was treated as reusable: found=%t path=%q", found, candidatePath)
+	}
+}
+
 func TestConcurrentDockerSandboxesPublicationPrecedesSecondConfigReuse(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), "host-state")
 	t.Setenv("EPAR_STATE_HOME", stateRoot)
