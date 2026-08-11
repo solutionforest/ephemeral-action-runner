@@ -135,20 +135,44 @@ func TestPublisherProtectedPromotionAdvancesRecipeCandidate(t *testing.T) {
 	}
 }
 
-func TestPublisherProtectedPromotionRejectsDisabledFull(t *testing.T) {
+func TestPublisherProtectedPromotionBootstrapsAcceptedFull(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
-	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest)}}
-	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileFull: {Enabled: false}}}
+	source := sourceObservation(digest)
+	source.Reference = "ghcr.io/catthehacker/ubuntu:full-latest"
+	resolver := &sequenceResolver{observations: []ResolvedReference{source, source}}
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, WizardDefault: true, AutoAdvance: true}, ProfileFull: {Enabled: false}}}
 	input := publicationInput(digest)
 	input.Profile = ProfileFull
 	input.SourceReference = resolver.observations[0].Reference
 	input.SourceTag = "full-latest"
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	publisher := Publisher{Resolver: resolver}
+	plan, err := publisher.Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := (Publisher{Resolver: resolver}).PromoteProtected(context.Background(), &catalog, plan); err == nil || !strings.Contains(err.Error(), "disabled") {
-		t.Fatalf("disabled Full promotion error = %v", err)
+	if err := publisher.Promote(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.PromoteProtected(context.Background(), &catalog, plan); err == nil || !strings.Contains(err.Error(), "acceptance") {
+		t.Fatalf("unaccepted Full promotion error = %v", err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptanceForProfile(ProfileFull, digest, "linux/amd64", 101, 102)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendAcceptance(validAcceptanceForProfile(ProfileFull, digest, "linux/arm64", 201, 202)); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.PromoteProtected(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if got := catalog.Aliases[ProfileFull].PackageIndexDigest; got != digest {
+		t.Fatalf("protected Full alias digest = %s, want %s", got, digest)
+	}
+	if policy := catalog.Policies[ProfileFull]; !policy.Enabled || !policy.AutoAdvance || !policy.WizardDefault {
+		t.Fatalf("protected Full policy = %#v, want enabled/default/auto-advance", policy)
+	}
+	if catalog.Policies[ProfileAct].WizardDefault {
+		t.Fatal("Act remained the catalog wizard default after Full promotion")
 	}
 }
 

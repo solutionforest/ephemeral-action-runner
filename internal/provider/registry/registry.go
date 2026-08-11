@@ -100,21 +100,29 @@ func catthehackerProfiles() []provider.WizardImageProfile {
 
 func dockerSandboxesProfiles() []provider.WizardImageProfile {
 	return []provider.WizardImageProfile{
-		{Name: "full", Tag: "full-latest"},
-		{Name: "act", Tag: "act-latest"},
+		{Name: "full", Tag: "full-latest", Label: "Catthehacker Ubuntu Full", Description: "Downloads and builds ghcr.io/catthehacker/ubuntu:full-latest on this machine. CAUTION: image preparation can take 30–60 minutes."},
+		{Name: "act", Tag: "act-latest", Label: "Catthehacker Ubuntu Act", Description: "Downloads and builds ghcr.io/catthehacker/ubuntu:act-latest on this machine."},
 	}
 }
 
 func dockerSandboxesArtifactSources() []provider.WizardArtifactSource {
-	return []provider.WizardArtifactSource{{
-		Distribution: config.ImageDistributionPrebuilt,
-		Profile:      "act",
-		Reference:    config.DockerSandboxesPrebuiltActReference,
-		Label:        "EPAR verified prebuilt Act",
-		Description:  "Preview: built from Catthehacker Ubuntu Act and verified by immutable digest plus GitHub/Sigstore attestation. Host and enterprise CAs are applied at runtime where safe; custom scripts create only a small local derivative.",
-		Preview:      true,
-		Default:      false,
-	}}
+	return []provider.WizardArtifactSource{
+		{
+			Distribution: config.ImageDistributionPrebuilt,
+			Profile:      "full",
+			Reference:    config.DockerSandboxesPrebuiltFullReference,
+			Label:        "EPAR verified prebuilt Full",
+			Description:  "Built from Catthehacker Ubuntu:full-latest and nearest to the GitHub-hosted runner image.",
+			Default:      true,
+		},
+		{
+			Distribution: config.ImageDistributionPrebuilt,
+			Profile:      "act",
+			Reference:    config.DockerSandboxesPrebuiltActReference,
+			Label:        "EPAR verified prebuilt Act",
+			Description:  "Built from Catthehacker Ubuntu:act-latest for minimum size with only critical runner dependencies.",
+		},
+	}
 }
 
 func Descriptors() []provider.Descriptor {

@@ -30,14 +30,15 @@ type Descriptor struct {
 }
 
 type WizardImageProfile struct {
-	Name string
-	Tag  string
+	Name        string
+	Tag         string
+	Label       string
+	Description string
 }
 
-// WizardArtifactSource describes an optional reusable runner artifact offered
-// during onboarding. Local builds remain the implicit baseline; providers can
-// advertise a prebuilt source without changing that default until promotion
-// gates have passed.
+// WizardArtifactSource describes a reusable runner artifact offered during
+// onboarding. A provider with artifact sources must identify exactly one
+// default across those sources; local image profiles follow them in the menu.
 type WizardArtifactSource struct {
 	Distribution string
 	Profile      string
@@ -168,6 +169,23 @@ func ValidateWizardContributions(descriptor Descriptor) error {
 		}
 		if !descriptor.GuidedArtifacts || len(descriptor.WizardImageProfiles) == 0 {
 			return fmt.Errorf("Catthehacker onboarding requires guided artifact profiles")
+		}
+		for _, profile := range descriptor.WizardImageProfiles {
+			if profile.Name == "" || profile.Tag == "" {
+				return fmt.Errorf("Catthehacker onboarding image profiles require name and tag")
+			}
+		}
+		defaults := 0
+		for _, source := range descriptor.WizardArtifactSources {
+			if source.Distribution == "" || source.Profile == "" || source.Reference == "" || source.Label == "" {
+				return fmt.Errorf("Catthehacker onboarding artifact sources require distribution, profile, reference, and label")
+			}
+			if source.Default {
+				defaults++
+			}
+		}
+		if len(descriptor.WizardArtifactSources) > 0 && defaults != 1 {
+			return fmt.Errorf("Catthehacker onboarding artifact sources require exactly one default, got %d", defaults)
 		}
 	}
 	return nil

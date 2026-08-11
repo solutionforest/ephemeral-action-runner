@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "artifactKind": "docker-sandboxes-template-base",
   "packageRepository": "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template",
   "runtimeContract": "docker-sandboxes-v1",
@@ -7,6 +7,7 @@
   "sourceRepository": "ghcr.io/catthehacker/ubuntu",
   "sourceResolution": "registry-descriptor",
   "sourceObservations": "catalog-only",
+  "profilePolicyAuthority": "signed-catalog",
   "sourceLock": "sources.lock.json",
   "supportedPlatforms": [
     "linux/amd64",
@@ -16,19 +17,12 @@
     "act": {
       "sourceTag": "act-latest",
       "aliasTag": "act-latest",
-      "channel": "stable",
-      "enabled": true,
-      "autoAdvance": true,
-      "wizardDefault": false
+      "channel": "stable"
     },
     "full": {
       "sourceTag": "full-latest",
       "aliasTag": "full-latest",
-      "channel": "stable",
-      "enabled": false,
-      "autoAdvance": false,
-      "wizardDefault": false,
-      "reason": "Full remains gated until independent capacity, architecture, import/readback, and rollback validation passes"
+      "channel": "stable"
     }
   },
   "runner": {
