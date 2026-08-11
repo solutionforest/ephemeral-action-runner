@@ -1032,8 +1032,8 @@ jobs:
             existing_manifest="$(oras resolve "$immutable_ref")"
           fi
           [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          oras manifest fetch "$immutable_ref" --format json > "$RUNNER_TEMP/epar-promotion/catalog-manifest.json"
-          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.schemaVersion == 2) and (.mediaType == "application/vnd.oci.image.manifest.v1+json") and (.artifactType == $artifact) and (.content.config.mediaType == $config) and ((.content.layers | length) == 1) and (.content.layers[0].mediaType == $layer)' "$RUNNER_TEMP/epar-promotion/catalog-manifest.json" >/dev/null
+          oras manifest fetch "$immutable_ref" > "$RUNNER_TEMP/epar-promotion/catalog-manifest.json"
+          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.schemaVersion == 2) and (.mediaType == "application/vnd.oci.image.manifest.v1+json") and (.artifactType == $artifact) and (.config.mediaType == $config) and ((.layers | length) == 1) and (.layers[0].mediaType == $layer)' "$RUNNER_TEMP/epar-promotion/catalog-manifest.json" >/dev/null
           echo "catalog_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
           echo "manifest_digest=$existing_manifest" >> "$GITHUB_OUTPUT"
           echo "immutable_ref=$immutable_ref" >> "$GITHUB_OUTPUT"
@@ -1433,8 +1433,8 @@ jobs:
             existing_manifest="$(oras resolve "$immutable_ref")"
           fi
           [[ "$existing_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          oras manifest fetch "$immutable_ref" --format json > "$RUNNER_TEMP/manual-catalog-manifest.json"
-          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.schemaVersion == 2) and (.mediaType == "application/vnd.oci.image.manifest.v1+json") and (.artifactType == $artifact) and (.content.config.mediaType == $config) and ((.content.layers | length) == 1) and (.content.layers[0].mediaType == $layer)' "$RUNNER_TEMP/manual-catalog-manifest.json" >/dev/null
+          oras manifest fetch "$immutable_ref" > "$RUNNER_TEMP/manual-catalog-manifest.json"
+          jq -e --arg artifact "$CATALOG_ARTIFACT_TYPE" --arg config "$CATALOG_CONFIG_MEDIA_TYPE" --arg layer "$CATALOG_LAYER_MEDIA_TYPE" '(.schemaVersion == 2) and (.mediaType == "application/vnd.oci.image.manifest.v1+json") and (.artifactType == $artifact) and (.config.mediaType == $config) and ((.layers | length) == 1) and (.layers[0].mediaType == $layer)' "$RUNNER_TEMP/manual-catalog-manifest.json" >/dev/null
           echo "catalog_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
           echo "manifest_digest=$existing_manifest" >> "$GITHUB_OUTPUT"
           echo "immutable_ref=$immutable_ref" >> "$GITHUB_OUTPUT"
