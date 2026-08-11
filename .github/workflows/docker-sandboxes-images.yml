@@ -3,6 +3,7 @@ name: Docker Sandboxes prebuilt images
 on:
   schedule:
     - cron: '37 */6 * * *'
+    - cron: '7 1,7,13,19 * * *'
   push:
     branches:
       - main
@@ -113,6 +114,8 @@ jobs:
         run: |
           scripts/docker-sandboxes/validate-assets.ps1 -Platform linux/amd64
           scripts/docker-sandboxes/validate-assets.ps1 -Platform linux/arm64
+          scripts/docker-sandboxes/validate-prebuilt.ps1 -Platform linux/amd64
+          scripts/docker-sandboxes/validate-prebuilt.ps1 -Platform linux/arm64
 
   resolve:
     name: Resolve immutable upstream and publication state
@@ -162,15 +165,23 @@ jobs:
         shell: bash
         env:
           DISPATCH_PROFILE: ${{ inputs.profile }}
+          SCHEDULE_EXPRESSION: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
           profile="${DISPATCH_PROFILE:-act}"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            case "$SCHEDULE_EXPRESSION" in
+              '37 */6 * * *') profile=act ;;
+              '7 1,7,13,19 * * *') profile=full ;;
+              *) echo "unsupported schedule expression: $SCHEDULE_EXPRESSION" >&2; exit 1 ;;
+            esac
+          fi
           case "$profile" in
             act|full) ;;
             *) echo "unsupported profile: $profile" >&2; exit 1 ;;
           esac
-          if [[ "$profile" == full && "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
-            echo 'full is candidate-only and may be selected only by an explicit workflow dispatch' >&2
+          if [[ "$profile" == full && "$GITHUB_EVENT_NAME" != workflow_dispatch && "$GITHUB_EVENT_NAME" != schedule ]]; then
+            echo 'full may be selected only by its dedicated schedule or an explicit workflow dispatch' >&2
             exit 1
           fi
           source_tag="${profile}-latest"
@@ -379,7 +390,7 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.noop != 'true'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -400,6 +411,35 @@ jobs:
       - name: Check out source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
+      - name: Prepare hosted capacity for the Full profile
+        if: needs.resolve.outputs.profile == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Full requires substantially more unpacked Docker storage than the standard 14 GB hosted-runner allowance.'
+          df -h /
+          free -h
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force --volumes
+          available_kib="$(df --output=avail / | tail -n 1 | tr -d '[:space:]')"
+          minimum_kib="$((40 * 1024 * 1024))"
+          if (( available_kib < minimum_kib )); then
+            echo "Full publication requires at least 40 GiB free before its 8 GiB swap allocation; observed $((available_kib / 1024 / 1024)) GiB" >&2
+            exit 1
+          fi
+          swap_path=/mnt/epar-full-build.swap
+          sudo fallocate -l 8G "$swap_path"
+          sudo chmod 0600 "$swap_path"
+          sudo mkswap "$swap_path"
+          sudo swapon "$swap_path"
+          df -h /
+          free -h
+
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -415,6 +455,10 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 1
 
       - name: Fetch immutable runner, Tini, and emulation license inputs
         id: inputs
@@ -540,7 +584,7 @@ jobs:
       - build
     if: needs.resolve.outputs.noop != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     outputs:
       profile: ${{ needs.resolve.outputs.profile }}
       index_digest: ${{ steps.index.outputs.index_digest }}
@@ -1191,7 +1235,7 @@ jobs:
           ACCEPTANCE_EVIDENCE_JSON: ${{ inputs.acceptance_evidence_json }}
         run: |
           set -euo pipefail
-          [[ "$PROFILE" == act ]]
+          [[ "$PROFILE" == act || "$PROFILE" == full ]]
           [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}:catalog-v1-pkg-"* || "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
           evidence_input="$RUNNER_TEMP/promotion-review-input.json"
@@ -1214,10 +1258,10 @@ jobs:
           [[ "$arm64_receipt" =~ ^sha256:[0-9a-f]{64}$ ]]
           digest_prefix="${CANDIDATE_DIGEST#sha256:}"
           digest_prefix="${digest_prefix:0:12}"
-          [[ "$amd64_playwright_runner" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
-          [[ "$amd64_dockerhub_runner" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
-          [[ "$arm64_playwright_runner" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
-          [[ "$arm64_dockerhub_runner" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$amd64_playwright_runner" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$amd64_dockerhub_runner" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$arm64_playwright_runner" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$arm64_dockerhub_runner" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
           [[ "$amd64_playwright_runner" != "$amd64_dockerhub_runner" ]]
           [[ "$arm64_playwright_runner" != "$arm64_dockerhub_runner" ]]
 
@@ -1228,7 +1272,7 @@ jobs:
           go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$exact_catalog_reference" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog" >/dev/null
           jq -e --arg digest "$CANDIDATE_DIGEST" '([.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")] | length) == 1 and ([.transitions[]? | select(.packageIndexDigest == $digest)] | length) == 0' "$catalog" >/dev/null
           entry="$RUNNER_TEMP/promotion-review-entry.json"
-          jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest)' "$catalog" > "$entry"
+          jq -e --arg digest "$CANDIDATE_DIGEST" --arg profile "$PROFILE" '.entries[] | select(.packageIndexDigest == $digest and .profile == $profile)' "$catalog" > "$entry"
           jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and (.platforms | length == 2) and ([.platforms[] | select(.validated != true)] | length == 0)' "$entry" >/dev/null
           go run ./cmd/epar-prebuilt-publisher verify-package --reference "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --entry "$entry" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
           source_reference="$(jq -er '.source.reference' "$entry")"
@@ -1279,9 +1323,9 @@ jobs:
             echo '- [ ] Confirm every job used the listed unique EPAR runner and the `epar-dev-test` runner group.'
             echo '- [ ] Confirm the two receipt hashes match the accepted amd64 and arm64 EPAR controllers.'
             echo '- [ ] Confirm both EPAR controllers stopped with no owned Sandbox, runner, or staging residue.'
-            echo '- [ ] Confirm this exact package digest and catalog are the artifacts intended for `act-latest`.'
+            echo "- [ ] Confirm this exact package digest and catalog are the artifacts intended for \`${PROFILE}-latest\`."
             echo
-            echo 'After this review, approve the waiting protected deployment. The protected job repeats all machine-verifiable checks before it can move `catalog-v1` and then `act-latest`.'
+            echo "After this review, approve the waiting protected deployment. The protected job repeats all machine-verifiable checks before it can move \`catalog-v1\` and then \`${PROFILE}-latest\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
   manual-promote:
@@ -1324,7 +1368,7 @@ jobs:
           PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
         run: |
           set -euo pipefail
-          [[ "$PROFILE" == act ]]
+          [[ "$PROFILE" == act || "$PROFILE" == full ]]
           [[ "$CANDIDATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}:catalog-v1-pkg-"* || "$CANDIDATE_CATALOG_REFERENCE" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
           evidence_input="$RUNNER_TEMP/manual-acceptance-input.json"
@@ -1347,10 +1391,10 @@ jobs:
           [[ "$ARM64_RECEIPT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]
           digest_prefix="${CANDIDATE_DIGEST#sha256:}"
           digest_prefix="${digest_prefix:0:12}"
-          [[ "$AMD64_PLAYWRIGHT_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
-          [[ "$AMD64_DOCKERHUB_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
-          [[ "$ARM64_PLAYWRIGHT_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
-          [[ "$ARM64_DOCKERHUB_RUNNER_NAME" =~ ^epar-prebuilt-act-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$AMD64_PLAYWRIGHT_RUNNER_NAME" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$AMD64_DOCKERHUB_RUNNER_NAME" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-amd64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$ARM64_PLAYWRIGHT_RUNNER_NAME" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
+          [[ "$ARM64_DOCKERHUB_RUNNER_NAME" =~ ^epar-prebuilt-${PROFILE}-${digest_prefix}-arm64-[0-9]{8}-[0-9]{6}-[0-9]{3}$ ]]
           [[ "$AMD64_PLAYWRIGHT_RUNNER_NAME" != "$AMD64_DOCKERHUB_RUNNER_NAME" ]]
           [[ "$ARM64_PLAYWRIGHT_RUNNER_NAME" != "$ARM64_DOCKERHUB_RUNNER_NAME" ]]
           candidate_catalog_manifest="$(oras resolve "$CANDIDATE_CATALOG_REFERENCE")"
@@ -1359,7 +1403,7 @@ jobs:
           catalog="$RUNNER_TEMP/manual-catalog.json"
           go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --reference "$exact_catalog_reference" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog" >/dev/null
           jq -e --arg digest "$CANDIDATE_DIGEST" '([.entries[] | select(.packageIndexDigest == $digest and .status == "candidate")] | length) == 1 and ([.transitions[]? | select(.packageIndexDigest == $digest)] | length) == 0' "$catalog" >/dev/null
-          jq -e --arg digest "$CANDIDATE_DIGEST" '.entries[] | select(.packageIndexDigest == $digest)' "$catalog" > "$RUNNER_TEMP/manual-entry.json"
+          jq -e --arg digest "$CANDIDATE_DIGEST" --arg profile "$PROFILE" '.entries[] | select(.packageIndexDigest == $digest and .profile == $profile)' "$catalog" > "$RUNNER_TEMP/manual-entry.json"
           jq -e --arg repo "$PACKAGE_REPOSITORY" --arg digest "$CANDIDATE_DIGEST" '.packageReference == ($repo + "@" + $digest) and (.platforms | length == 2) and ([.platforms[] | select(.validated != true)] | length == 0)' "$RUNNER_TEMP/manual-entry.json" >/dev/null
           go run ./cmd/epar-prebuilt-publisher verify-package --reference "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" --entry "$RUNNER_TEMP/manual-entry.json" --repository "$PACKAGE_REPOSITORY" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
           source_reference="$(jq -er '.source.reference' "$RUNNER_TEMP/manual-entry.json")"
@@ -1367,25 +1411,25 @@ jobs:
           [[ "$(oras resolve "$source_reference")" == "$source_digest" ]]
           accepted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           jq -n \
-            --arg digest "$CANDIDATE_DIGEST" --arg acceptedAt "$accepted_at" --arg reviewer "$GITHUB_ACTOR" \
+            --arg digest "$CANDIDATE_DIGEST" --arg profile "$PROFILE" --arg acceptedAt "$accepted_at" --arg reviewer "$GITHUB_ACTOR" \
             --arg amd64Receipt "$AMD64_RECEIPT_SHA256" --arg arm64Receipt "$ARM64_RECEIPT_SHA256" \
             --arg amd64PlaywrightRunner "$AMD64_PLAYWRIGHT_RUNNER_NAME" --arg amd64DockerHubRunner "$AMD64_DOCKERHUB_RUNNER_NAME" \
             --arg arm64PlaywrightRunner "$ARM64_PLAYWRIGHT_RUNNER_NAME" --arg arm64DockerHubRunner "$ARM64_DOCKERHUB_RUNNER_NAME" \
-            --arg amd64Label "epar-prebuilt-act-${digest_prefix}-amd64" --arg arm64Label "epar-prebuilt-act-${digest_prefix}-arm64" \
+            --arg amd64Label "epar-prebuilt-${PROFILE}-${digest_prefix}-amd64" --arg arm64Label "epar-prebuilt-${PROFILE}-${digest_prefix}-arm64" \
             --argjson amd64Playwright "$AMD64_PLAYWRIGHT_RUN_ID" --argjson amd64DockerHub "$AMD64_DOCKERHUB_RUN_ID" \
             --argjson arm64Playwright "$ARM64_PLAYWRIGHT_RUN_ID" --argjson arm64DockerHub "$ARM64_DOCKERHUB_RUN_ID" \
             '[
-              {schemaVersion:2,packageIndexDigest:$digest,platform:"linux/amd64",runnerGroup:"epar-dev-test",runnerLabel:$amd64Label,receiptSha256:$amd64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
+              {schemaVersion:3,profile:$profile,packageIndexDigest:$digest,platform:"linux/amd64",runnerGroup:"epar-dev-test",runnerLabel:$amd64Label,receiptSha256:$amd64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
                 {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$amd64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64Playwright|tostring)),conclusion:"success",runnerName:$amd64PlaywrightRunner},
                 {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$amd64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($amd64DockerHub|tostring)),conclusion:"success",runnerName:$amd64DockerHubRunner}
               ]},
-              {schemaVersion:2,packageIndexDigest:$digest,platform:"linux/arm64",runnerGroup:"epar-dev-test",runnerLabel:$arm64Label,receiptSha256:$arm64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
+              {schemaVersion:3,profile:$profile,packageIndexDigest:$digest,platform:"linux/arm64",runnerGroup:"epar-dev-test",runnerLabel:$arm64Label,receiptSha256:$arm64Receipt,importReadback:true,runtimeValidated:true,cleanupValidated:true,reviewedBy:$reviewer,acceptedAt:$acceptedAt,workflowRuns:[
                 {repository:"solutionforest/ephemeral-action-runner-test",workflow:"playwright-docker.yml",runId:$arm64Playwright,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64Playwright|tostring)),conclusion:"success",runnerName:$arm64PlaywrightRunner},
                 {repository:"solutionforest/ephemeral-action-runner-test",workflow:"dockerhub-private-pull.yml",runId:$arm64DockerHub,url:("https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/"+($arm64DockerHub|tostring)),conclusion:"success",runnerName:$arm64DockerHubRunner}
               ]}
             ]' > "$RUNNER_TEMP/manual-acceptance.json"
           go run ./cmd/epar-prebuilt-publisher accept --catalog "$catalog" --input "$RUNNER_TEMP/manual-acceptance.json"
-          alias_digest="$(jq -r '.aliases.act.packageIndexDigest // empty' "$catalog")"
+          alias_digest="$(jq -r --arg profile "$PROFILE" '.aliases[$profile].packageIndexDigest // empty' "$catalog")"
           jq -n --slurpfile entry "$RUNNER_TEMP/manual-entry.json" --arg source "$source_digest" --arg sourceReference "$source_reference" --arg alias "$alias_digest" '{action:"candidate",reason:"protected human-reviewed two-platform EPAR acceptance",expectedSourceDigest:$source,expectedAliasDigest:$alias,sourceReference:$sourceReference,entry:$entry[0]}' > "$RUNNER_TEMP/manual-plan.json"
           echo "catalog=$catalog" >> "$GITHUB_OUTPUT"
           echo "plan=$RUNNER_TEMP/manual-plan.json" >> "$GITHUB_OUTPUT"
@@ -1467,6 +1511,7 @@ jobs:
       - name: Verify signed manual catalog and move exact aliases
         shell: bash
         env:
+          PROFILE: ${{ inputs.profile }}
           CATALOG_DIGEST: ${{ steps.manual-catalog.outputs.catalog_digest }}
           CATALOG_MANIFEST: ${{ steps.manual-catalog.outputs.manifest_digest }}
           IMMUTABLE_REF: ${{ steps.manual-catalog.outputs.immutable_ref }}
@@ -1476,7 +1521,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(oras resolve "$IMMUTABLE_REF")" == "$CATALOG_MANIFEST" ]]
-          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "$IMMUTABLE_REF" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
+          go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile "$PROFILE" --reference "$IMMUTABLE_REF" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push >/dev/null
           catalog_moving="${PACKAGE_REPOSITORY}:catalog-v1"
           catalog_pointer_error="$RUNNER_TEMP/manual-catalog-pointer-resolve.error"
           old_catalog_digest=''
@@ -1489,7 +1534,8 @@ jobs:
             fi
             old_catalog_digest=''
           fi
-          alias_ref="${PACKAGE_REPOSITORY}:act-latest"
+          alias_tag="${PROFILE}-latest"
+          alias_ref="${PACKAGE_REPOSITORY}:${alias_tag}"
           expected_alias="$(jq -r '.expectedAliasDigest // empty' "$PLAN")"
           alias_pointer_error="$RUNNER_TEMP/manual-alias-pointer-resolve.error"
           old_alias_digest=''
@@ -1512,7 +1558,7 @@ jobs:
             set +e
             if [[ "$alias_moved" == true ]]; then
               if [[ -n "$old_alias_digest" ]]; then
-                oras tag "${PACKAGE_REPOSITORY}@${old_alias_digest}" act-latest >/dev/null
+                oras tag "${PACKAGE_REPOSITORY}@${old_alias_digest}" "$alias_tag" >/dev/null
                 [[ "$(oras resolve "$alias_ref")" == "$old_alias_digest" ]] || echo 'manual alias rollback readback failed' >&2
               else
                 echo 'manual alias rollback cannot remove a first-publication alias; catalog rollback remains authoritative' >&2
@@ -1540,7 +1586,7 @@ jobs:
             fi
             [[ -z "$expected_alias" ]]
           fi
-          oras tag "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" act-latest
+          oras tag "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" "$alias_tag"
           alias_moved=true
           [[ "$(oras resolve "$alias_ref")" == "$CANDIDATE_DIGEST" ]]
           trap - EXIT

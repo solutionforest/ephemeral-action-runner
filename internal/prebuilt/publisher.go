@@ -217,7 +217,9 @@ func (p Publisher) Promote(ctx context.Context, catalog *Catalog, plan Publicati
 // candidate produced by Plan. It is deliberately separate from Promote so a
 // recipe/runner/tool change can never auto-advance an alias merely because all
 // build gates happen to pass. The same mutable-source recheck and alias CAS
-// rules apply, and disabled profiles (including Full) remain unavailable.
+// rules apply. Full is the one bootstrap exception: its first independently
+// accepted protected promotion enables its stable policy atomically with the
+// alias move, so it cannot become a wizard default before the gates pass.
 func (p Publisher) PromoteProtected(ctx context.Context, catalog *Catalog, plan PublicationPlan) error {
 	if catalog == nil {
 		return fmt.Errorf("nil prebuilt catalog")
@@ -230,7 +232,8 @@ func (p Publisher) PromoteProtected(ctx context.Context, catalog *Catalog, plan 
 		return err
 	}
 	policy, ok := catalog.Policies[entry.Profile]
-	if !ok || !policy.Enabled {
+	bootstrapFull := ok && entry.Profile == ProfileFull && !policy.Enabled
+	if !ok || !policy.Enabled && !bootstrapFull {
 		return fmt.Errorf("profile %s is disabled for protected promotion", entry.Profile)
 	}
 	gates, err := catalog.EffectiveGates(entry.PackageIndexDigest)
@@ -250,6 +253,17 @@ func (p Publisher) PromoteProtected(ctx context.Context, catalog *Catalog, plan 
 		return err
 	}
 	clone := cloneCatalog(*catalog)
+	if bootstrapFull {
+		policy.Enabled = true
+		policy.WizardDefault = true
+		policy.AutoAdvance = true
+		policy.Reason = "Full completed protected amd64 and arm64 EPAR acceptance"
+		clone.Policies[ProfileFull] = policy
+		if actPolicy, exists := clone.Policies[ProfileAct]; exists {
+			actPolicy.WizardDefault = false
+			clone.Policies[ProfileAct] = actPolicy
+		}
+	}
 	if _, err := clone.AppendEntry(entry); err != nil {
 		return err
 	}

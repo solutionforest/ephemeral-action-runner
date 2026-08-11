@@ -86,9 +86,9 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveAndVerify(ctx context
 	if err := r.initialize(ctx); err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, err
 	}
-	wantAlias := prebuilt.DefaultPackageRepository + ":" + prebuilt.ProfileAct + "-latest"
-	if strings.TrimSpace(packageAlias) != wantAlias {
-		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("unsupported prebuilt package alias %q", packageAlias)
+	profile, err := dockerSandboxesPrebuiltProfileForAlias(packageAlias)
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
 	}
 	registry := r.resolver.Registry
 	var catalog prebuilt.Catalog
@@ -110,7 +110,7 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveAndVerify(ctx context
 		}
 		catalog, catalogDigest, entry, immutableDescriptor, effectiveStatus = resolved.Catalog, resolved.CatalogDigest, resolved.Entry, resolved.Package, resolved.EffectiveStatus
 	} else {
-		resolved, err := r.resolver.Resolve(ctx, prebuilt.ProfileAct)
+		resolved, err := r.resolver.Resolve(ctx, profile)
 		if err != nil {
 			return VerifiedDockerSandboxesPrebuilt{}, err
 		}
@@ -127,6 +127,9 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveAndVerify(ctx context
 		}
 		catalog, catalogDigest, entry = resolved.Catalog, resolved.CatalogDigest, resolved.Entry
 	}
+	if entry.Profile != profile {
+		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("prebuilt package profile %q does not match configured alias profile %q", entry.Profile, profile)
+	}
 	selected, err := prebuilt.ResolvePlatform(immutableDescriptor, platform)
 	if err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, err
@@ -141,11 +144,11 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveCandidate(ctx context
 	if err := r.initialize(ctx); err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, err
 	}
-	wantAlias := prebuilt.DefaultPackageRepository + ":" + prebuilt.ProfileAct + "-latest"
-	if strings.TrimSpace(packageAlias) != wantAlias {
-		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("unsupported prebuilt package alias %q", packageAlias)
+	profile, err := dockerSandboxesPrebuiltProfileForAlias(packageAlias)
+	if err != nil {
+		return VerifiedDockerSandboxesPrebuilt{}, err
 	}
-	packageDigest, err := prebuilt.NormalizeDigest(packageDigest)
+	packageDigest, err = prebuilt.NormalizeDigest(packageDigest)
 	if err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, err
 	}
@@ -169,6 +172,9 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveCandidate(ctx context
 	if !ok {
 		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("package digest %s is not present in immutable candidate catalog", packageDigest)
 	}
+	if entry.Profile != profile {
+		return VerifiedDockerSandboxesPrebuilt{}, fmt.Errorf("candidate package profile %q does not match configured alias profile %q", entry.Profile, profile)
+	}
 	verifiedPackage, err := resolver.VerifyPackage(ctx, packageDigest, entry)
 	if err != nil {
 		return VerifiedDockerSandboxesPrebuilt{}, err
@@ -185,6 +191,20 @@ func (r *productionDockerSandboxesPrebuiltResolver) ResolveCandidate(ctx context
 		EvidenceRef: evidenceRef, Acceptance: true, Entry: entry, Package: verifiedPackage.Package, Platform: selected,
 		EffectiveStatus: status, VerifiedAt: time.Now().UTC(), CompressedBytes: uint64(selected.Size),
 	}, nil
+}
+
+func dockerSandboxesPrebuiltProfileForAlias(packageAlias string) (string, error) {
+	packageAlias = strings.TrimSpace(packageAlias)
+	for _, profile := range []string{prebuilt.ProfileFull, prebuilt.ProfileAct} {
+		alias, err := prebuilt.AliasTag(profile)
+		if err != nil {
+			return "", err
+		}
+		if packageAlias == prebuilt.DefaultPackageRepository+":"+alias {
+			return profile, nil
+		}
+	}
+	return "", fmt.Errorf("unsupported prebuilt package alias %q", packageAlias)
 }
 
 func (r *productionDockerSandboxesPrebuiltResolver) ResolveStatus(ctx context.Context, packageDigest string) (prebuilt.CatalogStatus, error) {
@@ -350,7 +370,7 @@ func (m *Coordinator) resolveVerifiedDockerSandboxesPrebuilt(ctx context.Context
 	if m.Config.Image.PrebuiltAcceptance {
 		resolver, ok := m.PrebuiltResolver.(dockerSandboxesPrebuiltAcceptanceResolver)
 		if !ok {
-			return VerifiedDockerSandboxesPrebuilt{}, errors.New("prebuilt Docker Sandboxes candidate verification is unavailable; EPAR will not follow act-latest or fall back to a local build")
+			return VerifiedDockerSandboxesPrebuilt{}, errors.New("prebuilt Docker Sandboxes candidate verification is unavailable; EPAR will not follow a moving package alias or fall back to a local build")
 		}
 		verified, err = resolver.ResolveCandidate(ctx, reference, pin, platform, strings.TrimSpace(m.Config.Image.PrebuiltCatalogReference), strings.TrimSpace(m.Config.Image.PrebuiltEvidenceRef))
 	} else {

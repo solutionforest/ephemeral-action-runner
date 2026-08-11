@@ -168,6 +168,12 @@ func TestPrebuiltImageDistributionValidation(t *testing.T) {
 	if err := Validate(base); err != nil {
 		t.Fatalf("valid prebuilt configuration rejected: %v", err)
 	}
+	full := base
+	full.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
+	full.Image.PrebuiltReference = DockerSandboxesPrebuiltFullReference
+	if err := Validate(full); err != nil {
+		t.Fatalf("valid Full prebuilt configuration rejected: %v", err)
+	}
 
 	cases := []struct {
 		name string
@@ -179,7 +185,8 @@ func TestPrebuiltImageDistributionValidation(t *testing.T) {
 		{name: "untrusted reference", edit: func(cfg *Config) {
 			cfg.Image.PrebuiltReference = "ghcr.io/example/ephemeral-action-runner/docker-sandboxes-act:preview"
 		}, want: "arbitrary GHCR packages"},
-		{name: "full profile", edit: func(cfg *Config) { cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest" }, want: "Act profile"},
+		{name: "mismatched Full source", edit: func(cfg *Config) { cfg.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest" }, want: "must match"},
+		{name: "mismatched Full reference", edit: func(cfg *Config) { cfg.Image.PrebuiltReference = DockerSandboxesPrebuiltFullReference }, want: "must match"},
 		{name: "pinned runner", edit: func(cfg *Config) { cfg.Image.RunnerVersion = "2.333.0" }, want: "not supported"},
 		{name: "wrong provider", edit: func(cfg *Config) { cfg.Provider.Type = "docker-container"; cfg.Provider.SourceImage = "epar-image" }, want: "supported only with provider.type=docker-sandboxes"},
 		{name: "local fields", edit: func(cfg *Config) { cfg.Image.Distribution = ImageDistributionLocalBuild }, want: "require image.distribution=prebuilt"},
@@ -224,6 +231,14 @@ func TestPrebuiltCandidateAcceptanceValidation(t *testing.T) {
 
 	if err := Validate(base); err != nil {
 		t.Fatalf("valid candidate acceptance configuration rejected: %v", err)
+	}
+	full := base
+	full.Image.SourceImage = "ghcr.io/catthehacker/ubuntu:full-latest"
+	full.Image.PrebuiltReference = DockerSandboxesPrebuiltFullReference
+	full.Pool.NamePrefix = "epar-prebuilt-full-" + strings.Repeat("a", 12) + "-amd64"
+	full.Runner.Labels = []string{"epar-prebuilt-full-" + strings.Repeat("a", 12) + "-amd64"}
+	if err := Validate(full); err != nil {
+		t.Fatalf("valid Full candidate acceptance configuration rejected: %v", err)
 	}
 
 	cases := []struct {

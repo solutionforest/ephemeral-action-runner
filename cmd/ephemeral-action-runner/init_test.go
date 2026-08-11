@@ -1093,7 +1093,7 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n2\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n4\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1139,7 +1139,7 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 			t.Fatalf("dockerSandboxes.%s = %q, want %q", key, values.got, values.want)
 		}
 	}
-	for _, want := range []string{"Docker Sandboxes image setup:", "Runner base image:", "1. full — full-latest (default)", "2. act — act-latest", "Image catalog:", "Runner artifact estimate:", "Source: ghcr.io/catthehacker/ubuntu:act-latest", "Automatic sandbox root limit:"} {
+	for _, want := range []string{"Docker Sandboxes image setup:", "Runner base image:", "1. EPAR verified prebuilt Full (default)", "2. EPAR verified prebuilt Act", "3. Catthehacker Ubuntu Full", "4. Catthehacker Ubuntu Act", "Image catalog:", "Runner artifact estimate:", "Source: ghcr.io/catthehacker/ubuntu:act-latest", "Automatic sandbox root limit:"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("init output omitted %q:\n%s", want, out.String())
 		}
@@ -1149,11 +1149,11 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 			t.Fatalf("wizard review omitted %q:\n%s", want, out.String())
 		}
 	}
-	setupHints := "  Choose the Catthehacker Ubuntu image for this runner. EPAR will provision or update the reusable runner artifact during startup.\n  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.\n  Image catalog: https://github.com/catthehacker/docker_images#images-available\n\nRunner base image:"
+	setupHints := "  Choose how EPAR should provision the reusable runner artifact during startup.\n  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.\n  Image catalog: https://github.com/catthehacker/docker_images#images-available\n\nRunner base image:"
 	if !strings.Contains(out.String(), setupHints) {
 		t.Fatalf("Docker Sandboxes setup hints were not grouped before the option list:\n%s", out.String())
 	}
-	cleanOptions := "Runner base image:\n  1. full — full-latest (default)\n  2. act — act-latest\n  0. Back"
+	cleanOptions := "Runner base image:\n  1. EPAR verified prebuilt Full (default)"
 	if !strings.Contains(out.String(), cleanOptions) {
 		t.Fatalf("Docker Sandboxes option list contains non-option text:\n%s", out.String())
 	}
@@ -1195,24 +1195,31 @@ func TestInitDockerSandboxesWritesConfigBeforeOrdinaryProvisioning(t *testing.T)
 
 func TestDockerSandboxesWizardResolvesEveryBuiltInImageChoice(t *testing.T) {
 	for _, test := range []struct {
-		choice string
-		want   string
+		choice       string
+		want         string
+		distribution string
+		reference    string
 	}{
-		{choice: "", want: "ghcr.io/catthehacker/ubuntu:full-latest"},
-		{choice: "1", want: "ghcr.io/catthehacker/ubuntu:full-latest"},
-		{choice: "2", want: "ghcr.io/catthehacker/ubuntu:act-latest"},
+		{choice: "", want: "ghcr.io/catthehacker/ubuntu:full-latest", distribution: config.ImageDistributionPrebuilt, reference: config.DockerSandboxesPrebuiltFullReference},
+		{choice: "1", want: "ghcr.io/catthehacker/ubuntu:full-latest", distribution: config.ImageDistributionPrebuilt, reference: config.DockerSandboxesPrebuiltFullReference},
+		{choice: "2", want: "ghcr.io/catthehacker/ubuntu:act-latest", distribution: config.ImageDistributionPrebuilt, reference: config.DockerSandboxesPrebuiltActReference},
+		{choice: "3", want: "ghcr.io/catthehacker/ubuntu:full-latest", distribution: config.ImageDistributionLocalBuild},
+		{choice: "4", want: "ghcr.io/catthehacker/ubuntu:act-latest", distribution: config.ImageDistributionLocalBuild},
 	} {
 		t.Run(test.want, func(t *testing.T) {
 			stubInitDockerSandboxesSetup(t, sandboxpromotion.WindowsAMD64, initDockerSandboxesDiscovery{
 				PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 			}, nil)
-			input := test.choice + "\nn\n\n\n"
+			input := test.choice + "\n"
 			profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, io.Discard, bufio.NewReader(strings.NewReader(input)))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !accepted || profile == nil || profile.SourceImage != test.want {
 				t.Fatalf("wizard profile = %+v, accepted=%t, want source %q", profile, accepted, test.want)
+			}
+			if profile.Distribution != test.distribution || profile.PrebuiltReference != test.reference {
+				t.Fatalf("wizard artifact = distribution %q reference %q, want %q %q", profile.Distribution, profile.PrebuiltReference, test.distribution, test.reference)
 			}
 		})
 	}
@@ -1224,7 +1231,7 @@ func TestDockerSandboxesWizardOffersVerifiedPrebuiltActChoice(t *testing.T) {
 		PolicyFingerprint: policyFingerprint,
 	}, nil)
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("P\n")))
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("2\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1240,21 +1247,23 @@ func TestDockerSandboxesWizardOffersVerifiedPrebuiltActChoice(t *testing.T) {
 	if got, want := profile.SourceImage, "ghcr.io/catthehacker/ubuntu:act-latest"; got != want {
 		t.Fatalf("profile source image = %q, want %q", got, want)
 	}
-	if !profile.PrebuiltPreview {
-		t.Fatal("prebuilt profile is not marked preview")
+	if profile.PrebuiltPreview {
+		t.Fatal("stable prebuilt profile is still marked preview")
 	}
 	if profile.PrebuiltDigest != "" {
 		t.Fatalf("prebuilt digest = %q, want unresolved until startup", profile.PrebuiltDigest)
 	}
 	for _, want := range []string{
-		"P. EPAR verified prebuilt Act (preview)",
-		"immutable digest plus GitHub/Sigstore attestation",
-		"Host and enterprise CAs are applied at runtime where safe",
+		"2. EPAR verified prebuilt Act",
+		"minimum size with only critical runner dependencies",
 		"first-use Docker Sandboxes materialization remains local",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("prebuilt wizard output omitted %q:\n%s", want, out.String())
 		}
+	}
+	if strings.Contains(out.String(), "EPAR verifies its immutable digest") {
+		t.Fatalf("prebuilt wizard output retained the removed verbose verification sentence:\n%s", out.String())
 	}
 }
 
@@ -1298,7 +1307,7 @@ func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.
 				PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 			}, nil)
 			var out bytes.Buffer
-			profile, accepted, err := promptDockerImageProfile(context.Background(), t.TempDir(), providerType, sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("\nn\n\n")))
+			profile, accepted, err := promptDockerImageProfile(context.Background(), t.TempDir(), providerType, sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("\n")))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1309,7 +1318,7 @@ func TestSharedDockerImageWizardCoversDockerContainerSandboxesAndWSL(t *testing.
 			if providerType != "docker-sandboxes" {
 				wants = append(wants, "3. Another catthehacker/ubuntu tag")
 			} else {
-				wants = append(wants, "specialized and custom tags are not admitted")
+				wants = []string{"1. EPAR verified prebuilt Full (default)", "2. EPAR verified prebuilt Act", "3. Catthehacker Ubuntu Full", "4. Catthehacker Ubuntu Act", "specialized and custom tags are not admitted"}
 			}
 			for _, want := range wants {
 				if !strings.Contains(out.String(), want) {
@@ -1356,7 +1365,7 @@ func TestDockerSandboxesWizardUsesNoCustomInstallScriptsByDefault(t *testing.T) 
 		PolicyFingerprint: "sha256:" + strings.Repeat("b", 64),
 	}, nil)
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("1\n")))
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("3\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1646,7 +1655,7 @@ func TestDockerSandboxesProfileShowsEstimateWithoutCapacityAdmission(t *testing.
 	t.Cleanup(func() { initDockerSandboxesCapacityCheck = oldCapacityCheck })
 
 	var out bytes.Buffer
-	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("1\nn\n\n")))
+	profile, accepted, err := promptDockerSandboxesProfile(context.Background(), t.TempDir(), sandboxpromotion.WindowsAMD64, &out, bufio.NewReader(strings.NewReader("3\n")))
 	if err != nil {
 		t.Fatalf("informational estimate error = %v", err)
 	}
@@ -1720,8 +1729,8 @@ func TestInitCapabilityReadyDockerSandboxesIsDefaultWithoutPreviewAcknowledgemen
 				"Runner provider (press Enter to use 1):",
 				"Docker Sandboxes image setup:",
 				"Runner base image:",
-				"full — full-latest (default)",
-				"Runner artifact estimate:",
+				"1. EPAR verified prebuilt Full (default)",
+				"Runner artifact: EPAR verified prebuilt Full",
 			} {
 				if !strings.Contains(out.String(), want) {
 					t.Fatalf("capability-default output omitted %q:\n%s", want, out.String())
@@ -1829,7 +1838,7 @@ func TestInitDockerSandboxesUsesGuidedRootDiskDefault(t *testing.T) {
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n3\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1845,7 +1854,8 @@ func TestInitDockerSandboxesUsesGuidedRootDiskDefault(t *testing.T) {
 		t.Fatalf("image.sourceImage = %q, want guided default %q", got, want)
 	}
 	for _, want := range []string{
-		"1. full — full-latest (default)",
+		"1. EPAR verified prebuilt Full (default)",
+		"3. Catthehacker Ubuntu Full",
 		"Automatic sandbox root limit:",
 		"Estimated download:",
 	} {
@@ -1929,7 +1939,7 @@ func TestInitDockerSandboxesDiscoveryRetryKeepsProviderSelectionAndWritesVerifie
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n\n\n\n\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n3\n3\n\n\n\n"),
 		Out:                &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -1968,7 +1978,7 @@ func TestInitDockerSandboxesDiscoveryRetryDeclinedExitsWithoutRepeatingProviderO
 		ConfigPath:         path,
 		SkipDockerCheck:    true,
 		SkipHostTrustCheck: true,
-		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n"),
+		In:                 strings.NewReader("123456\nsolutionforest\n.local/github-app.pem\n1\n1\n3"),
 		Out:                &out,
 	})
 	if err == nil || !strings.Contains(err.Error(), "resolve runner source image") {

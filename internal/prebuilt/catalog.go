@@ -63,12 +63,12 @@ var (
 	profilePattern = regexp.MustCompile(`^[a-z][a-z0-9.-]{0,31}$`)
 )
 
-// ProfileEnabled reports whether a profile is permitted to advance a public
-// alias.  Full is represented in the schema from the start so the catalog can
-// be forward-compatible, but publication code must leave it disabled until
-// its independent live gates pass.
+// ProfileEnabled reports whether a profile is supported by the publication
+// contract. Catalog policy, complete platform acceptance, and protected
+// promotion still gate whether a supported profile can advance an alias.
 func ProfileEnabled(profile string) bool {
-	return strings.EqualFold(strings.TrimSpace(profile), ProfileAct)
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	return profile == ProfileAct || profile == ProfileFull
 }
 
 // NormalizeProfile validates the profile key used in aliases, tags, and
@@ -309,7 +309,8 @@ type StatusTransition struct {
 
 const (
 	legacyAcceptanceRecordSchemaVersion = 1
-	AcceptanceRecordSchemaVersion       = 2
+	profilelessAcceptanceSchemaVersion  = 2
+	AcceptanceRecordSchemaVersion       = 3
 )
 
 // WorkflowRunEvidence is human-reviewed evidence from the private EPAR test
@@ -330,6 +331,7 @@ type WorkflowRunEvidence struct {
 // immutable package Entry that was created by hosted publication.
 type PlatformAcceptance struct {
 	SchemaVersion      int                   `json:"schemaVersion"`
+	Profile            string                `json:"profile,omitempty"`
 	PackageIndexDigest string                `json:"packageIndexDigest"`
 	Platform           string                `json:"platform"`
 	RunnerGroup        string                `json:"runnerGroup"`
@@ -663,8 +665,8 @@ func (e Entry) Validate(packageRepository string) error {
 	if e.Status == StatusActive && !e.Gates.AllPass() {
 		return errors.New("active entry has incomplete publication gates")
 	}
-	if e.Status == StatusActive && e.Profile == ProfileAct {
-		if err := validateActPlatforms(e); err != nil {
+	if e.Status == StatusActive {
+		if err := validateActivePlatforms(e); err != nil {
 			return err
 		}
 	}
@@ -680,37 +682,37 @@ func (e Entry) Validate(packageRepository string) error {
 	return nil
 }
 
-func validateActPlatforms(e Entry) error {
+func validateActivePlatforms(e Entry) error {
 	if len(e.Platforms) != 2 {
-		return fmt.Errorf("active Act entry must contain exactly amd64 and arm64 platforms, got %d", len(e.Platforms))
+		return fmt.Errorf("active %s entry must contain exactly amd64 and arm64 platforms, got %d", e.Profile, len(e.Platforms))
 	}
 	want := map[string]bool{"linux/amd64": false, "linux/arm64": false}
 	for _, platform := range e.Platforms {
 		name := NormalizePlatform(platform.Platform)
 		if _, ok := want[name]; !ok {
-			return fmt.Errorf("active Act entry has unsupported platform %q", platform.Platform)
+			return fmt.Errorf("active %s entry has unsupported platform %q", e.Profile, platform.Platform)
 		}
 		if want[name] {
-			return fmt.Errorf("active Act entry has duplicate platform %q", name)
+			return fmt.Errorf("active %s entry has duplicate platform %q", e.Profile, name)
 		}
 		want[name] = true
 		if !platform.Validated {
-			return fmt.Errorf("active Act entry platform %s is not validated", name)
+			return fmt.Errorf("active %s entry platform %s is not validated", e.Profile, name)
 		}
 		if expected := e.Source.PlatformDigests[name]; expected == "" || expected != platform.SourceManifestDigest {
-			return fmt.Errorf("active Act platform %s source digest does not match source descriptor", name)
+			return fmt.Errorf("active %s platform %s source digest does not match source descriptor", e.Profile, name)
 		}
 	}
 	for platform, found := range want {
 		if !found {
-			return fmt.Errorf("active Act entry is missing platform %s", platform)
+			return fmt.Errorf("active %s entry is missing platform %s", e.Profile, platform)
 		}
 		if _, ok := e.Source.PlatformDigests[platform]; !ok {
-			return fmt.Errorf("active Act source platform digest %s is missing", platform)
+			return fmt.Errorf("active %s source platform digest %s is missing", e.Profile, platform)
 		}
 	}
 	if len(e.Source.PlatformDigests) != len(want) {
-		return errors.New("active Act source descriptor has extra platform digests")
+		return fmt.Errorf("active %s source descriptor has extra platform digests", e.Profile)
 	}
 	return nil
 }
@@ -738,7 +740,7 @@ func validTransition(from, to string) bool {
 }
 
 func (a PlatformAcceptance) Validate() error {
-	if a.SchemaVersion != legacyAcceptanceRecordSchemaVersion && a.SchemaVersion != AcceptanceRecordSchemaVersion {
+	if a.SchemaVersion != legacyAcceptanceRecordSchemaVersion && a.SchemaVersion != profilelessAcceptanceSchemaVersion && a.SchemaVersion != AcceptanceRecordSchemaVersion {
 		return fmt.Errorf("unsupported acceptance schema %d", a.SchemaVersion)
 	}
 	if _, err := NormalizeDigest(a.PackageIndexDigest); err != nil {
@@ -754,7 +756,17 @@ func (a PlatformAcceptance) Validate() error {
 	if a.RunnerGroup != "epar-dev-test" {
 		return errors.New("acceptance requires epar-dev-test runner group")
 	}
-	wantLabel := "epar-prebuilt-act-" + strings.TrimPrefix(a.PackageIndexDigest, "sha256:")[:12] + "-" + strings.TrimPrefix(platform, "linux/")
+	profile := ProfileAct
+	if a.SchemaVersion == AcceptanceRecordSchemaVersion {
+		var err error
+		profile, err = NormalizeProfile(a.Profile)
+		if err != nil {
+			return fmt.Errorf("acceptance profile: %w", err)
+		}
+	} else if strings.TrimSpace(a.Profile) != "" && a.Profile != ProfileAct {
+		return errors.New("legacy acceptance records may describe only the Act profile")
+	}
+	wantLabel := "epar-prebuilt-" + profile + "-" + strings.TrimPrefix(a.PackageIndexDigest, "sha256:")[:12] + "-" + strings.TrimPrefix(platform, "linux/")
 	if a.RunnerLabel != wantLabel {
 		return fmt.Errorf("acceptance runner label must be %s", wantLabel)
 	}
@@ -763,7 +775,7 @@ func (a PlatformAcceptance) Validate() error {
 			return fmt.Errorf("acceptance runner name must be generated from pool prefix %s", wantLabel)
 		}
 	} else if strings.TrimSpace(a.RunnerName) != "" {
-		return errors.New("acceptance schema 2 records runner names on individual workflow runs")
+		return errors.New("acceptance schema 2 and later record runner names on individual workflow runs")
 	}
 	if _, err := NormalizeDigest(a.ReceiptSHA256); err != nil {
 		return fmt.Errorf("acceptance receipt digest: %w", err)
@@ -790,7 +802,7 @@ func (a PlatformAcceptance) Validate() error {
 		if run.URL != wantURL {
 			return fmt.Errorf("acceptance workflow URL must be %s", wantURL)
 		}
-		if a.SchemaVersion == AcceptanceRecordSchemaVersion {
+		if a.SchemaVersion >= profilelessAcceptanceSchemaVersion {
 			if !strings.HasPrefix(run.RunnerName, wantLabel+"-") {
 				return fmt.Errorf("acceptance workflow runner name must be generated from pool prefix %s", wantLabel)
 			}
@@ -813,8 +825,18 @@ func (c *Catalog) AppendAcceptance(acceptance PlatformAcceptance) (bool, error) 
 	if err := acceptance.Validate(); err != nil {
 		return false, err
 	}
-	if _, ok := c.EntryByDigest(acceptance.PackageIndexDigest); !ok {
+	entry, ok := c.EntryByDigest(acceptance.PackageIndexDigest)
+	if !ok {
 		return false, fmt.Errorf("acceptance references unknown package digest %s", acceptance.PackageIndexDigest)
+	}
+	acceptanceProfile := acceptance.Profile
+	if acceptance.SchemaVersion < AcceptanceRecordSchemaVersion {
+		acceptanceProfile = ProfileAct
+	} else {
+		acceptanceProfile, _ = NormalizeProfile(acceptance.Profile)
+	}
+	if entry.Profile != acceptanceProfile {
+		return false, fmt.Errorf("acceptance profile %s does not match package profile %s", acceptanceProfile, entry.Profile)
 	}
 	for _, existing := range c.Acceptances {
 		if existing.PackageIndexDigest != acceptance.PackageIndexDigest || existing.Platform != acceptance.Platform {

@@ -4,13 +4,13 @@ EPAR publishes its Docker Sandboxes template as an immutable multi-platform OCI 
 
 The canonical source is `ghcr.io/catthehacker/ubuntu`. The public package is `ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template`. Docker Hub is never used as a source fallback because its OCI identities may differ from GHCR even when the logical image content matches.
 
-Act (`act-latest`) is the initial supported profile. Full (`full-latest`) remains disabled and candidate-only until it completes an independent acceptance cycle.
+Act (`act-latest`) is the first accepted profile. Full (`full-latest`) uses the same publication, verification, and runtime contracts but remains candidate-only until its independent amd64 and arm64 acceptance cycle completes; its first protected promotion enables the Full stable policy atomically with the alias move.
 
 ## Workflow triggers and hosted build gates
 
-`.github/workflows/docker-sandboxes-images.yml` polls every six hours at minute 37, supports manual dispatch, and publishes for recipe-related pushes only on `main`. GitHub executes the cron only from the default branch. Pull requests to `develop` or `main` that change a publisher, recipe, or committed-asset path run publisher, signed-evidence, and asset validation without logging in to GHCR, building a package, or pushing any manifest. This prevents a normal `develop` to `main` promotion from publishing the same source change twice.
+`.github/workflows/docker-sandboxes-images.yml` polls Act every six hours at minute 37 and Full on an offset six-hour schedule at minute 7, supports manual dispatch, and publishes for recipe-related pushes only on `main`. GitHub executes both cron expressions only from the default branch. Pull requests to `develop` or `main` that change a publisher, recipe, or committed-asset path run publisher, signed-evidence, and asset validation without logging in to GHCR, building a package, or pushing any manifest. This prevents a normal `develop` to `main` promotion from publishing the same source change twice.
 
-The amd64 build runs on GitHub-hosted `ubuntu-latest`; the arm64 build runs on GitHub-hosted `ubuntu-24.04-arm`. The workflow has no persistent self-hosted runner dependency and no `EPAR_PREBUILT_LIVE` switch. Hosted jobs resolve the GHCR source descriptor, build from its immutable digest, inspect both runnable platform manifests by digest, assemble an index from those exact digests, require exactly two descriptors, run package smoke checks, generate and sign one index-level SLSA provenance statement and one index-level SPDX SBOM, verify their referrers, and publish an immutable signed candidate catalog. Platform builds disable BuildKit's additional per-platform SBOM/provenance indexes because EPAR's trust decision uses the separately signed index-level evidence and catalog. The index-level SPDX document records the package, recipe, and exact platform identities rather than reproducing BuildKit's more detailed component inventory; this deliberate narrower audit scope avoids four additional per-publication GHCR version rows without weakening the evidence enforced by EPAR.
+The amd64 build runs on GitHub-hosted `ubuntu-latest`; the arm64 build runs on GitHub-hosted `ubuntu-24.04-arm`. The workflow has no persistent self-hosted runner dependency and no `EPAR_PREBUILT_LIVE` switch. Full jobs first reclaim disposable hosted-runner tool caches, require at least 40 GiB free before allocating 8 GiB of swap, serialize BuildKit execution, and allow a three-hour timeout; failing that capacity gate leaves Full unpublished rather than silently changing its recipe or dropping a platform. Hosted jobs resolve the GHCR source descriptor, build from its immutable digest, inspect both runnable platform manifests by digest, assemble an index from those exact digests, require exactly two descriptors, run package smoke checks, generate and sign one index-level SLSA provenance statement and one index-level SPDX SBOM, verify their referrers, and publish an immutable signed candidate catalog. Platform builds disable BuildKit's additional per-platform SBOM/provenance indexes because EPAR's trust decision uses the separately signed index-level evidence and catalog. The index-level SPDX document records the package, recipe, and exact platform identities rather than reproducing BuildKit's more detailed component inventory; this deliberate narrower audit scope avoids four additional per-publication GHCR version rows without weakening the evidence enforced by EPAR.
 
 The workflow grants `contents: read`, `packages: write`, `attestations: write`, and `id-token: write` to publication jobs, while pull-request validation overrides permissions to `contents: read`. Third-party actions are pinned to full commit SHAs. Publication is serialized by one non-cancelling concurrency group; validation uses one group per pull request and cancels only a superseded validation run for that same pull request.
 
@@ -18,26 +18,28 @@ The workflow grants `contents: read`, `packages: write`, `attestations: write`, 
 
 Every new package is first recorded as `candidate`. Before manual acceptance, publication may create:
 
-- an immutable package index and canonical tag such as `act-latest-pkg-<64 hex index digest>`;
+- an immutable package index and canonical tag such as `<profile>-latest-pkg-<64 hex index digest>`;
 - exact amd64 and arm64 platform manifests;
 - signed SLSA provenance and SPDX SBOM referrers;
 - an immutable catalog object and canonical tag such as `catalog-v1-pkg-<64 hex catalog digest>`.
 
-Candidate publication does not move `catalog-v1` or `act-latest`. This permits first-catalog bootstrap: a candidate can be acquired through its exact signed immutable catalog even when no moving catalog exists yet.
+Candidate publication does not move `catalog-v1` or the profile's `*-latest` alias. This permits first-catalog bootstrap: a candidate can be acquired through its exact signed immutable catalog even when no moving catalog exists yet.
 
 Catalog readers resolve an exact catalog manifest, validate its artifact/config/single-layer media contract, and fetch that layer by descriptor digest into a caller-chosen file. They never extract the publisher-supplied OCI layer title as a filesystem path. New catalogs are published from controlled relative filenames, while this descriptor path remains compatible with the initial catalogs that recorded absolute runner-temporary titles.
 
 ### GHCR version graph
 
-GitHub Packages displays every OCI manifest as a package version, so one logical candidate appears as several rows. The expected retained graph contains the final multi-platform package index, its amd64 and arm64 runnable manifests, signed SLSA and SPDX referrer manifests and their discovery index, the immutable catalog manifest, and the catalog signature and discovery index. Tags named `act-latest-pkg-<digest>` and `catalog-v1-pkg-<digest>` are write-once audit identities. Run-specific `candidate-<profile>-<run>-<attempt>` tags are staging and diagnostic aliases, while `sha256-<subject digest>` tags are attestation-discovery indexes used by the verifier; neither is an end-user image channel. An untagged child manifest can still be required by a retained index and must not be deleted merely because the GitHub Packages page calls it untagged.
+GitHub Packages displays every OCI manifest as a package version, so one logical candidate appears as several rows. The expected retained graph contains the final multi-platform package index, its amd64 and arm64 runnable manifests, signed SLSA and SPDX referrer manifests and their discovery index, the immutable catalog manifest, and the catalog signature and discovery index. Tags named `act-latest-pkg-<digest>`, `full-latest-pkg-<digest>`, and `catalog-v1-pkg-<digest>` are write-once audit identities. Run-specific `candidate-<profile>-<run>-<attempt>` tags are staging and diagnostic aliases, while `sha256-<subject digest>` tags are attestation-discovery indexes used by the verifier; neither is an end-user image channel. An untagged child manifest can still be required by a retained index and must not be deleted merely because the GitHub Packages page calls it untagged.
 
 Production builds always use the resolved immutable upstream digest. The upstream tag is re-resolved before publication. If it moves during the build, the package remains an immutable candidate and no moving alias advances.
 
-The stable tuple is `(source index and platform digests, recipe digest and revision, runtime contract, template schema, runner version and asset digests, locked tool digests)`. Recipe, runtime, runner, tooling, schema, or platform changes always require fresh manual acceptance. After one tuple has completed two-platform acceptance, a later source-only Catthehacker digest change may auto-promote only when the EPAR-controlled tuple is identical and every hosted package/evidence gate passes. Full never auto-promotes while disabled.
+The stable tuple is `(source index and platform digests, recipe digest and revision, runtime contract, template schema, runner version and asset digests, locked tool digests)`. Recipe, runtime, runner, tooling, schema, or platform changes always require fresh manual acceptance. After one profile tuple has completed two-platform acceptance, a later source-only Catthehacker digest change may auto-promote that profile only when the EPAR-controlled tuple is identical and every hosted package/evidence gate passes. Full never auto-promotes while disabled; its first protected acceptance enables later source-only auto-advancement.
+
+`templates/docker-sandboxes/prebuilt.lock.json` commits only stable recipe and profile identities. Mutable profile enablement, wizard-default, automatic-advancement, acceptance, and revocation state belongs exclusively to the signed catalog, so protected Full promotion does not make a committed lock file stale.
 
 ## Explicit candidate-acceptance configuration
 
-Candidate mode is an operator-only acceptance path. The wizard never generates it. It requires an exact package digest, exact immutable candidate catalog, and exact GitHub workflow evidence ref; it never follows `act-latest`, never falls back to local building, and persists `candidate` status in the receipt.
+Candidate mode is an operator-only acceptance path. The wizard never generates it. It requires an exact package digest, exact immutable candidate catalog, and exact GitHub workflow evidence ref; it never follows a moving package alias, never falls back to local building, and persists `candidate` status in the receipt.
 
 Create separate configs derived from `.local/config.sbx.yml`. Replace every placeholder below with values from the candidate publication summary. The digest label uses the first 12 hexadecimal characters after `sha256:`.
 
@@ -45,9 +47,9 @@ Create separate configs derived from `.local/config.sbx.yml`. Replace every plac
 image:
   distribution: prebuilt
   sourceType: docker-image
-  sourceImage: ghcr.io/catthehacker/ubuntu:act-latest
+  sourceImage: ghcr.io/catthehacker/ubuntu:<profile>-latest
   sourcePlatform: linux/amd64
-  prebuiltReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest
+  prebuiltReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:<profile>-latest
   prebuiltDigest: sha256:<candidate-index-digest>
   prebuiltAcceptance: true
   prebuiltCatalogReference: ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:catalog-v1-pkg-<catalog-digest>
@@ -60,11 +62,11 @@ image:
 
 pool:
   instances: 1
-  namePrefix: epar-prebuilt-act-<digest12>-amd64
+  namePrefix: epar-prebuilt-<profile>-<digest12>-amd64
 
 runner:
   group: epar-dev-test
-  labels: [epar-prebuilt-act-<digest12>-amd64]
+  labels: [epar-prebuilt-<profile>-<digest12>-amd64]
   includeHostLabel: false
   ephemeral: true
   noDefaultLabels: true
@@ -82,7 +84,7 @@ provider:
   platform: linux/amd64
 ```
 
-For the Mac config, change `sourcePlatform` and `provider.platform` to `linux/arm64`, use a distinct `pool.namePrefix`, and change the unique label suffix to `-arm64`. The organization runner group `epar-dev-test` must allow only `solutionforest/ephemeral-action-runner-test` and must not allow public repositories. The host machines run EPAR normally; they are not registered directly as persistent GitHub Actions runners.
+Replace `<profile>` consistently with `act` or `full`. For the Mac config, change `sourcePlatform` and `provider.platform` to `linux/arm64`, use a distinct `pool.namePrefix`, and change the unique label suffix to `-arm64`. The organization runner group `epar-dev-test` must allow only `solutionforest/ephemeral-action-runner-test` and must not allow public repositories. The host machines run EPAR normally; they are not registered directly as persistent GitHub Actions runners.
 
 Run `./start --config <candidate-config>` to provision and start the temporary acceptance pool; it automatically performs the required image acquisition before creating a Sandbox. An explicit `./start image build --config <candidate-config>` is optional when an operator wants to provision and inspect the template without starting the pool. Successful acquisition verifies the immutable catalog and package evidence, materializes/imports the selected platform, performs exact `sbx template ls` readback, and writes `.local/state/image/<config-id>/docker-sandboxes/active.json`. A missing, mismatched, unsigned, revoked, or wrong-ref candidate fails closed without a local Catthehacker build or provider fallback.
 
@@ -92,8 +94,8 @@ Start one temporary EPAR controller from each candidate config. Wait until its o
 
 | Workflow | amd64 | arm64 |
 | --- | --- | --- |
-| `playwright-docker.yml` | one run on `epar-prebuilt-act-<digest12>-amd64` | one run on `epar-prebuilt-act-<digest12>-arm64` |
-| `dockerhub-private-pull.yml` | one run on `epar-prebuilt-act-<digest12>-amd64` | one run on `epar-prebuilt-act-<digest12>-arm64` |
+| `playwright-docker.yml` | one run on `epar-prebuilt-<profile>-<digest12>-amd64` | one run on `epar-prebuilt-<profile>-<digest12>-arm64` |
+| `dockerhub-private-pull.yml` | one run on `epar-prebuilt-<profile>-<digest12>-amd64` | one run on `epar-prebuilt-<profile>-<digest12>-arm64` |
 
 For every run, the human reviewer verifies the private repository, exact workflow file, successful conclusion, unique runner label, expected generated runner name, and the candidate/platform identity in the EPAR receipt. Each ephemeral job must be replaced normally while the controller is running. If the default private Docker Hub fixture is not arm64-compatible, acceptance is blocked; do not waive or silently skip that run.
 
@@ -108,7 +110,7 @@ Stable promotion must run from `main`, and the package evidence must have been p
 Dispatch `docker-sandboxes-images.yml` on `main` with:
 
 - `promote_candidate: true`;
-- `profile: act`;
+- `profile: act` or `profile: full`, matching the candidate;
 - the exact `candidate_digest` and `candidate_catalog_reference`;
 - `acceptance_evidence_json` containing the four reviewed workflow run IDs, two EPAR receipt SHA-256 values, and the exact ephemeral runner name used by every workflow run;
 - `promotion_confirmation: PROMOTE`.
@@ -121,7 +123,7 @@ The evidence input is one JSON object so the workflow remains below GitHub's ten
 
 Before GitHub requests approval for the protected environment, an unprotected `Prepare protected promotion review` job verifies the signed candidate catalog and package evidence and writes a job summary containing the exact package, catalog, source, recipe, runtime, runner, platform, four acceptance-run links, runner names, and receipt hashes. The reviewer opens that completed job summary, follows the four authenticated private-repository links, completes its checklist, and only then approves the waiting `epar-prebuilt-promotion` deployment. The prepare job cannot approve a deployment or move a package tag.
 
-The `epar-prebuilt-promotion` environment must require an authorized reviewer. After approval, the protected job independently repeats the immutable catalog and package checks, rechecks the upstream source, appends two platform acceptance records, requires exactly the two approved workflows per platform, and performs protected catalog compare-and-swap. It then signs and verifies the promoted catalog, moves `catalog-v1`, and moves `act-latest` last. Incomplete, failed, misrouted, single-platform, wrong-workflow, alias-raced, or source-raced evidence cannot promote.
+The `epar-prebuilt-promotion` environment must require an authorized reviewer. After approval, the protected job independently repeats the immutable catalog and package checks, rechecks the upstream source, appends two profile-bound platform acceptance records, requires exactly the two approved workflows per platform, and performs protected catalog compare-and-swap. It then signs and verifies the promoted catalog, moves `catalog-v1`, and moves the matching `act-latest` or `full-latest` alias last. Incomplete, failed, misrouted, single-platform, wrong-profile, wrong-workflow, alias-raced, or source-raced evidence cannot promote.
 
 Catalog pointer and package-alias updates remain journaled by workflow rollback/reconciliation logic. A failure before stable pointer movement leaves the candidate immutable. A failure between pointer movements restores or idempotently reconciles the previous verified state.
 

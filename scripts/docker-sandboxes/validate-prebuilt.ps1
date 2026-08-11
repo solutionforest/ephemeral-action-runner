@@ -25,12 +25,13 @@ function Assert-Contains {
     }
 }
 
-Assert-Equal 'prebuilt lock schema' $lock.schemaVersion 1
+Assert-Equal 'prebuilt lock schema' $lock.schemaVersion 2
 Assert-Equal 'prebuilt artifact kind' $lock.artifactKind 'docker-sandboxes-template-base'
 Assert-Equal 'runtime contract' $lock.runtimeContract 'docker-sandboxes-v1'
 Assert-Equal 'template schema' $lock.templateSchema 2
 Assert-Equal 'source resolution' $lock.sourceResolution 'registry-descriptor'
 Assert-Equal 'source observation authority' $lock.sourceObservations 'catalog-only'
+Assert-Equal 'profile policy authority' $lock.profilePolicyAuthority 'signed-catalog'
 Assert-Equal 'platform count' @($lock.supportedPlatforms).Count 2
 if (-not @($lock.supportedPlatforms) -contains $Platform) {
     throw "platform $Platform is not in the supported prebuilt lock"
@@ -39,13 +40,16 @@ if (-not @($lock.supportedPlatforms) -contains $Platform) {
 $act = $lock.profiles.act
 Assert-Equal 'Act source tag' $act.sourceTag 'act-latest'
 Assert-Equal 'Act alias tag' $act.aliasTag 'act-latest'
-Assert-Equal 'Act enabled' $act.enabled $true
-Assert-Equal 'Act auto advance' $act.autoAdvance $true
 $full = $lock.profiles.full
 Assert-Equal 'Full source tag' $full.sourceTag 'full-latest'
 Assert-Equal 'Full alias tag' $full.aliasTag 'full-latest'
-Assert-Equal 'Full disabled' $full.enabled $false
-Assert-Equal 'Full auto advance' $full.autoAdvance $false
+foreach ($profile in @($act, $full)) {
+    foreach ($catalogField in @('enabled', 'autoAdvance', 'wizardDefault', 'reason')) {
+        if ($null -ne $profile.PSObject.Properties[$catalogField]) {
+            throw "mutable catalog policy $catalogField must not be committed in prebuilt.lock.json"
+        }
+    }
+}
 Assert-Equal 'runner selector' $lock.runner.selector 'latest'
 Assert-Equal 'runner resolution' $lock.runner.assetResolution 'actions-release-descriptor'
 Assert-Equal 'runner source' $lock.runner.assetSource 'github-actions-runner-release'

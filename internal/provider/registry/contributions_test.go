@@ -3,6 +3,7 @@ package registry
 import (
 	"testing"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -69,26 +70,25 @@ func TestProviderOnboardingTiersAndRuntimeOnlyTart(t *testing.T) {
 	}
 }
 
-func TestDockerSandboxesRegistersPreviewPrebuiltActSource(t *testing.T) {
+func TestDockerSandboxesRegistersVerifiedPrebuiltFullAndActSources(t *testing.T) {
 	descriptor, found := DescriptorFor("docker-sandboxes")
 	if !found {
 		t.Fatal("docker-sandboxes descriptor not found")
 	}
-	if len(descriptor.WizardArtifactSources) != 1 {
-		t.Fatalf("WizardArtifactSources = %d, want 1", len(descriptor.WizardArtifactSources))
+	if len(descriptor.WizardArtifactSources) != 2 {
+		t.Fatalf("WizardArtifactSources = %d, want 2", len(descriptor.WizardArtifactSources))
 	}
-	source := descriptor.WizardArtifactSources[0]
-	if source.Distribution != "prebuilt" || source.Profile != "act" {
-		t.Fatalf("artifact source = %#v, want prebuilt Act", source)
+	full, act := descriptor.WizardArtifactSources[0], descriptor.WizardArtifactSources[1]
+	if full.Distribution != "prebuilt" || full.Profile != "full" || full.Reference != config.DockerSandboxesPrebuiltFullReference || !full.Default || full.Preview {
+		t.Fatalf("Full artifact source = %#v, want stable default prebuilt Full", full)
 	}
-	if source.Reference != "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template:act-latest" {
-		t.Fatalf("artifact reference = %q, want official EPAR Act reference", source.Reference)
+	if act.Distribution != "prebuilt" || act.Profile != "act" || act.Reference != config.DockerSandboxesPrebuiltActReference || act.Default || act.Preview {
+		t.Fatalf("Act artifact source = %#v, want stable non-default prebuilt Act", act)
 	}
-	if !source.Preview || source.Default {
-		t.Fatalf("artifact source preview/default = %t/%t, want true/false", source.Preview, source.Default)
-	}
-	if source.Label == "" || source.Description == "" {
-		t.Fatalf("artifact source is missing user-facing label/description: %#v", source)
+	for _, source := range descriptor.WizardArtifactSources {
+		if source.Label == "" || source.Description == "" {
+			t.Fatalf("artifact source is missing user-facing label/description: %#v", source)
+		}
 	}
 }
 

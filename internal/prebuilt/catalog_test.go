@@ -254,14 +254,19 @@ func validEntry(profile, hexChar, status string) Entry {
 }
 
 func validAcceptance(digest, platform string, playwrightRun, dockerHubRun int64) PlatformAcceptance {
+	return validAcceptanceForProfile(ProfileAct, digest, platform, playwrightRun, dockerHubRun)
+}
+
+func validAcceptanceForProfile(profile, digest, platform string, playwrightRun, dockerHubRun int64) PlatformAcceptance {
 	arch := strings.TrimPrefix(platform, "linux/")
+	label := "epar-prebuilt-" + profile + "-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch
 	return PlatformAcceptance{
-		SchemaVersion: AcceptanceRecordSchemaVersion, PackageIndexDigest: digest, Platform: platform,
-		RunnerGroup: "epar-dev-test", RunnerLabel: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch,
+		SchemaVersion: AcceptanceRecordSchemaVersion, Profile: profile, PackageIndexDigest: digest, Platform: platform,
+		RunnerGroup: "epar-dev-test", RunnerLabel: label,
 		ReceiptSHA256: "sha256:" + strings.Repeat("f", 64), ImportReadback: true, RuntimeValidated: true, CleanupValidated: true,
 		WorkflowRuns: []WorkflowRunEvidence{
-			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "playwright-docker.yml", RunID: playwrightRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(playwrightRun), Conclusion: "success", RunnerName: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch + "-20260810-000000-001"},
-			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "dockerhub-private-pull.yml", RunID: dockerHubRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(dockerHubRun), Conclusion: "success", RunnerName: "epar-prebuilt-act-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + arch + "-20260810-000000-002"},
+			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "playwright-docker.yml", RunID: playwrightRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(playwrightRun), Conclusion: "success", RunnerName: label + "-20260810-000000-001"},
+			{Repository: "solutionforest/ephemeral-action-runner-test", Workflow: "dockerhub-private-pull.yml", RunID: dockerHubRun, URL: "https://github.com/solutionforest/ephemeral-action-runner-test/actions/runs/" + fmt.Sprint(dockerHubRun), Conclusion: "success", RunnerName: label + "-20260810-000000-002"},
 		},
 		ReviewedBy: "reviewer", AcceptedAt: time.Unix(2, 0),
 	}
