@@ -154,7 +154,12 @@ image:
         if ($owner -ne $entry.Process.Id) { throw "Windows host-trust watcher lock owner $owner did not match process $($entry.Process.Id)" }
         $readyOwner = Get-EparHostTrustReadyOwner -FeedDir $entry.FeedDir
         if ($readyOwner -ne $entry.Process.Id) { throw "Windows host-trust watcher ready marker $readyOwner did not match process $($entry.Process.Id)" }
-        if (-not (Test-EparHostTrustCurrentFeed -Path (Join-Path $entry.FeedDir 'current.json'))) { throw 'Windows host-trust bridge returned before current.json was valid and fresh' }
+        $currentPath = Join-Path $entry.FeedDir 'current.json'
+        $currentDeadline = [DateTime]::UtcNow.AddSeconds(1)
+        while (-not (Test-EparHostTrustCurrentFeed -Path $currentPath) -and [DateTime]::UtcNow -lt $currentDeadline) {
+            Start-Sleep -Milliseconds 10
+        }
+        if (-not (Test-EparHostTrustCurrentFeed -Path $currentPath)) { throw 'Windows host-trust bridge returned before current.json was valid and fresh' }
     }
     $runnerEntry = @($watchEntries | Where-Object { $_.FeedDir -eq $bridge.RunnerFeedDir })[0]
     if ($bridge.WatchProcess.Id -ne $runnerEntry.Process.Id) { throw 'Windows bridge WatchProcess did not retain runner/final watcher compatibility' }
