@@ -10,6 +10,7 @@ import (
 
 	"github.com/moby/moby/client"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	"github.com/solutionforest/ephemeral-action-runner/internal/terminalprogress"
 )
 
 const dockerPullProgressInterval = 250 * time.Millisecond
@@ -74,6 +75,7 @@ func (m *Coordinator) renderDockerPullProgress(ctx context.Context, response cli
 	layers := map[string]DockerPullProgress{}
 	lastRender := time.Time{}
 	rendered := false
+	progressRenderer := m.newTerminalProgressRenderer()
 	err = ConsumeDockerPullProgress(ctx, response, func(message DockerPullEvent) error {
 		writeDockerPullEvent(transcript.Stdout, message)
 		if message.Error != nil {
@@ -96,7 +98,7 @@ func (m *Coordinator) renderDockerPullProgress(ctx context.Context, response cli
 			layers[message.ID] = layer
 		}
 		if time.Since(lastRender) >= dockerPullProgressInterval {
-			m.writeDockerPullProgress(logPath, layers)
+			m.writeDockerPullProgressWithRenderer(logPath, layers, progressRenderer)
 			lastRender = time.Now()
 			rendered = true
 		}
@@ -106,10 +108,8 @@ func (m *Coordinator) renderDockerPullProgress(ctx context.Context, response cli
 		return err
 	}
 	if rendered {
-		m.writeDockerPullProgress(logPath, layers)
-		if m.dockerPullProgressIsInteractive() {
-			fmt.Fprintln(m.environment.ProgressConsole())
-		}
+		m.writeDockerPullProgressWithRenderer(logPath, layers, progressRenderer)
+		progressRenderer.Finish()
 	}
 	return nil
 }
@@ -153,9 +153,13 @@ func writeDockerPullEvent(logFile io.Writer, event DockerPullEvent) {
 }
 
 func (m *Coordinator) writeDockerPullProgress(logPath string, layers map[string]DockerPullProgress) {
+	m.writeDockerPullProgressWithRenderer(logPath, layers, m.newTerminalProgressRenderer())
+}
+
+func (m *Coordinator) writeDockerPullProgressWithRenderer(logPath string, layers map[string]DockerPullProgress, progressRenderer *terminalprogress.Renderer) {
 	line := DockerPullProgressSummary(layers)
-	if m.dockerPullProgressIsInteractive() {
-		_, _ = fmt.Fprintf(m.environment.ProgressConsole(), "\r\033[2K%s", line)
+	if progressRenderer != nil {
+		progressRenderer.Write(line)
 		return
 	}
 	m.environment.LogInfo(line, "provider", m.Config.Provider.Type, "operation", "docker-pull", "logPath", logPath)
@@ -163,6 +167,17 @@ func (m *Coordinator) writeDockerPullProgress(logPath string, layers map[string]
 
 func (m *Coordinator) dockerPullProgressIsInteractive() bool {
 	return m.environment.ProgressTerminal() && containsString(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text"
+}
+
+func (m *Coordinator) newTerminalProgressRenderer() *terminalprogress.Renderer {
+	if !m.dockerPullProgressIsInteractive() {
+		return nil
+	}
+	renderer := terminalprogress.New(m.environment.ProgressConsole(), m.environment.ProgressWidth)
+	if !renderer.Available() {
+		return nil
+	}
+	return renderer
 }
 
 func containsString(values []string, wanted string) bool {

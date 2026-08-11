@@ -24,6 +24,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
+	"github.com/solutionforest/ephemeral-action-runner/internal/projectlayout"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
@@ -881,13 +882,56 @@ func (m *Coordinator) dockerSandboxesPrebuiltAcquisitionRoot(verified VerifiedDo
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(m.ProjectRoot, ".local", "state", "image", configID, "prebuilt", strings.TrimPrefix(verified.Entry.PackageIndexDigest, "sha256:"), strings.ReplaceAll(verified.Platform.Platform, "/", "-")), nil
+	return filepath.Join(projectlayout.CacheRoot(m.ProjectRoot), "image", configID, "prebuilt", strings.TrimPrefix(verified.Entry.PackageIndexDigest, "sha256:"), strings.ReplaceAll(verified.Platform.Platform, "/", "-")), nil
+}
+
+func (m *Coordinator) legacyDockerSandboxesPrebuiltAcquisitionRoot(verified VerifiedDockerSandboxesPrebuilt) (string, error) {
+	configID, err := storagecatalog.ConfigID(m.ProjectRoot, m.effectiveConfigPath())
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(projectlayout.StateRoot(m.ProjectRoot), "image", configID, "prebuilt", strings.TrimPrefix(verified.Entry.PackageIndexDigest, "sha256:"), strings.ReplaceAll(verified.Platform.Platform, "/", "-")), nil
+}
+
+func (m *Coordinator) migrateLegacyDockerSandboxesPrebuiltAcquisition(root string, verified VerifiedDockerSandboxesPrebuilt) error {
+	if _, err := os.Lstat(root); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	legacyRoot, err := m.legacyDockerSandboxesPrebuiltAcquisitionRoot(verified)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(legacyRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("legacy prebuilt acquisition cache is not a real directory: %s", legacyRoot)
+	}
+	if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+		return err
+	}
+	if err := os.Rename(legacyRoot, root); err != nil {
+		return fmt.Errorf("move legacy prebuilt acquisition cache into .local/cache: %w", err)
+	}
+	if m.environment != nil {
+		m.infof("moved legacy Docker Sandboxes prebuilt acquisition cache into %s\n", root)
+	}
+	return nil
 }
 
 func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context, verified VerifiedDockerSandboxesPrebuilt) (string, dockerSandboxesPrebuiltAcquisition, error) {
 	localTag := dockerSandboxesPrebuiltBaseTag(verified)
 	root, err := m.dockerSandboxesPrebuiltAcquisitionRoot(verified)
 	if err != nil {
+		return "", dockerSandboxesPrebuiltAcquisition{}, err
+	}
+	if err := m.migrateLegacyDockerSandboxesPrebuiltAcquisition(root, verified); err != nil {
 		return "", dockerSandboxesPrebuiltAcquisition{}, err
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -912,6 +956,9 @@ func (m *Coordinator) acquireDockerSandboxesPrebuiltArchive(ctx context.Context,
 				return archivePath, stored, nil
 			}
 		}
+	}
+	if err := os.Remove(archivePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", dockerSandboxesPrebuiltAcquisition{}, fmt.Errorf("remove invalid prebuilt Docker archive: %w", err)
 	}
 	partialPath := archivePath + ".partial"
 	if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {

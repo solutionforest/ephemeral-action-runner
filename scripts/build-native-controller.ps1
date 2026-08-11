@@ -943,8 +943,8 @@ if ($UseOld) {
                         $oldCgo = $env:CGO_ENABLED; $oldOS = $env:GOOS; $oldArch = $env:GOARCH; $oldGoCache = $env:GOCACHE; $oldGoTmp = $env:GOTMPDIR
                         try {
                             $env:CGO_ENABLED = '0'; $env:GOOS = $TargetOS; $env:GOARCH = $TargetArch
-                            $projectGoCache = Join-Path $RepoRoot '.local\go-build-cache'
-                            $projectGoTmp = Join-Path $RepoRoot '.local\go-build-tmp'
+                            $projectGoCache = Join-Path $RepoRoot '.local\cache\go\build'
+                            $projectGoTmp = Join-Path $RepoRoot '.local\cache\go\tmp'
                             New-Item -ItemType Directory -Force -Path $projectGoCache, $projectGoTmp | Out-Null
                             $env:GOCACHE = $projectGoCache; $env:GOTMPDIR = $projectGoTmp
                             $output = @(& $localToolchain.Path build -trimpath -ldflags $ldflags -o $candidateBinary ./cmd/ephemeral-action-runner 2>&1)

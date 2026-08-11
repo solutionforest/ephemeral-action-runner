@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/terminalprogress"
 )
 
 func TestFormatDockerSandboxesPrebuiltArchiveProgressReportsBytesRateAndElapsedWithoutFalseTotal(t *testing.T) {
@@ -28,6 +29,25 @@ func TestFormatDockerSandboxesPrebuiltArchiveProgressReportsBytesRateAndElapsedW
 	}
 	if strings.Contains(got, "%") || strings.Contains(got, "/17") {
 		t.Fatalf("progress claimed an unavailable archive total: %q", got)
+	}
+}
+
+func TestDockerSandboxesPrebuiltArchiveProgressAdaptsToNarrowTerminals(t *testing.T) {
+	snapshot := dockerSandboxesPrebuiltArchiveProgressSnapshot{
+		Label:        "Docker Sandboxes prebuilt Full archive",
+		Phase:        "downloading/materializing (attempt 1/2)",
+		ArchiveBytes: 3 * 1024 * 1024 * 1024,
+		Elapsed:      2*time.Minute + 30*time.Second,
+		ShowRate:     true,
+	}
+	candidates := dockerSandboxesPrebuiltArchiveProgressCandidates(snapshot)
+	medium := terminalprogress.Fit(candidates, 90)
+	if !strings.Contains(medium, "Prebuilt Full:") || !strings.Contains(medium, "3.0 GiB") || !strings.Contains(medium, "20.5 MiB/s") || !strings.Contains(medium, "2m30s") {
+		t.Fatalf("medium terminal lost useful progress values: %q", medium)
+	}
+	narrow := terminalprogress.Fit(candidates, 40)
+	if !strings.Contains(narrow, "Full") || !strings.Contains(narrow, "3.0 GiB") || !strings.Contains(narrow, "2m30s") {
+		t.Fatalf("narrow terminal lost essential progress values: %q", narrow)
 	}
 }
 
@@ -115,6 +135,8 @@ func (environment *prebuiltProgressEnvironment) Infof(format string, args ...any
 func (*prebuiltProgressEnvironment) Warnf(string, ...any) {}
 
 func (*prebuiltProgressEnvironment) ProgressTerminal() bool { return true }
+
+func (*prebuiltProgressEnvironment) ProgressWidth() int { return 120 }
 
 func (environment *prebuiltProgressEnvironment) ProgressConsole() io.Writer {
 	return environment.console

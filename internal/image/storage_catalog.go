@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/projectlayout"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	sandboxcapacity "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/capacity"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
@@ -1591,20 +1592,6 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 		}
 		return os.Remove(absolute)
 	case catalogPrebuiltPackageArchiveKind:
-		acquisitionRoot, err := filepath.Abs(filepath.Join(m.ProjectRoot, ".local", "state", "image"))
-		if err != nil {
-			return err
-		}
-		rootTarget, err := storage.SnapshotFilesystemTarget(acquisitionRoot)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if rootTarget.Kind != storage.TargetDirectory {
-			return errors.New("prebuilt acquisition root is not a directory")
-		}
 		archiveTarget, err := storage.SnapshotFilesystemTarget(resource.Locator)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -1616,9 +1603,28 @@ func (m *Coordinator) removeCatalogResource(ctx context.Context, resource storag
 			return errors.New("prebuilt acquisition is not a directory")
 		}
 		absolute := archiveTarget.Locator
-		acquisitionRoot = rootTarget.Locator
-		relative, err := filepath.Rel(acquisitionRoot, absolute)
-		if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		var acquisitionRoot string
+		for _, candidate := range []string{
+			filepath.Join(projectlayout.CacheRoot(m.ProjectRoot), "image"),
+			filepath.Join(projectlayout.StateRoot(m.ProjectRoot), "image"),
+		} {
+			rootTarget, snapshotErr := storage.SnapshotFilesystemTarget(candidate)
+			if errors.Is(snapshotErr, os.ErrNotExist) {
+				continue
+			}
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			if rootTarget.Kind != storage.TargetDirectory {
+				return errors.New("prebuilt acquisition root is not a directory")
+			}
+			relative, relativeErr := filepath.Rel(rootTarget.Locator, absolute)
+			if relativeErr == nil && relative != "." && relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				acquisitionRoot = rootTarget.Locator
+				break
+			}
+		}
+		if acquisitionRoot == "" {
 			return errors.New("prebuilt acquisition belongs to another project or lies outside the exact acquisition root")
 		}
 		executor, err := storage.NewFilesystemExecutor(acquisitionRoot)

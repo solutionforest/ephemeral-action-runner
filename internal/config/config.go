@@ -309,7 +309,7 @@ func Default() Config {
 		DockerSandboxes: DockerSandboxesConfig{
 			NetworkBaseline:       DockerSandboxesNetworkBaselineOpen,
 			ArchitectureEmulation: DockerSandboxesArchitectureEmulationBestEffort,
-			StagingRoot:           ".local/docker-sandboxes-staging",
+			StagingRoot:           ".local/cache/docker-sandboxes/staging",
 			CPUs:                  4,
 			Memory:                "8GiB",
 			RootDisk:              DockerSandboxesAutomaticRootDisk,

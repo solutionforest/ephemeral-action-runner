@@ -22,6 +22,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/filelock"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
 	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
+	"github.com/solutionforest/ephemeral-action-runner/internal/projectlayout"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
@@ -967,7 +968,11 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			return err
 		}
 	} else {
-		contextRoot, err = os.MkdirTemp(filepath.Join(m.ProjectRoot, ".local"), "docker-sandboxes-context-")
+		contextParent := filepath.Join(projectlayout.CacheRoot(m.ProjectRoot), "docker-sandboxes", "contexts")
+		if err := os.MkdirAll(contextParent, 0o700); err != nil {
+			return fmt.Errorf("create Docker Sandboxes context cache root: %w", err)
+		}
+		contextRoot, err = os.MkdirTemp(contextParent, "context-")
 		if err != nil {
 			return err
 		}
@@ -1329,6 +1334,12 @@ func (m *Coordinator) reusableDockerSandboxesReceipt(manifest Manifest, source R
 			receiptPath := filepath.Join(configRecord.ProjectRoot, ".local", "state", "image", reference.ConfigID, "docker-sandboxes", "active.json")
 			receipt, readErr := readDockerSandboxesReceiptPath(receiptPath)
 			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					if m.environment != nil {
+						m.warnf("cataloged Docker Sandboxes receipt %s is missing; skipping unverified template reuse and reacquiring the configured artifact\n", receiptPath)
+					}
+					continue
+				}
 				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("read cataloged Docker Sandboxes receipt %s: %w", receiptPath, readErr)
 			}
 			recomputedHash, hashErr := ManifestHash(receipt.Manifest)
@@ -1345,6 +1356,15 @@ func (m *Coordinator) reusableDockerSandboxesReceipt(manifest Manifest, source R
 			if requestedHash != recomputedHash {
 				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("cataloged Docker Sandboxes receipt does not match the requested manifest")
 			}
+			if evidenceErr := validateDockerSandboxesReceiptEvidence(receiptPath, receipt); evidenceErr != nil {
+				if errors.Is(evidenceErr, errDockerSandboxesReceiptEvidenceUnavailable) {
+					if m.environment != nil {
+						m.warnf("cataloged Docker Sandboxes evidence for %s is missing; skipping unverified template reuse and reacquiring the configured artifact\n", receiptPath)
+					}
+					continue
+				}
+				return dockerSandboxesReceipt{}, "", false, evidenceErr
+			}
 			if selectedPath != "" && (selected.Artifact != receipt.Artifact || selected.ArchiveSHA256 != receipt.ArchiveSHA256 || selected.MetadataSHA256 != receipt.MetadataSHA256) {
 				return dockerSandboxesReceipt{}, "", false, fmt.Errorf("multiple conflicting current Docker Sandboxes artifacts claim manifest %s", manifestHash)
 			}
@@ -1355,11 +1375,10 @@ func (m *Coordinator) reusableDockerSandboxesReceipt(manifest Manifest, source R
 	if selectedPath == "" {
 		return dockerSandboxesReceipt{}, "", false, nil
 	}
-	if err := validateDockerSandboxesReceiptEvidence(selectedPath, selected); err != nil {
-		return dockerSandboxesReceipt{}, "", false, err
-	}
 	return selected, selectedPath, true, nil
 }
+
+var errDockerSandboxesReceiptEvidenceUnavailable = errors.New("Docker Sandboxes receipt evidence is unavailable")
 
 func validateDockerSandboxesReceiptEvidence(receiptPath string, receipt dockerSandboxesReceipt) error {
 	receiptDirectory := filepath.Dir(receiptPath)
@@ -1384,7 +1403,13 @@ func validateDockerSandboxesReceiptEvidence(receiptPath string, receipt dockerSa
 		}
 		path := filepath.Join(receiptDirectory, clean)
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %q", errDockerSandboxesReceiptEvidenceUnavailable, name)
+		}
+		if err != nil {
+			return fmt.Errorf("inspect Docker Sandboxes receipt evidence %q: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
 			return fmt.Errorf("Docker Sandboxes receipt evidence %q is missing or not a regular file", name)
 		}
 		digest, _, err := hashFile(path)

@@ -2059,7 +2059,7 @@ dockerSandboxes:
   policyGeneration: %s
   networkBaseline: open
   architectureEmulation: %s
-  stagingRoot: .local/docker-sandboxes-staging
+  stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 8GiB
   rootDisk: %s

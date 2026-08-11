@@ -768,6 +768,7 @@ Commands:
   ephemeral-action-runner logs prune [--dry-run]
   ephemeral-action-runner storage status [--operation NAME] [--provider NAME] [--json]
   ephemeral-action-runner storage prune [--provider NAME] [--json] [--execute]
+  ephemeral-action-runner storage reset --config PATH [--json] [--execute --plan HASH]
   ephemeral-action-runner version
 `)
 }

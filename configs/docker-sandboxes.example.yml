@@ -63,7 +63,7 @@ dockerSandboxes:
     - '*.githubusercontent.com:443'
   additionalDeny:
     - telemetry.example.invalid
-  stagingRoot: .local/docker-sandboxes-staging
+  stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 8GiB
   # EPAR derives this sparse logical maximum from the selected image and stores the effective size in the active artifact receipt.

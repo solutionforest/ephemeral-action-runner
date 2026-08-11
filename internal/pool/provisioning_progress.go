@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/solutionforest/ephemeral-action-runner/internal/terminalprogress"
 )
 
 var dockerSandboxesCreateHeartbeatInterval = 5 * time.Second
@@ -23,10 +25,13 @@ func (m *Manager) runDockerSandboxesCreateProgress(instance string, operation fu
 	startedAt := time.Now()
 	m.logger().Info(label+" started; first use may materialize cached template layers and prepare the private Docker filesystem and VM", attributes...)
 
-	interactive := dockerPullProgressTerminal() && stringSliceContains(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text"
+	interactiveConfigured := dockerPullProgressTerminal() && stringSliceContains(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text"
+	var progressRenderer *terminalprogress.Renderer
+	if interactiveConfigured {
+		progressRenderer = newInteractiveProgressRenderer(dockerPullProgressConsole)
+	}
 	done := make(chan struct{})
 	var heartbeat sync.WaitGroup
-	interactiveRendered := false
 	if dockerSandboxesCreateHeartbeatInterval > 0 {
 		heartbeat.Add(1)
 		go func() {
@@ -38,9 +43,8 @@ func (m *Manager) runDockerSandboxesCreateProgress(instance string, operation fu
 				case <-ticker.C:
 					elapsed := time.Since(startedAt).Round(time.Second)
 					line := fmt.Sprintf("%s: still working; elapsed %s", label, elapsed)
-					if interactive {
-						writeInteractiveProgressLine(dockerPullProgressConsole, line)
-						interactiveRendered = true
+					if progressRenderer != nil {
+						progressRenderer.Write(line)
 						continue
 					}
 					m.logger().Info(line, attributes...)
@@ -55,9 +59,7 @@ func (m *Manager) runDockerSandboxesCreateProgress(instance string, operation fu
 	close(done)
 	heartbeat.Wait()
 	elapsed := time.Since(startedAt).Round(time.Second)
-	if interactive && interactiveRendered {
-		_, _ = fmt.Fprint(dockerPullProgressConsole, "\r\033[2K\n")
-	}
+	progressRenderer.Finish()
 	if err != nil {
 		m.logger().Warn(label+" failed", append(attributes, "elapsed", elapsed)...)
 		return err

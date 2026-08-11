@@ -14,6 +14,7 @@ import (
 
 	artifactimage "github.com/solutionforest/ephemeral-action-runner/internal/image"
 	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	"github.com/solutionforest/ephemeral-action-runner/internal/terminalprogress"
 )
 
 var buildxProgressHeartbeatInterval = 5 * time.Second
@@ -165,7 +166,11 @@ func (m *Manager) runHostBuildxLogged(ctx context.Context, logPath, name string,
 	}
 	attributes := []any{"provider", m.Config.Provider.Type, "operation", "buildx-build", "logPath", logPath}
 	rawTranscriptOnConsole := stringSliceContains(m.Config.Logging.TranscriptSinks, "console")
-	interactive := dockerPullProgressTerminal() && stringSliceContains(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text" && !rawTranscriptOnConsole
+	interactiveConfigured := dockerPullProgressTerminal() && stringSliceContains(m.Config.Logging.ManagerSinks, "console") && m.Config.Logging.ManagerConsoleFormat == "text" && !rawTranscriptOnConsole
+	var progressRenderer *terminalprogress.Renderer
+	if interactiveConfigured {
+		progressRenderer = newInteractiveProgressRenderer(dockerPullProgressConsole)
+	}
 	archiveExportPath := buildxDockerArchiveDestination(args)
 	var reportMu sync.Mutex
 	report := func(snapshot artifactimage.BuildxProgressSnapshot) {
@@ -180,8 +185,8 @@ func (m *Manager) runHostBuildxLogged(ctx context.Context, logPath, name string,
 				line += "; archive written " + artifactimage.FormatDockerPullBytes(info.Size())
 			}
 		}
-		if interactive {
-			writeInteractiveProgressLine(dockerPullProgressConsole, line)
+		if progressRenderer != nil {
+			progressRenderer.Write(line)
 			return
 		}
 		m.logger().Info(line, attributes...)
@@ -212,9 +217,7 @@ func (m *Manager) runHostBuildxLogged(ctx context.Context, logPath, name string,
 	heartbeat.Wait()
 	stdoutProgress.Flush()
 	stderrProgress.Flush()
-	if interactive {
-		fmt.Fprintln(dockerPullProgressConsole)
-	}
+	progressRenderer.Finish()
 	if commandErr == nil {
 		snapshot := monitor.Snapshot()
 		completion := prefix + " complete"

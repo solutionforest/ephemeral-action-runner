@@ -41,6 +41,9 @@ func runStorage(args []string) error {
 	if subcommand == "effective-go-cache-limit" {
 		return runEffectiveGoCacheLimit(args[1:])
 	}
+	if subcommand == "reset" {
+		return runStorageReset(args[1:])
+	}
 	if subcommand != "status" && subcommand != "prune" {
 		return fmt.Errorf("unknown storage subcommand %q", subcommand)
 	}
