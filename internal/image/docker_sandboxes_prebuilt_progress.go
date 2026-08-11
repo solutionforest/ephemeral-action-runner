@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/solutionforest/ephemeral-action-runner/internal/terminalprogress"
 )
 
 const (
@@ -28,7 +30,7 @@ type dockerSandboxesPrebuiltArchiveProgress struct {
 	label       string
 	reference   string
 	startedAt   time.Time
-	interactive bool
+	renderer    *terminalprogress.Renderer
 	interval    time.Duration
 
 	mu       sync.RWMutex
@@ -37,16 +39,13 @@ type dockerSandboxesPrebuiltArchiveProgress struct {
 	stopped  chan struct{}
 	stopOnce sync.Once
 	renderMu sync.Mutex
-	rendered bool
 }
 
 func (m *Coordinator) startDockerSandboxesPrebuiltArchiveProgress(partialPath, archivePath, profile, platform string) *dockerSandboxesPrebuiltArchiveProgress {
-	interactive := m.dockerPullProgressIsInteractive()
-	interval := dockerSandboxesPrebuiltLoggedProgressInterval
-	if interactive {
-		interval = dockerSandboxesPrebuiltInteractiveProgressInterval
+	progress := newDockerSandboxesPrebuiltArchiveProgress(m, partialPath, archivePath, profile, platform, dockerSandboxesPrebuiltLoggedProgressInterval, m.dockerPullProgressIsInteractive())
+	if progress.renderer != nil {
+		progress.interval = dockerSandboxesPrebuiltInteractiveProgressInterval
 	}
-	progress := newDockerSandboxesPrebuiltArchiveProgress(m, partialPath, archivePath, profile, platform, interval, interactive)
 	progress.start()
 	return progress
 }
@@ -64,11 +63,13 @@ func newDockerSandboxesPrebuiltArchiveProgress(m *Coordinator, partialPath, arch
 		archivePath: archivePath,
 		label:       "Docker Sandboxes prebuilt " + profileName + " archive",
 		startedAt:   time.Now(),
-		interactive: interactive,
 		interval:    interval,
 		phase:       "resolving immutable platform",
 		done:        make(chan struct{}),
 		stopped:     make(chan struct{}),
+	}
+	if interactive {
+		progress.renderer = m.newTerminalProgressRenderer()
 	}
 	if archiveRange, durationRange, ok := dockerSandboxesPrebuiltAcquisitionReference(profile, platform); ok {
 		progress.reference = fmt.Sprintf("typical first-acquisition reference for %s: %s archive output and %s", platform, archiveRange, durationRange)
@@ -133,9 +134,7 @@ func (progress *dockerSandboxesPrebuiltArchiveProgress) finish(success bool) {
 		close(progress.done)
 		<-progress.stopped
 		progress.renderMu.Lock()
-		if progress.interactive && progress.rendered {
-			_, _ = fmt.Fprint(progress.coordinator.environment.ProgressConsole(), "\r\033[2K\n")
-		}
+		progress.renderer.Finish()
 		progress.renderMu.Unlock()
 		if success {
 			snapshot := progress.snapshot()
@@ -147,10 +146,10 @@ func (progress *dockerSandboxesPrebuiltArchiveProgress) finish(success bool) {
 func (progress *dockerSandboxesPrebuiltArchiveProgress) render() {
 	progress.renderMu.Lock()
 	defer progress.renderMu.Unlock()
-	line := formatDockerSandboxesPrebuiltArchiveProgress(progress.snapshot())
-	if progress.interactive {
-		_, _ = fmt.Fprintf(progress.coordinator.environment.ProgressConsole(), "\r\033[2K%s", line)
-		progress.rendered = true
+	snapshot := progress.snapshot()
+	line := formatDockerSandboxesPrebuiltArchiveProgress(snapshot)
+	if progress.renderer != nil {
+		progress.renderer.Write(dockerSandboxesPrebuiltArchiveProgressCandidates(snapshot)...)
 		return
 	}
 	progress.coordinator.infof("%s\n", line)
@@ -189,4 +188,38 @@ func formatDockerSandboxesPrebuiltArchiveProgress(snapshot dockerSandboxesPrebui
 	}
 	parts = append(parts, "elapsed "+formatBuildxElapsed(snapshot.Elapsed))
 	return snapshot.Label + ": " + strings.Join(parts, "; ")
+}
+
+func dockerSandboxesPrebuiltArchiveProgressCandidates(snapshot dockerSandboxesPrebuiltArchiveProgressSnapshot) []string {
+	full := formatDockerSandboxesPrebuiltArchiveProgress(snapshot)
+	profile := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(snapshot.Label, "Docker Sandboxes prebuilt "), " archive"))
+	if profile == "" {
+		profile = "Package"
+	}
+	elapsed := formatBuildxElapsed(snapshot.Elapsed)
+	phase := strings.TrimSpace(snapshot.Phase)
+	mediumParts := []string{phase}
+	compactParts := []string{}
+	if snapshot.ArchiveBytes > 0 {
+		bytesWritten := FormatDockerPullBytes(snapshot.ArchiveBytes)
+		mediumParts = append(mediumParts, bytesWritten)
+		compactParts = append(compactParts, bytesWritten)
+		if snapshot.ShowRate && snapshot.Elapsed > 0 {
+			rate := int64(float64(snapshot.ArchiveBytes) / snapshot.Elapsed.Seconds())
+			if rate > 0 {
+				rateText := FormatDockerPullBytes(rate) + "/s"
+				mediumParts = append(mediumParts, rateText)
+				compactParts = append(compactParts, rateText)
+			}
+		}
+	}
+	mediumParts = append(mediumParts, elapsed)
+	compactParts = append(compactParts, elapsed)
+	medium := "Prebuilt " + profile + ": " + strings.Join(mediumParts, "; ")
+	compact := profile + ": " + strings.Join(compactParts, " | ")
+	tiny := profile + " " + elapsed
+	if snapshot.ArchiveBytes > 0 {
+		tiny = profile + " " + FormatDockerPullBytes(snapshot.ArchiveBytes) + " " + elapsed
+	}
+	return []string{full, medium, compact, tiny}
 }

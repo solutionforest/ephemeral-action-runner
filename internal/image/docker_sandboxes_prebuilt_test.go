@@ -58,6 +58,7 @@ func (environment *prebuiltAcquisitionEnvironment) Infof(format string, args ...
 func (*prebuiltAcquisitionEnvironment) Warnf(string, ...any)       {}
 func (*prebuiltAcquisitionEnvironment) ProgressTerminal() bool     { return false }
 func (*prebuiltAcquisitionEnvironment) ProgressConsole() io.Writer { return io.Discard }
+func (*prebuiltAcquisitionEnvironment) ProgressWidth() int         { return 0 }
 
 func (environment *prebuiltAcquisitionEnvironment) infoMessages() string {
 	environment.mu.Lock()
