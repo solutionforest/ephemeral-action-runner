@@ -163,13 +163,16 @@ func newProvisioningProgressTestManager(t *testing.T) (*Manager, *bytes.Buffer, 
 func setProvisioningProgressTestGlobals(t *testing.T, terminal bool, console *bytes.Buffer, interval time.Duration) {
 	t.Helper()
 	previousTerminal := dockerPullProgressTerminal
+	previousWidth := progressTerminalWidth
 	previousConsole := dockerPullProgressConsole
 	previousInterval := dockerSandboxesCreateHeartbeatInterval
 	dockerPullProgressTerminal = func() bool { return terminal }
+	progressTerminalWidth = func() int { return 160 }
 	dockerPullProgressConsole = console
 	dockerSandboxesCreateHeartbeatInterval = interval
 	t.Cleanup(func() {
 		dockerPullProgressTerminal = previousTerminal
+		progressTerminalWidth = previousWidth
 		dockerPullProgressConsole = previousConsole
 		dockerSandboxesCreateHeartbeatInterval = previousInterval
 	})

@@ -22,7 +22,11 @@ storage:
 ./start storage prune --execute
 ./start storage prune --legacy
 ./start storage prune --legacy --execute --plan <hash>
+./start storage reset --config .local/config.yml
+./start storage reset --config .local/config.yml --execute --plan <hash>
 ```
+
+Use `storage reset` only for an intentional fresh artifact acquisition by one exact configuration. It requires the preview hash, preserves the configuration, user-owned secrets/customization, and compact builder/ownership metadata, retains shared resources, removes only exact exclusively referenced resources, and clears the selected configuration's generated cache/state after live identity checks. See [Generated files and recovery](generated-files.md) for the complete project and host layout.
 
 Use `--provider` together with `--config` and `--project-root` when diagnosing a non-default configuration. Text and schema-v2 JSON reports include operation phases, role allocations, resolved domains, raw and resolved locations, discovery provenance, confidence, and warnings. The status plan is read-only and does not authorize cleanup.
 
@@ -30,7 +34,7 @@ With `automaticHousekeeping: conservative`, EPAR reconciles interrupted work at 
 
 Setting `automaticHousekeeping: disabled` suppresses controller-managed artifact cleanup. The no-Go wrapper still maintains one correct stable native binary and removes only inactive legacy revision directories with valid ownership metadata.
 
-The exact host resource catalog lives in the platform's per-user state directory and coordinates all EPAR project directories on that account. References use canonical configuration paths, so separate configs may keep different generations and exact shared artifacts remain protected until the last reference disappears.
+The exact host resource catalog lives in the platform's per-user state directory and coordinates all EPAR project directories on that account. References use canonical configuration paths, so separate configs may keep different generations and exact shared artifacts remain protected until the last reference disappears. Large disposable project content lives under `.local/cache`; `.local/state` is compact receipt/policy/lifecycle evidence, and `.local/storage` is compact ownership and builder metadata.
 
 Older prefix-era resources are never adopted automatically. Use `storage prune --legacy` to produce their exact preview; execution requires the preview plan hash. The Docker Sandboxes base template `docker/sandbox-templates:shell-docker` is always protected.
 

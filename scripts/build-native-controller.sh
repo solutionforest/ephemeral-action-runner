@@ -524,7 +524,7 @@ epar_prepare_docker_toolchain() {
 }
 
 epar_build_candidate() {
-  local source_digest="$1" recipe_digest="$2" toolchain build_digest build_stderr build_exit build_log_directory build_log_path
+  local source_digest="$1" recipe_digest="$2" toolchain build_digest build_stderr build_exit build_log_directory build_log_path project_go_cache project_go_tmp
   temporary_directory="$(mktemp -d "${cache_root}/.build.XXXXXX")"
   build_lease_file="$(mktemp "${temporary_directory}/lease-build-$$.XXXXXX")"
   printf '%s\n' 'schemaVersion=1' "host=$(hostname 2>/dev/null || true)" "pid=$$" "startedAtUnix=$(date +%s)" >"$build_lease_file"
@@ -538,7 +538,10 @@ epar_build_candidate() {
       build_digest="$(epar_build_digest "$source_digest" local-go "$toolchain" "$recipe_digest")"
       printf '%s\n' "EPAR native-controller build started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" "Builder: local-go" "Toolchain: ${toolchain}" "Target: ${goos}/${goarch}" '' >"$build_log_path"
       set +e
-      CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$native_go_bin" build -trimpath -ldflags "-X main.sourceRevision=${source_digest} -X main.sourceDigest=${source_digest} -X main.buildDigest=${build_digest}" -o "${temporary_directory}/${native_executable}" ./cmd/ephemeral-action-runner 2>"$build_stderr"
+      project_go_cache="${repo_root}/.local/cache/go/build"
+      project_go_tmp="${repo_root}/.local/cache/go/tmp"
+      mkdir -p "$project_go_cache" "$project_go_tmp"
+      CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOCACHE="$project_go_cache" GOTMPDIR="$project_go_tmp" "$native_go_bin" build -trimpath -ldflags "-X main.sourceRevision=${source_digest} -X main.sourceDigest=${source_digest} -X main.buildDigest=${build_digest}" -o "${temporary_directory}/${native_executable}" ./cmd/ephemeral-action-runner 2>"$build_stderr"
       build_exit=$?
       set -e
       ;;

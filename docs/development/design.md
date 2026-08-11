@@ -43,3 +43,9 @@ Each provider reports the storage surfaces and temporary expansion required by b
 Artifacts are classified as active, current reusable, superseded EPAR-owned, incomplete temporary, or shared/unknown. At startup and after activation, conservative housekeeping reconciles interrupted work and removes only unreferenced, exactly owned superseded resources after live readback. It retains resources used by another configuration, lease, container, sandbox, distribution, or builder. Prefix-only and shared resources require an explicit previewed prune; cleanup never expands to a broad prune, reset, or wildcard.
 
 See [Adding a Provider](adding-provider.md) for the extension checklist.
+
+## Generated Filesystem Contract
+
+New runtime-generated paths must follow the classification in [Generated files and recovery](../generated-files.md). Large reproducible downloads, archives, contexts, and compiler caches belong under `.local/cache`; compact receipts, update policy, supervision, and pool lifecycle records belong under `.local/state`; compact builder, bootstrap, trust, and exact ownership metadata belongs under `.local/storage`; operational output belongs under `work/logs`; provider-specific resumable work belongs under an explicitly documented `work/` subdirectory. Do not add large binary content to state or place logs directly under `.local`.
+
+Every generated resource outside the checkout must have a provider readback identity and, when EPAR owns or introduced it, an exact per-user catalog record. A human-readable `epar-` prefix is useful for diagnostics but never sufficient cleanup authority. Recovery from missing cache/state must reacquire or rebuild without silently changing the configured source/provider; reset and cleanup must remain exact, previewed, lease-aware, and shared-reference-aware.

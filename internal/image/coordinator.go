@@ -48,6 +48,7 @@ type Environment interface {
 	LogWarn(message string, args ...any)
 	ProgressTerminal() bool
 	ProgressConsole() io.Writer
+	ProgressWidth() int
 	RunnerName(prefix string, sequence int, now time.Time) string
 	TranscriptComponent(path string) string
 }

@@ -68,6 +68,8 @@ Storage-consuming commands fail before their provider side effects when a measur
 
 Each normal start also reconciles interrupted exact-owned work and retires unreferenced superseded artifacts after replacement readback. Use `./start storage status` to inspect the result. `./start storage prune --legacy` previews prefix-era resources, which remain manual and require the displayed plan hash before execution.
 
+Large disposable downloads and temporary build data live under `.local/cache`; compact receipts and lifecycle state live under `.local/state`; builder and ownership metadata live under `.local/storage`; logs live under `work/logs`. See [Generated files and recovery](generated-files.md) before manual deletion. For a last-resort fresh start of one stopped configuration, run `./start storage reset --config <path>`, review its exact targets, then repeat with `--execute --plan <hash>`.
+
 Press `Ctrl-C` once to stop a foreground pool, then wait for cleanup to finish before closing the terminal. Use `--keep-on-exit` only to retain owned resources for deliberate debugging.
 
 ## Update runner artifacts

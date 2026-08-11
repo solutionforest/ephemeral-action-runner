@@ -228,11 +228,11 @@ func TestDockerContainerBuildxInteractiveProgressRedrawIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	terminalText := terminalConsole.String()
-	if !strings.HasPrefix(terminalText, "\r\033[2K") || strings.Count(terminalText, "\r\033[2K") != 1 {
+	if !strings.HasPrefix(terminalText, "\r\033[2K") || strings.Count(terminalText, "\r\033[2K") != 2 || !strings.HasSuffix(terminalText, "\r\033[2K\n") {
 		t.Fatalf("interactive Docker Container progress was not rendered as one redraw: %q", terminalText)
 	}
-	line := strings.TrimSuffix(strings.TrimPrefix(terminalText, "\r\033[2K"), "\n")
-	if len([]rune(line)) > 39 || !strings.HasPrefix(line, "Docker Container") || !strings.Contains(line, terminalProgressEllipsis) || !strings.HasSuffix(line, "elapsed 0s") {
+	line := strings.TrimSuffix(strings.TrimPrefix(terminalText, "\r\033[2K"), "\r\033[2K\n")
+	if len([]rune(line)) > 39 || !strings.HasPrefix(line, "Docker Container") || !strings.Contains(line, "...") || !strings.HasSuffix(line, "elapsed 0s") {
 		t.Fatalf("interactive Docker Container progress was not bounded with a middle ellipsis: %q", line)
 	}
 	if strings.Contains(managerConsole.String(), "Docker Container image build:") {
@@ -580,11 +580,13 @@ func TestDockerPullProgressUsesSingleLineTerminalDisplayForTextManagerConsole(t 
 	}
 	defer runtime.Close()
 
-	previousTerminal, previousConsole := dockerPullProgressTerminal, dockerPullProgressConsole
+	previousTerminal, previousWidth, previousConsole := dockerPullProgressTerminal, progressTerminalWidth, dockerPullProgressConsole
 	dockerPullProgressTerminal = func() bool { return true }
+	progressTerminalWidth = func() int { return 160 }
 	dockerPullProgressConsole = &terminalConsole
 	t.Cleanup(func() {
 		dockerPullProgressTerminal = previousTerminal
+		progressTerminalWidth = previousWidth
 		dockerPullProgressConsole = previousConsole
 	})
 
@@ -596,6 +598,41 @@ func TestDockerPullProgressUsesSingleLineTerminalDisplayForTextManagerConsole(t 
 	}
 	if got := managerConsole.String(); got != "" {
 		t.Fatalf("interactive pull progress was duplicated through manager logger: %q", got)
+	}
+}
+
+func TestDockerPullProgressFallsBackToManagerLogWhenTerminalWidthIsUnknown(t *testing.T) {
+	root := t.TempDir()
+	var managerConsole, terminalConsole bytes.Buffer
+	runtime, err := logging.NewRuntime(logging.Options{
+		Directory:       root,
+		ManagerSinks:    logging.SinkConsole,
+		TranscriptSinks: logging.SinkFile,
+		Stdout:          &managerConsole,
+		Stderr:          &managerConsole,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	previousTerminal, previousWidth, previousConsole := dockerPullProgressTerminal, progressTerminalWidth, dockerPullProgressConsole
+	dockerPullProgressTerminal = func() bool { return true }
+	progressTerminalWidth = func() int { return 0 }
+	dockerPullProgressConsole = &terminalConsole
+	t.Cleanup(func() {
+		dockerPullProgressTerminal = previousTerminal
+		progressTerminalWidth = previousWidth
+		dockerPullProgressConsole = previousConsole
+	})
+
+	manager := Manager{Config: config.Default(), Logging: runtime}
+	manager.writeDockerPullProgress("source.docker-pull.log", map[string]image.DockerPullProgress{"layer-a": {Current: 1, Total: 2}})
+	if terminalConsole.Len() != 0 {
+		t.Fatalf("unknown-width progress wrote cursor controls: %q", terminalConsole.String())
+	}
+	if !strings.Contains(managerConsole.String(), "Docker source pull: 0/1 layers complete; 1 B/2 B (50%)") {
+		t.Fatalf("unknown-width progress omitted newline fallback: %q", managerConsole.String())
 	}
 }
 

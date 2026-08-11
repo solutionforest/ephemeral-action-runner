@@ -72,7 +72,7 @@ dockerSandboxes:
   policyGeneration: sha256:<balanced-policy-fingerprint>
   networkBaseline: open
   architectureEmulation: best-effort
-  stagingRoot: .local/docker-sandboxes-staging
+  stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 8GiB
   rootDisk: auto

@@ -380,6 +380,10 @@ func (environment imageEnvironment) ProgressConsole() io.Writer {
 	return dockerPullProgressConsole
 }
 
+func (environment imageEnvironment) ProgressWidth() int {
+	return progressTerminalWidth()
+}
+
 func (environment imageEnvironment) RunnerName(prefix string, sequence int, now time.Time) string {
 	return RunnerName(prefix, sequence, now)
 }
