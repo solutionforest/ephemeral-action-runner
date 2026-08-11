@@ -79,6 +79,7 @@ func TestWorkflowPublishesOnlyFromMainAndValidatesPullRequestsWithoutPublishing(
 		"if: github.event_name == 'pull_request'",
 		"permissions:\n      contents: read",
 		"go test ./internal/prebuilt ./cmd/epar-prebuilt-publisher -count=1",
+		"bash -n .github/scripts/fetch-prebuilt-catalog.sh",
 		"if: github.event_name != 'pull_request' && inputs.promote_candidate != true",
 	} {
 		if !strings.Contains(workflow, required) {
@@ -107,11 +108,93 @@ func TestWorkflowPublicationCannotMutateGitOrSourceReleaseState(t *testing.T) {
 	}
 }
 
-func TestWorkflowAllowsAbsoluteCatalogPathsForORASPush(t *testing.T) {
+func TestWorkflowFetchesCatalogsByValidatedDescriptorAndPublishesSafeRelativeTitles(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
-	const push = `oras push --disable-path-validation "$immutable_ref"`
-	if got := strings.Count(workflow, push); got != 2 {
-		t.Fatalf("automatic and manual catalog publication must allow their absolute runner-temp paths: got %d guarded pushes", got)
+	if strings.Contains(workflow, "oras pull") {
+		t.Fatal("catalog retrieval must not extract OCI layer titles as filesystem paths")
+	}
+	if strings.Contains(workflow, "--allow-path-traversal") || strings.Contains(workflow, "--disable-path-validation") {
+		t.Fatal("catalog publication and retrieval must not disable ORAS path validation")
+	}
+	if got := strings.Count(workflow, `bash .github/scripts/fetch-prebuilt-catalog.sh "$PACKAGE_REPOSITORY"`); got != 2 {
+		t.Fatalf("both unsigned collision checks must use the descriptor-addressed fetcher: got %d calls", got)
+	}
+	if got := strings.Count(workflow, `verify-catalog --repository "$PACKAGE_REPOSITORY"`); got < 5 {
+		t.Fatalf("signed catalog reads must remain in-process verified: got %d verifier calls", got)
+	}
+	for _, required := range []string{
+		`cd "$RUNNER_TEMP/epar-promotion"`,
+		`--config "catalog-config.json:$CATALOG_CONFIG_MEDIA_TYPE" "catalog.json:$CATALOG_LAYER_MEDIA_TYPE"`,
+		`cd "$RUNNER_TEMP"`,
+		`--config "manual-catalog-config.json:$CATALOG_CONFIG_MEDIA_TYPE" "manual-catalog.canonical.json:$CATALOG_LAYER_MEDIA_TYPE"`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("catalog publication must use controlled relative OCI layer titles: missing %q", required)
+		}
+	}
+	if got := strings.Count(workflow, `oras push "$immutable_ref"`); got != 2 {
+		t.Fatalf("automatic and manual catalog publication must retain exactly two guarded pushes: got %d", got)
+	}
+}
+
+func TestCatalogFetcherRejectsLayerPathsAndValidatesExactBlob(t *testing.T) {
+	script := readCatalogFetchScript(t)
+	for _, required := range []string{
+		`oras manifest fetch "$reference" --format json`,
+		`catalog reference must be an exact digest`,
+		`select(.artifactType == $artifact)`,
+		`select((.content.layers | length) == 1)`,
+		`oras blob fetch --output "$catalog_file" "${repository}@${layer_digest}"`,
+		`actual_digest="sha256:$(sha256sum "$catalog_file"`,
+		`(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("catalog fetcher is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"oras pull", "--allow-path-traversal", "--disable-path-validation"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("catalog fetcher contains unsafe path behavior %q", forbidden)
+		}
+	}
+}
+
+func TestWorkflowPreparesReviewSummaryBeforeProtectedPromotion(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	prepare := strings.Index(workflow, "  prepare-promotion-review:\n")
+	manual := strings.Index(workflow, "  manual-promote:\n")
+	if prepare < 0 || manual <= prepare {
+		t.Fatalf("prepare review job must precede manual promotion: prepare=%d manual=%d", prepare, manual)
+	}
+	prepareJob := workflow[prepare:manual]
+	if strings.Contains(prepareJob, "    environment:") {
+		t.Fatal("review summary must be available before protected environment approval")
+	}
+	for _, required := range []string{
+		"name: Prepare protected promotion review",
+		"## EPAR prebuilt promotion review",
+		"### Candidate identity",
+		"### Human-reviewed acceptance evidence",
+		"### Reviewer checklist",
+		`[[ "$PROFILE" == act ]]`,
+		"playwright-docker.yml run ${amd64_playwright_run_id}",
+		"dockerhub-private-pull.yml run ${amd64_dockerhub_run_id}",
+		"playwright-docker.yml run ${arm64_playwright_run_id}",
+		"dockerhub-private-pull.yml run ${arm64_dockerhub_run_id}",
+		`go run ./cmd/epar-prebuilt-publisher verify-package`,
+	} {
+		if !strings.Contains(prepareJob, required) {
+			t.Fatalf("promotion review summary is missing %q", required)
+		}
+	}
+	manualJob := workflow[manual:]
+	for _, required := range []string{
+		"needs: prepare-promotion-review",
+		"environment: epar-prebuilt-promotion",
+	} {
+		if !strings.Contains(manualJob, required) {
+			t.Fatalf("protected promotion must depend on prepared review: missing %q", required)
+		}
 	}
 }
 
@@ -167,6 +250,16 @@ func TestWorkflowUsesGitHubSupportedSLSAWorkflowBuildType(t *testing.T) {
 func readPublisherWorkflow(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "..", ".github", "workflows", "docker-sandboxes-images.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func readCatalogFetchScript(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", ".github", "scripts", "fetch-prebuilt-catalog.sh")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
