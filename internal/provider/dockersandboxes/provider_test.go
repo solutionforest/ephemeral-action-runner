@@ -1585,12 +1585,12 @@ func TestPolicySchemaFailsClosed(t *testing.T) {
 }
 
 func TestPolicyReadbackAcceptsAttributedProviderBaselinePatterns(t *testing.T) {
-	fixture := policyFixture(`[{"id":"default-cert-validation","name":"default-cert-validation","policy_id":"local-policy","scope":"global","applies_to":"all","resource_type":"network","decision":"allow","resources":["**.openai.com:443","crl*.digicert.com:80","**"],"origin":"local","status":"active","editable":true}]`)
+	fixture := policyFixture(`[{"id":"default-cert-validation","name":"default-cert-validation","policy_id":"local-policy","scope":"global","applies_to":"all","resource_type":"network","decision":"allow","resources":["**.example.com:443","crl*.digicert.com:80","**"],"origin":"local","status":"active","editable":true}]`)
 	rules, err := parseNetworkPolicy([]byte(fixture), testName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rules) != 1 || !reflect.DeepEqual(rules[0].Resources, []string{"**.openai.com:443", "crl*.digicert.com:80", "**"}) {
+	if len(rules) != 1 || !reflect.DeepEqual(rules[0].Resources, []string{"**.example.com:443", "crl*.digicert.com:80", "**"}) {
 		t.Fatalf("provider baseline resources = %#v", rules)
 	}
 }

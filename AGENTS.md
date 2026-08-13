@@ -8,7 +8,7 @@ A provider or onboarding change is incomplete until its wizard and generated con
 
 ## Agent-created temporary files
 
-Do not create ad hoc top-level directories under `.local`. All scratch files, temporary build output, one-off test state, and agent-specific caches created while investigating, implementing, or validating work must live under `.local/tmp/`, grouped beneath a descriptive task or tool directory such as `.local/tmp/codex/<task-name>/`. This includes manually assigned `GOCACHE`, `GOTMPDIR`, `GOMODCACHE`, test state roots, downloaded diagnostic tools, generated fixtures, and transient command output.
+Do not create ad hoc top-level directories under `.local`. All scratch files, temporary build output, one-off test state, and agent-specific caches created while investigating, implementing, or validating work must live under `.local/tmp/`, grouped beneath a descriptive task or tool directory such as `.local/tmp/<agent-name>/<task-name>/`. This includes manually assigned `GOCACHE`, `GOTMPDIR`, `GOMODCACHE`, test state roots, downloaded diagnostic tools, generated fixtures, and transient command output.
 
 Do not place agent-created temporary content in the product-owned `.local/bin`, `.local/cache`, `.local/state`, or `.local/storage` trees unless the product code being exercised creates that exact documented path as part of its normal behavior. Never introduce another top-level `.local/<tool-name>` or `.local/<purpose>` directory for convenience. Prefer the operating system temporary directory when the artifact does not need to remain with the checkout.
 

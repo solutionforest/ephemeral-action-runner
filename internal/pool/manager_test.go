@@ -1639,6 +1639,53 @@ func TestQuarantinedRunnersAdoptOrRetireAfterGitHubRecovery(t *testing.T) {
 	}
 }
 
+func TestReconciliationDoesNotAdoptSameNameDifferentRunnerID(t *testing.T) {
+	p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-runner", State: "running"}}}
+	g := &fakeGitHub{listRunners: []gh.Runner{{Name: "epar-test-runner", ID: 43, Status: "online"}}}
+	manager := newRegisteredTestManager(t, p, g)
+	known := map[string]ProvisionedInstance{
+		"epar-test-runner": {Name: "epar-test-runner", RunnerID: 42, Phase: LifecycleQuarantined},
+	}
+
+	active, err := manager.reconcilePhysicalPool(context.Background(), known, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := active["epar-test-runner"].Phase; got != LifecycleQuarantined {
+		t.Fatalf("runner phase = %q, want quarantined", got)
+	}
+	if got := active["epar-test-runner"].RunnerID; got != 42 {
+		t.Fatalf("persisted runner id = %d, want 42", got)
+	}
+	if got := atomic.LoadInt32(&g.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0 for same-name identity mismatch", got)
+	}
+}
+
+func TestControllerRestartHydratesImmutableRunnerIDBeforeReconciliation(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	p := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	g := &fakeGitHub{listRunners: []gh.Runner{{Name: name, ID: 43, Status: "online"}}}
+	manager.Provider = p
+	manager.Lifecycle = provider.AdaptLegacy(p)
+	manager.GitHub = g
+	manager.LifecycleState = store
+
+	active, err := manager.reconcilePhysicalPool(context.Background(), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := active[name].Phase; got != LifecycleQuarantined {
+		t.Fatalf("runner phase = %q, want quarantined", got)
+	}
+	if got := active[name].RunnerID; got != 42 {
+		t.Fatalf("hydrated runner id = %d, want 42", got)
+	}
+	if got := atomic.LoadInt32(&g.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0 for restart identity mismatch", got)
+	}
+}
+
 func TestReplacementBackoffSequenceJitterCapRetryAfterAndReset(t *testing.T) {
 	manager := Manager{Config: config.Config{Pool: config.PoolConfig{
 		ReplacementRetryInitialSeconds: 15,

@@ -393,11 +393,59 @@ func TestHostTrustReconciliationFencesLeaseWhenTransportRefreshFails(t *testing.
 	if activator.calls != 1 {
 		t.Fatalf("activation calls = %d, want 1", activator.calls)
 	}
-	if got := atomic.LoadInt32(&github.runnerByNameCalls); got != 0 {
-		t.Fatalf("GitHub status calls = %d, want no lease path after activation failure", got)
+	if got := atomic.LoadInt32(&github.runnerByNameCalls); got != 1 {
+		t.Fatalf("GitHub status calls = %d, want one exact registration fence lookup after activation failure", got)
 	}
-	if fake.commandCount("rm -f '/run/epar/host-trust-lease.json'") != 1 {
-		t.Fatalf("guest commands = %v, want exact lease fence", fake.commands)
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub registration fence calls = %d, want 1", got)
+	}
+	if got := active["runner-1"].Phase; got != LifecycleQuarantined {
+		t.Fatalf("runner phase = %s, want %s", got, LifecycleQuarantined)
+	}
+	if fake.commandCount("rm -f '/run/epar/host-trust-lease.json'") != 0 {
+		t.Fatalf("guest commands = %v, want immediate exact GitHub fence without a second blocked transport attempt", fake.commands)
+	}
+}
+
+func TestHostTrustReconciliationFencesRegistrationWhenIdleLeaseRefreshFails(t *testing.T) {
+	fake := &fakeProvider{execErrs: []error{errors.New("lease transport unavailable"), nil}}
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online"}, found: true}
+	manager := Manager{
+		Config: config.Config{
+			Image:    config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
+			Timeouts: config.TimeoutConfig{CommandSeconds: 5},
+		},
+		Provider: fake,
+		GitHub:   github,
+	}
+	current := hosttrust.Snapshot{Generation: "g1", HostOS: "linux", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}
+
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
+
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub registration fence calls = %d, want 1", got)
+	}
+	github.mu.Lock()
+	deletedIDs := append([]int64(nil), github.deletedIDs...)
+	github.mu.Unlock()
+	if len(deletedIDs) != 1 || deletedIDs[0] != 42 {
+		t.Fatalf("deleted runner ids = %v, want [42]", deletedIDs)
+	}
+	if got := active["runner-1"].Phase; got != LifecycleQuarantined {
+		t.Fatalf("runner phase = %s, want %s", got, LifecycleQuarantined)
+	}
+}
+
+func TestHostTrustRegistrationFenceRejectsSameNameDifferentRunnerID(t *testing.T) {
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 43, Status: "online"}, found: true}
+	manager := Manager{GitHub: github}
+	err := manager.fenceHostTrustRunnerRegistration(context.Background(), ProvisionedInstance{Name: "runner-1", RunnerID: 42}, errors.New("lease unavailable"))
+	if err == nil || !strings.Contains(err.Error(), "does not match expected id=42") {
+		t.Fatalf("fence error = %v, want exact identity mismatch", err)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub delete calls = %d, want 0 for same-name identity mismatch", got)
 	}
 }
 

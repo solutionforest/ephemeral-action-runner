@@ -5,6 +5,7 @@ Start with the symptom that most closely matches the failure. Regardless of prov
 ## Contents
 
 - [Quick diagnostics](#quick-diagnostics)
+- [Startup reports that the pool controller configuration lock is already held](#startup-reports-that-the-pool-controller-configuration-lock-is-already-held)
 - [Windows no-Go startup prints an HTTP/2 named-pipe diagnostic](#windows-no-go-startup-prints-an-http2-named-pipe-diagnostic)
 - [A Docker workload fails with an architecture error](#a-docker-workload-fails-with-an-architecture-error)
 - [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
@@ -48,6 +49,42 @@ docker run --rm ghcr.io/catthehacker/ubuntu:full-latest df -h /
 ```
 
 Container-visible free space is the relevant value for Docker builds. Windows Explorer or Finder free space does not necessarily equal the free space in a Linux VM backing the daemon.
+
+## Startup reports that the pool controller configuration lock is already held
+
+### Symptom
+
+`./start` exits with an error like:
+
+```text
+ephemeral-action-runner: pool controller configuration lock is already held for "/Users/someone/epar/.local/config.yml" (owner config="/Users/someone/epar/.local/config.yml" provider="docker-sandboxes" prefix="example-pool" pid=12345 startedAt=2026-01-02T03:04:05Z)
+```
+
+This can appear after the startup wrapper rebuilds the native controller because its source digest changed. The rebuild prepares a new binary but does not replace an already-running controller, so the new process still stops at the ownership lock.
+
+### Diagnosis and remediation
+
+The lock prevents two mutating controllers from managing the same pool. Treat the reported config path, provider, prefix, PID, and start time as owner-identification evidence rather than deleting a lock file.
+
+On macOS or Linux, inspect the reported PID, replacing `12345` with the value from the error:
+
+```bash
+ps -p 12345 -o pid=,ppid=,lstart=,command=
+```
+
+On Windows PowerShell:
+
+```powershell
+Get-Process -Id 12345 -ErrorAction SilentlyContinue | Format-List Id, StartTime, Path
+```
+
+If the PID is the intended live EPAR controller, do not start another controller for that pool. Return to its terminal and press Ctrl-C once, or stop it through the service manager that launched it, then wait for `Cleanup complete. EPAR can now exit safely.` before running `./start` again. Use this sequence when activating copied source or a rebuilt controller: stop the old controller cleanly, wait for cleanup, then start the new version.
+
+If no process owns the reported PID, rerun `./start`. The operating-system lock is authoritative and is released when its owning process exits; stale descriptive metadata may remain on disk but is replaced on the next successful acquisition. Do not manually delete files under the controller-lock state directory, and do not signal a process solely because its PID matches stale metadata—PID values can be reused.
+
+If the exact EPAR controller is unresponsive, prefer its service manager's graceful stop or a single interrupt and allow time for cleanup. After a confirmed abnormal exit, rerun `./start` so normal lifecycle reconciliation can inspect and recover exact owned resources. Avoid force-killing the process, deleting runner records manually, or using broad Docker, Sandbox, WSL, or GitHub cleanup commands as a first response.
+
+Multiple EPAR controllers may run on one machine, but every concurrently active controller must use both a distinct canonical configuration path and a distinct normalized `pool.namePrefix`. Reusing either the same config path or the same pool prefix intentionally conflicts, including across different project directories or providers. Give each controller its own config and pool identity instead of bypassing the lock.
 
 ## Windows no-Go startup prints an HTTP/2 named-pipe diagnostic
 
@@ -182,7 +219,7 @@ EPAR does not query or mutate host-global `sbx` secrets. After creating its exac
 
 ## An idle runner reports GitHub or Sandbox health warnings
 
-A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR keeps the exact runner, lets a trust lease expire closed when it cannot refresh it, and retries. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
+A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR preserves uncertain local capacity, but a runner whose host-trust transport or lease cannot be maintained is quarantined and its exact GitHub registration is fenced after immutable name-and-ID verification so it cannot accept new work with an expired lease. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
 
 `networkBaseline: open` is a sandbox-scoped public-egress compatibility rule with EPAR host-alias deny guardrails. It does not alter the host-global policy. If a required service is blocked, use a narrow `additionalAllow` hostname rule; do not allow `host.docker.internal`, `gateway.docker.internal`, `kubernetes.docker.internal`, or `host.containers.internal` through the Open-policy guardrails.
 

@@ -470,6 +470,32 @@ func (m *Manager) revokeHostTrustLease(ctx context.Context, instanceName string)
 	return err
 }
 
+func (m *Manager) fenceHostTrustRunnerRegistration(ctx context.Context, instance ProvisionedInstance, cause error) error {
+	// Admission uncertainty must be durable even when the exact remote fence
+	// cannot be completed. The physical instance remains capacity-counting and
+	// reconciliation must not advertise it as Ready again by name alone.
+	fenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
+	defer cancel()
+	m.quarantineLifecycle(fenceCtx, instance.Name, cause)
+	if m.GitHub == nil || instance.RunnerID == 0 {
+		return fmt.Errorf("exact GitHub runner identity is unavailable; cannot fence registration")
+	}
+	runner, found, err := m.GitHub.RunnerByName(fenceCtx, instance.Name)
+	if err != nil {
+		return fmt.Errorf("verify exact GitHub runner before host-trust fence: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	if runner.ID != instance.RunnerID {
+		return fmt.Errorf("same-name GitHub runner id=%d does not match expected id=%d; refusing registration fence", runner.ID, instance.RunnerID)
+	}
+	if err := m.GitHub.DeleteRunnerIfExists(fenceCtx, runner.ID); err != nil {
+		return fmt.Errorf("delete exact GitHub runner id=%d: %w", instance.RunnerID, err)
+	}
+	return nil
+}
+
 func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot, busyHandoff map[string]bool) int {
 	if m.GitHub == nil {
 		return 0
@@ -487,23 +513,21 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 		if _, requiresTransport := m.providerLifecycle().(provider.HostTrustRuntimeActivator); requiresTransport {
 			providerInstance, providerErr := m.providerInstance(ctx, name)
 			if providerErr != nil {
-				revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
-				revokeErr := m.revokeHostTrustLease(revokeCtx, name)
-				cancel()
 				m.warnf("[%s] host trust transport identity warning; lease not refreshed: %v\n", name, providerErr)
-				if revokeErr != nil {
-					m.warnf("[%s] host trust transport identity fencing warning: %v\n", name, revokeErr)
+				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, providerErr); fenceErr != nil {
+					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
 				}
+				instance.Phase = LifecycleQuarantined
+				active[name] = instance
 				continue
 			}
 			if err := m.activateProviderHostTrustRuntime(ctx, providerInstance); err != nil {
-				revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
-				revokeErr := m.revokeHostTrustLease(revokeCtx, name)
-				cancel()
 				m.warnf("[%s] host trust transport refresh warning; lease not refreshed: %v\n", name, err)
-				if revokeErr != nil {
-					m.warnf("[%s] host trust transport refresh fencing warning: %v\n", name, revokeErr)
+				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
+					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
 				}
+				instance.Phase = LifecycleQuarantined
+				active[name] = instance
 				continue
 			}
 		}
@@ -513,6 +537,12 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			// the assignment window even when GitHub status is unavailable.
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
 				m.warnf("[%s] old-generation revocation warning: %v\n", name, err)
+				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
+					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
+				}
+				instance.Phase = LifecycleQuarantined
+				active[name] = instance
+				continue
 			}
 		}
 		runner, found, err := m.GitHub.RunnerByName(ctx, name)
@@ -538,6 +568,11 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 				// renew it while the job remains busy.
 				if err := m.issueHostTrustLeaseWithLifetime(ctx, name, current, hostTrustHandoffLease); err != nil {
 					m.warnf("[%s] host trust job handoff lease warning: %v\n", name, err)
+					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
+						m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
+					}
+					instance.Phase = LifecycleQuarantined
+					active[name] = instance
 					continue
 				}
 				busyHandoff[name] = true
@@ -546,6 +581,11 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			delete(busyHandoff, name)
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
 				m.warnf("[%s] host trust lease refresh warning: %v\n", name, err)
+				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
+					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
+				}
+				instance.Phase = LifecycleQuarantined
+				active[name] = instance
 			}
 			continue
 		}
@@ -557,7 +597,7 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			continue
 		}
 		reason := fmt.Sprintf("host trust generation changed from %s to %s", instance.HostTrustGeneration, current.Generation)
-		if err := m.retireInstance(context.Background(), instance, reason); err != nil {
+		if err := m.retireInstance(ctx, instance, reason); err != nil {
 			m.warnf("[%s] old-generation retirement warning: %v\n", name, err)
 			continue
 		}
@@ -608,6 +648,11 @@ func (m *Manager) startHostTrustLeaseKeeper(parent context.Context) (func(Provis
 					if instance.HostTrustGeneration != current.Generation {
 						if err := m.issueHostTrustLease(ctx, name, current); err != nil {
 							m.warnf("[%s] host trust initial stale-generation revocation warning: %v\n", name, err)
+							if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
+								m.warnf("[%s] host trust initial registration fencing warning: %v\n", name, fenceErr)
+							}
+							instance.Phase = LifecycleQuarantined
+							active[name] = instance
 						}
 						continue
 					}
@@ -617,6 +662,11 @@ func (m *Manager) startHostTrustLeaseKeeper(parent context.Context) (func(Provis
 					}
 					if err := m.issueHostTrustLease(ctx, name, current); err != nil {
 						m.warnf("[%s] host trust initial lease refresh warning: %v\n", name, err)
+						if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
+							m.warnf("[%s] host trust initial registration fencing warning: %v\n", name, fenceErr)
+						}
+						instance.Phase = LifecycleQuarantined
+						active[name] = instance
 					}
 				}
 			}
