@@ -473,7 +473,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							// receive a mismatching lease so no subsequent job can start.
 							currentHostTrust = current
 							if !dependencyCooldown {
-								trustRetired += m.reconcileHostTrustRunners(ctx, active, current, hostTrustBusyHandoff)
+								trustCtx, cancelTrust := m.steadyStateMaintenanceContext(ctx)
+								trustRetired += m.reconcileHostTrustRunners(trustCtx, active, current, hostTrustBusyHandoff)
+								cancelTrust()
 								hostTrustReconciled = true
 								nextHostTrustReconciliation = m.currentTime().Add(hostTrustRefreshInterval)
 							}
@@ -523,13 +525,17 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					}
 				}
 				if currentHostTrust.Generation != "" && !dependencyCooldown && !hostTrustReconciled && (nextHostTrustReconciliation.IsZero() || !m.currentTime().Before(nextHostTrustReconciliation)) {
-					trustRetired += m.reconcileHostTrustRunners(ctx, active, currentHostTrust, hostTrustBusyHandoff)
+					trustCtx, cancelTrust := m.steadyStateMaintenanceContext(ctx)
+					trustRetired += m.reconcileHostTrustRunners(trustCtx, active, currentHostTrust, hostTrustBusyHandoff)
+					cancelTrust()
 					nextHostTrustReconciliation = m.currentTime().Add(hostTrustRefreshInterval)
 				}
 			}
 			if dependencyCooldown {
 				var localErr error
-				active, localErr = m.reconcileLocalInventory(active)
+				maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(ctx)
+				active, localErr = m.reconcileLocalInventoryWithContext(maintenanceCtx, active)
+				cancelMaintenance()
 				if localErr != nil {
 					m.warnf("local pool housekeeping warning during replacement cooldown: %v\n", localErr)
 				}
@@ -537,10 +543,19 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			if opts.ReplaceCompleted && !time.Now().Before(nextLivenessCheck) {
 				nextLivenessCheck = time.Now().Add(opts.MonitorInterval)
+				livenessCtx := ctx
+				cancelLiveness := func() {}
+				if m.hostTrustEnabled() {
+					// Health checks are advisory, while host-trust lease refresh is a
+					// safety deadline. Bound the complete sweep so one unreachable
+					// provider instance cannot starve every runner's lease cadence.
+					livenessCtx, cancelLiveness = context.WithTimeout(ctx, hostTrustRefreshInterval/2)
+				}
 				for name, vm := range active {
-					alive, reason, err := m.runnerAlive(ctx, vm)
+					alive, reason, err := m.runnerAlive(livenessCtx, vm)
 					if err != nil {
 						if ctx.Err() != nil {
+							cancelLiveness()
 							return cleanup()
 						}
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
@@ -557,16 +572,17 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						continue
 					}
 					if reason == runnerProcessInactiveReason {
-						m.captureRunnerReadinessDiagnostics(name, vm.GuestLogPath)
+						m.captureRunnerReadinessDiagnostics(livenessCtx, name, vm.GuestLogPath)
 					}
 					m.infof("[%s] runner is finished or unhealthy: %s\n", name, reason)
-					if err := m.retireInstance(context.Background(), vm, reason); err != nil {
+					if err := m.retireInstance(livenessCtx, vm, reason); err != nil {
 						m.warnf("[%s] retirement warning: %v\n", name, err)
 						continue
 					}
 					delete(active, name)
 					delete(confirmedInactiveChecks, name)
 				}
+				cancelLiveness()
 			}
 			var reconcileErr error
 			beforeReconcile := active
@@ -574,11 +590,17 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if attemptErr != nil {
 				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 			}
-			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
+			active, reconcileErr = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
 				if ctx.Err() != nil {
 					return cleanup()
+				}
+				if errors.Is(reconcileErr, context.DeadlineExceeded) {
+					m.warnf("pool reconciliation exceeded the host-trust maintenance budget; preserving exact capacity and retrying after lease refresh: %v\n", reconcileErr)
+					continue
 				}
 				if handled, outageErr := m.deferExternalOutage("steady-state-pool-reconciliation", reconcileErr); handled {
 					if outageErr != nil {
@@ -598,9 +620,15 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if attemptErr != nil {
 				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 			}
-			active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
+			maintenanceCtx, cancelMaintenance = m.steadyStateMaintenanceContext(attemptCtx)
+			active, reconcileErr = m.reduceOverCapacity(maintenanceCtx, active, opts.Instances, opts.Register)
+			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
+				if errors.Is(reconcileErr, context.DeadlineExceeded) && ctx.Err() == nil {
+					m.warnf("over-capacity reconciliation exceeded the host-trust maintenance budget; preserving exact capacity and retrying after lease refresh: %v\n", reconcileErr)
+					continue
+				}
 				if handled, outageErr := m.deferExternalOutage("steady-state-over-capacity-reconciliation", reconcileErr); handled {
 					if outageErr != nil {
 						return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
@@ -644,9 +672,15 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				if attemptErr != nil {
 					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
-				active, err = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+				maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
+				active, err = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+				cancelMaintenance()
 				cancelAttempt()
 				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+						m.warnf("[%s] replacement preallocation reconciliation exceeded the host-trust maintenance budget; retrying after lease refresh: %v\n", name, err)
+						break
+					}
 					if handled, outageErr := m.deferExternalOutage("replacement-preallocation-reconciliation", err); handled {
 						if outageErr != nil {
 							return m.cleanupAfterPoolFailure(outageErr, active, opts.KeepOnExit)
@@ -856,6 +890,22 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			continue
 		}
 		delete(remoteByName, name)
+		if m.LifecycleState != nil && vm.RunnerID == 0 {
+			cause := fmt.Errorf("same-name GitHub runner id=%d cannot be adopted because no immutable runner id was recorded", runner.ID)
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			m.quarantineLifecycle(context.WithoutCancel(ctx), name, cause)
+			m.warnf("[%s] reconciliation quarantined exact provider capacity with an unidentified same-name GitHub runner: %v\n", name, cause)
+			continue
+		}
+		if vm.RunnerID != 0 && runner.ID != vm.RunnerID {
+			cause := fmt.Errorf("same-name GitHub runner id=%d does not match persisted immutable id=%d", runner.ID, vm.RunnerID)
+			vm.Phase = LifecycleQuarantined
+			reconciled[name] = vm
+			m.quarantineLifecycle(context.WithoutCancel(ctx), name, cause)
+			m.warnf("[%s] reconciliation quarantined exact provider capacity after GitHub identity changed: %v\n", name, cause)
+			continue
+		}
 		vm.RunnerID = runner.ID
 		if err := m.recordLifecycleJobObservation(ctx, runner); err != nil {
 			vm.Phase = LifecycleQuarantined
@@ -978,6 +1028,13 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			return known, fmt.Errorf("verify lifecycle ownership for %s: %w", local.Name, ownershipErr)
 		}
 		vm.ProviderOwned = owned
+		if owned && m.LifecycleState != nil {
+			record, recordErr := m.LifecycleState.Read(ctx, local.Name)
+			if recordErr != nil {
+				return known, fmt.Errorf("read lifecycle identity for %s: %w", local.Name, recordErr)
+			}
+			vm.RunnerID = record.GitHub.RunnerID
+		}
 		if !owned {
 			providerID := local.ProviderID
 			if providerID == "" {
@@ -1136,6 +1193,13 @@ func (m *Manager) currentTime() time.Time {
 		return m.now()
 	}
 	return time.Now()
+}
+
+func (m *Manager) steadyStateMaintenanceContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if !m.hostTrustEnabled() {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, hostTrustRefreshInterval/2)
 }
 
 func (m *Manager) randomValue() float64 {
@@ -1746,7 +1810,7 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			runner, err = m.waitRunnerReadyAndHealthy(ctx, vm, time.Duration(m.Config.Timeouts.GitHubOnlineSeconds)*time.Second, allowBusy)
 			return err
 		}); err != nil {
-			m.captureRunnerReadinessDiagnostics(name, guestLogPath)
+			m.captureRunnerReadinessDiagnostics(ctx, name, guestLogPath)
 			return vm, err
 		}
 		vm.RunnerID = runner.ID
@@ -1896,8 +1960,8 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 	}
 }
 
-func (m *Manager) captureRunnerReadinessDiagnostics(name, guestLogPath string) {
-	diagnosticCtx, cancel := context.WithTimeout(context.Background(), runnerReadinessDiagnosticsTimeout)
+func (m *Manager) captureRunnerReadinessDiagnostics(ctx context.Context, name, guestLogPath string) {
+	diagnosticCtx, cancel := context.WithTimeout(ctx, runnerReadinessDiagnosticsTimeout)
 	defer cancel()
 	_, err := m.execGuest(
 		diagnosticCtx,
