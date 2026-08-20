@@ -61,6 +61,9 @@ type Manager struct {
 	randomFloat64         func() float64
 	externalOutageMu      sync.Mutex
 	externalOutage        *externalOutageRuntime
+	providerRecoveryMu    sync.Mutex
+	providerRecoveryNext  time.Time
+	providerRecoveryTries int
 }
 
 func (m *Manager) ConfigureStorageAdmissionOverride(allow bool, command string) {
@@ -287,28 +290,85 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
 	var active map[string]ProvisionedInstance
-	err = m.RunExternalOutageStage(ctx, "initial-pool-reconciliation", func(attemptCtx context.Context) error {
-		var reconcileErr error
-		active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
-		return reconcileErr
-	})
+	for {
+		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			err = waitErr
+			break
+		}
+		err = m.RunExternalOutageStage(ctx, "initial-pool-reconciliation", func(attemptCtx context.Context) error {
+			var reconcileErr error
+			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			return reconcileErr
+		})
+		if err == nil {
+			break
+		}
+		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		if !handled {
+			break
+		}
+		if recoveryErr != nil {
+			if ctx.Err() != nil {
+				return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
+			}
+			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+		}
+	}
 	if err != nil {
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial pool reconciliation: %w", err), active, opts.KeepOnExit)
 	}
-	err = m.RunExternalOutageStage(ctx, "initial-over-capacity-reconciliation", func(attemptCtx context.Context) error {
-		var reconcileErr error
-		active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
-		return reconcileErr
-	})
+	for {
+		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			err = waitErr
+			break
+		}
+		err = m.RunExternalOutageStage(ctx, "initial-over-capacity-reconciliation", func(attemptCtx context.Context) error {
+			var reconcileErr error
+			active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
+			return reconcileErr
+		})
+		if err == nil {
+			break
+		}
+		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		if !handled {
+			break
+		}
+		if recoveryErr != nil {
+			if ctx.Err() != nil {
+				return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
+			}
+			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+		}
+	}
 	if err != nil {
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial over-capacity reconciliation: %w", err), active, opts.KeepOnExit)
 	}
 	var poolTrustGeneration string
-	err = m.RunExternalOutageStage(ctx, "initial-host-trust-preparation", func(attemptCtx context.Context) error {
-		var prepareErr error
-		poolTrustGeneration, prepareErr = m.prepareExistingHostTrustRuntimes(attemptCtx, active, opts.Register)
-		return prepareErr
-	})
+	for {
+		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			err = waitErr
+			break
+		}
+		err = m.RunExternalOutageStage(ctx, "initial-host-trust-preparation", func(attemptCtx context.Context) error {
+			var prepareErr error
+			poolTrustGeneration, prepareErr = m.prepareExistingHostTrustRuntimes(attemptCtx, active, opts.Register)
+			return prepareErr
+		})
+		if err == nil {
+			break
+		}
+		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		if !handled {
+			break
+		}
+		if recoveryErr != nil {
+			if ctx.Err() != nil {
+				return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
+			}
+			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+		}
+	}
 	if err != nil {
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial host-trust runtime preparation: %w", err), active, opts.KeepOnExit)
 	}
@@ -322,6 +382,13 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
 	for len(active) < opts.Instances {
+		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			stopLeaseKeeper()
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			return m.cleanupAfterPoolFailure(waitErr, active, opts.KeepOnExit)
+		}
 		var vm ProvisionedInstance
 		err = m.RunExternalOutageStage(ctx, "initial-capacity-provisioning", func(attemptCtx context.Context) error {
 			vm = ProvisionedInstance{}
@@ -340,6 +407,17 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			return provisionErr
 		})
 		if err != nil {
+			handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+			if handled {
+				if recoveryErr != nil {
+					if ctx.Err() != nil {
+						stopLeaseKeeper()
+						return cleanup()
+					}
+					m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+				}
+				continue
+			}
 			stopLeaseKeeper()
 			if ctx.Err() != nil {
 				return cleanup()
@@ -402,6 +480,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			return cleanup()
 		case <-ticker.C:
 			now := m.currentTime()
+			imageMaintenanceWaiting := false
 			dependencyCooldown := retry.active(now)
 			if m.externalOutageEnabled() {
 				_, dependencyCooldown, err = m.externalOutageCooldown(now)
@@ -439,20 +518,31 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if imageMaintenancePending {
 				remaining, drainErr := m.drainPoolForImageUpdate(ctx, active, imageMaintenanceIdleChecks)
 				if drainErr != nil {
-					m.warnf("scheduled image maintenance drain warning; retrying without creating replacements: %v\n", drainErr)
-					continue
-				}
-				if remaining > 0 {
-					continue
-				}
-				m.infof("scheduled image maintenance drain complete; building and activating the verified replacement artifact\n")
-				if updateErr := m.ApplyPendingImageUpdate(ctx, now); updateErr != nil {
-					m.warnf("scheduled image update failed; restoring pool capacity with the previous verified generation: %v\n", updateErr)
+					handled, recoveryErr := m.recoverProviderControlPlane(ctx, drainErr)
+					if handled {
+						if recoveryErr != nil {
+							if ctx.Err() != nil {
+								return cleanup()
+							}
+							m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+						}
+						imageMaintenanceWaiting = true
+					} else {
+						m.warnf("scheduled image maintenance drain warning; retrying without creating replacements: %v\n", drainErr)
+						imageMaintenanceWaiting = true
+					}
+				} else if remaining > 0 {
+					imageMaintenanceWaiting = true
 				} else {
-					m.infof("scheduled image update activated; restoring pool capacity\n")
+					m.infof("scheduled image maintenance drain complete; building and activating the verified replacement artifact\n")
+					if updateErr := m.ApplyPendingImageUpdate(ctx, now); updateErr != nil {
+						m.warnf("scheduled image update failed; restoring pool capacity with the previous verified generation: %v\n", updateErr)
+					} else {
+						m.infof("scheduled image update activated; restoring pool capacity\n")
+					}
+					imageMaintenancePending = false
+					clear(imageMaintenanceIdleChecks)
 				}
-				imageMaintenancePending = false
-				clear(imageMaintenanceIdleChecks)
 			}
 			trustRetired := 0
 			trustCapacityReady := true
@@ -595,6 +685,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
+				handled, recoveryErr := m.recoverProviderControlPlane(ctx, reconcileErr)
+				if handled {
+					if recoveryErr != nil {
+						if ctx.Err() != nil {
+							return cleanup()
+						}
+						m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+					}
+					continue
+				}
 				if ctx.Err() != nil {
 					return cleanup()
 				}
@@ -625,6 +725,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
+				handled, recoveryErr := m.recoverProviderControlPlane(ctx, reconcileErr)
+				if handled {
+					if recoveryErr != nil {
+						if ctx.Err() != nil {
+							return cleanup()
+						}
+						m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+					}
+					continue
+				}
 				if errors.Is(reconcileErr, context.DeadlineExceeded) && ctx.Err() == nil {
 					m.warnf("over-capacity reconciliation exceeded the host-trust maintenance budget; preserving exact capacity and retrying after lease refresh: %v\n", reconcileErr)
 					continue
@@ -648,6 +758,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				if err := m.markExternalOutageRecovered(); err != nil {
 					return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
+			}
+			if imageMaintenanceWaiting {
+				continue
 			}
 			replacementCapacity := len(active)
 			needsTrustCapacity := false
@@ -677,6 +790,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				cancelMaintenance()
 				cancelAttempt()
 				if err != nil {
+					handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+					if handled {
+						if recoveryErr != nil {
+							if ctx.Err() != nil {
+								return cleanup()
+							}
+							m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+						}
+						break
+					}
 					if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 						m.warnf("[%s] replacement preallocation reconciliation exceeded the host-trust maintenance budget; retrying after lease refresh: %v\n", name, err)
 						break
@@ -710,6 +833,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					active[vm.Name] = vm
 				}
 				if err != nil {
+					handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+					if handled {
+						if recoveryErr != nil {
+							if ctx.Err() != nil {
+								return cleanup()
+							}
+							m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+						}
+						break
+					}
 					if ctx.Err() != nil {
 						return cleanup()
 					}
@@ -774,7 +907,7 @@ func (m *Manager) drainPoolForImageUpdate(ctx context.Context, active map[string
 			}
 		}
 		m.infof("[%s] retiring idle runner for scheduled image maintenance\n", name)
-		if err := m.retireInstance(context.Background(), vm, "scheduled image and Actions runner update"); err != nil {
+		if err := m.retireInstance(ctx, vm, "scheduled image and Actions runner update"); err != nil {
 			return len(active), err
 		}
 		delete(active, name)
@@ -880,7 +1013,10 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				reconciled[name] = vm
 				return reconciled, fmt.Errorf("record GitHub runner absence for %s: %w", name, err)
 			}
-			if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
+			if err := m.deleteLocalInstance(ctx, vm); err != nil {
+				if errors.Is(err, provider.ErrControlPlaneFailure) {
+					return reconciled, err
+				}
 				vm.Phase = LifecycleCleanupPending
 				reconciled[name] = vm
 				m.warnf("[%s] unregistered-instance cleanup pending: %v\n", name, err)
@@ -923,7 +1059,10 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			continue
 		}
 		if vm.Phase == LifecycleQuarantined {
-			if err := m.retireInstance(context.Background(), vm, "GitHub recovered but quarantined runner remained offline"); err != nil {
+			if err := m.retireInstance(ctx, vm, "GitHub recovered but quarantined runner remained offline"); err != nil {
+				if errors.Is(err, provider.ErrControlPlaneFailure) {
+					return reconciled, err
+				}
 				vm.Phase = LifecycleCleanupPending
 				reconciled[name] = vm
 				m.warnf("[%s] recovered-offline retirement pending: %v\n", name, err)
@@ -944,7 +1083,10 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			reconciled[name] = vm
 			continue
 		}
-		if err := m.retireInstance(context.Background(), vm, "reconciliation found offline runner with inactive listener"); err != nil {
+		if err := m.retireInstance(ctx, vm, "reconciliation found offline runner with inactive listener"); err != nil {
+			if errors.Is(err, provider.ErrControlPlaneFailure) {
+				return reconciled, err
+			}
 			vm.Phase = LifecycleCleanupPending
 			reconciled[name] = vm
 			m.warnf("[%s] inactive-instance cleanup pending: %v\n", name, err)
@@ -961,7 +1103,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			m.warnf("reconciliation: quarantined unowned GitHub runner %s id=%d; prefix-only resources are report-only\n", runner.Name, runner.ID)
 			continue
 		}
-		if err := m.deleteRemoteRunner(context.Background(), runner); err != nil {
+		if err := m.deleteRemoteRunner(ctx, runner); err != nil {
 			return reconciled, err
 		}
 		m.infof("reconciliation: deleted stale GitHub runner %s id=%d\n", runner.Name, runner.ID)
@@ -994,7 +1136,10 @@ func (m *Manager) reduceOverCapacity(ctx context.Context, active map[string]Prov
 			continue
 		}
 		vm.RunnerID = runner.ID
-		if err := m.retireInstance(context.Background(), vm, "reconciling legacy physical inventory above pool.instances"); err != nil {
+		if err := m.retireInstance(ctx, vm, "reconciling legacy physical inventory above pool.instances"); err != nil {
+			if errors.Is(err, provider.ErrControlPlaneFailure) {
+				return active, err
+			}
 			vm.Phase = LifecycleCleanupPending
 			active[name] = vm
 			continue
@@ -1051,7 +1196,10 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			reconciled[local.Name] = vm
 			continue
 		}
-		if err := m.deleteLocalInstance(context.Background(), vm); err != nil {
+		if err := m.deleteLocalInstance(ctx, vm); err != nil {
+			if errors.Is(err, provider.ErrControlPlaneFailure) {
+				return reconciled, err
+			}
 			vm.Phase = LifecycleCleanupPending
 			reconciled[local.Name] = vm
 			m.warnf("[%s] stopped-instance cleanup pending: %v\n", local.Name, err)

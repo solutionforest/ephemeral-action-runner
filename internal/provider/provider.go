@@ -13,7 +13,66 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
-var ErrTemplateNotFound = errors.New("imported provider template not found")
+var (
+	ErrTemplateNotFound            = errors.New("imported provider template not found")
+	ErrControlPlaneFailure         = errors.New("provider control plane failure")
+	ErrControlPlaneRecoveryFailure = errors.New("provider control plane recovery failed")
+)
+
+// ControlPlaneFailure marks a failed provider control-plane command without
+// exposing command output through the user-facing error string. The original
+// cause remains available to errors.Is/errors.As for cancellation and
+// diagnostic handling.
+type ControlPlaneFailure struct {
+	Operation string
+	cause     error
+}
+
+func (failure *ControlPlaneFailure) Error() string {
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrControlPlaneFailure.Error()
+	}
+	return ErrControlPlaneFailure.Error()
+}
+
+func (failure *ControlPlaneFailure) Unwrap() error { return failure.cause }
+
+func (failure *ControlPlaneFailure) Is(target error) bool {
+	return target == ErrControlPlaneFailure
+}
+
+// NewControlPlaneFailure constructs a typed control-plane failure. Callers
+// must supply an operation label that contains no command output or secrets.
+func NewControlPlaneFailure(operation string, cause error) error {
+	return &ControlPlaneFailure{Operation: operation, cause: cause}
+}
+
+// ControlPlaneRecoveryFailure marks a failed provider recovery command without
+// exposing command output through the user-facing error string. The original
+// cause remains available to errors.Is/errors.As for cancellation and tests.
+type ControlPlaneRecoveryFailure struct {
+	Operation string
+	cause     error
+}
+
+func (failure *ControlPlaneRecoveryFailure) Error() string {
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrControlPlaneRecoveryFailure.Error()
+	}
+	return ErrControlPlaneRecoveryFailure.Error()
+}
+
+func (failure *ControlPlaneRecoveryFailure) Unwrap() error { return failure.cause }
+
+func (failure *ControlPlaneRecoveryFailure) Is(target error) bool {
+	return target == ErrControlPlaneRecoveryFailure
+}
+
+// NewControlPlaneRecoveryFailure constructs a typed recovery failure. Callers
+// must supply an operation label that contains no command output or secrets.
+func NewControlPlaneRecoveryFailure(operation string, cause error) error {
+	return &ControlPlaneRecoveryFailure{Operation: operation, cause: cause}
+}
 
 type Instance struct {
 	Name           string
@@ -112,6 +171,19 @@ type Lifecycle interface {
 	Stop(ctx context.Context, instance Instance) error
 	Delete(ctx context.Context, instance Instance) error
 	Inventory(ctx context.Context) ([]InventoryItem, error)
+}
+
+// ControlPlaneRecoveryRequest defines the bounded cold-start interval for an
+// optional provider control-plane recovery operation.
+type ControlPlaneRecoveryRequest struct {
+	Quiescence time.Duration
+}
+
+// ControlPlaneRecoverer is an optional provider capability. Shared lifecycle
+// orchestration decides whether recovery is permitted; implementations must
+// fail closed when the stopped state cannot be established authoritatively.
+type ControlPlaneRecoverer interface {
+	RecoverControlPlane(ctx context.Context, request ControlPlaneRecoveryRequest) error
 }
 
 // ArtifactManager is an optional provider capability for runtimes whose

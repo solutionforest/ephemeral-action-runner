@@ -1,6 +1,6 @@
 //go:build windows
 
-package dockersandboxes
+package promotion
 
 import (
 	"errors"
@@ -15,66 +15,60 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func isolateKeepaliveProcess(command *exec.Cmd) {
+func isolatePreflightProcess(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, NoInheritHandles: true, CreationFlags: windows.CREATE_SUSPENDED}
 }
 
-func isolateManagedProcess(command *exec.Cmd) {
-	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, NoInheritHandles: true, CreationFlags: windows.CREATE_SUSPENDED}
-}
+var preflightProcessJobs sync.Map
 
-var managedProcessJobs sync.Map
-
-func attachManagedProcess(command *exec.Cmd, preserveDescendantsOnSuccess bool) (func(), error) {
+func attachPreflightProcess(command *exec.Cmd) (func(), error) {
 	if command.Process == nil {
-		return nil, fmt.Errorf("managed process has not started")
+		return nil, fmt.Errorf("preflight process has not started")
 	}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create Windows process job: %w", err)
+		return nil, fmt.Errorf("create Windows preflight job: %w", err)
 	}
 	closeJob := func() { _ = windows.CloseHandle(job) }
-	if !preserveDescendantsOnSuccess {
-		var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-		limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-		if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-			closeJob()
-			return nil, fmt.Errorf("configure Windows process job: %w", err)
-		}
+	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		closeJob()
+		return nil, fmt.Errorf("configure Windows preflight job: %w", err)
 	}
 	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(command.Process.Pid))
 	if err != nil {
 		closeJob()
-		return nil, fmt.Errorf("open managed process for Windows job: %w", err)
+		return nil, fmt.Errorf("open preflight process for Windows job: %w", err)
 	}
 	assignErr := windows.AssignProcessToJobObject(job, process)
 	_ = windows.CloseHandle(process)
 	if assignErr != nil {
 		closeJob()
-		return nil, fmt.Errorf("assign managed process to Windows job: %w", assignErr)
+		return nil, fmt.Errorf("assign preflight process to Windows job: %w", assignErr)
 	}
-	if err := assignExistingDescendantsToJob(job, command.Process.Pid); err != nil {
+	if err := assignExistingPreflightDescendantsToJob(job, command.Process.Pid); err != nil {
 		_ = windows.TerminateJobObject(job, 1)
 		closeJob()
-		return nil, fmt.Errorf("assign pre-existing Docker Sandboxes descendants to Windows job: %w", err)
+		return nil, fmt.Errorf("assign pre-existing preflight descendants to Windows job: %w", err)
 	}
-	if err := resumeManagedProcess(command); err != nil {
+	if err := resumePreflightProcess(command); err != nil {
 		_ = windows.TerminateJobObject(job, 1)
 		closeJob()
-		return nil, fmt.Errorf("resume Docker Sandboxes process after containment: %w", err)
+		return nil, fmt.Errorf("resume sbx preflight process after containment: %w", err)
 	}
-	managedProcessJobs.Store(command.Process.Pid, job)
+	preflightProcessJobs.Store(command.Process.Pid, job)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			managedProcessJobs.Delete(command.Process.Pid)
+			preflightProcessJobs.Delete(command.Process.Pid)
 			closeJob()
 		})
 	}, nil
 }
 
-func resumeManagedProcess(command *exec.Cmd) error {
-	threadID, err := mainThreadID(command.Process.Pid)
+func resumePreflightProcess(command *exec.Cmd) error {
+	threadID, err := preflightMainThreadID(command.Process.Pid)
 	if err != nil {
 		return err
 	}
@@ -87,7 +81,7 @@ func resumeManagedProcess(command *exec.Cmd) error {
 	return err
 }
 
-func mainThreadID(processID int) (uint32, error) {
+func preflightMainThreadID(processID int) (uint32, error) {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
 		return 0, err
@@ -112,10 +106,10 @@ func mainThreadID(processID int) (uint32, error) {
 	return 0, fmt.Errorf("main thread for process %d was not found", processID)
 }
 
-func assignExistingDescendantsToJob(job windows.Handle, rootPID int) error {
+func assignExistingPreflightDescendantsToJob(job windows.Handle, rootPID int) error {
 	assigned := map[uint32]bool{uint32(rootPID): true}
 	for pass := 0; pass < 3; pass++ {
-		descendants, err := descendantProcessIDs(rootPID)
+		descendants, err := preflightDescendantProcessIDs(rootPID)
 		if err != nil {
 			return err
 		}
@@ -141,7 +135,7 @@ func assignExistingDescendantsToJob(job windows.Handle, rootPID int) error {
 	return nil
 }
 
-func descendantProcessIDs(rootPID int) ([]uint32, error) {
+func preflightDescendantProcessIDs(rootPID int) ([]uint32, error) {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, err
@@ -180,11 +174,11 @@ func descendantProcessIDs(rootPID int) ([]uint32, error) {
 	return descendants, nil
 }
 
-func killManagedProcess(command *exec.Cmd) error {
+func killPreflightProcess(command *exec.Cmd) error {
 	if command.Process == nil {
 		return nil
 	}
-	if value, ok := managedProcessJobs.Load(command.Process.Pid); ok {
+	if value, ok := preflightProcessJobs.Load(command.Process.Pid); ok {
 		if err := windows.TerminateJobObject(value.(windows.Handle), 1); err == nil {
 			return nil
 		}
@@ -194,9 +188,7 @@ func killManagedProcess(command *exec.Cmd) error {
 		return err
 	}
 	done := make(chan error, 1)
-	go func() {
-		done <- taskkill.Wait()
-	}()
+	go func() { done <- taskkill.Wait() }()
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
 	select {

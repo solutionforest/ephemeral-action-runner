@@ -9,6 +9,7 @@ Start with the symptom that most closely matches the failure. Regardless of prov
 - [Windows no-Go startup prints an HTTP/2 named-pipe diagnostic](#windows-no-go-startup-prints-an-http2-named-pipe-diagnostic)
 - [A Docker workload fails with an architecture error](#a-docker-workload-fails-with-an-architecture-error)
 - [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
+- [Docker Sandboxes daemon health passes but inventory hangs](#docker-sandboxes-daemon-health-passes-but-inventory-hangs)
 - [Docker Sandboxes rejects template, policy, or capacity](#docker-sandboxes-rejects-template-policy-or-capacity)
 - [Docker Sandboxes creation fails after a runtime-helper prompt](#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt)
 - [Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present](#docker-sandboxes-rejects-a-staging-workspace-because-ssh-agent-forwarding-is-present)
@@ -148,6 +149,22 @@ sbx diagnose --output json
 
 EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose `R` to refresh availability; do not manually force a provider selection or substitute a compatibility provider for a configured Docker Sandboxes pool. Use `C. Show compatibility providers` only when you deliberately intend to create or maintain a compatibility configuration.
 
+## Docker Sandboxes daemon health passes but inventory hangs
+
+### Symptom
+
+`sbx daemon status --json` reports `running` and `sbx diagnose -o json` passes, but `sbx ls --json` hangs, returns an empty response slowly, or ends with a runtime-list cancellation. EPAR may repeatedly report `context canceled`, quarantine instances after the host-trust or inventory deadline, and keep the controller process alive with no ready capacity.
+
+### Diagnosis and remediation
+
+The daemon health and diagnostic commands do not prove that the `/sandbox` inventory path or a managed sandbox's inner Docker API is responsive. Run `sbx ls --json` only with an external operating-system timeout; record whether it returns valid JSON, its elapsed time, and whether stderr reports a cancelled runtime listing. Treat a slow or cancelled inventory response as provider state unknown even when daemon status and diagnostics pass.
+
+Preserve the controller output, daemon log, process tree, durable pool lifecycle state, and a before/after count of the daemon's managed Docker-socket descriptors. Do not repeatedly invoke unbounded `sbx ls`, start a second EPAR controller, use `sbx reset`, remove a sandbox by prefix, prune Docker state, or manually delete GitHub runners. EPAR intentionally quarantines uncertain resources and keeps them counted against `pool.instances` until exact ownership and cleanup can be verified.
+
+With the default `dockerSandboxes.recoveryMode: exclusive-auto`, EPAR keeps the controller alive, acquires a host-global recovery lock, and performs a cold stop, authoritative stopped-state confirmation, configured quiescence interval, sanitized detached start, and repeated inventory verification. During that sequence it lets already-running provider commands drain and gates new provider commands so another lifecycle operation cannot race the daemon restart. It backs off after failed attempts and preserves exact capacity while recovery is unresolved. The recovery path never invokes `sbx reset`, `sbx logout`, `sbx prune`, or wildcard deletion. Set `recoveryMode: observe` only when an operator deliberately needs to prevent daemon mutation during maintenance.
+
+If automatic recovery is disabled or the controller is not running, stop only the affected controller before a manual daemon interruption. Then run `sbx daemon stop`, wait until `sbx daemon status --json` reports `stopped`, and start with `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach`. Before starting a new EPAR controller, require `sbx daemon status --json` to report `running`, `sbx diagnose -o json` to have no failed checks, and repeated bounded `sbx ls --json` calls to complete with valid JSON in a stable time. A passing diagnostic report without a responsive inventory is not a healthy Sandbox provider.
+
 ## Docker Sandboxes rejects template, policy, or capacity
 
 ### Symptom
@@ -186,14 +203,14 @@ Sandbox creation reaches `verify dedicated docker sandbox staging workspace` and
 
 Docker Sandboxes may forward the host SSH agent when its shared daemon inherits the host's agent environment. EPAR rejects the resulting sandbox because the forwarded socket or gateway could let a workflow use host SSH credentials. This is not evidence that the staging mount is missing or read-only, and deleting only `/run/ssh-agent.sock` is insufficient when the forwarding gateway remains configured.
 
-EPAR never stops or restarts a running shared daemon automatically. Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then stop it and restart it with all forwarding variables removed before retrying EPAR:
+This admission failure is distinct from the inventory control-plane recovery path. EPAR rejects a running daemon that has already inherited host SSH-agent forwarding because restarting it would also change the credential exposure boundary. Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then stop it and restart it with all forwarding variables removed before retrying EPAR:
 
 ```sh
 sbx daemon stop
 env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
 ```
 
-EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. A stopped daemon can also be started explicitly from the sanitized environment above; EPAR does not mutate a running shared daemon as a recovery action. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
+EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
 
 ## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
 

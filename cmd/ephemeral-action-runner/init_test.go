@@ -1128,8 +1128,17 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationBestEffort; got != want {
 		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want wizard value %q", got, want)
 	}
+	if got, want := cfg.DockerSandboxes.RecoveryMode, config.DockerSandboxesRecoveryModeExclusiveAuto; got != want {
+		t.Fatalf("dockerSandboxes.recoveryMode = %q, want wizard value %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.RecoveryQuiescenceSeconds, config.DockerSandboxesDefaultRecoveryQuiescenceSeconds; got != want {
+		t.Fatalf("dockerSandboxes.recoveryQuiescenceSeconds = %d, want wizard value %d", got, want)
+	}
 	if !strings.Contains(string(configContent), "architectureEmulation: best-effort") {
 		t.Fatalf("wizard config omitted best-effort architecture emulation:\n%s", configContent)
+	}
+	if !strings.Contains(string(configContent), "recoveryMode: exclusive-auto") || !strings.Contains(string(configContent), "recoveryQuiescenceSeconds: 60") {
+		t.Fatalf("wizard config omitted exclusive automatic recovery defaults:\n%s", configContent)
 	}
 	for key, values := range map[string]struct{ got, want string }{
 		"rootDisk":   {cfg.DockerSandboxes.RootDisk, "auto"},
@@ -2100,7 +2109,7 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: best-effort"} {
+	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: best-effort", "recoveryMode: exclusive-auto", "recoveryQuiescenceSeconds: 60"} {
 		if !strings.Contains(string(configText), required) {
 			t.Fatalf("generated Docker Sandboxes config omitted %q:\n%s", required, configText)
 		}

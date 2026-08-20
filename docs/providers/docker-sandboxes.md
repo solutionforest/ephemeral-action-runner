@@ -72,6 +72,8 @@ dockerSandboxes:
   policyGeneration: sha256:<balanced-policy-fingerprint>
   networkBaseline: open
   architectureEmulation: best-effort
+  recoveryMode: exclusive-auto
+  recoveryQuiescenceSeconds: 60
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 8GiB
@@ -116,7 +118,7 @@ Each allocation receives an empty owner-restricted staging directory, but Action
 
 The listener identity is explicit and self-consistent: `agent` owns its home, XDG, runtime, and Docker configuration directories, and every workflow action and shell command inherits those exact paths. Template construction removes Docker credentials inherited from source-image user homes, and the registration path performs a second narrow scrub of `.docker/config.json` and `.dockercfg` across the actual passwd homes after sandbox boot while preserving `.docker/sandbox/locks`; verification rejects reusable artifacts that retain registry authentication or point identity-derived paths at another user. A workflow login can therefore write only to the disposable sandbox's Docker client configuration, and that file disappears with the sandbox. Registry authorization can still be changed by Docker Sandboxes' host-side credential proxy as described below.
 
-Docker Sandboxes can automatically forward the host SSH agent when its shared daemon inherits `SSH_AUTH_SOCK`. That would expose a host credential capability to every sandbox created by that daemon, so EPAR rejects any guest containing `SSH_AUTH_SOCK`, `SSH_AUTH_SOCK_GATEWAY`, `SSH_AGENT_PID`, or `/run/ssh-agent.sock`. EPAR removes these variables whenever it launches Docker Sandboxes commands, so a stopped daemon that those commands auto-start is sanitized. EPAR cannot repair an already-running daemon that another shell or tool started with forwarding enabled. If creation reports the known `failed to run sandbox container` signature, EPAR preserves that original error and adds this SSH-daemon remediation hint; unrelated create failures do not receive it. EPAR never stops or restarts a running shared daemon automatically. Coordinate with every process using Docker Sandboxes on the host, then stop the daemon and restart it from a sanitized environment before retrying EPAR:
+Docker Sandboxes can automatically forward the host SSH agent when its shared daemon inherits `SSH_AUTH_SOCK`. That would expose a host credential capability to every sandbox created by that daemon, so EPAR rejects any guest containing `SSH_AUTH_SOCK`, `SSH_AUTH_SOCK_GATEWAY`, `SSH_AGENT_PID`, or `/run/ssh-agent.sock`. EPAR removes these variables whenever it launches Docker Sandboxes commands, so a stopped daemon that those commands auto-start is sanitized. EPAR cannot repair an already-running daemon that another shell or tool started with forwarding enabled. If creation reports the known `failed to run sandbox container` signature, EPAR preserves that original error and adds this SSH-daemon remediation hint; unrelated create failures do not receive it. This admission failure is distinct from the default `recoveryMode: exclusive-auto` inventory recovery: EPAR may cold-stop and restart the shared daemon only after a bounded control-plane inventory failure, never to weaken an SSH-agent admission failure. Coordinate with every process using Docker Sandboxes on the host, then stop the daemon and restart it from a sanitized environment before retrying EPAR:
 
 ```sh
 sbx daemon stop

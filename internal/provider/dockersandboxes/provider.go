@@ -23,15 +23,20 @@ import (
 )
 
 const (
-	defaultOutputLimit    = 8 << 20
-	diagnosticOutputLimit = 256 << 10
-	commandWaitDelay      = 5 * time.Second
-	keepaliveStartupDelay = 500 * time.Millisecond
+	defaultOutputLimit        = 8 << 20
+	diagnosticOutputLimit     = 256 << 10
+	commandWaitDelay          = 5 * time.Second
+	keepaliveStartupDelay     = 500 * time.Millisecond
+	providerReadbackTimeout   = 30 * time.Second
+	providerCleanupTimeout    = 2 * time.Minute
+	providerCreateTimeout     = 10 * time.Minute
+	daemonStatePollInterval   = 250 * time.Millisecond
+	maximumRecoveryQuiescence = 5 * time.Minute
 )
 
 const sandboxContainerFailureSignature = "failed to run sandbox container"
 
-const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. EPAR will not stop or restart a running shared daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
+const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. EPAR will not stop or restart a running shared daemon for an SSH-agent admission failure; automatic exclusive recovery is reserved for bounded inventory control-plane failures. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
 
 const directWorkspaceVerificationScript = `set -euo pipefail
 if test -n "${SSH_AUTH_SOCK:-}" || test -n "${SSH_AUTH_SOCK_GATEWAY:-}" || test -n "${SSH_AGENT_PID:-}" || test -e /run/ssh-agent.sock || test -L /run/ssh-agent.sock; then
@@ -62,6 +67,10 @@ type Provider struct {
 	Binary string
 
 	runCommand            runCommandFunc
+	wait                  func(context.Context, time.Duration) error
+	controlPlaneGate      controlPlaneCommandGate
+	recoverySlotOnce      sync.Once
+	recoverySlot          chan struct{}
 	activationMu          sync.RWMutex
 	admissionBlockReason  string
 	activeMu              sync.RWMutex
@@ -113,6 +122,12 @@ type commandRequest struct {
 	sensitiveValues []string
 	operation       string
 	outputLimit     int
+	// timeout bounds this provider CLI operation; zero preserves the caller's
+	// lifetime for long-running guest commands and the detached keepalive.
+	timeout time.Duration
+	// preserveDescendantsOnSuccess is reserved for the exact detached daemon
+	// start command. Transient commands retain kill-on-close containment.
+	preserveDescendantsOnSuccess bool
 }
 
 type runCommandFunc func(ctx context.Context, request commandRequest) (provider.ExecResult, error)
@@ -142,7 +157,7 @@ func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectu
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]string), relayConnections: make(map[string]map[net.Conn]struct{})}
+	return &Provider{Binary: binary, wait: waitForContext, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]string), relayConnections: make(map[string]map[net.Conn]struct{})}
 }
 
 // ConfigureHostTrustRelay enables the Windows-host trust transport used by
@@ -167,11 +182,157 @@ func (p *Provider) SetLogger(logger *slog.Logger) {
 // other daemon mutations through this path.
 func (p *Provider) StartDaemon(ctx context.Context) error {
 	_, err := p.run(ctx, commandRequest{
-		args:        []string{"daemon", "start", "--detach"},
-		operation:   "start docker sandboxes daemon",
-		outputLimit: diagnosticOutputLimit,
+		args:                         []string{"daemon", "start", "--detach"},
+		operation:                    "start docker sandboxes daemon",
+		outputLimit:                  diagnosticOutputLimit,
+		timeout:                      providerReadbackTimeout,
+		preserveDescendantsOnSuccess: true,
 	})
 	return err
+}
+
+type daemonControlState string
+
+const (
+	daemonControlStateRunning daemonControlState = "running"
+	daemonControlStateStopped daemonControlState = "stopped"
+)
+
+// RecoverControlPlane performs the provider-owned mutation for an exclusive
+// Docker Sandboxes host. It never starts the daemon unless stopped state was
+// observed both after the cold stop and again after the quiescence interval.
+func (p *Provider) RecoverControlPlane(ctx context.Context, request provider.ControlPlaneRecoveryRequest) (err error) {
+	defer func() {
+		if err == nil {
+			return
+		}
+		var failure *provider.ControlPlaneRecoveryFailure
+		if !errors.As(err, &failure) {
+			err = provider.NewControlPlaneRecoveryFailure("Docker Sandboxes control-plane recovery", err)
+		}
+	}()
+	if request.Quiescence <= 0 || request.Quiescence > maximumRecoveryQuiescence {
+		return fmt.Errorf("Docker Sandboxes recovery quiescence must be greater than zero and no more than %s", maximumRecoveryQuiescence)
+	}
+	if p.dryRun {
+		return fmt.Errorf("Docker Sandboxes control-plane recovery is unavailable in dry-run mode")
+	}
+	releaseRecoverySlot, err := p.acquireRecoverySlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseRecoverySlot()
+	releaseControlPlaneGate, err := p.controlPlaneGate.beginRecovery(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseControlPlaneGate()
+	var releaseHostLock func()
+	if p.runCommand == nil {
+		releaseHostLock, err = provider.TryAcquireControlPlaneRecoveryLock()
+		if err != nil {
+			return err
+		}
+		defer releaseHostLock()
+	}
+	recoveryCtx := provider.WithControlPlaneLock(withControlPlaneGate(ctx))
+
+	_, stopErr := p.run(recoveryCtx, commandRequest{
+		args:        []string{"daemon", "stop"},
+		operation:   "stop docker sandboxes daemon for control-plane recovery",
+		outputLimit: diagnosticOutputLimit,
+		timeout:     providerCleanupTimeout,
+	})
+	if stateErr := p.waitForDaemonState(recoveryCtx, daemonControlStateStopped, providerCleanupTimeout); stateErr != nil {
+		if stopErr != nil {
+			return errors.Join(stopErr, fmt.Errorf("confirm Docker Sandboxes daemon stopped: %w", stateErr))
+		}
+		return fmt.Errorf("confirm Docker Sandboxes daemon stopped: %w", stateErr)
+	}
+	if stopErr != nil && p.logger != nil {
+		p.logger.Warn("Docker Sandboxes daemon stop returned an error but authoritative status confirmed stopped; continuing exclusive recovery", "provider", "docker-sandboxes")
+	}
+
+	if err := p.wait(recoveryCtx, request.Quiescence); err != nil {
+		return fmt.Errorf("wait for Docker Sandboxes daemon quiescence: %w", err)
+	}
+	state, err := p.readDaemonControlState(recoveryCtx)
+	if err != nil {
+		return fmt.Errorf("refusing Docker Sandboxes daemon start because stopped state is unknown after quiescence: %w", err)
+	}
+	if state != daemonControlStateStopped {
+		return fmt.Errorf("refusing Docker Sandboxes daemon start after quiescence: state is %q, want %q", state, daemonControlStateStopped)
+	}
+
+	startErr := p.StartDaemon(recoveryCtx)
+	stateErr := p.waitForDaemonState(recoveryCtx, daemonControlStateRunning, providerReadbackTimeout)
+	if stateErr != nil {
+		if startErr != nil {
+			return errors.Join(startErr, fmt.Errorf("confirm Docker Sandboxes daemon running: %w", stateErr))
+		}
+		return fmt.Errorf("confirm Docker Sandboxes daemon running: %w", stateErr)
+	}
+	if startErr != nil && p.logger != nil {
+		p.logger.Warn("Docker Sandboxes daemon detached start returned an error but authoritative status confirmed running; recovery succeeded", "provider", "docker-sandboxes")
+	}
+	return nil
+}
+
+func (p *Provider) waitForDaemonState(ctx context.Context, expected daemonControlState, timeout time.Duration) error {
+	confirmationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		state, err := p.readDaemonControlState(confirmationCtx)
+		if err != nil {
+			return err
+		}
+		if state == expected {
+			return nil
+		}
+		if err := p.wait(confirmationCtx, daemonStatePollInterval); err != nil {
+			return fmt.Errorf("Docker Sandboxes daemon remained %q while waiting for %q: %w", state, expected, err)
+		}
+	}
+}
+
+func (p *Provider) readDaemonControlState(ctx context.Context) (daemonControlState, error) {
+	result, err := p.run(ctx, commandRequest{
+		args:        []string{"daemon", "status", "--json"},
+		operation:   "read docker sandboxes daemon control state",
+		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
+	})
+	if err != nil {
+		return "", err
+	}
+	return parseDaemonControlState([]byte(result.Stdout))
+}
+
+func parseDaemonControlState(data []byte) (daemonControlState, error) {
+	state, _, err := parseDaemonStatus(data)
+	if err != nil {
+		return "", err
+	}
+	if state != strings.TrimSpace(state) {
+		return "", fmt.Errorf("docker sandboxes daemon status returned a non-canonical state")
+	}
+	switch normalized := daemonControlState(strings.ToLower(state)); normalized {
+	case daemonControlStateRunning, daemonControlStateStopped:
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("docker sandboxes daemon status returned unsupported state %q", state)
+	}
+}
+
+func waitForContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // VerifyHostReadiness requires machine-readable Docker Sandboxes diagnostics
@@ -264,7 +425,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 	if request.DockerDisk != "" {
 		environment["DOCKER_SANDBOXES_DOCKER_SIZE"] = request.DockerDisk
 	}
-	if _, err := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox"}); err != nil {
+	if _, err := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox", timeout: providerCreateTimeout}); err != nil {
 		return provider.Instance{}, withSandboxContainerFailureRemediation(err)
 	}
 	items, err = p.inventoryVerified(ctx)
@@ -360,6 +521,7 @@ func (p *Provider) ImportTemplate(ctx context.Context, archivePath string) error
 		args:        []string{"template", "load", archivePath},
 		operation:   "load exact Docker Sandboxes runner template",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerCreateTimeout,
 	}); err != nil {
 		return err
 	}
@@ -484,6 +646,7 @@ func (p *Provider) RemoveTemplate(ctx context.Context, artifact provider.Templat
 		args:        []string{"template", "rm", artifact.CacheID},
 		operation:   "remove exact Docker Sandboxes runner template",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerCleanupTimeout,
 	}); err != nil {
 		return err
 	}
@@ -586,6 +749,7 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 		args:        []string{"inspect", "--json", instance.Name},
 		operation:   "verify docker sandbox attached capabilities",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return err
@@ -658,6 +822,7 @@ func (p *Provider) verifyNoPublishedPorts(ctx context.Context, instance provider
 		args:        []string{"ports", instance.Name, "--json"},
 		operation:   "verify docker sandbox has no published ports",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return err
@@ -677,6 +842,7 @@ func (p *Provider) verifyDirectWorkspace(ctx context.Context, instance provider.
 		args:      []string{"exec", "-i", instance.Name, "--", "bash", "-lc", directWorkspaceVerificationScript},
 		stdin:     strings.NewReader(""),
 		operation: "verify dedicated docker sandbox staging workspace",
+		timeout:   providerReadbackTimeout,
 	})
 	if err != nil {
 		return err
@@ -724,6 +890,16 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 	if err := validateCommandRequest(request); err != nil {
 		return nil, err
 	}
+	releaseGate, err := p.controlPlaneGate.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseGate()
+	releaseHostLock, err := provider.AcquireControlPlaneCommandLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHostLock()
 	// The caller's context bounds startup only. The returned keepalive owns the
 	// sandbox lifetime and must survive the provisioning-attempt context that the
 	// pool cancels as soon as Start returns.
@@ -739,9 +915,17 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("%s failed: %w", request.operation, err)
 	}
+	cleanup, attachErr := attachManagedProcess(command, false)
+	if attachErr != nil {
+		killErr := killManagedProcess(command)
+		waitErr := waitForManagedCommandExit(command, commandWaitDelay)
+		return nil, fmt.Errorf("%s failed to establish process containment: %w", request.operation, errors.Join(attachErr, killErr, waitErr))
+	}
 	finished := make(chan error, 1)
 	go func() {
-		finished <- command.Wait()
+		err := command.Wait()
+		cleanup()
+		finished <- err
 	}()
 	timer := time.NewTimer(keepaliveStartupDelay)
 	defer timer.Stop()
@@ -756,13 +940,47 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 		}
 		return nil, fmt.Errorf("%s failed: %w", request.operation, err)
 	case <-ctx.Done():
-		if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			return nil, errors.Join(ctx.Err(), fmt.Errorf("stop keepalive after canceled startup: %w", err))
+		killErr := killManagedProcess(command)
+		waitErr := waitForManagedProcessExit(finished, commandWaitDelay)
+		if waitErr != nil {
+			if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				return nil, errors.Join(ctx.Err(), fmt.Errorf("stop keepalive after canceled startup: %w", killErr), waitErr)
+			}
+			return nil, errors.Join(ctx.Err(), waitErr)
 		}
-		<-finished
 		return nil, ctx.Err()
 	case <-timer.C:
 		return &provider.RunningProcess{Name: name, PID: command.Process.Pid}, nil
+	}
+}
+
+func waitForManagedCommandExit(command *exec.Cmd, timeout time.Duration) error {
+	finished := make(chan error, 1)
+	go func() { finished <- command.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-finished:
+		return err
+	case <-timer.C:
+		_ = command.Process.Kill()
+		select {
+		case err := <-finished:
+			return errors.Join(fmt.Errorf("managed process did not exit within %s", timeout), err)
+		case <-time.After(timeout):
+			return fmt.Errorf("managed process did not exit after forced termination")
+		}
+	}
+}
+
+func waitForManagedProcessExit(finished <-chan error, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-finished:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("managed process did not exit within %s", timeout)
 	}
 }
 
@@ -778,6 +996,7 @@ func (p *Provider) VerifyRuntime(ctx context.Context, instance provider.Instance
 		args:      []string{"exec", "-i", instance.Name, "--", "bash", "-lc", runtimeVerificationScript},
 		stdin:     strings.NewReader(""),
 		operation: "verify docker sandbox runtime",
+		timeout:   providerReadbackTimeout,
 	})
 	if err != nil {
 		return provider.RuntimeInfo{}, err
@@ -836,6 +1055,7 @@ func (p *Provider) Diagnostics(ctx context.Context, instance provider.Instance) 
 		args:        []string{"daemon", "status", "--json"},
 		operation:   "read docker sandbox daemon status",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return provider.Diagnostics{}, err
@@ -863,6 +1083,7 @@ func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error)
 		args:        []string{"diagnose", "--output", "json"},
 		operation:   "diagnose docker sandboxes",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return HostReadiness{}, err
@@ -888,7 +1109,7 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 	if err != nil || !present {
 		return err
 	}
-	result, err := p.run(ctx, commandRequest{args: []string{"stop", instance.Name}, operation: "stop docker sandbox"})
+	result, err := p.run(ctx, commandRequest{args: []string{"stop", instance.Name}, operation: "stop docker sandbox", timeout: providerCleanupTimeout})
 	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error()) {
 		return nil
 	}
@@ -921,7 +1142,7 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 			return fmt.Errorf("refusing Docker Sandbox deletion without an exact staging ownership receipt")
 		}
 	}
-	result, err := p.run(ctx, commandRequest{args: []string{"rm", "--force", instance.Name}, operation: "delete docker sandbox"})
+	result, err := p.run(ctx, commandRequest{args: []string{"rm", "--force", instance.Name}, operation: "delete docker sandbox", timeout: providerCleanupTimeout})
 	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error()) {
 		err = nil
 	}
@@ -950,9 +1171,9 @@ func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, err
 
 func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryItem, error) {
 	for attempt := 1; attempt <= 2; attempt++ {
-		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes"})
+		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes", timeout: providerReadbackTimeout})
 		if err != nil {
-			return nil, err
+			return nil, provider.NewControlPlaneFailure("inventory Docker Sandboxes", err)
 		}
 		items, parseErr := parseInventory([]byte(result.Stdout))
 		if parseErr == nil {
@@ -960,7 +1181,7 @@ func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryI
 			return items, nil
 		}
 		if attempt == 2 {
-			return nil, parseErr
+			return nil, provider.NewControlPlaneFailure("inventory Docker Sandboxes", parseErr)
 		}
 		if p.logger != nil {
 			p.logger.Debug("Docker Sandboxes inventory returned invalid machine-readable output; retrying once", "provider", "docker-sandboxes", "stdoutBytes", len(result.Stdout))
@@ -977,6 +1198,7 @@ func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error
 		args:        []string{"template", "ls", "--json"},
 		operation:   "read docker sandbox template cache",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -998,7 +1220,7 @@ func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error
 }
 
 func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, cacheID string) error {
-	result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: "verify cached docker sandbox template"})
+	result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: "verify cached docker sandbox template", timeout: providerReadbackTimeout})
 	if err != nil {
 		return err
 	}
@@ -1069,10 +1291,19 @@ func (p *Provider) run(ctx context.Context, request commandRequest) (provider.Ex
 	if err := validateCommandRequest(request); err != nil {
 		return provider.ExecResult{}, err
 	}
+	if !controlPlaneGateHeld(ctx) {
+		release, err := p.controlPlaneGate.acquire(ctx)
+		if err != nil {
+			return provider.ExecResult{}, err
+		}
+		defer release()
+	}
+	operationCtx, cancel := contextWithTimeout(ctx, request.timeout)
+	defer cancel()
 	if request.outputLimit == 0 {
 		request.outputLimit = defaultOutputLimit
 	}
-	if err := ctx.Err(); err != nil {
+	if err := operationCtx.Err(); err != nil {
 		return provider.ExecResult{}, err
 	}
 	bufferedStdout, bufferedStderr, flush := provider.BufferSensitiveSinks(request.sensitiveValues, request.stdout, request.stderr)
@@ -1082,16 +1313,16 @@ func (p *Provider) run(ctx context.Context, request commandRequest) (provider.Ex
 	var result provider.ExecResult
 	var runErr error
 	if p.runCommand != nil {
-		result, runErr = p.runCommand(ctx, request)
+		result, runErr = p.runCommand(operationCtx, request)
 	} else {
-		result, runErr = p.runRaw(ctx, request)
+		result, runErr = p.runRaw(operationCtx, request)
 	}
 	if len(result.Stdout) > request.outputLimit || len(result.Stderr) > request.outputLimit {
 		runErr = errors.Join(runErr, fmt.Errorf("%s exceeded the output limit", request.operation))
 		result.Stdout = truncate(result.Stdout, request.outputLimit)
 		result.Stderr = truncate(result.Stderr, request.outputLimit)
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := operationCtx.Err(); ctxErr != nil {
 		runErr = errors.Join(ctxErr, runErr)
 	}
 	result, finishErr := provider.FinishSensitiveExecution(result, runErr, flush(), request.sensitiveValues)
@@ -1107,13 +1338,148 @@ func (p *Provider) run(ctx context.Context, request commandRequest) (provider.Ex
 	return result, finishErr
 }
 
+func contextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+type controlPlaneGateContextKey struct{}
+
+func withControlPlaneGate(ctx context.Context) context.Context {
+	return context.WithValue(ctx, controlPlaneGateContextKey{}, true)
+}
+
+func controlPlaneGateHeld(ctx context.Context) bool {
+	held, _ := ctx.Value(controlPlaneGateContextKey{}).(bool)
+	return held
+}
+
+// controlPlaneCommandGate lets in-flight provider commands drain before a
+// daemon recovery begins, then prevents new commands from racing its stop,
+// quiescence, and start sequence.
+type controlPlaneCommandGate struct {
+	initOnce   sync.Once
+	mu         sync.Mutex
+	active     int
+	pending    bool
+	recovering bool
+	changed    chan struct{}
+}
+
+func (gate *controlPlaneCommandGate) initialize() {
+	gate.initOnce.Do(func() {
+		gate.changed = make(chan struct{})
+	})
+}
+
+func (gate *controlPlaneCommandGate) signalLocked() {
+	close(gate.changed)
+	gate.changed = make(chan struct{})
+}
+
+func (gate *controlPlaneCommandGate) acquire(ctx context.Context) (func(), error) {
+	gate.initialize()
+	for {
+		gate.mu.Lock()
+		if !gate.pending && !gate.recovering {
+			gate.active++
+			gate.mu.Unlock()
+			return func() { gate.releaseOperation() }, nil
+		}
+		changed := gate.changed
+		gate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (gate *controlPlaneCommandGate) releaseOperation() {
+	gate.mu.Lock()
+	gate.active--
+	if gate.active == 0 && gate.pending {
+		gate.signalLocked()
+	}
+	gate.mu.Unlock()
+}
+
+func (gate *controlPlaneCommandGate) beginRecovery(ctx context.Context) (func(), error) {
+	gate.initialize()
+	for {
+		gate.mu.Lock()
+		if !gate.pending && !gate.recovering {
+			gate.pending = true
+			gate.signalLocked()
+		}
+		if gate.pending && gate.active == 0 && !gate.recovering {
+			gate.pending = false
+			gate.recovering = true
+			gate.mu.Unlock()
+			return func() { gate.endRecovery() }, nil
+		}
+		changed := gate.changed
+		gate.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			gate.cancelRecovery()
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (gate *controlPlaneCommandGate) cancelRecovery() {
+	gate.mu.Lock()
+	if gate.pending && !gate.recovering {
+		gate.pending = false
+		gate.signalLocked()
+	}
+	gate.mu.Unlock()
+}
+
+func (gate *controlPlaneCommandGate) endRecovery() {
+	gate.mu.Lock()
+	gate.recovering = false
+	gate.signalLocked()
+	gate.mu.Unlock()
+}
+
+func (p *Provider) acquireRecoverySlot(ctx context.Context) (func(), error) {
+	p.recoverySlotOnce.Do(func() {
+		p.recoverySlot = make(chan struct{}, 1)
+	})
+	select {
+	case p.recoverySlot <- struct{}{}:
+		return func() { <-p.recoverySlot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+	var releaseHostLock func()
+	if !provider.ControlPlaneLockHeld(ctx) {
+		var err error
+		releaseHostLock, err = provider.AcquireControlPlaneCommandLock(ctx)
+		if err != nil {
+			return provider.ExecResult{}, err
+		}
+		defer releaseHostLock()
+	}
 	cmd := exec.CommandContext(ctx, p.Binary, request.args...)
+	isolateManagedProcess(cmd)
 	cmd.WaitDelay = commandWaitDelay
 	var cancellationKilledProcess atomic.Bool
 	defaultCancel := cmd.Cancel
 	cmd.Cancel = func() error {
-		err := defaultCancel()
+		err := killManagedProcess(cmd)
+		if err != nil {
+			err = defaultCancel()
+		}
 		if err == nil {
 			cancellationKilledProcess.Store(true)
 		}
@@ -1125,7 +1491,23 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 	stderr := &boundedBuffer{limit: request.outputLimit}
 	cmd.Stdout = captureWriter(stdout, request.stdout)
 	cmd.Stderr = captureWriter(stderr, request.stderr)
-	err := cmd.Run()
+	err := cmd.Start()
+	if err == nil {
+		cleanup, attachErr := attachManagedProcess(cmd, request.preserveDescendantsOnSuccess)
+		if attachErr != nil {
+			killErr := killManagedProcess(cmd)
+			waitErr := waitForManagedCommandExit(cmd, commandWaitDelay)
+			err = errors.Join(fmt.Errorf("attach Docker Sandboxes process containment: %w", attachErr), killErr, waitErr)
+		} else {
+			defer cleanup()
+			err = cmd.Wait()
+			if request.preserveDescendantsOnSuccess && err != nil {
+				if killErr := killManagedProcess(cmd); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+					err = errors.Join(err, fmt.Errorf("clean up failed detached Docker Sandboxes daemon start: %w", killErr))
+				}
+			}
+		}
+	}
 	if cancellationKilledProcess.Load() {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			err = ctxErr
@@ -1161,8 +1543,13 @@ func validateCommandRequest(request commandRequest) error {
 			return err
 		}
 	}
-	if request.args[0] == "daemon" && (len(request.args) != 3 || !((request.args[1] == "status" && request.args[2] == "--json") || (request.args[1] == "start" && request.args[2] == "--detach"))) {
-		return fmt.Errorf("only exact daemon status or detached-start operations are permitted")
+	if request.args[0] == "daemon" {
+		exactStop := len(request.args) == 2 && request.args[1] == "stop"
+		exactStatus := len(request.args) == 3 && request.args[1] == "status" && request.args[2] == "--json"
+		exactDetachedStart := len(request.args) == 3 && request.args[1] == "start" && request.args[2] == "--detach"
+		if !exactStop && !exactStatus && !exactDetachedStart {
+			return fmt.Errorf("only exact daemon status, cold-stop, or detached-start operations are permitted")
+		}
 	}
 	for _, arg := range request.args {
 		if strings.ContainsRune(arg, 0) {
@@ -1256,6 +1643,7 @@ func decodeStrictJSON(data []byte, destination any) error {
 }
 
 var _ provider.Lifecycle = (*Provider)(nil)
+var _ provider.ControlPlaneRecoverer = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)

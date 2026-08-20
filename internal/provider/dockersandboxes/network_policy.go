@@ -58,6 +58,7 @@ func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance prov
 		args:        []string{"policy", "log", instance.Name, "--json"},
 		operation:   "verify Docker Sandboxes host-trust relay route",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return err
@@ -121,7 +122,7 @@ func (p *Provider) ApplyNetworkPolicy(ctx context.Context, instance provider.Ins
 			return err
 		}
 		args := []string{"policy", string(rule.Decision), "network", "--sandbox", instance.Name, strings.Join(rule.Resources, ",")}
-		result, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy"})
+		result, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy", timeout: providerCleanupTimeout})
 		if runErr != nil && !strings.Contains(strings.ToLower(result.Stdout+"\n"+result.Stderr), "already covered") {
 			return runErr
 		}
@@ -157,6 +158,7 @@ func (p *Provider) ReadGlobalNetworkPolicy(ctx context.Context) ([]provider.Netw
 		args:        []string{"policy", "ls", "--include-inactive", "--json"},
 		operation:   "read docker sandboxes global network policy",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -168,6 +170,7 @@ func (p *Provider) readNetworkPolicyVerified(ctx context.Context, instance provi
 	result, err := p.run(ctx, commandRequest{
 		args:      []string{"policy", "ls", instance.Name, "--include-inactive", "--json"},
 		operation: "read docker sandbox network policy",
+		timeout:   providerReadbackTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -209,6 +212,7 @@ func (p *Provider) RemoveNetworkPolicy(ctx context.Context, instance provider.In
 		result, runErr := p.run(ctx, commandRequest{
 			args:      []string{"policy", "rm", "network", "--sandbox", instance.Name, "--id", rule.ID},
 			operation: "remove docker sandbox network policy",
+			timeout:   providerCleanupTimeout,
 		})
 		if runErr != nil && !isMissingPolicyRule(result.Stdout+"\n"+result.Stderr+"\n"+runErr.Error()) {
 			return runErr

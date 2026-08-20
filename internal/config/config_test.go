@@ -1588,6 +1588,8 @@ security:
 dockerSandboxes:
   policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
   networkBaseline: balanced
+  recoveryMode: observe
+  recoveryQuiescenceSeconds: 90
   additionalAllow: [api.github.com, '*.githubusercontent.com:443']
   additionalDeny:
     - telemetry.example.invalid
@@ -1621,6 +1623,12 @@ dockerSandboxes:
 	}
 	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, DockerSandboxesArchitectureEmulationBestEffort; got != want {
 		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want omitted configuration to default to %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.RecoveryMode, DockerSandboxesRecoveryModeObserve; got != want {
+		t.Fatalf("dockerSandboxes.recoveryMode = %q, want %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.RecoveryQuiescenceSeconds, 90; got != want {
+		t.Fatalf("dockerSandboxes.recoveryQuiescenceSeconds = %d, want %d", got, want)
 	}
 	if got, want := cfg.DockerSandboxes.AdditionalAllow, []string{"api.github.com", "*.githubusercontent.com:443"}; !slices.Equal(got, want) {
 		t.Fatalf("dockerSandboxes.additionalAllow = %#v, want %#v", got, want)
@@ -1662,6 +1670,20 @@ func TestLoadDockerSandboxesArchitectureEmulation(t *testing.T) {
 				t.Fatalf("ValidateDockerSandboxes() rejected %q: %v", value, err)
 			}
 		})
+	}
+}
+
+func TestDockerSandboxesRecoveryDefaults(t *testing.T) {
+	cfg := Default()
+	if got, want := cfg.DockerSandboxes.RecoveryMode, DockerSandboxesRecoveryModeExclusiveAuto; got != want {
+		t.Fatalf("dockerSandboxes.recoveryMode = %q, want default %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.RecoveryQuiescenceSeconds, DockerSandboxesDefaultRecoveryQuiescenceSeconds; got != want {
+		t.Fatalf("dockerSandboxes.recoveryQuiescenceSeconds = %d, want default %d", got, want)
+	}
+	cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+	if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err != nil {
+		t.Fatalf("ValidateDockerSandboxes() rejected recovery defaults: %v", err)
 	}
 }
 
@@ -1713,6 +1735,20 @@ func TestValidateDockerSandboxesRejectsInvalidPreviewConfiguration(t *testing.T)
 		{
 			name:   "network baseline is unsupported",
 			mutate: func(cfg *Config) { cfg.DockerSandboxes.NetworkBaseline = "locked-down" },
+		},
+		{
+			name:   "recovery mode is unsupported",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.RecoveryMode = "shared-auto" },
+		},
+		{
+			name:   "recovery quiescence is not positive",
+			mutate: func(cfg *Config) { cfg.DockerSandboxes.RecoveryQuiescenceSeconds = 0 },
+		},
+		{
+			name: "recovery quiescence exceeds bound",
+			mutate: func(cfg *Config) {
+				cfg.DockerSandboxes.RecoveryQuiescenceSeconds = DockerSandboxesMaximumRecoveryQuiescenceSeconds + 1
+			},
 		},
 		{
 			name:   "allowlist wildcard is unsafe",

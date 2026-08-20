@@ -1592,6 +1592,43 @@ func TestLegacyOverCapacityInventoryBlocksAllocation(t *testing.T) {
 	}
 }
 
+func TestReconciliationCleanupUsesMaintenanceContext(t *testing.T) {
+	p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-stopped", State: "stopped"}}}
+	p.deleteFunc = func(ctx context.Context, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	manager := newRegisteredTestManager(t, p, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	active, err := manager.reconcilePhysicalPool(ctx, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := active["epar-test-stopped"].Phase; got != LifecycleCleanupPending {
+		t.Fatalf("stopped instance phase = %q, want cleanup-pending", got)
+	}
+	if got := atomic.LoadInt32(&p.deleteCalls); got != 1 {
+		t.Fatalf("local delete calls = %d, want 1", got)
+	}
+}
+
+func TestReconciliationPropagatesControlPlaneCleanupFailure(t *testing.T) {
+	const daemonFailure = "inventory control plane unavailable"
+	p := &fakeProvider{
+		instances: []provider.Instance{{Name: "epar-test-stopped", ProviderID: "fake:epar-test-stopped", State: "stopped"}},
+		deleteErr: provider.NewControlPlaneFailure("delete Docker Sandboxes instance", errors.New(daemonFailure)),
+	}
+	manager := newRegisteredTestManager(t, p, nil)
+	active, err := manager.reconcilePhysicalPool(context.Background(), nil, false)
+	if !errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("reconcilePhysicalPool() error = %v, want control-plane failure", err)
+	}
+	if _, found := active["epar-test-stopped"]; found {
+		t.Fatalf("active inventory = %#v, want caller to retain its prior map on typed failure", active)
+	}
+}
+
 func TestLegacyIdleOverCapacityIsReducedToTarget(t *testing.T) {
 	p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing-1", State: "running"}, {Name: "epar-test-existing-2", State: "running"}, {Name: "epar-test-existing-3", State: "running"}}}
 	g := &fakeGitHub{
@@ -1613,6 +1650,33 @@ func TestLegacyIdleOverCapacityIsReducedToTarget(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&p.deleteCalls); got != 2 {
 		t.Fatalf("local delete calls = %d, want 2 idle excess runners retired", got)
+	}
+}
+
+func TestLegacyOverCapacityPropagatesControlPlaneCleanupFailure(t *testing.T) {
+	p := &fakeProvider{
+		instances: []provider.Instance{
+			{Name: "epar-test-existing-1", ProviderID: "fake:epar-test-existing-1", State: "running"},
+			{Name: "epar-test-existing-2", ProviderID: "fake:epar-test-existing-2", State: "running"},
+		},
+		deleteErr: provider.NewControlPlaneFailure("delete Docker Sandboxes instance", errors.New("daemon inventory unavailable")),
+	}
+	g := &fakeGitHub{
+		runner: gh.Runner{ID: 9, Status: "online"},
+		found:  true,
+		listRunners: []gh.Runner{
+			{Name: "epar-test-existing-1", ID: 1, Status: "online"},
+			{Name: "epar-test-existing-2", ID: 2, Status: "online"},
+		},
+	}
+	manager := newRegisteredTestManager(t, p, g)
+	active, err := manager.reconcilePhysicalPool(context.Background(), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.reduceOverCapacity(context.Background(), active, 1, true)
+	if !errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("reduceOverCapacity() error = %v, want control-plane failure", err)
 	}
 }
 
@@ -1824,16 +1888,17 @@ func newRegisteredTestManager(t *testing.T, provider provider.Provider, github G
 }
 
 type fakeProvider struct {
-	execErr   error
-	execErrs  []error
-	execFunc  func(context.Context, string, []string, provider.ExecOptions) (provider.ExecResult, error)
-	ip        string
-	cloneErr  error
-	startErr  error
-	ipErr     error
-	deleteErr error
-	listErr   error
-	mu        sync.Mutex
+	execErr    error
+	execErrs   []error
+	execFunc   func(context.Context, string, []string, provider.ExecOptions) (provider.ExecResult, error)
+	ip         string
+	cloneErr   error
+	startErr   error
+	ipErr      error
+	deleteErr  error
+	listErr    error
+	deleteFunc func(context.Context, string) error
+	mu         sync.Mutex
 
 	configureEnv     map[string]string
 	configureOptions provider.ExecOptions
@@ -1931,8 +1996,11 @@ func (p *fakeProvider) Stop(context.Context, string) error {
 	return nil
 }
 
-func (p *fakeProvider) Delete(_ context.Context, name string) error {
+func (p *fakeProvider) Delete(ctx context.Context, name string) error {
 	atomic.AddInt32(&p.deleteCalls, 1)
+	if p.deleteFunc != nil {
+		return p.deleteFunc(ctx, name)
+	}
 	if p.deleteErr != nil {
 		return p.deleteErr
 	}
