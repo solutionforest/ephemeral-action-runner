@@ -36,7 +36,7 @@ const (
 
 const sandboxContainerFailureSignature = "failed to run sandbox container"
 
-const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. EPAR will not stop or restart a running shared daemon for an SSH-agent admission failure; automatic exclusive recovery is reserved for bounded inventory control-plane failures. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
+const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. In recoveryMode=exclusive-auto, the pool may make one bounded stop-wait-start recovery attempt for this create-stage signature; recoveryMode=observe never mutates the daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
 
 const directWorkspaceVerificationScript = `set -euo pipefail
 if test -n "${SSH_AUTH_SOCK:-}" || test -n "${SSH_AUTH_SOCK_GATEWAY:-}" || test -n "${SSH_AGENT_PID:-}" || test -e /run/ssh-agent.sock || test -L /run/ssh-agent.sock; then
@@ -393,9 +393,13 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			return provider.Instance{}, fmt.Errorf("docker sandbox name is already allocated")
 		}
 	}
-	var ownedStaging staging.OwnedDirectory
+	var (
+		stagingRoot  *staging.Staging
+		ownedStaging staging.OwnedDirectory
+	)
 	if p.runCommand == nil {
-		stagingRoot, openErr := staging.Open(filepath.Dir(request.StagingPath))
+		var openErr error
+		stagingRoot, openErr = staging.Open(filepath.Dir(request.StagingPath))
 		if openErr != nil {
 			return provider.Instance{}, openErr
 		}
@@ -425,8 +429,18 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 	if request.DockerDisk != "" {
 		environment["DOCKER_SANDBOXES_DOCKER_SIZE"] = request.DockerDisk
 	}
-	if _, err := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox", timeout: providerCreateTimeout}); err != nil {
-		return provider.Instance{}, withSandboxContainerFailureRemediation(err)
+	result, createErr := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox", timeout: providerCreateTimeout})
+	if createErr != nil {
+		if stagingRoot != nil {
+			if cleanupErr := stagingRoot.RemoveEmptyOwned(request.Name, ownedStaging.Identity); cleanupErr != nil {
+				createErr = errors.Join(createErr, fmt.Errorf("remove failed Docker Sandboxes staging workspace: %w", cleanupErr))
+			}
+		}
+		failure := withSandboxContainerFailureRemediation(createErr)
+		if hasSandboxCreateAdmissionSignature(result.Stderr) {
+			return provider.Instance{}, provider.NewControlPlaneAdmissionFailure("create Docker Sandboxes instance", failure)
+		}
+		return provider.Instance{}, failure
 	}
 	items, err = p.inventoryVerified(ctx)
 	if err != nil {
@@ -481,6 +495,13 @@ func withSandboxContainerFailureRemediation(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w; %s", err, sandboxContainerFailureRemediation)
+}
+
+// hasSandboxCreateAdmissionSignature deliberately inspects only the stderr
+// captured from the immediate `sbx create` operation. Matching a wrapped
+// controller error would turn unrelated failures into daemon-restart triggers.
+func hasSandboxCreateAdmissionSignature(stderr string) bool {
+	return strings.Contains(strings.ToLower(stderr), sandboxContainerFailureSignature)
 }
 
 func (p *Provider) logArchitectureCapability(instanceName string, emulation architectureEmulationResult) {

@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrTemplateNotFound            = errors.New("imported provider template not found")
-	ErrControlPlaneFailure         = errors.New("provider control plane failure")
-	ErrControlPlaneRecoveryFailure = errors.New("provider control plane recovery failed")
+	ErrTemplateNotFound             = errors.New("imported provider template not found")
+	ErrControlPlaneFailure          = errors.New("provider control plane failure")
+	ErrControlPlaneAdmissionFailure = errors.New("provider control plane admission failure")
+	ErrControlPlaneRecoveryFailure  = errors.New("provider control plane recovery failed")
 )
 
 // ControlPlaneFailure marks a failed provider control-plane command without
@@ -45,6 +46,37 @@ func (failure *ControlPlaneFailure) Is(target error) bool {
 // must supply an operation label that contains no command output or secrets.
 func NewControlPlaneFailure(operation string, cause error) error {
 	return &ControlPlaneFailure{Operation: operation, cause: cause}
+}
+
+// ControlPlaneAdmissionFailure marks a provider admission failure that may be
+// recoverable by restarting the provider control plane. Its Error method
+// preserves the provider's existing safe diagnostic because admission errors
+// already carry the user-facing remediation and redacted command detail.
+type ControlPlaneAdmissionFailure struct {
+	Operation string
+	cause     error
+}
+
+func (failure *ControlPlaneAdmissionFailure) Error() string {
+	if failure.cause != nil {
+		return failure.cause.Error()
+	}
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrControlPlaneAdmissionFailure.Error()
+	}
+	return ErrControlPlaneAdmissionFailure.Error()
+}
+
+func (failure *ControlPlaneAdmissionFailure) Unwrap() error { return failure.cause }
+
+func (failure *ControlPlaneAdmissionFailure) Is(target error) bool {
+	return target == ErrControlPlaneAdmissionFailure
+}
+
+// NewControlPlaneAdmissionFailure constructs a typed provider admission
+// failure without changing the existing user-facing diagnostic.
+func NewControlPlaneAdmissionFailure(operation string, cause error) error {
+	return &ControlPlaneAdmissionFailure{Operation: operation, cause: cause}
 }
 
 // ControlPlaneRecoveryFailure marks a failed provider recovery command without

@@ -58,7 +58,7 @@ dockerSandboxes:
   # best-effort attempts bundled QEMU/binfmt, then continues with a warning when the sandbox supports native containers only.
   # Use required only when every runner must execute foreign-architecture containers.
   architectureEmulation: best-effort
-  # exclusive-auto cold-stops and restarts sbx after bounded inventory failures; use observe only for emergency maintenance.
+  # exclusive-auto permits one bounded stop-wait-start recovery per create-admission incident; inventory recovery keeps its bounded backoff retries, and observe never mutates sbx.
   recoveryMode: exclusive-auto
   recoveryQuiescenceSeconds: 60
   additionalAllow:

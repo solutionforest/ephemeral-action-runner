@@ -68,6 +68,100 @@ func TestControlPlaneRecoveryDefaultsToExclusiveAuto(t *testing.T) {
 	}
 }
 
+func TestControlPlaneAdmissionRecoveryBypassesHealthyInventoryProbe(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	lifecycle := &controlPlaneRecoveryLifecycle{}
+	cfg := config.Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	manager := Manager{Config: cfg, Lifecycle: lifecycle}
+
+	handled, err := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+	if err != nil || !handled {
+		t.Fatalf("recoverProviderControlPlane() = handled %t, error %v; want handled success", handled, err)
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.recoverCalls != 1 {
+		t.Fatalf("recovery calls = %d, want 1", lifecycle.recoverCalls)
+	}
+	if lifecycle.inventoryCalls != providerRecoveryProbeCount {
+		t.Fatalf("inventory calls = %d, want only %d post-recovery probes", lifecycle.inventoryCalls, providerRecoveryProbeCount)
+	}
+}
+
+func TestControlPlaneAdmissionRecoveryObserveModeDoesNotMutate(t *testing.T) {
+	lifecycle := &controlPlaneRecoveryLifecycle{}
+	cfg := config.Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	cfg.DockerSandboxes.RecoveryMode = config.DockerSandboxesRecoveryModeObserve
+	manager := Manager{Config: cfg, Lifecycle: lifecycle}
+
+	handled, err := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+	if err != nil || handled {
+		t.Fatalf("observe admission recovery = handled %t, error %v; want no automatic handling", handled, err)
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.recoverCalls != 0 || lifecycle.inventoryCalls != 0 {
+		t.Fatalf("observe mode invoked recovery=%d inventory=%d; want both zero", lifecycle.recoverCalls, lifecycle.inventoryCalls)
+	}
+}
+
+func TestControlPlaneAdmissionRecoveryRunsAtMostOnceUntilCreateSucceeds(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	lifecycle := &controlPlaneRecoveryLifecycle{}
+	cfg := config.Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	manager := Manager{Config: cfg, Lifecycle: lifecycle}
+
+	handled, err := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+	if err != nil || !handled {
+		t.Fatalf("first admission recovery = handled %t, error %v; want handled success", handled, err)
+	}
+	handled, err = manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+	if err != nil || !handled {
+		t.Fatalf("second admission recovery = handled %t, error %v; want handled backoff", handled, err)
+	}
+	lifecycle.mu.Lock()
+	if lifecycle.recoverCalls != 1 {
+		t.Fatalf("recovery calls after repeated admission failure = %d, want 1", lifecycle.recoverCalls)
+	}
+	lifecycle.mu.Unlock()
+
+	manager.resetProviderAdmissionRecovery()
+	manager.providerRecoveryNext = time.Time{}
+	handled, err = manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+	if err != nil || !handled {
+		t.Fatalf("re-armed admission recovery = handled %t, error %v; want handled success", handled, err)
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.recoverCalls != 2 {
+		t.Fatalf("recovery calls after successful-create rearm = %d, want 2", lifecycle.recoverCalls)
+	}
+}
+
+func TestControlPlaneAdmissionRecoveryBlocksInventoryRestartUntilCreateSucceeds(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	lifecycle := &controlPlaneRecoveryLifecycle{}
+	cfg := config.Default()
+	cfg.Provider.Type = "docker-sandboxes"
+	manager := Manager{Config: cfg, Lifecycle: lifecycle}
+
+	if handled, err := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure); err != nil || !handled {
+		t.Fatalf("admission recovery = handled %t, error %v; want handled success", handled, err)
+	}
+	manager.providerRecoveryNext = time.Time{}
+	if handled, err := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneFailure); err != nil || !handled {
+		t.Fatalf("inventory recovery during admission incident = handled %t, error %v; want handled backoff", handled, err)
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.recoverCalls != 1 {
+		t.Fatalf("recovery calls after admission-to-inventory transition = %d, want 1", lifecycle.recoverCalls)
+	}
+}
+
 func TestControlPlaneRecoveryObserveModeDoesNotRestart(t *testing.T) {
 	lifecycle := &controlPlaneRecoveryLifecycle{}
 	cfg := config.Default()

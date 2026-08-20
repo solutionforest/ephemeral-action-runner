@@ -51,19 +51,20 @@ type Manager struct {
 	transcriptMu                 sync.Mutex
 	transcripts                  map[string]*logging.Transcript
 
-	hostTrustResolver     func(context.Context) (hosttrust.Snapshot, error)
-	buildTrustResolver    func(context.Context) (hosttrust.Snapshot, error)
-	hostTrustImageEnsurer func(context.Context) error
-	hostTrustImageMu      sync.Mutex
-	imageEnsureMu         sync.Mutex
-	imageEnsured          bool
-	now                   func() time.Time
-	randomFloat64         func() float64
-	externalOutageMu      sync.Mutex
-	externalOutage        *externalOutageRuntime
-	providerRecoveryMu    sync.Mutex
-	providerRecoveryNext  time.Time
-	providerRecoveryTries int
+	hostTrustResolver                  func(context.Context) (hosttrust.Snapshot, error)
+	buildTrustResolver                 func(context.Context) (hosttrust.Snapshot, error)
+	hostTrustImageEnsurer              func(context.Context) error
+	hostTrustImageMu                   sync.Mutex
+	imageEnsureMu                      sync.Mutex
+	imageEnsured                       bool
+	now                                func() time.Time
+	randomFloat64                      func() float64
+	externalOutageMu                   sync.Mutex
+	externalOutage                     *externalOutageRuntime
+	providerRecoveryMu                 sync.Mutex
+	providerRecoveryNext               time.Time
+	providerRecoveryTries              int
+	providerAdmissionRecoveryAttempted bool
 }
 
 func (m *Manager) ConfigureStorageAdmissionOverride(allow bool, command string) {
@@ -1361,6 +1362,9 @@ func isTransientDependencyError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		return false
+	}
 	var httpErr *gh.HTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= http.StatusInternalServerError
@@ -1787,6 +1791,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	}
 	if createStageErr != nil {
 		return vm, createStageErr
+	}
+	if created.Name == name && created.ProviderID != "" {
+		m.resetProviderAdmissionRecovery()
 	}
 	if created.Name != name || created.ProviderID == "" {
 		return vm, fmt.Errorf("provider create returned no immutable identity for %q", name)

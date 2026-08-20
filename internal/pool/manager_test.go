@@ -1822,6 +1822,7 @@ func TestTransientDependencyClassification(t *testing.T) {
 		{name: "forbidden", err: &gh.HTTPError{StatusCode: http.StatusForbidden}, want: false},
 		{name: "guest opaque forbidden", err: errors.New("Response status code does not indicate success: 403 (Forbidden)"), want: false},
 		{name: "cancellation", err: context.Canceled, want: false},
+		{name: "sandbox create admission", err: provider.NewControlPlaneAdmissionFailure("create Docker Sandboxes instance", errors.New("failed to run sandbox container")), want: false},
 		{name: "deterministic configuration", err: errors.New("runner labels are invalid"), want: false},
 	}
 	for _, test := range tests {

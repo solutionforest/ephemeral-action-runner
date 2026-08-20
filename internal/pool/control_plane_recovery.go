@@ -33,7 +33,8 @@ const (
 // recovery-capable, an explicit observe mode, or a non-control-plane failure
 // returns handled=false so existing fail-closed behavior remains unchanged.
 func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) (handled bool, err error) {
-	if !errors.Is(cause, provider.ErrControlPlaneFailure) || !m.dockerSandboxesExclusiveRecovery() {
+	admissionFailure := errors.Is(cause, provider.ErrControlPlaneAdmissionFailure)
+	if (!admissionFailure && !errors.Is(cause, provider.ErrControlPlaneFailure)) || !m.dockerSandboxesExclusiveRecovery() {
 		return false, nil
 	}
 	recoverer, ok := m.providerLifecycle().(provider.ControlPlaneRecoverer)
@@ -43,20 +44,35 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 	if !m.providerRecoveryWindowReady() {
 		return true, nil
 	}
+	if permitted, admissionIncident := m.reserveProviderRecovery(admissionFailure); !permitted {
+		next := m.scheduleProviderRecovery(providerRecoveryBackoffMaximum)
+		if admissionFailure || admissionIncident {
+			m.warnf("Docker Sandboxes create-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
+		} else {
+			m.warnf("Docker Sandboxes inventory recovery is suppressed while a create-admission incident remains open; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
+		}
+		return true, nil
+	}
 
 	// The timeout may have been caused by a transient runtime stall that
 	// cleared before recovery began. Recheck first so an already-healthy daemon
 	// is never restarted unnecessarily.
-	if probeErr := m.probeProviderInventory(ctx); probeErr == nil {
-		m.resetProviderRecovery()
-		m.infof("Docker Sandboxes inventory recovered before daemon intervention; resuming pool reconciliation\n")
-		return true, nil
-	} else if ctx.Err() != nil {
-		return true, ctx.Err()
+	if !admissionFailure {
+		if probeErr := m.probeProviderInventory(ctx); probeErr == nil {
+			m.resetProviderRecovery()
+			m.infof("Docker Sandboxes inventory recovered before daemon intervention; resuming pool reconciliation\n")
+			return true, nil
+		} else if ctx.Err() != nil {
+			return true, ctx.Err()
+		}
 	}
 
 	attempt := m.beginProviderRecoveryAttempt()
-	m.warnf("Docker Sandboxes control-plane recovery attempt %d starting after inventory failure: %v\n", attempt, cause)
+	recoveryCause := "inventory failure"
+	if admissionFailure {
+		recoveryCause = "create-admission failure"
+	}
+	m.warnf("Docker Sandboxes control-plane recovery attempt %d starting after %s: %v\n", attempt, recoveryCause, cause)
 	quiescence := time.Duration(m.Config.DockerSandboxes.RecoveryQuiescenceSeconds) * time.Second
 	if quiescence <= 0 {
 		quiescence = config.DockerSandboxesDefaultRecoveryQuiescenceSeconds * time.Second
@@ -65,6 +81,9 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 	defer cancel()
 	if recoveryErr := recoverer.RecoverControlPlane(recoveryCtx, provider.ControlPlaneRecoveryRequest{Quiescence: quiescence}); recoveryErr != nil {
 		if errors.Is(recoveryErr, provider.ErrControlPlaneRecoveryBusy) {
+			if admissionFailure {
+				m.cancelProviderAdmissionRecovery()
+			}
 			m.cancelProviderRecoveryAttempt()
 			next := m.scheduleProviderRecovery(providerRecoveryLockRetry)
 			m.warnf("Docker Sandboxes control-plane recovery is already running on this host; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
@@ -209,6 +228,33 @@ func (m *Manager) resetProviderRecovery() {
 	m.providerRecoveryMu.Lock()
 	m.providerRecoveryTries = 0
 	m.providerRecoveryNext = time.Time{}
+	m.providerRecoveryMu.Unlock()
+}
+
+// reserveProviderRecovery atomically reserves the next recovery opportunity.
+// Once an admission recovery has been attempted, ordinary inventory failures
+// cannot restart the same daemon incident until a provider create succeeds.
+func (m *Manager) reserveProviderRecovery(admissionFailure bool) (permitted, admissionIncident bool) {
+	m.providerRecoveryMu.Lock()
+	defer m.providerRecoveryMu.Unlock()
+	if m.providerAdmissionRecoveryAttempted {
+		return false, true
+	}
+	if admissionFailure {
+		m.providerAdmissionRecoveryAttempted = true
+	}
+	return true, false
+}
+
+func (m *Manager) cancelProviderAdmissionRecovery() {
+	m.providerRecoveryMu.Lock()
+	m.providerAdmissionRecoveryAttempted = false
+	m.providerRecoveryMu.Unlock()
+}
+
+func (m *Manager) resetProviderAdmissionRecovery() {
+	m.providerRecoveryMu.Lock()
+	m.providerAdmissionRecoveryAttempted = false
 	m.providerRecoveryMu.Unlock()
 }
 

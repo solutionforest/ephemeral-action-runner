@@ -203,14 +203,14 @@ Sandbox creation reaches `verify dedicated docker sandbox staging workspace` and
 
 Docker Sandboxes may forward the host SSH agent when its shared daemon inherits the host's agent environment. EPAR rejects the resulting sandbox because the forwarded socket or gateway could let a workflow use host SSH credentials. This is not evidence that the staging mount is missing or read-only, and deleting only `/run/ssh-agent.sock` is insufficient when the forwarding gateway remains configured.
 
-This admission failure is distinct from the inventory control-plane recovery path. EPAR rejects a running daemon that has already inherited host SSH-agent forwarding because restarting it would also change the credential exposure boundary. Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then stop it and restart it with all forwarding variables removed before retrying EPAR:
+In the default `recoveryMode: exclusive-auto`, EPAR treats the known immediate create-stage signature as a bounded admission incident and may perform one stop-wait-start recovery using the existing host-global gates, then retry lifecycle reconciliation. The recovery is limited to one daemon restart per incident, including controller reconciliation retries; `recoveryMode: observe` never probes or mutates the daemon. Coordinate the interruption with every process using the shared Docker Sandboxes daemon. If the automatic attempt has already been used or manual recovery is required, stop it and restart it with all forwarding variables removed before retrying EPAR:
 
 ```sh
 sbx daemon stop
 env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
 ```
 
-EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
+EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check, use `sbx reset` or `sbx logout`, or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
 
 ## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
 

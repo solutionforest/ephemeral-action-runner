@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/staging"
 )
 
 const (
@@ -617,10 +618,14 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 	if !errors.Is(err, cause) {
 		t.Fatalf("Create error = %v, want original command error to remain wrapped", err)
 	}
+	if !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create error = %v, want typed control-plane admission failure", err)
+	}
 	for _, expected := range []string{
 		sandboxContainerFailureSignature,
 		"EPAR removes SSH-agent variables when its commands start a stopped daemon",
-		"EPAR will not stop or restart a running shared daemon",
+		"recoveryMode=exclusive-auto",
+		"recoveryMode=observe never mutates the daemon",
 		"Coordinate with every process using that daemon",
 		"sbx daemon stop",
 		"env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach",
@@ -630,6 +635,63 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 		}
 	}
 	done()
+}
+
+func TestCreateAdmissionClassificationUsesImmediateCreateStderrOnly(t *testing.T) {
+	const signature = "500 Internal Server Error: failed to run sandbox container"
+	if !hasSandboxCreateAdmissionSignature(signature) {
+		t.Fatal("known create stderr signature was not classified")
+	}
+	if hasSandboxCreateAdmissionSignature("permission denied") {
+		t.Fatal("unrelated create stderr was classified")
+	}
+}
+
+func TestCreateDoesNotClassifyWrappedSignatureWithoutCreateStderr(t *testing.T) {
+	const signature = "500 Internal Server Error: failed to run sandbox container"
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: "permission denied"}, err: errors.New(signature)},
+	)
+	_, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create error = %v, want ordinary failure without admission classification", err)
+	}
+	done()
+}
+
+func TestCreateRemovesEmptyStagingAfterImmediateCreateFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	root := filepath.Join(t.TempDir(), "staging")
+	if _, err := staging.Open(root); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	script := fmt.Sprintf(`#!/bin/sh
+case "$1:$2" in
+diagnose:--output) printf '%%s' '%s' ;;
+template:ls) printf '%%s' '%s' ;;
+ls:--json) printf '%%s' '{"sandboxes":[]}' ;;
+create:*) printf '%%s\n' '500 Internal Server Error: failed to run sandbox container' >&2; exit 1 ;;
+*) exit 91 ;;
+esac
+`, healthyDiagnoseJSON, templateListJSON)
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := New(helper)
+	request := validCreateRequest()
+	request.StagingPath = filepath.Join(root, testName)
+	if _, err := p.Create(context.Background(), request); err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create() error = %v, want typed admission failure", err)
+	}
+	if _, err := os.Stat(request.StagingPath); !os.IsNotExist(err) {
+		t.Fatalf("failed create staging path stat error = %v, want exact empty staging removal", err)
+	}
 }
 
 func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
