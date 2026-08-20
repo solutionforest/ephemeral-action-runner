@@ -25,6 +25,12 @@ func TestKillManagedProcessTerminatesProcessTree(t *testing.T) {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
+	childPID, err := waitForChildPID(pidFile)
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal(err)
+	}
 	cleanup, err := attachManagedProcess(command, false)
 	if err != nil {
 		_ = command.Process.Kill()
@@ -32,23 +38,6 @@ func TestKillManagedProcessTerminatesProcessTree(t *testing.T) {
 		t.Fatalf("attachManagedProcess() = %v", err)
 	}
 	defer cleanup()
-	var childPID int
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, readErr := os.ReadFile(pidFile)
-		if readErr == nil {
-			childPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
-			if err == nil && childPID > 0 {
-				break
-			}
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	if childPID <= 0 {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		t.Fatal("child process did not publish its PID")
-	}
 	if running, err := processIsRunning(childPID); err != nil || !running {
 		t.Fatalf("captured child process was not running before termination: running=%t error=%v", running, err)
 	}
@@ -116,6 +105,21 @@ func TestAttachManagedProcessPreservesDetachedDescendant(t *testing.T) {
 	if !running {
 		t.Fatalf("detached child process %d was terminated when the containment job closed", childPID)
 	}
+}
+
+func waitForChildPID(pidFile string) (int, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(pidFile)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr == nil && pid > 0 {
+				return pid, nil
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return 0, fmt.Errorf("child process did not publish its PID within 5s")
 }
 
 func processIsRunning(pid int) (bool, error) {
