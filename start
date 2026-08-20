@@ -56,7 +56,11 @@ if ((use_old == 1)); then
 fi
 
 if [[ "${USE_DOCKER_RUN}" == "1" ]] || { [[ "${USE_DOCKER_RUN}" == "auto" ]] && ! go_usable "${GO_BIN}"; }; then
-  echo "Go not found or not runnable (or EPAR_USE_DOCKER_RUN=1); using the Docker compiler for the cached native controller..." >&2
+  if ! go_usable "${GO_BIN}"; then
+    printf '%s\n' "Go is not installed or runnable on this machine. EPAR will use Docker's Go build environment if the project-local controller needs to be rebuilt." >&2
+  else
+    printf '%s\n' "EPAR is configured to use Docker's Go build environment if the project-local controller needs to be rebuilt." >&2
+  fi
   exec env EPAR_NATIVE_CONTROLLER_BACKEND=docker "${script_dir}/scripts/build-native-controller.sh" "${epar_args[@]}"
 fi
 
