@@ -16,7 +16,12 @@ import (
 )
 
 func isolatePreflightProcess(command *exec.Cmd) {
-	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, NoInheritHandles: true, CreationFlags: windows.CREATE_SUSPENDED}
+	// Leave handle inheritance enabled so os/exec can pass the command's
+	// stdin/stdout/stderr handles to sbx. On Windows, os/exec supplies an
+	// explicit PROC_THREAD_ATTRIBUTE_HANDLE_LIST, so unrelated inheritable
+	// handles are still excluded. NoInheritHandles would suppress that list as
+	// well and make the preflight JSON output unavailable to EPAR.
+	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_SUSPENDED}
 }
 
 var preflightProcessJobs sync.Map
@@ -52,10 +57,12 @@ func attachPreflightProcess(command *exec.Cmd) (func(), error) {
 		closeJob()
 		return nil, fmt.Errorf("assign pre-existing preflight descendants to Windows job: %w", err)
 	}
-	if err := resumePreflightProcess(command); err != nil {
-		_ = windows.TerminateJobObject(job, 1)
-		closeJob()
-		return nil, fmt.Errorf("resume sbx preflight process after containment: %w", err)
+	if preflightProcessWasCreatedSuspended(command) {
+		if err := resumePreflightProcess(command); err != nil {
+			_ = windows.TerminateJobObject(job, 1)
+			closeJob()
+			return nil, fmt.Errorf("resume sbx preflight process after containment: %w", err)
+		}
 	}
 	preflightProcessJobs.Store(command.Process.Pid, job)
 	var once sync.Once
@@ -65,6 +72,10 @@ func attachPreflightProcess(command *exec.Cmd) (func(), error) {
 			closeJob()
 		})
 	}, nil
+}
+
+func preflightProcessWasCreatedSuspended(command *exec.Cmd) bool {
+	return command.SysProcAttr != nil && command.SysProcAttr.CreationFlags&windows.CREATE_SUSPENDED != 0
 }
 
 func resumePreflightProcess(command *exec.Cmd) error {

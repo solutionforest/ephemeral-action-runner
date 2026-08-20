@@ -3,6 +3,7 @@
 package promotion
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,8 +17,11 @@ import (
 func TestKillPreflightProcessTerminatesProcessTree(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	powershellPath := strings.ReplaceAll(filepath.ToSlash(pidFile), "'", "''")
-	powershell := fmt.Sprintf("$child=Start-Process -FilePath ping.exe -ArgumentList @('-t','127.0.0.1') -PassThru; Set-Content -NoNewline -Path '%s' -Value $child.Id; Wait-Process -Id $child.Id", powershellPath)
+	powershell := fmt.Sprintf("$child=Start-Process -FilePath ping.exe -ArgumentList @('-t','127.0.0.1') -PassThru; Write-Output 'preflight-process-ready'; Set-Content -NoNewline -Path '%s' -Value $child.Id; Wait-Process -Id $child.Id", powershellPath)
 	command := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +68,34 @@ func TestKillPreflightProcessTerminatesProcessTree(t *testing.T) {
 	}
 	if running {
 		t.Fatalf("child process %d survived preflight process termination", childPID)
+	}
+	if !strings.Contains(stdout.String(), "preflight-process-ready") {
+		t.Fatalf("preflight process stdout was not captured: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestPreflightProcessCapturesStdout(t *testing.T) {
+	command := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'preflight-process-ready'")
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	isolatePreflightProcess(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := attachPreflightProcess(command)
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("attachPreflightProcess() = %v", err)
+	}
+	if err := command.Wait(); err != nil {
+		cleanup()
+		t.Fatalf("preflight launcher exited with error: %v", err)
+	}
+	cleanup()
+	if !strings.Contains(stdout.String(), "preflight-process-ready") {
+		t.Fatalf("preflight process stdout was not captured: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

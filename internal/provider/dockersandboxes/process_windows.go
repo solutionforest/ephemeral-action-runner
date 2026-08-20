@@ -16,11 +16,18 @@ import (
 )
 
 func isolateKeepaliveProcess(command *exec.Cmd) {
-	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, NoInheritHandles: true, CreationFlags: windows.CREATE_SUSPENDED}
+	// Leave handle inheritance enabled so os/exec can pass the command's
+	// stdin/stdout/stderr handles to the child. On Windows, os/exec supplies an
+	// explicit PROC_THREAD_ATTRIBUTE_HANDLE_LIST, so unrelated inheritable
+	// handles are still excluded. NoInheritHandles would suppress that list as
+	// well and break EPAR's output capture (and some child process startups).
+	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_SUSPENDED}
 }
 
 func isolateManagedProcess(command *exec.Cmd) {
-	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, NoInheritHandles: true, CreationFlags: windows.CREATE_SUSPENDED}
+	// Keep the standard-handle list that os/exec builds; see the keepalive
+	// process comment above.
+	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_SUSPENDED}
 }
 
 var managedProcessJobs sync.Map
@@ -58,10 +65,12 @@ func attachManagedProcess(command *exec.Cmd, preserveDescendantsOnSuccess bool) 
 		closeJob()
 		return nil, fmt.Errorf("assign pre-existing Docker Sandboxes descendants to Windows job: %w", err)
 	}
-	if err := resumeManagedProcess(command); err != nil {
-		_ = windows.TerminateJobObject(job, 1)
-		closeJob()
-		return nil, fmt.Errorf("resume Docker Sandboxes process after containment: %w", err)
+	if managedProcessWasCreatedSuspended(command) {
+		if err := resumeManagedProcess(command); err != nil {
+			_ = windows.TerminateJobObject(job, 1)
+			closeJob()
+			return nil, fmt.Errorf("resume Docker Sandboxes process after containment: %w", err)
+		}
 	}
 	managedProcessJobs.Store(command.Process.Pid, job)
 	var once sync.Once
@@ -71,6 +80,10 @@ func attachManagedProcess(command *exec.Cmd, preserveDescendantsOnSuccess bool) 
 			closeJob()
 		})
 	}, nil
+}
+
+func managedProcessWasCreatedSuspended(command *exec.Cmd) bool {
+	return command.SysProcAttr != nil && command.SysProcAttr.CreationFlags&windows.CREATE_SUSPENDED != 0
 }
 
 func resumeManagedProcess(command *exec.Cmd) error {

@@ -3,6 +3,7 @@
 package dockersandboxes
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,8 +17,11 @@ import (
 func TestKillManagedProcessTerminatesProcessTree(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	powershellPath := strings.ReplaceAll(filepath.ToSlash(pidFile), "'", "''")
-	powershell := fmt.Sprintf("$child=Start-Process -FilePath ping.exe -ArgumentList @('-t','127.0.0.1') -PassThru; Set-Content -NoNewline -Path '%s' -Value $child.Id; Wait-Process -Id $child.Id", powershellPath)
+	powershell := fmt.Sprintf("$child=Start-Process -FilePath ping.exe -ArgumentList @('-t','127.0.0.1') -PassThru; Write-Output 'managed-process-ready'; Set-Content -NoNewline -Path '%s' -Value $child.Id; Wait-Process -Id $child.Id", powershellPath)
 	command := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -65,13 +69,19 @@ func TestKillManagedProcessTerminatesProcessTree(t *testing.T) {
 	if running {
 		t.Fatalf("child process %d survived managed process termination", childPID)
 	}
+	if !strings.Contains(stdout.String(), "managed-process-ready") {
+		t.Fatalf("managed process stdout was not captured: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
 }
 
 func TestAttachManagedProcessPreservesDetachedDescendant(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	powershellPath := strings.ReplaceAll(filepath.ToSlash(pidFile), "'", "''")
-	powershell := fmt.Sprintf("$child=Start-Process -FilePath ping.exe -ArgumentList @('-t','127.0.0.1') -PassThru; Set-Content -NoNewline -Path '%s' -Value $child.Id; exit 0", powershellPath)
+	powershell := fmt.Sprintf("$child=Start-Process -FilePath ping.exe -ArgumentList @('-t','127.0.0.1') -PassThru; Write-Output 'detached-process-ready'; Set-Content -NoNewline -Path '%s' -Value $child.Id; exit 0", powershellPath)
 	command := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", powershell)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
 	isolateManagedProcess(command)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
@@ -87,6 +97,9 @@ func TestAttachManagedProcessPreservesDetachedDescendant(t *testing.T) {
 		t.Fatalf("detached launcher exited with error: %v", err)
 	}
 	cleanup()
+	if !strings.Contains(stdout.String(), "detached-process-ready") {
+		t.Fatalf("managed process stdout was not captured: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		t.Fatal(err)
