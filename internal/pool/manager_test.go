@@ -478,6 +478,119 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 	}
 }
 
+func TestRunPoolFailsClosedWhenReplacementHostTrustActivationFails(t *testing.T) {
+	const activationFailure = "activate provider host-trust runtime: execute in docker sandbox failed: exit status 1: EPAR host-trust relay: activation failed at private-dockerd-contract (exit=1)"
+	snapshot := hosttrust.Snapshot{
+		Generation:   "g1",
+		HostOS:       "windows",
+		Scopes:       []string{"system"},
+		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+		CollectedAt:  time.Now().UTC(),
+	}
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	marker, err := hostTrustMarkerJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		commandText := strings.Join(command, " ")
+		if commandText == "cat "+hostTrustMarkerGuest {
+			return provider.ExecResult{Stdout: string(marker)}, nil
+		}
+		if strings.Contains(commandText, runnerProcessRunningSentinel) {
+			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+	github := &fakeGitHub{
+		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+	}
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
+	activator.onActivate = func(provider.Instance) {
+		if activator.calls == 2 {
+			activator.err = errors.New(activationFailure)
+		}
+	}
+	manager := newRegisteredTestManager(t, fake, github)
+	manager.Config.Provider.Type = "docker-sandboxes"
+	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+	manager.Config.Image.HostTrustScopes = []string{"system"}
+	manager.AllowInsufficientStorage = true
+	manager.Lifecycle = activator
+	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+	manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
+	state, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.LifecycleState = state
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = manager.RunPool(ctx, RunOptions{
+		Instances:         1,
+		Register:          true,
+		ReplaceCompleted:  true,
+		MonitorInterval:   5 * time.Millisecond,
+		PoolLockHeld:      true,
+		HostTrustLockHeld: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "private-dockerd-contract") {
+		t.Fatalf("RunPool() error = %v, want terminal host-trust stage failure", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunPool() timed out instead of returning the replacement failure: %v", err)
+	}
+	if isTransientDependencyError(err) {
+		t.Fatalf("replacement failure was classified transient: %v", err)
+	}
+	if activator.calls != 2 {
+		t.Fatalf("host-trust activation calls = %d, want initial activation and one failed replacement", activator.calls)
+	}
+	if got := atomic.LoadInt32(&fake.cloneCalls); got != 2 {
+		t.Fatalf("Clone calls = %d, want exactly two candidates and no retry storm", got)
+	}
+	if got := atomic.LoadInt32(&github.registrationCalls); got != 1 {
+		t.Fatalf("registration token calls = %d, want only the initial runner registered", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 2 {
+		t.Fatalf("provider delete calls = %d, want retired runner and failed replacement", got)
+	}
+	fake.mu.Lock()
+	deletedNames := append([]string(nil), fake.deletedNames...)
+	remaining := append([]provider.Instance(nil), fake.instances...)
+	fake.mu.Unlock()
+	if len(remaining) != 0 {
+		t.Fatalf("provider inventory after terminal cleanup = %#v, want empty", remaining)
+	}
+	if len(activator.instances) < 2 {
+		t.Fatalf("activated instances = %#v, want the failed replacement candidate", activator.instances)
+	}
+	replacementName := activator.instances[1].Name
+	deletedReplacement := false
+	for _, deletedName := range deletedNames {
+		if deletedName == replacementName {
+			deletedReplacement = true
+			break
+		}
+	}
+	if !deletedReplacement {
+		t.Fatalf("deleted provider names = %v, want exact failed replacement %q", deletedNames, replacementName)
+	}
+	records, err := state.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("lifecycle records = %#v, want initial and replacement tombstones", records)
+	}
+	for _, record := range records {
+		if record.Phase != poolstate.PhaseTombstoned || !strings.HasPrefix(record.ProviderID, "fake:") {
+			t.Fatalf("lifecycle record = %#v, want exact tombstoned provider identity", record)
+		}
+	}
+}
+
 func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 	fake := &fakeProvider{ip: "127.0.0.1"}
 	github := &fakeGitHub{
@@ -1355,10 +1468,12 @@ func TestRunPoolControllerRestartFencesRebindsAndLeasesExistingRunner(t *testing
 
 type activatingLifecycle struct {
 	provider.Lifecycle
-	calls      int
-	err        error
-	instances  []provider.Instance
-	onActivate func(provider.Instance)
+	calls       int
+	verifyCalls int
+	err         error
+	verifyErr   error
+	instances   []provider.Instance
+	onActivate  func(provider.Instance)
 }
 
 func (l *activatingLifecycle) ActivateHostTrustRuntime(_ context.Context, instance provider.Instance) error {
@@ -1368,6 +1483,14 @@ func (l *activatingLifecycle) ActivateHostTrustRuntime(_ context.Context, instan
 		l.onActivate(instance)
 	}
 	return l.err
+}
+
+func (l *activatingLifecycle) VerifyRuntime(ctx context.Context, instance provider.Instance) (provider.RuntimeInfo, error) {
+	l.verifyCalls++
+	if l.verifyErr != nil {
+		return provider.RuntimeInfo{}, l.verifyErr
+	}
+	return l.Lifecycle.VerifyRuntime(ctx, instance)
 }
 
 type partialCreateLifecycle struct {
@@ -1906,6 +2029,7 @@ type fakeProvider struct {
 	commands         []string
 	execOptions      []provider.ExecOptions
 	instances        []provider.Instance
+	deletedNames     []string
 
 	cloneCalls        int32
 	execCalls         int32
@@ -1999,6 +2123,9 @@ func (p *fakeProvider) Stop(context.Context, string) error {
 
 func (p *fakeProvider) Delete(ctx context.Context, name string) error {
 	atomic.AddInt32(&p.deleteCalls, 1)
+	p.mu.Lock()
+	p.deletedNames = append(p.deletedNames, name)
+	p.mu.Unlock()
 	if p.deleteFunc != nil {
 		return p.deleteFunc(ctx, name)
 	}

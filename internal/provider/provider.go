@@ -320,8 +320,11 @@ type InstanceAdmissionVerifier interface {
 
 // HostTrustRuntimeActivator is an optional provider capability for runtimes
 // that need provider-specific transport work after the common host CA overlay
-// has been installed. The pool invokes it before registration and again after
-// any runtime trust refresh. Implementations must fail closed: returning nil
+// has been installed. The pool invokes it before registration and when a
+// fresh runtime must be prepared after replacement or controller restart.
+// Steady-state reconciliation uses VerifyRuntime instead of invoking this
+// mutating capability on an already registered runner. Implementations must
+// fail closed: returning nil
 // means every provider-owned trust transport needed by the runtime is active
 // and verified for the exact instance.
 type HostTrustRuntimeActivator interface {

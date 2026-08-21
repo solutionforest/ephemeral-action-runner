@@ -504,6 +504,25 @@ func TestDockerSandboxesDockerDaemonBootstrapsThenUsesAuthenticatedHostTrustRela
 		`((keys - ["proxies", "registry-mirrors"]) | length) == 0 and .proxies == {"https-proxy": $proxy, "no-proxy": $no_proxy}`,
 		`daemon_backup="${config_dir}/docker-daemon.pre-relay.json"`,
 		`rollback_daemon()`,
+		`relay_operation="activation"`,
+		`echo "EPAR host-trust relay: ${relay_operation} failed at ${failed_stage} (exit=${status})" >&2`,
+		`relay_stage="bootstrap"`,
+		`relay_stage="validate-daemon-config"`,
+		`relay_stage="commit"`,
+		`relay_stage="validate-guest-relay"`,
+		`relay_stage="install-relay-ca"`,
+		`relay_stage="write-relay-config"`,
+		`relay_stage="publish-relay-config"`,
+		`relay_stage="guest-bridge-health"`,
+		`relay_stage="recover-daemon-transaction"`,
+		`relay_stage="detect-private-dockerd"`,
+		`relay_stage="configure-private-dockerd"`,
+		`relay_stage="restart-private-dockerd"`,
+		`relay_stage="private-dockerd-contract"`,
+		`relay_stage="registry-tls-proof"`,
+		`relay_stage="publish-active-marker"`,
+		`relay_stage="rollback-daemon"`,
+		`relay_stage="rollback-relay-ca"`,
 		`if [[ "${mode}" == "--commit" ]]`,
 		`if [[ "${mode}" == "--rollback" ]]`,
 		`mv -f "${daemon_config}.rollback.new" "${daemon_config}"`,
@@ -518,6 +537,13 @@ func TestDockerSandboxesDockerDaemonBootstrapsThenUsesAuthenticatedHostTrustRela
 		if !strings.Contains(activation, required) {
 			t.Fatalf("Docker Sandboxes runtime relay activation omitted %q", required)
 		}
+	}
+	failureDiagnostic := `echo "EPAR host-trust relay: ${relay_operation} failed at ${failed_stage} (exit=${status})" >&2`
+	capturedStageIndex := strings.Index(activation, `failed_stage="${relay_stage}"`)
+	failureDiagnosticIndex := strings.Index(activation, failureDiagnostic)
+	rollbackStageIndex := strings.Index(activation, `relay_stage="rollback-daemon"`)
+	if capturedStageIndex < 0 || failureDiagnosticIndex < capturedStageIndex || rollbackStageIndex < failureDiagnosticIndex {
+		t.Fatal("Docker Sandboxes relay failure diagnostic must capture the original stage before rollback")
 	}
 }
 

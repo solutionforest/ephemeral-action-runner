@@ -370,9 +370,13 @@ func TestHostTrustReconciliationPreservesRunnerDuringGitHub503(t *testing.T) {
 	}
 }
 
-func TestHostTrustReconciliationFencesLeaseWhenTransportRefreshFails(t *testing.T) {
+func TestHostTrustReconciliationFencesWhenTransportVerificationFails(t *testing.T) {
 	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
-	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false), err: errors.New("relay unavailable")}
+	activator := &activatingLifecycle{
+		Lifecycle: provider.AdaptLegacy(fake, false),
+		err:       errors.New("relay unavailable"),
+		verifyErr: errors.New("relay marker unavailable"),
+	}
 	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online"}, found: true}
 	manager := Manager{
 		Config: config.Config{
@@ -390,11 +394,14 @@ func TestHostTrustReconciliationFencesLeaseWhenTransportRefreshFails(t *testing.
 	if retired := manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool)); retired != 0 {
 		t.Fatalf("retired runners = %d, want fenced preservation", retired)
 	}
-	if activator.calls != 1 {
-		t.Fatalf("activation calls = %d, want 1", activator.calls)
+	if activator.calls != 0 {
+		t.Fatalf("activation calls = %d, want zero while fencing the unhealthy registered runner", activator.calls)
 	}
-	if got := atomic.LoadInt32(&github.runnerByNameCalls); got != 1 {
-		t.Fatalf("GitHub status calls = %d, want one exact registration fence lookup after activation failure", got)
+	if activator.verifyCalls != 1 {
+		t.Fatalf("runtime verification calls = %d, want one before fencing the unhealthy registered runner", activator.verifyCalls)
+	}
+	if got := atomic.LoadInt32(&github.runnerByNameCalls); got != 2 {
+		t.Fatalf("GitHub status calls = %d, want status lookup plus exact registration fence lookup", got)
 	}
 	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
 		t.Fatalf("GitHub registration fence calls = %d, want 1", got)
@@ -404,6 +411,76 @@ func TestHostTrustReconciliationFencesLeaseWhenTransportRefreshFails(t *testing.
 	}
 	if fake.commandCount("rm -f '/run/epar/host-trust-lease.json'") != 0 {
 		t.Fatalf("guest commands = %v, want immediate exact GitHub fence without a second blocked transport attempt", fake.commands)
+	}
+}
+
+func TestHostTrustReconciliationDoesNotReactivateHealthyTransport(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
+	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: false}, found: true}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{Type: "docker-sandboxes"},
+			Image:    config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
+		},
+		Provider:  fake,
+		Lifecycle: activator,
+		GitHub:    github,
+	}
+	current := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", ProviderID: "fake:runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}
+
+	if retired := manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool)); retired != 0 {
+		t.Fatalf("retired runners = %d, want 0", retired)
+	}
+	if activator.calls != 0 {
+		t.Fatalf("host trust transport activations = %d, want zero for healthy current-generation transport", activator.calls)
+	}
+	if activator.verifyCalls != 1 {
+		t.Fatalf("runtime verification calls = %d, want one for healthy current-generation transport", activator.verifyCalls)
+	}
+	if got := len(hostTrustLeaseInputs(fake)); got != 1 {
+		t.Fatalf("host trust lease writes = %d, want one refresh without relay reactivation", got)
+	}
+	if got := fake.commandCount("configure-egress-relay.sh"); got != 0 {
+		t.Fatalf("relay activation commands = %d, want zero for healthy current-generation transport", got)
+	}
+}
+
+func TestHostTrustReconciliationFencesBusyRunnerWhenTransportVerificationFails(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
+	activator := &activatingLifecycle{
+		Lifecycle: provider.AdaptLegacy(fake, false),
+		verifyErr: errors.New("relay marker unavailable"),
+	}
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: true}, found: true}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{Type: "docker-sandboxes"},
+			Image:    config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
+		},
+		Provider:  fake,
+		Lifecycle: activator,
+		GitHub:    github,
+	}
+	current := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", ProviderID: "fake:runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}
+
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
+	if got := active["runner-1"].Phase; got != LifecycleQuarantined {
+		t.Fatalf("runner phase = %s, want %s", got, LifecycleQuarantined)
+	}
+	if activator.calls != 0 {
+		t.Fatalf("host trust transport activations = %d, want zero for failed verification", activator.calls)
+	}
+	if activator.verifyCalls != 1 {
+		t.Fatalf("runtime verification calls = %d, want one before fencing the busy runner", activator.verifyCalls)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub registration fence calls = %d, want 1", got)
+	}
+	if got := len(hostTrustLeaseInputs(fake)); got != 0 {
+		t.Fatalf("host trust lease writes = %d, want zero after failed transport verification", got)
 	}
 }
 

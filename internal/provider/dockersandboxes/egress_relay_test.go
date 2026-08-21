@@ -123,6 +123,7 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 	rulePresent := false
 	removed := false
 	rolledBack := false
+	var activationToken string
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 		args := strings.Join(request.args, " ")
 		switch {
@@ -146,7 +147,11 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 			rolledBack = true
 			return provider.ExecResult{}, nil
 		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/opt/epar/configure-egress-relay.sh"):
-			return provider.ExecResult{}, errors.New("guest activation failed")
+			if len(request.sensitiveValues) != 1 {
+				t.Fatalf("sensitive value count = %d, want one relay token", len(request.sensitiveValues))
+			}
+			activationToken = request.sensitiveValues[0]
+			return provider.ExecResult{Stderr: "EPAR host-trust relay: activation failed at private-dockerd-contract (exit=1) token=" + activationToken}, errors.New("guest activation failed")
 		default:
 			t.Fatalf("unexpected command: %v", request.args)
 			return provider.ExecResult{}, nil
@@ -155,7 +160,16 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 
 	err := p.ActivateHostTrustRuntime(context.Background(), testInstance)
 	if err == nil || !strings.Contains(err.Error(), "guest activation failed") {
-		t.Fatalf("activation error = %v, want guest failure", err)
+		t.Fatalf("activation error did not preserve the guest failure")
+	}
+	if !strings.Contains(err.Error(), "activation failed at private-dockerd-contract") {
+		t.Fatalf("activation error did not preserve the fixed failure stage")
+	}
+	if activationToken == "" {
+		t.Fatalf("activation request did not contain a relay token")
+	}
+	if strings.Contains(err.Error(), activationToken) {
+		t.Fatalf("activation error contained the sensitive relay token")
 	}
 	if rulePresent || !removed || !rolledBack {
 		t.Fatalf("rollback state = policy present %t policy removed %t guest rolled back %t", rulePresent, removed, rolledBack)
