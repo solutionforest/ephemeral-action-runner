@@ -497,6 +497,8 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 			fmt.Fprintf(out, "  Architecture emulation: %s\n", architectureEmulation)
 			if architectureEmulation == config.DockerSandboxesArchitectureEmulationBestEffort {
 				fmt.Fprintln(out, "  QEMU/binfmt will be attempted; unsupported hosts continue with verified native containers and a warning.")
+			} else if architectureEmulation == config.DockerSandboxesArchitectureEmulationNativeOnly {
+				fmt.Fprintln(out, "  QEMU/binfmt is disabled by default; Docker Sandboxes runs native containers only.")
 			}
 		}
 	default:
@@ -576,5 +578,5 @@ func renderInitWizardConfig(draft initWizardDraft) (string, error) {
 }
 
 func initDockerSandboxesArchitectureEmulation() string {
-	return config.DockerSandboxesArchitectureEmulationBestEffort
+	return config.DockerSandboxesArchitectureEmulationNativeOnly
 }

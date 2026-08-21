@@ -315,7 +315,7 @@ func Default() Config {
 		},
 		DockerSandboxes: DockerSandboxesConfig{
 			NetworkBaseline:           DockerSandboxesNetworkBaselineOpen,
-			ArchitectureEmulation:     DockerSandboxesArchitectureEmulationBestEffort,
+			ArchitectureEmulation:     DockerSandboxesArchitectureEmulationNativeOnly,
 			RecoveryMode:              DockerSandboxesRecoveryModeExclusiveAuto,
 			RecoveryQuiescenceSeconds: DockerSandboxesDefaultRecoveryQuiescenceSeconds,
 			StagingRoot:               ".local/cache/docker-sandboxes/staging",

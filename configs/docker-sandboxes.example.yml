@@ -55,9 +55,9 @@ dockerSandboxes:
   # The wizard reads and records the exact active host-global policy fingerprint.
   policyGeneration: sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
   networkBaseline: open
-  # best-effort attempts bundled QEMU/binfmt, then continues with a warning when the sandbox supports native containers only.
-  # Use required only when every runner must execute foreign-architecture containers.
-  architectureEmulation: best-effort
+  # native-only disables QEMU/binfmt by default and verifies the native guest and private Docker architecture.
+  # Use best-effort or required only after validating the exact foreign-architecture workload.
+  architectureEmulation: native-only
   # exclusive-auto permits one bounded stop-wait-start recovery per create-admission incident; inventory recovery keeps its bounded backoff retries, and observe never mutates sbx.
   recoveryMode: exclusive-auto
   recoveryQuiescenceSeconds: 60

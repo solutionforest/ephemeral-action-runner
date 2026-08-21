@@ -1621,7 +1621,7 @@ dockerSandboxes:
 	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
 		t.Fatalf("dockerSandboxes.memory = %q, want %q", got, want)
 	}
-	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, DockerSandboxesArchitectureEmulationBestEffort; got != want {
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, DockerSandboxesArchitectureEmulationNativeOnly; got != want {
 		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want omitted configuration to default to %q", got, want)
 	}
 	if got, want := cfg.DockerSandboxes.RecoveryMode, DockerSandboxesRecoveryModeObserve; got != want {

@@ -29,7 +29,7 @@ Choose Docker Sandboxes when its local checks pass and you want a microVM bounda
 
 ## Support Status
 
-EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and configured architecture-capability admission before any runner starts. The wizard uses best-effort QEMU on every host: sandbox runtimes with usable `binfmt_misc` enable the bundled handlers, while runtimes without it continue as verified native runners with a warning. Native lifecycle support does not certify foreign workloads.
+EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and configured architecture-capability admission before any runner starts. The wizard selects `native-only` on every host: it verifies the native guest and private Docker architecture without attempting bundled handlers. Native lifecycle support does not certify foreign workloads.
 
 ## Prerequisites
 
@@ -71,7 +71,7 @@ image:
 dockerSandboxes:
   policyGeneration: sha256:<balanced-policy-fingerprint>
   networkBaseline: open
-  architectureEmulation: best-effort
+  architectureEmulation: native-only
   recoveryMode: exclusive-auto
   recoveryQuiescenceSeconds: 60
   stagingRoot: .local/cache/docker-sandboxes/staging
@@ -94,9 +94,9 @@ The reusable template disables and masks Ubuntu's periodic apt units. Docker San
 
 ## Cross-Architecture Containers
 
-`dockerSandboxes.architectureEmulation` is an explicit capability contract. The default `best-effort` mode copies the pinned `tonistiigi/binfmt:qemu-v10.2.3-68` installer and all static QEMU interpreters from the immutable template, then each newly created sandbox tries the equivalent of `binfmt --install all` as root inside its private VM. This does not run a privileged container on the host. When handlers become active, EPAR records QEMU capability normally. When the sandbox kernel reports that `binfmt_misc` is unavailable, EPAR verifies the configured native guest and private Docker architecture, emits a warning, and continues.
+`dockerSandboxes.architectureEmulation` is an explicit capability contract. The default `native-only` mode skips the QEMU/binfmt attempt and verifies the configured native guest and private Docker architecture. The template still contains the pinned `tonistiigi/binfmt:qemu-v10.2.3-68` installer and static QEMU interpreters for explicit opt-in modes. With `best-effort`, each newly created sandbox tries the equivalent of `binfmt --install all` as root inside its private VM; this does not run a privileged container on the host. When handlers become active, EPAR records QEMU capability normally. When the sandbox kernel reports that `binfmt_misc` is unavailable, EPAR verifies the configured native guest and private Docker architecture, emits a warning, and continues.
 
-`required` uses the same QEMU attempt but fails creation unless at least one bundled handler is active; select it only when foreign-architecture execution is a runner admission requirement. `native-only` skips the attempt and requires no EPAR-owned QEMU handler. Both native paths verify that the guest kernel and private Docker daemon match `provider.platform`. Configurations that omit the key default to `best-effort`, so ordinary native jobs are not blocked by a sandbox-runtime QEMU limitation.
+`required` uses the same QEMU attempt but fails creation unless at least one bundled handler is active; select it only when foreign-architecture execution is a runner admission requirement. `native-only` skips the attempt and requires no EPAR-owned QEMU handler. Both native paths verify that the guest kernel and private Docker daemon match `provider.platform`. Configurations that omit the key default to `native-only`, so ordinary native jobs do not depend on a sandbox-runtime QEMU limitation.
 
 Native image processes remain native because foreign binfmt handlers match only their foreign ELF signatures. Docker manifest selection is unchanged: EPAR does not set `DOCKER_DEFAULT_PLATFORM`, QEMU cannot create a missing manifest, and a Compose service should use its `platform` property when a multi-platform tag must select a foreign variant deliberately. A single-architecture local image can run without a service override when its image metadata already identifies the foreign platform. Treat actual workload startup, health checks, networking, and performance as the compatibility proof.
 

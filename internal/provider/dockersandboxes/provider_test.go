@@ -764,6 +764,17 @@ func TestNewWithArchitectureModeMapsEveryValidatedMode(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsToNativeOnly(t *testing.T) {
+	p := New("sbx")
+	enabler, ok := p.architectureEmulation.(nativeArchitectureEnabler)
+	if !ok {
+		t.Fatalf("default architecture enabler = %T, want nativeArchitectureEnabler", p.architectureEmulation)
+	}
+	if enabler.platform != defaultNativePlatform() {
+		t.Fatalf("default native platform = %q, want %q", enabler.platform, defaultNativePlatform())
+	}
+}
+
 func TestExperimentalV2ReceiptRemainsReadableForCleanup(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{
 		"schemaVersion":   2,

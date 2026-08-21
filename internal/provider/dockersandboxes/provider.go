@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -137,7 +138,18 @@ func New(binary string) *Provider {
 }
 
 func NewWithDryRun(binary string, dryRun bool) *Provider {
-	return newWithArchitectureEmulation(binary, dryRun, qemuBinfmtEnabler{})
+	return NewWithArchitectureMode(binary, dryRun, architectureEmulationNativeOnly, defaultNativePlatform())
+}
+
+func defaultNativePlatform() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "linux/amd64"
+	case "arm64":
+		return "linux/arm64"
+	default:
+		return ""
+	}
 }
 
 func NewWithArchitectureMode(binary string, dryRun bool, mode, platform string) *Provider {
