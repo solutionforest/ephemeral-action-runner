@@ -183,25 +183,32 @@ type DockerConfig struct {
 // the exact imported template identity is stored in EPAR's local artifact
 // receipt rather than user configuration.
 type DockerSandboxesConfig struct {
-	PolicyGeneration      string
-	NetworkBaseline       string
-	ArchitectureEmulation string
-	AdditionalAllow       []string
-	AdditionalDeny        []string
-	StagingRoot           string
-	CPUs                  int
-	Memory                string
-	RootDisk              string
-	DockerDisk            string
-	MaxConcurrentCreates  int
+	PolicyGeneration          string
+	NetworkBaseline           string
+	ArchitectureEmulation     string
+	RecoveryMode              string
+	RecoveryQuiescenceSeconds int
+	AdditionalAllow           []string
+	AdditionalDeny            []string
+	StagingRoot               string
+	CPUs                      int
+	Memory                    string
+	RootDisk                  string
+	DockerDisk                string
+	MaxConcurrentCreates      int
 }
 
 const (
-	DockerSandboxesNetworkBaselineOpen             = "open"
-	DockerSandboxesNetworkBaselineBalanced         = "balanced"
-	DockerSandboxesArchitectureEmulationBestEffort = "best-effort"
-	DockerSandboxesArchitectureEmulationRequired   = "required"
-	DockerSandboxesArchitectureEmulationNativeOnly = "native-only"
+	DockerSandboxesNetworkBaselineOpen              = "open"
+	DockerSandboxesNetworkBaselineBalanced          = "balanced"
+	DockerSandboxesArchitectureEmulationBestEffort  = "best-effort"
+	DockerSandboxesArchitectureEmulationRequired    = "required"
+	DockerSandboxesArchitectureEmulationNativeOnly  = "native-only"
+	DockerSandboxesRecoveryModeExclusiveAuto        = "exclusive-auto"
+	DockerSandboxesRecoveryModeObserve              = "observe"
+	DockerSandboxesDefaultRecoveryQuiescenceSeconds = 60
+	DockerSandboxesMinimumRecoveryQuiescenceSeconds = 1
+	DockerSandboxesMaximumRecoveryQuiescenceSeconds = 300
 )
 
 var dockerSandboxesOpenDefaultDenyResources = []string{
@@ -307,14 +314,16 @@ func Default() Config {
 			},
 		},
 		DockerSandboxes: DockerSandboxesConfig{
-			NetworkBaseline:       DockerSandboxesNetworkBaselineOpen,
-			ArchitectureEmulation: DockerSandboxesArchitectureEmulationBestEffort,
-			StagingRoot:           ".local/cache/docker-sandboxes/staging",
-			CPUs:                  4,
-			Memory:                "8GiB",
-			RootDisk:              DockerSandboxesAutomaticRootDisk,
-			DockerDisk:            DockerSandboxesDefaultDockerDisk,
-			MaxConcurrentCreates:  2,
+			NetworkBaseline:           DockerSandboxesNetworkBaselineOpen,
+			ArchitectureEmulation:     DockerSandboxesArchitectureEmulationNativeOnly,
+			RecoveryMode:              DockerSandboxesRecoveryModeExclusiveAuto,
+			RecoveryQuiescenceSeconds: DockerSandboxesDefaultRecoveryQuiescenceSeconds,
+			StagingRoot:               ".local/cache/docker-sandboxes/staging",
+			CPUs:                      4,
+			Memory:                    "8GiB",
+			RootDisk:                  DockerSandboxesAutomaticRootDisk,
+			DockerDisk:                DockerSandboxesDefaultDockerDisk,
+			MaxConcurrentCreates:      2,
 		},
 		Timeouts: TimeoutConfig{
 			BootSeconds:         180,
@@ -759,6 +768,14 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.DockerSandboxes.NetworkBaseline = strings.ToLower(value)
 		case "architectureEmulation":
 			cfg.DockerSandboxes.ArchitectureEmulation = value
+		case "recoveryMode":
+			cfg.DockerSandboxes.RecoveryMode = strings.ToLower(value)
+		case "recoveryQuiescenceSeconds":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid dockerSandboxes.recoveryQuiescenceSeconds: %w", err)
+			}
+			cfg.DockerSandboxes.RecoveryQuiescenceSeconds = v
 		case "additionalAllow", "additionalDeny":
 			return setListValue(cfg, section, key, parseList(value))
 		case "stagingRoot":
@@ -1368,6 +1385,12 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 	}
 	if sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationBestEffort && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationRequired && sandboxes.ArchitectureEmulation != DockerSandboxesArchitectureEmulationNativeOnly {
 		return fmt.Errorf("unsupported dockerSandboxes.architectureEmulation %q; supported values are best-effort, required, and native-only", sandboxes.ArchitectureEmulation)
+	}
+	if sandboxes.RecoveryMode != DockerSandboxesRecoveryModeExclusiveAuto && sandboxes.RecoveryMode != DockerSandboxesRecoveryModeObserve {
+		return fmt.Errorf("unsupported dockerSandboxes.recoveryMode %q; supported values are exclusive-auto and observe", sandboxes.RecoveryMode)
+	}
+	if sandboxes.RecoveryQuiescenceSeconds < DockerSandboxesMinimumRecoveryQuiescenceSeconds || sandboxes.RecoveryQuiescenceSeconds > DockerSandboxesMaximumRecoveryQuiescenceSeconds {
+		return fmt.Errorf("dockerSandboxes.recoveryQuiescenceSeconds must be between %d and %d", DockerSandboxesMinimumRecoveryQuiescenceSeconds, DockerSandboxesMaximumRecoveryQuiescenceSeconds)
 	}
 	if err := validateDockerSandboxHostnameList("additionalAllow", sandboxes.AdditionalAllow); err != nil {
 		return err

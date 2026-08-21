@@ -41,6 +41,7 @@ func (qemuBinfmtEnabler) Enable(ctx context.Context, sandboxProvider *Provider, 
 		args:        []string{"exec", instance.Name, "--", "sudo", "-n", architectureEmulationHelper},
 		operation:   "enable Docker Sandboxes architecture emulation",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return architectureEmulationResult{}, err
@@ -63,6 +64,7 @@ func (enabler nativeArchitectureEnabler) Enable(ctx context.Context, sandboxProv
 		args:        []string{"exec", instance.Name, "--", "sudo", "-n", nativeArchitectureHelper, enabler.platform},
 		operation:   "verify Docker Sandboxes native architecture",
 		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
 		return architectureEmulationResult{}, err

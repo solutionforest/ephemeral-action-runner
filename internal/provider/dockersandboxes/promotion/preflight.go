@@ -20,8 +20,10 @@ import (
 )
 
 const (
-	DisableEnvironment   = "EPAR_DISABLE_DOCKER_SANDBOXES"
-	preflightOutputLimit = 256 << 10
+	DisableEnvironment      = "EPAR_DISABLE_DOCKER_SANDBOXES"
+	preflightOutputLimit    = 256 << 10
+	preflightCommandTimeout = 30 * time.Second
+	preflightWaitDelay      = 5 * time.Second
 )
 
 var (
@@ -186,13 +188,44 @@ func runSBXCommand(ctx context.Context, args []string) ([]byte, error) {
 	if args[0] == "tui" || args[0] == "reset" {
 		return nil, fmt.Errorf("refusing to invoke forbidden sbx subcommand %q", args[0])
 	}
-	command := exec.CommandContext(ctx, "sbx", args...)
+	commandCtx, cancel := context.WithTimeout(ctx, preflightCommandTimeout)
+	defer cancel()
+	releaseHostLock, err := provider.AcquireControlPlaneCommandLock(commandCtx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHostLock()
+	command := exec.CommandContext(commandCtx, "sbx", args...)
+	isolatePreflightProcess(command)
+	command.WaitDelay = preflightWaitDelay
+	defaultCancel := command.Cancel
+	command.Cancel = func() error {
+		if err := killPreflightProcess(command); err != nil {
+			return defaultCancel()
+		}
+		return nil
+	}
 	command.Env = sandboxCommandEnvironment()
 	stdout := &preflightBuffer{limit: preflightOutputLimit}
 	stderr := &preflightBuffer{limit: preflightOutputLimit}
 	command.Stdout = stdout
 	command.Stderr = stderr
-	err := command.Run()
+	err = command.Start()
+	if err == nil {
+		cleanup, attachErr := attachPreflightProcess(command)
+		if attachErr != nil {
+			cancel()
+			killErr := killPreflightProcess(command)
+			waitErr := command.Wait()
+			err = errors.Join(fmt.Errorf("attach sbx preflight process containment: %w", attachErr), killErr, waitErr)
+		} else {
+			defer cleanup()
+			err = command.Wait()
+		}
+	}
+	if ctxErr := commandCtx.Err(); ctxErr != nil {
+		err = errors.Join(ctxErr, err)
+	}
 	if stdout.overflow || stderr.overflow {
 		err = errors.Join(err, errors.New("sbx preflight output limit exceeded"))
 	}

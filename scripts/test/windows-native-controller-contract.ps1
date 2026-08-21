@@ -8,8 +8,9 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
 $ProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
 $builderPath = Join-Path $ProjectRoot 'scripts\build-native-controller.ps1'
 $dockerPath = Join-Path $ProjectRoot 'scripts\run-with-docker.ps1'
+$startPath = Join-Path $ProjectRoot 'start.ps1'
 
-foreach ($path in @($builderPath, $dockerPath)) {
+foreach ($path in @($builderPath, $dockerPath, $startPath)) {
     $tokens = $null
     $errors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($path, [ref] $tokens, [ref] $errors) | Out-Null
@@ -18,6 +19,7 @@ foreach ($path in @($builderPath, $dockerPath)) {
 
 $builder = Get-Content -Raw -LiteralPath $builderPath
 $docker = Get-Content -Raw -LiteralPath $dockerPath
+$start = Get-Content -Raw -LiteralPath $startPath
 foreach ($required in @(
     'schemaVersion=3',
     'artifactKind=native-controller',
@@ -40,10 +42,17 @@ foreach ($required in @(
     'EPAR_CONTROLLER_SLOT',
     'Remove-Item -LiteralPath $OldSlot -Recurse -Force',
     'Move-Item -LiteralPath $CurrentSlot -Destination $OldSlot',
-    'Move-Item -LiteralPath $Candidate -Destination $CurrentSlot'
+    'Move-Item -LiteralPath $Candidate -Destination $CurrentSlot',
+    'Get-EparFriendlyNativeControllerRebuildReason',
+    'EPAR is preparing its project-local controller because',
+    'Docker will download it now before building the controller'
 )) {
     if (-not $builder.Contains($required)) { throw "native-controller v3 contract is missing: $required" }
 }
+if (-not $start.Contains('Go is not installed or runnable on this machine')) { throw 'Windows ./start must explain the no-Go Docker fallback before controller resolution' }
+if (-not $start.Contains('if the project-local controller needs to be rebuilt')) { throw 'Windows ./start must explain that Docker is conditional on a rebuild' }
+if ($builder.IndexOf('EPAR is preparing its project-local controller because') -ge $builder.IndexOf('$buildLock = Enter-EparStableNativeControllerBuildLock')) { throw 'rebuild explanation must precede build-lock acquisition' }
+if ($builder.IndexOf('Docker will download it now before building the controller') -ge $builder.IndexOf('docker pull $GoImage')) { throw 'Docker image explanation must precede the Go toolchain pull' }
 if ($builder -match '(^|[^A-Za-z])go\s+run\s+\./cmd/ephemeral-action-runner') { throw 'native-controller builder must not execute the controller with go run' }
 if ($docker -match '(^|[^A-Za-z])go\s+run\s+\./cmd/ephemeral-action-runner') { throw 'Docker wrapper must not execute the controller with go run' }
 if (-not $docker.Contains('EPAR_LEGACY_CONTROLLER_IN_DOCKER=1 is no longer supported')) { throw 'legacy Docker controller mode must fail clearly' }
@@ -124,6 +133,7 @@ exit /b %ERRORLEVEL%
 
     $first = Invoke-RuntimeBuilder
     if ($first.ExitCode -ne 0) { throw "first hermetic native build failed: $($first.Output); fake go calls: $((Get-Content -LiteralPath $fakeGoLog -ErrorAction SilentlyContinue) -join ' | ')" }
+    if ($first.Output -notmatch 'EPAR is preparing its project-local controller because') { throw "first hermetic native build did not explain the rebuild: $($first.Output)" }
     $currentSlot = Join-Path $temporary '.local\bin\windows-amd64'
     $oldSlot = Join-Path $temporary '.local\bin\windows-amd64-old'
     $firstReceipt = Read-RuntimeReceipt -Path (Join-Path $currentSlot 'controller.receipt')

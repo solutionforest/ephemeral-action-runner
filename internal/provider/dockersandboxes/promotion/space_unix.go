@@ -3,6 +3,7 @@
 package promotion
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -35,7 +36,14 @@ func sandboxVirtualizationAvailable() error {
 		}
 		return file.Close()
 	case "darwin":
-		output, err := exec.Command("/usr/sbin/sysctl", "-n", "kern.hv_support").Output()
+		ctx, cancel := context.WithTimeout(context.Background(), preflightCommandTimeout)
+		defer cancel()
+		command := exec.CommandContext(ctx, "/usr/sbin/sysctl", "-n", "kern.hv_support")
+		command.WaitDelay = preflightWaitDelay
+		output, err := command.Output()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
 		if err != nil {
 			return fmt.Errorf("query kern.hv_support: %w", err)
 		}

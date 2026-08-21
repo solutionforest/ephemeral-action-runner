@@ -108,9 +108,24 @@ epar_docker_image_id() {
   printf '%s\n' "$image_id"
 }
 
+epar_friendly_native_controller_rebuild_reason() {
+  case "$1" in
+    'slot is missing') printf '%s' 'the project-local controller is not installed yet' ;;
+    'source digest mismatch'*) printf '%s' 'the project source code has changed' ;;
+    'build identity mismatch'*) printf '%s' 'the cached controller was built with a different compiler or build environment' ;;
+    'controller executable is missing'*) printf '%s' 'the cached controller executable needs to be refreshed' ;;
+    *) printf '%s' 'the cached project-local controller needs to be refreshed' ;;
+  esac
+}
+
 epar_resolve_go_toolchain_image() {
   local previous_id resolved_id
   previous_id="$(epar_docker_image_id "$go_image")"
+  if [[ -z "$previous_id" ]]; then
+    printf '%s\n' "EPAR did not find Docker's Go build image ${go_image} locally. Docker will download it now before building the controller. This may take a few minutes." >&2
+  else
+    printf '%s\n' "EPAR is checking Docker's Go build image ${go_image} before building the controller. Docker may download an updated image if needed." >&2
+  fi
   epar_write_bootstrap_acquisition_journal pulling-go-toolchain "$previous_id" '' '' "$previous_dev_image_id"
   docker pull "$go_image" >&2
   resolved_id="$(epar_docker_image_id "$go_image")"
@@ -667,7 +682,12 @@ if [[ -n "$expected_build_digest" ]] && epar_validate_slot "$current_slot" "$tar
   epar_launch_slot "$current_slot" current "$@"
   exit $?
 fi
-if [[ -e "$current_slot" || -L "$current_slot" ]]; then echo "Native controller rebuild required: ${receipt_error:-installed slot has no verifiable build identity}." >&2; else echo 'Native controller build required: no current project-local slot exists.' >&2; fi
+if [[ -e "$current_slot" || -L "$current_slot" ]]; then
+  rebuild_reason="${receipt_error:-installed slot has no verifiable build identity}"
+else
+  rebuild_reason='slot is missing'
+fi
+printf 'EPAR is preparing its project-local controller because %s. This may take a few minutes.\n' "$(epar_friendly_native_controller_rebuild_reason "$rebuild_reason")" >&2
 
 epar_acquire_stable_build_lock
 if [[ "$native_backend" == local-go ]]; then

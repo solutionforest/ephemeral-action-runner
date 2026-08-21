@@ -14,6 +14,14 @@ flowchart LR
   Remove --> Start
 ```
 
+## See it in action
+
+[![EPAR demo — disposable GitHub Actions runners with Docker Sandboxes](https://img.youtube.com/vi/5xDEFpf6iZc/maxresdefault.jpg)](https://www.youtube.com/watch?v=5xDEFpf6iZc)
+
+Watch EPAR take a GitHub Actions job from a warm runner, execute it inside a Docker Sandboxes microVM, retire the runner after the job, and bring a clean replacement back to ready state.
+
+[Watch the demo on YouTube →](https://www.youtube.com/watch?v=5xDEFpf6iZc)
+
 ## Why EPAR
 
 - **Put spare compute to work** — run long-running E2E, integration, and Docker-heavy CI on machines you already operate.

@@ -2,7 +2,7 @@
 3f1cee32d05ffad64004377f0276ef8aa46a2848b32bca74ac35efb3d71fd1bf  ./check-runner.sh
 4fe8e512539f97d00db3c2856f452f017c4de6a04832f1c1af86f1994862df59  ./collect-runner-diagnostics.sh
 b8e9a32759f1ab713af9165c445960528c736eb696ebaa060eaf38667cdee0bf  ./collect-software-inventory.sh
-ca4de65c63f3a7e226e406c2f246e26d12818edf9aaad5f1e37de38e8a131f90  ./configure-egress-relay.sh
+5a44fab73820b530f1fcb4974ffad57c19e92616ad41d984e1fa1236c3ed9680  ./configure-egress-relay.sh
 6257018b1373f0c3ec7b4b77d859b2114693b1173acb51e927f73296cf123fb5  ./configure-runner.sh
 1fbc8c68c8d75f3982e23718ed3d5bd984c2afee21e26657b7a64a9f185a747f  ./docker-daemon.json
 e912446ff3b08f1095f1d3f3935835030c62ba893e438ec88b5f02f07e8b4cb9  ./enable-architecture-emulation.sh

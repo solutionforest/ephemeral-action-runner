@@ -1125,11 +1125,20 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 	if got, want := cfg.DockerSandboxes.NetworkBaseline, config.DockerSandboxesNetworkBaselineOpen; got != want {
 		t.Fatalf("dockerSandboxes.networkBaseline = %q, want %q", got, want)
 	}
-	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationBestEffort; got != want {
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationNativeOnly; got != want {
 		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want wizard value %q", got, want)
 	}
-	if !strings.Contains(string(configContent), "architectureEmulation: best-effort") {
-		t.Fatalf("wizard config omitted best-effort architecture emulation:\n%s", configContent)
+	if got, want := cfg.DockerSandboxes.RecoveryMode, config.DockerSandboxesRecoveryModeExclusiveAuto; got != want {
+		t.Fatalf("dockerSandboxes.recoveryMode = %q, want wizard value %q", got, want)
+	}
+	if got, want := cfg.DockerSandboxes.RecoveryQuiescenceSeconds, config.DockerSandboxesDefaultRecoveryQuiescenceSeconds; got != want {
+		t.Fatalf("dockerSandboxes.recoveryQuiescenceSeconds = %d, want wizard value %d", got, want)
+	}
+	if !strings.Contains(string(configContent), "architectureEmulation: native-only") {
+		t.Fatalf("wizard config omitted native-only architecture emulation:\n%s", configContent)
+	}
+	if !strings.Contains(string(configContent), "recoveryMode: exclusive-auto") || !strings.Contains(string(configContent), "recoveryQuiescenceSeconds: 60") {
+		t.Fatalf("wizard config omitted exclusive automatic recovery defaults:\n%s", configContent)
 	}
 	for key, values := range map[string]struct{ got, want string }{
 		"rootDisk":   {cfg.DockerSandboxes.RootDisk, "auto"},
@@ -1144,10 +1153,13 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 			t.Fatalf("init output omitted %q:\n%s", want, out.String())
 		}
 	}
-	for _, want := range []string{"Architecture emulation: best-effort", "QEMU/binfmt will be attempted; unsupported hosts continue with verified native containers and a warning."} {
+	for _, want := range []string{"Architecture emulation: native-only", "QEMU/binfmt is disabled by default; Docker Sandboxes runs native containers only."} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("wizard review omitted %q:\n%s", want, out.String())
 		}
+	}
+	if strings.Contains(out.String(), "QEMU/binfmt will be attempted") {
+		t.Fatalf("wizard review unexpectedly enabled the QEMU attempt by default:\n%s", out.String())
 	}
 	setupHints := "  Choose how EPAR should provision the reusable runner artifact during startup.\n  Docker Sandboxes profiles must include a private Docker daemon; specialized and custom tags are not admitted.\n  Image catalog: https://github.com/catthehacker/docker_images#images-available\n\nRunner base image:"
 	if !strings.Contains(out.String(), setupHints) {
@@ -1288,6 +1300,7 @@ func TestDockerSandboxesPrebuiltConfigRendersExplicitDistributionAndReference(t 
 		"distribution: prebuilt",
 		"prebuiltReference: " + config.DockerSandboxesPrebuiltActReference,
 		"sourceImage: ghcr.io/catthehacker/ubuntu:act-latest",
+		"architectureEmulation: best-effort",
 		"updateFrequency: weekly",
 		"updateTime: \"07:00\"",
 	} {
@@ -2082,7 +2095,7 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if got, want := cfg.DockerSandboxes.PolicyGeneration, record.PolicyFingerprint; got != want {
 		t.Fatalf("dockerSandboxes.policyGeneration = %q, want %q", got, want)
 	}
-	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationBestEffort; got != want {
+	if got, want := cfg.DockerSandboxes.ArchitectureEmulation, config.DockerSandboxesArchitectureEmulationNativeOnly; got != want {
 		t.Fatalf("dockerSandboxes.architectureEmulation = %q, want Windows wizard value %q", got, want)
 	}
 	for key, values := range map[string]struct {
@@ -2100,7 +2113,7 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: best-effort"} {
+	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: native-only", "recoveryMode: exclusive-auto", "recoveryQuiescenceSeconds: 60"} {
 		if !strings.Contains(string(configText), required) {
 			t.Fatalf("generated Docker Sandboxes config omitted %q:\n%s", required, configText)
 		}
@@ -2113,10 +2126,13 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if !strings.Contains(out.String(), "PASS: the exact promoted platform") || !strings.Contains(out.String(), "Docker Sandboxes — recommended (default)") {
 		t.Fatalf("init output did not explain the promoted default:\n%s", out.String())
 	}
-	for _, want := range []string{"Architecture emulation: best-effort", "QEMU/binfmt will be attempted; unsupported hosts continue with verified native containers and a warning."} {
+	for _, want := range []string{"Architecture emulation: native-only", "QEMU/binfmt is disabled by default; Docker Sandboxes runs native containers only."} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("Windows wizard review omitted %q:\n%s", want, out.String())
 		}
+	}
+	if strings.Contains(out.String(), "QEMU/binfmt will be attempted") {
+		t.Fatalf("Windows wizard review unexpectedly enabled the QEMU attempt by default:\n%s", out.String())
 	}
 }
 
