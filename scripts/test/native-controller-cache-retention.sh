@@ -146,7 +146,7 @@ epar_prune_native_controller_cache "$policy_root" "$policy_current"
 [[ -d "${policy_root}/${policy_grace}" ]] || { echo "retention removed a grace-protected revision beyond the byte budget" >&2; exit 1; }
 
 builder_source="$(cat "$builder")"
-for required in 'golang:latest' 'controller.receipt' 'schemaVersion=3' 'sourceDigest' 'buildDigest' 'binaryDigest' 'lease-native-' 'epar_write_bootstrap_acquisition_journal' 'epar_resolve_go_toolchain_image' 'previousDevImageID' 'previous_dev_image_id' 'epar-native-controller-build.log' 'epar_report_tls_failure' 'TLS verification was not disabled' 'epar_prepare_bootstrap_build_trust' '--network none' 'GO111MODULE=off' 'GOTOOLCHAIN=local' 'SSL_CERT_FILE=/run/epar-bootstrap-ca.pem' 'scripts/bootstrap-trust' ':/run/epar-bootstrap-ca.pem:ro'; do
+for required in 'golang:latest' 'controller.receipt' 'schemaVersion=3' 'sourceDigest' 'buildDigest' 'binaryDigest' 'lease-native-' 'epar_write_bootstrap_acquisition_journal' 'epar_resolve_go_toolchain_image' 'epar_friendly_native_controller_rebuild_reason' 'previousDevImageID' 'previous_dev_image_id' 'epar-native-controller-build.log' 'epar_report_tls_failure' 'TLS verification was not disabled' 'epar_prepare_bootstrap_build_trust' 'EPAR is preparing its project-local controller because' 'Docker will download it now before building the controller' '--network none' 'GO111MODULE=off' 'GOTOOLCHAIN=local' 'SSL_CERT_FILE=/run/epar-bootstrap-ca.pem' 'scripts/bootstrap-trust' ':/run/epar-bootstrap-ca.pem:ro'; do
   [[ "$builder_source" == *"$required"* ]] || { echo "stable native-controller wrapper contract is missing: ${required}" >&2; exit 1; }
 done
 launch_source="$(sed -n '/^epar_launch_slot()/,/^}/p' "$builder")"
@@ -260,7 +260,9 @@ native_smoke_env=(
   'EPAR_CONTROLLER_HOST_OS=darwin'
   'EPAR_HOST_TRUST_INIT_DEFERRED=1'
 )
-(cd "$native_smoke_project" && env "${native_smoke_env[@]}" scripts/build-native-controller.sh start)
+native_first_output="$(cd "$native_smoke_project" && env "${native_smoke_env[@]}" scripts/build-native-controller.sh start 2>&1)"
+[[ "$native_first_output" == *'EPAR is preparing its project-local controller because the project-local controller is not installed yet.'* ]] || { echo 'first Docker controller build did not explain the rebuild' >&2; exit 1; }
+[[ "$native_first_output" == *"EPAR is checking Docker's Go build image golang:latest before building the controller."* ]] || { echo 'first Docker controller build did not explain the Docker Go environment' >&2; exit 1; }
 grep -Fxq 'runtime build=<> runner=<> os=<> deferred=<> args=<start>' "${native_smoke_root}/native.log"
 grep -Fxq 'bootstrap' "${native_smoke_root}/helper.log"
 [[ "$(wc -l <"${native_smoke_root}/helper.log" | tr -d ' ')" == 1 ]] || { echo 'ordinary cached-native start unexpectedly used a runtime trust bridge' >&2; exit 1; }

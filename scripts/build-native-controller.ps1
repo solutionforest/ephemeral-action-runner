@@ -243,6 +243,11 @@ function Get-EparDockerImageID {
 function Resolve-EparGoToolchainImage {
     param([AllowEmptyString()][string] $PreviousDevImageID = '')
     $previousImageID = Get-EparDockerImageID -Reference $GoImage
+    if ([string]::IsNullOrWhiteSpace($previousImageID)) {
+        Write-Host "EPAR did not find Docker's Go build image $GoImage locally. Docker will download it now before building the controller. This may take a few minutes."
+    } else {
+        Write-Host "EPAR is checking Docker's Go build image $GoImage before building the controller. Docker may download an updated image if needed."
+    }
     Write-EparBootstrapAcquisitionJournal -Phase 'pulling-go-toolchain' -PreviousGoImageID $previousImageID -PreviousDevImageID $PreviousDevImageID
     docker pull $GoImage | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "failed to resolve the current Go toolchain image $GoImage" }
@@ -850,6 +855,17 @@ function Test-EparNativeControllerSlot {
     return [pscustomobject]@{ Exists = $true; Owned = $true; Valid = $true; Reason = ''; Receipt = $receipt }
 }
 
+function Get-EparFriendlyNativeControllerRebuildReason {
+    param([Parameter(Mandatory = $true)][string] $Reason)
+    switch -Regex ($Reason) {
+        '^slot is missing$' { return 'the project-local controller is not installed yet' }
+        '^source digest differs' { return 'the project source code has changed' }
+        '^build identity differs' { return 'the cached controller was built with a different compiler or build environment' }
+        '^slot executable' { return 'the cached controller executable needs to be refreshed' }
+        default { return 'the cached project-local controller needs to be refreshed' }
+    }
+}
+
 function Write-EparNativeControllerReceipt {
     param([Parameter(Mandatory = $true)][string] $Directory, [Parameter(Mandatory = $true)][string] $SourceDigest, [Parameter(Mandatory = $true)][string] $BuildDigest, [Parameter(Mandatory = $true)][string] $Builder, [Parameter(Mandatory = $true)][string] $Toolchain)
     $binaryPath = Join-Path $Directory $NativeExecutable
@@ -907,7 +923,8 @@ if ($UseOld) {
     $expectedBuildDigest = if ($toolchain) { Get-EparNativeBuildDigest -SourceDigest $sourceDigest -Builder $Backend -Toolchain $toolchain } else { '' }
     $currentState = Test-EparNativeControllerSlot -Directory $currentSlot -ExpectedSourceDigest $sourceDigest -ExpectedBuildDigest $expectedBuildDigest
     if (-not $currentState.Valid) {
-        Write-Warning "Native controller rebuild required: $($currentState.Reason)"
+        $friendlyReason = Get-EparFriendlyNativeControllerRebuildReason -Reason $currentState.Reason
+        Write-Host "EPAR is preparing its project-local controller because $friendlyReason. This may take a few minutes."
         $buildLock = Enter-EparStableNativeControllerBuildLock -Path $buildLockPath
         try {
             if ($Backend -eq 'docker') {

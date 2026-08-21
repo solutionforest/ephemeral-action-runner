@@ -49,8 +49,12 @@ if ($UseDockerRun -eq '0' -and -not $goUsable) {
     throw "Go not found or not runnable: $GoBin`nInstall Go, set EPAR_GO_BIN, or set EPAR_USE_DOCKER_RUN=1 to use the Docker compiler."
 }
 $Backend = if ($UseDockerRun -eq '1' -or ($UseDockerRun -eq 'auto' -and -not $goUsable)) { 'docker' } else { 'local-go' }
-if ($Backend -eq 'docker') {
-    Write-Warning 'Using the Docker toolchain when a validated project-local controller rebuild is required.'
+if (-not $UseOld -and $Backend -eq 'docker') {
+    if (-not $goUsable) {
+        Write-Host "Go is not installed or runnable on this machine. EPAR will use Docker's Go build environment if the project-local controller needs to be rebuilt."
+    } else {
+        Write-Host "EPAR is configured to use Docker's Go build environment if the project-local controller needs to be rebuilt."
+    }
 }
 
 try {

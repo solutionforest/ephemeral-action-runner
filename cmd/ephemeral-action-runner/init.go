@@ -264,7 +264,7 @@ func runInitWithOptions(opts initOptions) error {
 			return err
 		}
 	}
-	fmt.Fprintln(opts.Out, "EPAR first-run setup")
+	fmt.Fprintln(opts.Out, "Welcome to EPAR first-run setup wizard.")
 	fmt.Fprintln(opts.Out, "")
 	fmt.Fprintln(opts.Out, "This creates an EPAR runner configuration.")
 	fmt.Fprintln(opts.Out, "Before continuing, create a GitHub App with organization self-hosted runner read/write access.")
@@ -2059,6 +2059,8 @@ dockerSandboxes:
   policyGeneration: %s
   networkBaseline: open
   architectureEmulation: %s
+  recoveryMode: exclusive-auto
+  recoveryQuiescenceSeconds: 60
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 8GiB

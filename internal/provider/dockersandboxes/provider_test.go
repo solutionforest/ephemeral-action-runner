@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/staging"
 )
 
 const (
@@ -94,6 +95,307 @@ func TestStartDaemonUsesExactDetachedCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	done()
+}
+
+func TestStartDaemonScrubsSSHAgentEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	t.Setenv("SSH_AUTH_SOCK", "/host/agent.sock")
+	t.Setenv("SSH_AUTH_SOCK_GATEWAY", "gateway.example.test:3129")
+	t.Setenv("SSH_AGENT_PID", "4242")
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	script := "#!/bin/sh\n" +
+		"test \"$#\" -eq 3 && test \"$1\" = daemon && test \"$2\" = start && test \"$3\" = --detach || exit 91\n" +
+		"test -z \"${SSH_AUTH_SOCK:-}\" && test -z \"${SSH_AUTH_SOCK_GATEWAY:-}\" && test -z \"${SSH_AGENT_PID:-}\" || exit 92\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(helper).StartDaemon(context.Background()); err != nil {
+		t.Fatalf("StartDaemon() did not use exact scrubbed detached start: %v", err)
+	}
+}
+
+func TestRecoverControlPlaneUsesExactColdStopAndDetachedStart(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "stop"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"running"}`}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"stopped"}`}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"stopped"}`}},
+		commandStep{args: []string{"daemon", "start", "--detach"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"running"}`}},
+	)
+	var waits []time.Duration
+	p.wait = func(_ context.Context, duration time.Duration) error {
+		waits = append(waits, duration)
+		return nil
+	}
+	if err := p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(waits, []time.Duration{daemonStatePollInterval, time.Minute}) {
+		t.Fatalf("recovery waits = %#v, want stop-state poll followed by exact one-minute quiescence", waits)
+	}
+	done()
+}
+
+func TestRecoverControlPlaneRejectsUnboundedQuiescenceBeforeCommands(t *testing.T) {
+	for _, duration := range []time.Duration{0, -time.Second, maximumRecoveryQuiescence + time.Nanosecond} {
+		p := New("sbx-test-double")
+		called := false
+		p.runCommand = func(context.Context, commandRequest) (provider.ExecResult, error) {
+			called = true
+			return provider.ExecResult{}, nil
+		}
+		if err := p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: duration}); err == nil {
+			t.Fatalf("RecoverControlPlane() accepted quiescence %s", duration)
+		}
+		if called {
+			t.Fatalf("invalid quiescence %s reached provider commands", duration)
+		}
+	}
+}
+
+func TestRecoverControlPlaneDoesNotStartWhenStoppedStateIsUnknown(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "stop"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"wedged"}`}},
+	)
+	err := p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	if err == nil || errors.Unwrap(err) == nil || !strings.Contains(errors.Unwrap(err).Error(), "unsupported state") {
+		t.Fatalf("RecoverControlPlane() error = %v, want unknown stopped-state refusal", err)
+	}
+	done()
+}
+
+func TestRecoverControlPlaneRechecksStoppedStateAfterQuiescence(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "stop"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"stopped"}`}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"running"}`}},
+	)
+	p.wait = func(context.Context, time.Duration) error { return nil }
+	err := p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	if err == nil || errors.Unwrap(err) == nil || !strings.Contains(errors.Unwrap(err).Error(), `state is "running"`) {
+		t.Fatalf("RecoverControlPlane() error = %v, want post-quiescence stopped-state refusal", err)
+	}
+	done()
+}
+
+func TestRecoverControlPlaneSanitizesCommandOutput(t *testing.T) {
+	const secret = "recovery-secret-from-daemon"
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "stop"}, err: errors.New(secret)},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"wedged"}`}},
+	)
+	err := p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	if err == nil {
+		t.Fatal("RecoverControlPlane() error = nil, want recovery failure")
+	}
+	if !errors.Is(err, provider.ErrControlPlaneRecoveryFailure) {
+		t.Fatalf("RecoverControlPlane() error = %v, want recovery sentinel", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("RecoverControlPlane() leaked daemon output: %v", err)
+	}
+	done()
+}
+
+func TestRecoverControlPlaneQuiescenceBlocksConcurrentProviderCommands(t *testing.T) {
+	p := New("sbx-test-double")
+	quiescenceStarted := make(chan struct{})
+	releaseQuiescence := make(chan struct{})
+	recoveryDone := make(chan error, 1)
+	var mu sync.Mutex
+	var calls [][]string
+	statusCalls := 0
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		mu.Lock()
+		calls = append(calls, append([]string(nil), request.args...))
+		mu.Unlock()
+		switch {
+		case reflect.DeepEqual(request.args, []string{"daemon", "stop"}):
+			return provider.ExecResult{}, nil
+		case reflect.DeepEqual(request.args, []string{"daemon", "status", "--json"}):
+			statusCalls++
+			if statusCalls < 3 {
+				return provider.ExecResult{Stdout: `{"status":"stopped"}`}, nil
+			}
+			return provider.ExecResult{Stdout: `{"status":"running"}`}, nil
+		case reflect.DeepEqual(request.args, []string{"daemon", "start", "--detach"}):
+			return provider.ExecResult{}, nil
+		default:
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		}
+	}
+	p.wait = func(waitCtx context.Context, _ time.Duration) error {
+		close(quiescenceStarted)
+		select {
+		case <-releaseQuiescence:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	}
+	go func() {
+		recoveryDone <- p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	}()
+	select {
+	case <-quiescenceStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery did not reach quiescence")
+	}
+	operationCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := p.Inventory(operationCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("concurrent inventory error = %v, want context deadline while recovery owns quiescence", err)
+	}
+	mu.Lock()
+	callCount := len(calls)
+	mu.Unlock()
+	if callCount != 2 {
+		t.Fatalf("provider commands during quiescence = %d, want only stop and first status readback", callCount)
+	}
+	close(releaseQuiescence)
+	if err := <-recoveryDone; err != nil {
+		t.Fatalf("recovery failed after quiescence release: %v", err)
+	}
+}
+
+func TestStartKeepaliveWaitsForControlPlaneRecovery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nsleep 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := New(helper)
+	quiescenceStarted := make(chan struct{})
+	releaseQuiescence := make(chan struct{})
+	recoveryDone := make(chan error, 1)
+	var waitOnce sync.Once
+	statusCalls := 0
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		switch {
+		case reflect.DeepEqual(request.args, []string{"daemon", "stop"}):
+			return provider.ExecResult{}, nil
+		case reflect.DeepEqual(request.args, []string{"daemon", "status", "--json"}):
+			statusCalls++
+			if statusCalls < 3 {
+				return provider.ExecResult{Stdout: `{"status":"stopped"}`}, nil
+			}
+			return provider.ExecResult{Stdout: `{"status":"running"}`}, nil
+		case reflect.DeepEqual(request.args, []string{"daemon", "start", "--detach"}):
+			return provider.ExecResult{}, nil
+		default:
+			t.Fatalf("unexpected recovery command: %#v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+	p.wait = func(waitCtx context.Context, _ time.Duration) error {
+		waitOnce.Do(func() { close(quiescenceStarted) })
+		select {
+		case <-releaseQuiescence:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	}
+	go func() {
+		recoveryDone <- p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	}()
+	select {
+	case <-quiescenceStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery did not reach quiescence")
+	}
+	keepaliveDone := make(chan error, 1)
+	go func() {
+		_, err := p.startKeepalive(context.Background(), testName, commandRequest{args: []string{"exec", "keepalive"}, operation: "test managed keepalive"})
+		keepaliveDone <- err
+	}()
+	select {
+	case err := <-keepaliveDone:
+		t.Fatalf("keepalive launched during recovery quiescence: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseQuiescence)
+	if err := <-recoveryDone; err != nil {
+		t.Fatalf("recovery failed after quiescence release: %v", err)
+	}
+	if err := <-keepaliveDone; err != nil {
+		t.Fatalf("keepalive failed after recovery release: %v", err)
+	}
+}
+
+func TestRecoverControlPlaneQuiescenceCancellationPreventsStart(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "stop"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"stopped"}`}},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	p.wait = func(waitCtx context.Context, _ time.Duration) error {
+		cancel()
+		<-waitCtx.Done()
+		return waitCtx.Err()
+	}
+	err := p.RecoverControlPlane(ctx, provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RecoverControlPlane() error = %v, want context cancellation", err)
+	}
+	done()
+}
+
+func TestRecoverControlPlaneStopTimeoutPreventsFurtherCommands(t *testing.T) {
+	p := New("sbx-test-double")
+	calls := 0
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		calls++
+		if !reflect.DeepEqual(request.args, []string{"daemon", "stop"}) {
+			t.Fatalf("command args = %#v, want exact daemon stop", request.args)
+		}
+		<-ctx.Done()
+		return provider.ExecResult{}, ctx.Err()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := p.RecoverControlPlane(ctx, provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RecoverControlPlane() error = %v, want context deadline", err)
+	}
+	if calls != 1 {
+		t.Fatalf("commands after timed-out stop = %d, want only the stop command", calls)
+	}
+}
+
+func TestParseDaemonControlStateFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		fixture string
+		want    daemonControlState
+		wantErr bool
+	}{
+		{name: "running", fixture: `{"status":"running"}`, want: daemonControlStateRunning},
+		{name: "stopped case insensitive", fixture: `{"status":"STOPPED"}`, want: daemonControlStateStopped},
+		{name: "unknown", fixture: `{"status":"starting"}`, wantErr: true},
+		{name: "non canonical", fixture: `{"status":" stopped "}`, wantErr: true},
+		{name: "missing", fixture: `{}`, wantErr: true},
+		{name: "trailing", fixture: `{"status":"running"} {}`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseDaemonControlState([]byte(test.fixture))
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parseDaemonControlState(%s) = %q, want error", test.fixture, got)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("parseDaemonControlState(%s) = %q, %v, want %q", test.fixture, got, err, test.want)
+			}
+		})
+	}
 }
 
 func TestRemoveTemplateUsesExactCacheIDAndRefusesLiveSandboxes(t *testing.T) {
@@ -316,10 +618,14 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 	if !errors.Is(err, cause) {
 		t.Fatalf("Create error = %v, want original command error to remain wrapped", err)
 	}
+	if !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create error = %v, want typed control-plane admission failure", err)
+	}
 	for _, expected := range []string{
 		sandboxContainerFailureSignature,
 		"EPAR removes SSH-agent variables when its commands start a stopped daemon",
-		"EPAR will not stop or restart a running shared daemon",
+		"recoveryMode=exclusive-auto",
+		"recoveryMode=observe never mutates the daemon",
 		"Coordinate with every process using that daemon",
 		"sbx daemon stop",
 		"env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach",
@@ -329,6 +635,63 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 		}
 	}
 	done()
+}
+
+func TestCreateAdmissionClassificationUsesImmediateCreateStderrOnly(t *testing.T) {
+	const signature = "500 Internal Server Error: failed to run sandbox container"
+	if !hasSandboxCreateAdmissionSignature(signature) {
+		t.Fatal("known create stderr signature was not classified")
+	}
+	if hasSandboxCreateAdmissionSignature("permission denied") {
+		t.Fatal("unrelated create stderr was classified")
+	}
+}
+
+func TestCreateDoesNotClassifyWrappedSignatureWithoutCreateStderr(t *testing.T) {
+	const signature = "500 Internal Server Error: failed to run sandbox container"
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: "permission denied"}, err: errors.New(signature)},
+	)
+	_, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create error = %v, want ordinary failure without admission classification", err)
+	}
+	done()
+}
+
+func TestCreateRemovesEmptyStagingAfterImmediateCreateFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	root := filepath.Join(t.TempDir(), "staging")
+	if _, err := staging.Open(root); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	script := fmt.Sprintf(`#!/bin/sh
+case "$1:$2" in
+diagnose:--output) printf '%%s' '%s' ;;
+template:ls) printf '%%s' '%s' ;;
+ls:--json) printf '%%s' '{"sandboxes":[]}' ;;
+create:*) printf '%%s\n' '500 Internal Server Error: failed to run sandbox container' >&2; exit 1 ;;
+*) exit 91 ;;
+esac
+`, healthyDiagnoseJSON, templateListJSON)
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := New(helper)
+	request := validCreateRequest()
+	request.StagingPath = filepath.Join(root, testName)
+	if _, err := p.Create(context.Background(), request); err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create() error = %v, want typed admission failure", err)
+	}
+	if _, err := os.Stat(request.StagingPath); !os.IsNotExist(err) {
+		t.Fatalf("failed create staging path stat error = %v, want exact empty staging removal", err)
+	}
 }
 
 func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
@@ -398,6 +761,17 @@ func TestNewWithArchitectureModeMapsEveryValidatedMode(t *testing.T) {
 	}
 	if p := NewWithArchitectureMode("sbx", false, "invalid", "linux/amd64"); p.architectureEmulation != nil {
 		t.Fatalf("invalid mode enabler = %T, want nil fail-closed enabler", p.architectureEmulation)
+	}
+}
+
+func TestNewDefaultsToNativeOnly(t *testing.T) {
+	p := New("sbx")
+	enabler, ok := p.architectureEmulation.(nativeArchitectureEnabler)
+	if !ok {
+		t.Fatalf("default architecture enabler = %T, want nativeArchitectureEnabler", p.architectureEmulation)
+	}
+	if enabler.platform != defaultNativePlatform() {
+		t.Fatalf("default native platform = %q, want %q", enabler.platform, defaultNativePlatform())
 	}
 }
 
@@ -1054,21 +1428,93 @@ func TestInventoryFailsClosedAfterSecondInvalidMachineReadableResponse(t *testin
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: "Starting sandboxd daemon..."}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"items":[]}`}},
 	)
-	if _, err := p.Inventory(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported json schema") {
+	_, err := p.Inventory(context.Background())
+	if err == nil || !errors.Is(err, provider.ErrControlPlaneFailure) {
 		t.Fatalf("persistent invalid inventory output was accepted: %v", err)
+	}
+	if cause := errors.Unwrap(err); cause == nil || !strings.Contains(cause.Error(), "unsupported json schema") {
+		t.Fatalf("persistent invalid inventory cause = %v, want schema error", cause)
 	}
 	done()
 }
 
 func TestInventoryDoesNotRetryCommandFailure(t *testing.T) {
-	expected := errors.New("sandboxd unavailable")
+	expected := errors.New("sandboxd unavailable with secret-token")
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"ls", "--json"}, err: expected},
 	)
-	if _, err := p.Inventory(context.Background()); !errors.Is(err, expected) {
+	_, err := p.Inventory(context.Background())
+	if !errors.Is(err, expected) {
 		t.Fatalf("Inventory() error = %v, want command failure", err)
 	}
+	if !errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("Inventory() error = %v, want control-plane sentinel", err)
+	}
+	var failure *provider.ControlPlaneFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("Inventory() error type = %T, want *provider.ControlPlaneFailure", err)
+	}
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("Inventory() user-facing error leaked command detail: %v", err)
+	}
 	done()
+}
+
+func TestInventoryWrapsPersistentMalformedOutputAsControlPlaneFailure(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":`}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":`}},
+	)
+	_, err := p.Inventory(context.Background())
+	if !errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("Inventory() error = %v, want control-plane sentinel", err)
+	}
+	var failure *provider.ControlPlaneFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("Inventory() error type = %T, want *provider.ControlPlaneFailure", err)
+	}
+	done()
+}
+
+func TestInventoryUsesProviderOwnedReadbackDeadline(t *testing.T) {
+	p := New("sbx-test-double")
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		if !reflect.DeepEqual(request.args, []string{"ls", "--json"}) {
+			t.Fatalf("inventory args = %#v", request.args)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("inventory command had no provider-owned deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > providerReadbackTimeout || remaining < providerReadbackTimeout-5*time.Second {
+			t.Fatalf("inventory deadline remaining = %s, want approximately %s", remaining, providerReadbackTimeout)
+		}
+		return provider.ExecResult{Stdout: readyListJSON}, nil
+	}
+	items, err := p.Inventory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Instance.ProviderID != testID {
+		t.Fatalf("inventory = %#v, want exact fixture identity", items)
+	}
+}
+
+func TestRunHonorsOperationTimeout(t *testing.T) {
+	p := New("sbx-test-double")
+	p.runCommand = func(ctx context.Context, _ commandRequest) (provider.ExecResult, error) {
+		<-ctx.Done()
+		return provider.ExecResult{}, ctx.Err()
+	}
+	_, err := p.run(context.Background(), commandRequest{
+		args:      []string{"ls", "--json"},
+		operation: "bounded test command",
+		timeout:   10 * time.Millisecond,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded command error = %v, want context deadline exceeded", err)
+	}
 }
 
 func TestLifecycleCommandsUseExactIdentityAndArgv(t *testing.T) {
@@ -1194,7 +1640,7 @@ func TestKeepaliveSurvivesSuccessfulStartContextCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if content, readErr := os.ReadFile(marker); readErr == nil {
 			if string(content) != "survived" {
@@ -1236,6 +1682,29 @@ func TestKeepaliveCancellationDuringStartupStopsProcess(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("canceled startup left the keepalive running: %v", statErr)
+	}
+}
+
+func TestKeepaliveCancellationDuringStartupStopsProcessTree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	marker := filepath.Join(t.TempDir(), "unexpected")
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	script := "#!/bin/sh\n(sleep 1; printf child-survived >\"$2.child\") &\nprintf '%s' \"$!\" >\"$2.pid\"\nwait\n"
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	p := New(helper)
+	_, err := p.startKeepalive(ctx, testName, commandRequest{args: []string{"exec", marker}, operation: "test managed keepalive"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if _, statErr := os.Stat(marker + ".child"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("canceled startup left a descendant running: %v", statErr)
 	}
 }
 
@@ -1620,6 +2089,11 @@ func TestInjectionCorpusIsRejectedBeforeCommandExecution(t *testing.T) {
 }
 
 func TestCommandBoundaryRejectsInteractiveAndDestructiveGlobalCommands(t *testing.T) {
+	for _, arguments := range [][]string{{"daemon", "status", "--json"}, {"daemon", "stop"}, {"daemon", "start", "--detach"}} {
+		if err := validateCommandRequest(commandRequest{args: arguments, operation: "test exact daemon command"}); err != nil {
+			t.Fatalf("exact Docker Sandboxes daemon command was rejected: %q: %v", arguments, err)
+		}
+	}
 	for _, command := range []string{"tui", "reset", "run", "kit", "secret", "login", "logout", "setup", "ssh", "cp", "completion", "help"} {
 		err := validateCommandRequest(commandRequest{args: []string{command}, operation: "test forbidden command"})
 		if err == nil {
@@ -1636,7 +2110,7 @@ func TestCommandBoundaryRejectsInteractiveAndDestructiveGlobalCommands(t *testin
 			t.Fatalf("non-exact Docker Sandboxes published-port inspection was accepted: %q", arguments)
 		}
 	}
-	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop"}, {"daemon", "stop", "--detach"}, {"daemon", "restart"}, {"daemon", "restart", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
+	for _, arguments := range [][]string{{"daemon"}, {"daemon", "start"}, {"daemon", "start", "--foreground"}, {"daemon", "stop", "--detach"}, {"daemon", "stop", "extra"}, {"daemon", "restart"}, {"daemon", "restart", "--detach"}, {"daemon", "status"}, {"daemon", "status", "--debug"}} {
 		if err := validateCommandRequest(commandRequest{args: arguments, operation: "test forbidden daemon command"}); err == nil {
 			t.Fatalf("non-exact Docker Sandboxes daemon command was accepted: %q", arguments)
 		}

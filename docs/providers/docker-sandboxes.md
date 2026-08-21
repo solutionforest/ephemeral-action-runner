@@ -29,7 +29,7 @@ Choose Docker Sandboxes when its local checks pass and you want a microVM bounda
 
 ## Support Status
 
-EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and configured architecture-capability admission before any runner starts. The wizard uses best-effort QEMU on every host: sandbox runtimes with usable `binfmt_misc` enable the bundled handlers, while runtimes without it continue as verified native runners with a warning. Native lifecycle support does not certify foreign workloads.
+EPAR recommends this provider in the wizard by capability, not by an operating-system allowlist: Docker must work, `sbx diagnose --output json` must report at least one passing check and no failed checks, and the controller architecture must have a matching native guest template. After configuration is saved, ordinary startup additionally requires storage, template, and configured architecture-capability admission before any runner starts. The wizard selects `native-only` on every host: it verifies the native guest and private Docker architecture without attempting bundled handlers. Native lifecycle support does not certify foreign workloads.
 
 ## Prerequisites
 
@@ -71,7 +71,9 @@ image:
 dockerSandboxes:
   policyGeneration: sha256:<balanced-policy-fingerprint>
   networkBaseline: open
-  architectureEmulation: best-effort
+  architectureEmulation: native-only
+  recoveryMode: exclusive-auto
+  recoveryQuiescenceSeconds: 60
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 8GiB
@@ -92,9 +94,9 @@ The reusable template disables and masks Ubuntu's periodic apt units. Docker San
 
 ## Cross-Architecture Containers
 
-`dockerSandboxes.architectureEmulation` is an explicit capability contract. The default `best-effort` mode copies the pinned `tonistiigi/binfmt:qemu-v10.2.3-68` installer and all static QEMU interpreters from the immutable template, then each newly created sandbox tries the equivalent of `binfmt --install all` as root inside its private VM. This does not run a privileged container on the host. When handlers become active, EPAR records QEMU capability normally. When the sandbox kernel reports that `binfmt_misc` is unavailable, EPAR verifies the configured native guest and private Docker architecture, emits a warning, and continues.
+`dockerSandboxes.architectureEmulation` is an explicit capability contract. The default `native-only` mode skips the QEMU/binfmt attempt and verifies the configured native guest and private Docker architecture. The template still contains the pinned `tonistiigi/binfmt:qemu-v10.2.3-68` installer and static QEMU interpreters for explicit opt-in modes. With `best-effort`, each newly created sandbox tries the equivalent of `binfmt --install all` as root inside its private VM; this does not run a privileged container on the host. When handlers become active, EPAR records QEMU capability normally. When the sandbox kernel reports that `binfmt_misc` is unavailable, EPAR verifies the configured native guest and private Docker architecture, emits a warning, and continues.
 
-`required` uses the same QEMU attempt but fails creation unless at least one bundled handler is active; select it only when foreign-architecture execution is a runner admission requirement. `native-only` skips the attempt and requires no EPAR-owned QEMU handler. Both native paths verify that the guest kernel and private Docker daemon match `provider.platform`. Configurations that omit the key default to `best-effort`, so ordinary native jobs are not blocked by a sandbox-runtime QEMU limitation.
+`required` uses the same QEMU attempt but fails creation unless at least one bundled handler is active; select it only when foreign-architecture execution is a runner admission requirement. `native-only` skips the attempt and requires no EPAR-owned QEMU handler. Both native paths verify that the guest kernel and private Docker daemon match `provider.platform`. Configurations that omit the key default to `native-only`, so ordinary native jobs do not depend on a sandbox-runtime QEMU limitation.
 
 Native image processes remain native because foreign binfmt handlers match only their foreign ELF signatures. Docker manifest selection is unchanged: EPAR does not set `DOCKER_DEFAULT_PLATFORM`, QEMU cannot create a missing manifest, and a Compose service should use its `platform` property when a multi-platform tag must select a foreign variant deliberately. A single-architecture local image can run without a service override when its image metadata already identifies the foreign platform. Treat actual workload startup, health checks, networking, and performance as the compatibility proof.
 
@@ -116,14 +118,14 @@ Each allocation receives an empty owner-restricted staging directory, but Action
 
 The listener identity is explicit and self-consistent: `agent` owns its home, XDG, runtime, and Docker configuration directories, and every workflow action and shell command inherits those exact paths. Template construction removes Docker credentials inherited from source-image user homes, and the registration path performs a second narrow scrub of `.docker/config.json` and `.dockercfg` across the actual passwd homes after sandbox boot while preserving `.docker/sandbox/locks`; verification rejects reusable artifacts that retain registry authentication or point identity-derived paths at another user. A workflow login can therefore write only to the disposable sandbox's Docker client configuration, and that file disappears with the sandbox. Registry authorization can still be changed by Docker Sandboxes' host-side credential proxy as described below.
 
-Docker Sandboxes can automatically forward the host SSH agent when its shared daemon inherits `SSH_AUTH_SOCK`. That would expose a host credential capability to every sandbox created by that daemon, so EPAR rejects any guest containing `SSH_AUTH_SOCK`, `SSH_AUTH_SOCK_GATEWAY`, `SSH_AGENT_PID`, or `/run/ssh-agent.sock`. EPAR removes these variables whenever it launches Docker Sandboxes commands, so a stopped daemon that those commands auto-start is sanitized. EPAR cannot repair an already-running daemon that another shell or tool started with forwarding enabled. If creation reports the known `failed to run sandbox container` signature, EPAR preserves that original error and adds this SSH-daemon remediation hint; unrelated create failures do not receive it. EPAR never stops or restarts a running shared daemon automatically. Coordinate with every process using Docker Sandboxes on the host, then stop the daemon and restart it from a sanitized environment before retrying EPAR:
+Docker Sandboxes can automatically forward the host SSH agent when its shared daemon inherits `SSH_AUTH_SOCK`. That would expose a host credential capability to every sandbox created by that daemon, so EPAR rejects any guest containing `SSH_AUTH_SOCK`, `SSH_AUTH_SOCK_GATEWAY`, `SSH_AGENT_PID`, or `/run/ssh-agent.sock`. EPAR removes these variables whenever it launches Docker Sandboxes commands, so a stopped daemon that those commands auto-start is sanitized. If creation reports the known `failed to run sandbox container` signature, EPAR preserves that original error and adds this SSH-daemon remediation hint; unrelated create failures do not receive it. In the default `recoveryMode: exclusive-auto`, the pool classifies that immediate create stderr as a bounded admission incident and may perform one stop-wait-start recovery using the existing host-global gates, then retry lifecycle reconciliation. It also recovers bounded inventory control-plane failures. `observe` never probes or mutates the daemon. Coordinate with every process using Docker Sandboxes on the host before any interruption; if the bounded automatic attempt has already been used or manual recovery is required, stop the daemon and restart it from a sanitized environment before retrying EPAR:
 
 ```sh
 sbx daemon stop
 env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
 ```
 
-Do not relax the verification or merely delete the relay socket: the gateway setting is itself a forwarding capability and the daemon's inherited environment is authoritative for subsequently created sandboxes. A stopped daemon may be started explicitly from the sanitized environment above or auto-started by an EPAR-launched `sbx` command; EPAR does not mutate a running shared daemon to recover from this failure.
+Do not relax the verification or merely delete the relay socket: the gateway setting is itself a forwarding capability and the daemon's inherited environment is authoritative for subsequently created sandboxes. A stopped daemon may be started explicitly from the sanitized environment above or auto-started by an EPAR-launched `sbx` command. EPAR limits automatic admission recovery to one daemon restart per incident, including controller reconciliation retries, and never invokes `sbx reset`, `sbx logout`, or wildcard deletion for this condition.
 
 ## Docker Hub Credentials and Transparent Egress
 

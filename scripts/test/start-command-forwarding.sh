@@ -18,6 +18,8 @@ cp "$source_root/scripts/bootstrap-trust/main.go" "$project/scripts/bootstrap-tr
 cp "$source_root/go.mod" "$source_root/go.sum" "$project/"
 cp -R "$source_root/cmd" "$source_root/internal" "$project/"
 chmod +x "$project/start" "$project/scripts/build-native-controller.sh" "$project/scripts/run-with-docker.sh"
+grep -Fq 'Go is not installed or runnable on this machine' "$project/start" || { echo 'start wrapper does not explain the no-Go Docker fallback' >&2; exit 1; }
+grep -Fq 'if the project-local controller needs to be rebuilt' "$project/start" || { echo 'start wrapper does not explain that Docker is conditional on a rebuild' >&2; exit 1; }
 
 cat >"$fake_bin/go" <<'SCRIPT'
 #!/usr/bin/env bash

@@ -54,7 +54,7 @@ The setup helper is privileged. Use it only in trusted workflows and treat its p
 | Docker Container | Run the setup action inside the disposable job before Docker or Compose uses a foreign image. No EPAR configuration key enables universal emulation. |
 | WSL | Run the setup action inside the WSL runner if its Linux Docker daemon needs a foreign image. An x64 WSL runner does not gain ARM64 execution merely by pulling an ARM64 image. |
 | Tart on Apple Silicon (retired) | The guest is ARM64. The optional Rosetta path is retained for existing configurations and is not equivalent to QEMU/binfmt. Use a distinct label and validate the exact image/workload. |
-| Docker Sandboxes | Keep `provider.platform` native. The default `best-effort` mode tries the bundled QEMU/binfmt handlers and warns when only native execution is available. Set `required` only when foreign execution must be an admission requirement; `native-only` skips the attempt. |
+| Docker Sandboxes | Keep `provider.platform` native. The default `native-only` mode skips QEMU/binfmt. Prefer a native or multi-platform image; `best-effort` and `required` are explicit opt-ins and are not a complete cross-architecture guarantee in `sbx` v0.39. |
 | GitHub-hosted Windows or macOS | These labels do not replace a Linux Docker daemon for container actions or service containers. Use a suitable Linux execution surface. |
 
 Keep architecture-specific jobs on a distinct `runs-on` label. Do not label an ARM64 runner as `ubuntu-latest`: GitHub's `ubuntu-latest` is a GitHub-managed environment, and x64 assumptions can fail on ARM64.
@@ -65,7 +65,7 @@ For an amd64-only service on an ARM64 host, first try a published ARM64 or multi
 
 For an ARM64 image on an x64 Linux runner, follow the same process with `platforms: arm64` and `--platform linux/arm64`. Never treat a successful `docker pull` as the proof; run a container and check both the expected architecture output and the real workload.
 
-Docker Sandboxes has no fixed advertised target matrix. `best-effort` and `required` install every handler available from the immutable host-platform `tonistiigi/binfmt` artifact and let QEMU handle an executable when a registered ELF signature matches. In `best-effort`, missing sandbox-kernel support produces a controller warning and foreign images fail normally at execution time while native jobs continue. `native-only` deliberately makes no foreign-execution claim.
+Docker Sandboxes has no fixed advertised target matrix. The default `native-only` mode deliberately makes no foreign-execution claim. `best-effort` and `required` install every handler available from the immutable host-platform `tonistiigi/binfmt` artifact and let QEMU handle an executable when a registered ELF signature matches, but `sbx` v0.39 does not fully support this path. In `best-effort`, missing sandbox-kernel support produces a controller warning and foreign images fail normally at execution time while native jobs continue. For a job that requires another architecture, use a native target-architecture EPAR machine with Docker Sandboxes or a separate Docker Container configuration with trusted Docker-in-Docker QEMU support.
 
 ## References
 

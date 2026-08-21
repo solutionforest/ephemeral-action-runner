@@ -13,7 +13,98 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 )
 
-var ErrTemplateNotFound = errors.New("imported provider template not found")
+var (
+	ErrTemplateNotFound             = errors.New("imported provider template not found")
+	ErrControlPlaneFailure          = errors.New("provider control plane failure")
+	ErrControlPlaneAdmissionFailure = errors.New("provider control plane admission failure")
+	ErrControlPlaneRecoveryFailure  = errors.New("provider control plane recovery failed")
+)
+
+// ControlPlaneFailure marks a failed provider control-plane command without
+// exposing command output through the user-facing error string. The original
+// cause remains available to errors.Is/errors.As for cancellation and
+// diagnostic handling.
+type ControlPlaneFailure struct {
+	Operation string
+	cause     error
+}
+
+func (failure *ControlPlaneFailure) Error() string {
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrControlPlaneFailure.Error()
+	}
+	return ErrControlPlaneFailure.Error()
+}
+
+func (failure *ControlPlaneFailure) Unwrap() error { return failure.cause }
+
+func (failure *ControlPlaneFailure) Is(target error) bool {
+	return target == ErrControlPlaneFailure
+}
+
+// NewControlPlaneFailure constructs a typed control-plane failure. Callers
+// must supply an operation label that contains no command output or secrets.
+func NewControlPlaneFailure(operation string, cause error) error {
+	return &ControlPlaneFailure{Operation: operation, cause: cause}
+}
+
+// ControlPlaneAdmissionFailure marks a provider admission failure that may be
+// recoverable by restarting the provider control plane. Its Error method
+// preserves the provider's existing safe diagnostic because admission errors
+// already carry the user-facing remediation and redacted command detail.
+type ControlPlaneAdmissionFailure struct {
+	Operation string
+	cause     error
+}
+
+func (failure *ControlPlaneAdmissionFailure) Error() string {
+	if failure.cause != nil {
+		return failure.cause.Error()
+	}
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrControlPlaneAdmissionFailure.Error()
+	}
+	return ErrControlPlaneAdmissionFailure.Error()
+}
+
+func (failure *ControlPlaneAdmissionFailure) Unwrap() error { return failure.cause }
+
+func (failure *ControlPlaneAdmissionFailure) Is(target error) bool {
+	return target == ErrControlPlaneAdmissionFailure
+}
+
+// NewControlPlaneAdmissionFailure constructs a typed provider admission
+// failure without changing the existing user-facing diagnostic.
+func NewControlPlaneAdmissionFailure(operation string, cause error) error {
+	return &ControlPlaneAdmissionFailure{Operation: operation, cause: cause}
+}
+
+// ControlPlaneRecoveryFailure marks a failed provider recovery command without
+// exposing command output through the user-facing error string. The original
+// cause remains available to errors.Is/errors.As for cancellation and tests.
+type ControlPlaneRecoveryFailure struct {
+	Operation string
+	cause     error
+}
+
+func (failure *ControlPlaneRecoveryFailure) Error() string {
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrControlPlaneRecoveryFailure.Error()
+	}
+	return ErrControlPlaneRecoveryFailure.Error()
+}
+
+func (failure *ControlPlaneRecoveryFailure) Unwrap() error { return failure.cause }
+
+func (failure *ControlPlaneRecoveryFailure) Is(target error) bool {
+	return target == ErrControlPlaneRecoveryFailure
+}
+
+// NewControlPlaneRecoveryFailure constructs a typed recovery failure. Callers
+// must supply an operation label that contains no command output or secrets.
+func NewControlPlaneRecoveryFailure(operation string, cause error) error {
+	return &ControlPlaneRecoveryFailure{Operation: operation, cause: cause}
+}
 
 type Instance struct {
 	Name           string
@@ -112,6 +203,19 @@ type Lifecycle interface {
 	Stop(ctx context.Context, instance Instance) error
 	Delete(ctx context.Context, instance Instance) error
 	Inventory(ctx context.Context) ([]InventoryItem, error)
+}
+
+// ControlPlaneRecoveryRequest defines the bounded cold-start interval for an
+// optional provider control-plane recovery operation.
+type ControlPlaneRecoveryRequest struct {
+	Quiescence time.Duration
+}
+
+// ControlPlaneRecoverer is an optional provider capability. Shared lifecycle
+// orchestration decides whether recovery is permitted; implementations must
+// fail closed when the stopped state cannot be established authoritatively.
+type ControlPlaneRecoverer interface {
+	RecoverControlPlane(ctx context.Context, request ControlPlaneRecoveryRequest) error
 }
 
 // ArtifactManager is an optional provider capability for runtimes whose
@@ -216,12 +320,25 @@ type InstanceAdmissionVerifier interface {
 
 // HostTrustRuntimeActivator is an optional provider capability for runtimes
 // that need provider-specific transport work after the common host CA overlay
-// has been installed. The pool invokes it before registration and again after
-// any runtime trust refresh. Implementations must fail closed: returning nil
-// means every provider-owned trust transport needed by the runtime is active
-// and verified for the exact instance.
+// has been installed. The pool invokes it before registration and when a
+// fresh runtime must be prepared after replacement or controller restart.
+// Steady-state reconciliation never invokes this mutating capability on an
+// already registered runner. Providers that need a transport-specific
+// steady-state check should also implement HostTrustRuntimeVerifier; otherwise
+// the pool falls back to the common VerifyRuntime check.
 type HostTrustRuntimeActivator interface {
 	ActivateHostTrustRuntime(ctx context.Context, instance Instance) error
+}
+
+// HostTrustRuntimeVerifier is an optional provider capability for read-only
+// verification of transport state needed by an already registered runtime.
+// The pool invokes it during steady-state reconciliation after the common
+// VerifyRuntime check. Implementations must fail closed and must not mutate
+// network policy, restart a daemon, reconfigure the guest, or expose
+// credentials; returning nil means the exact instance's provider-owned trust
+// transport is active and verified.
+type HostTrustRuntimeVerifier interface {
+	VerifyHostTrustRuntime(ctx context.Context, instance Instance) error
 }
 
 type NetworkPolicyDecision string

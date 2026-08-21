@@ -510,27 +510,6 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 		if !instance.ProviderOwned || (instance.Phase != LifecycleReady && instance.Phase != LifecycleDraining) {
 			continue
 		}
-		if _, requiresTransport := m.providerLifecycle().(provider.HostTrustRuntimeActivator); requiresTransport {
-			providerInstance, providerErr := m.providerInstance(ctx, name)
-			if providerErr != nil {
-				m.warnf("[%s] host trust transport identity warning; lease not refreshed: %v\n", name, providerErr)
-				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, providerErr); fenceErr != nil {
-					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
-				}
-				instance.Phase = LifecycleQuarantined
-				active[name] = instance
-				continue
-			}
-			if err := m.activateProviderHostTrustRuntime(ctx, providerInstance); err != nil {
-				m.warnf("[%s] host trust transport refresh warning; lease not refreshed: %v\n", name, err)
-				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
-					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
-				}
-				instance.Phase = LifecycleQuarantined
-				active[name] = instance
-				continue
-			}
-		}
 		if instance.HostTrustGeneration != current.Generation {
 			// Revoke the old generation before any remote status query. This is
 			// safe for an already-running job (its hook already ran) and closes
@@ -558,6 +537,36 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			if !found {
 				delete(busyHandoff, name)
 				continue
+			}
+			// Relay activation is a destructive guest transaction: it removes the
+			// job-start marker before reconfiguring the private daemon. Verify the
+			// current transport read-only first; if it is unhealthy, fence this
+			// registration and let normal replacement activate a fresh candidate
+			// before GitHub can assign it work.
+			lifecycle := m.providerLifecycle()
+			_, requiresTransportActivation := lifecycle.(provider.HostTrustRuntimeActivator)
+			_, hasTransportVerifier := lifecycle.(provider.HostTrustRuntimeVerifier)
+			if requiresTransportActivation || hasTransportVerifier {
+				providerInstance, providerErr := m.providerInstance(ctx, name)
+				if providerErr != nil {
+					m.warnf("[%s] host trust transport identity warning; lease not refreshed: %v\n", name, providerErr)
+					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, providerErr); fenceErr != nil {
+						m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
+					}
+					instance.Phase = LifecycleQuarantined
+					active[name] = instance
+					continue
+				}
+				if verifyErr := m.verifyProviderHostTrustRuntime(ctx, providerInstance); verifyErr != nil {
+					transportErr := fmt.Errorf("host trust transport verification failed: %w", verifyErr)
+					m.warnf("[%s] host trust transport verification warning; lease not refreshed: %v\n", name, transportErr)
+					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, transportErr); fenceErr != nil {
+						m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
+					}
+					instance.Phase = LifecycleQuarantined
+					active[name] = instance
+					continue
+				}
 			}
 			if runner.Busy {
 				if busyHandoff[name] {

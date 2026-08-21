@@ -9,6 +9,7 @@ Start with the symptom that most closely matches the failure. Regardless of prov
 - [Windows no-Go startup prints an HTTP/2 named-pipe diagnostic](#windows-no-go-startup-prints-an-http2-named-pipe-diagnostic)
 - [A Docker workload fails with an architecture error](#a-docker-workload-fails-with-an-architecture-error)
 - [Docker Sandboxes is unavailable or its preflight fails](#docker-sandboxes-is-unavailable-or-its-preflight-fails)
+- [Docker Sandboxes daemon health passes but inventory hangs](#docker-sandboxes-daemon-health-passes-but-inventory-hangs)
 - [Docker Sandboxes rejects template, policy, or capacity](#docker-sandboxes-rejects-template-policy-or-capacity)
 - [Docker Sandboxes creation fails after a runtime-helper prompt](#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt)
 - [Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present](#docker-sandboxes-rejects-a-staging-workspace-because-ssh-agent-forwarding-is-present)
@@ -130,7 +131,11 @@ docker compose config
 
 `no matching manifest` means the image does not publish the requested platform; emulation cannot create a missing manifest. A platform warning alone does not prove failure, and exit code `139` alone does not prove an architecture mismatch. Enabling emulation does not change normal manifest selection, so request the foreign image with `docker run --platform ...` or the affected Compose service's `platform:` property. EPAR does not inject `DOCKER_DEFAULT_PLATFORM`.
 
-For Docker Sandboxes, keep `provider.platform` native. The default `dockerSandboxes.architectureEmulation: best-effort` attempts the template's pinned QEMU handlers inside the sandbox VM. If `binfmt_misc` is unavailable, EPAR verifies the guest and private Docker architectures, warns that foreign containers may fail, and continues with native jobs. Use `required` only when missing QEMU must reject the runner, or `native-only` to skip the attempt. Do not add a privileged installer to the workflow: it cannot repair a sandbox kernel that does not expose the filesystem.
+For Docker Sandboxes, keep `provider.platform` native. QEMU/binfmt is disabled by default on Linux, macOS, and Windows with `dockerSandboxes.architectureEmulation: native-only`, which verifies the guest and private Docker architecture without attempting foreign execution. As of `sbx` v0.39, QEMU is not fully supported inside Docker Sandboxes, so a passing diagnostic, template build, or image pull is not proof that a foreign-architecture workload will run. Prefer building or publishing a multi-platform image instead of relying on emulation.
+
+If a job requires another architecture, such as X64 on ARM64 or ARM64 on X64, either run EPAR on a machine with the target architecture when using the Docker Sandboxes provider, or run a separate EPAR instance/configuration with `provider.type: docker-container`. Docker Container uses Docker-in-Docker for isolation and can support QEMU/binfmt inside its private daemon for trusted jobs. Select it in the setup wizard by choosing `C. Show compatibility providers`, then `Docker Container`. Keep the target-architecture pool on a distinct runner label and verify the actual workload rather than only pulling the image.
+
+The `best-effort` and `required` modes remain available as explicit configuration choices, but they do not make Docker Sandboxes QEMU fully supported on `sbx` v0.39. Do not add a privileged installer to a Docker Sandboxes workflow: it cannot repair a sandbox kernel that does not expose the required filesystem.
 
 ## Docker Sandboxes is unavailable or its preflight fails
 
@@ -147,6 +152,22 @@ sbx diagnose --output json
 ```
 
 EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose `R` to refresh availability; do not manually force a provider selection or substitute a compatibility provider for a configured Docker Sandboxes pool. Use `C. Show compatibility providers` only when you deliberately intend to create or maintain a compatibility configuration.
+
+## Docker Sandboxes daemon health passes but inventory hangs
+
+### Symptom
+
+`sbx daemon status --json` reports `running` and `sbx diagnose -o json` passes, but `sbx ls --json` hangs, returns an empty response slowly, or ends with a runtime-list cancellation. EPAR may repeatedly report `context canceled`, quarantine instances after the host-trust or inventory deadline, and keep the controller process alive with no ready capacity.
+
+### Diagnosis and remediation
+
+The daemon health and diagnostic commands do not prove that the `/sandbox` inventory path or a managed sandbox's inner Docker API is responsive. Run `sbx ls --json` only with an external operating-system timeout; record whether it returns valid JSON, its elapsed time, and whether stderr reports a cancelled runtime listing. Treat a slow or cancelled inventory response as provider state unknown even when daemon status and diagnostics pass.
+
+Preserve the controller output, daemon log, process tree, durable pool lifecycle state, and a before/after count of the daemon's managed Docker-socket descriptors. Do not repeatedly invoke unbounded `sbx ls`, start a second EPAR controller, use `sbx reset`, remove a sandbox by prefix, prune Docker state, or manually delete GitHub runners. EPAR intentionally quarantines uncertain resources and keeps them counted against `pool.instances` until exact ownership and cleanup can be verified.
+
+With the default `dockerSandboxes.recoveryMode: exclusive-auto`, EPAR keeps the controller alive, acquires a host-global recovery lock, and performs a cold stop, authoritative stopped-state confirmation, configured quiescence interval, sanitized detached start, and repeated inventory verification. During that sequence it lets already-running provider commands drain and gates new provider commands so another lifecycle operation cannot race the daemon restart. It backs off after failed attempts and preserves exact capacity while recovery is unresolved. The recovery path never invokes `sbx reset`, `sbx logout`, `sbx prune`, or wildcard deletion. Set `recoveryMode: observe` only when an operator deliberately needs to prevent daemon mutation during maintenance.
+
+If automatic recovery is disabled or the controller is not running, stop only the affected controller before a manual daemon interruption. Then run `sbx daemon stop`, wait until `sbx daemon status --json` reports `stopped`, and start with `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach`. Before starting a new EPAR controller, require `sbx daemon status --json` to report `running`, `sbx diagnose -o json` to have no failed checks, and repeated bounded `sbx ls --json` calls to complete with valid JSON in a stable time. A passing diagnostic report without a responsive inventory is not a healthy Sandbox provider.
 
 ## Docker Sandboxes rejects template, policy, or capacity
 
@@ -186,14 +207,14 @@ Sandbox creation reaches `verify dedicated docker sandbox staging workspace` and
 
 Docker Sandboxes may forward the host SSH agent when its shared daemon inherits the host's agent environment. EPAR rejects the resulting sandbox because the forwarded socket or gateway could let a workflow use host SSH credentials. This is not evidence that the staging mount is missing or read-only, and deleting only `/run/ssh-agent.sock` is insufficient when the forwarding gateway remains configured.
 
-EPAR never stops or restarts a running shared daemon automatically. Coordinate the interruption with every process using the shared Docker Sandboxes daemon, then stop it and restart it with all forwarding variables removed before retrying EPAR:
+In the default `recoveryMode: exclusive-auto`, EPAR treats the known immediate create-stage signature as a bounded admission incident and may perform one stop-wait-start recovery using the existing host-global gates, then retry lifecycle reconciliation. The recovery is limited to one daemon restart per incident, including controller reconciliation retries; `recoveryMode: observe` never probes or mutates the daemon. Coordinate the interruption with every process using the shared Docker Sandboxes daemon. If the automatic attempt has already been used or manual recovery is required, stop it and restart it with all forwarding variables removed before retrying EPAR:
 
 ```sh
 sbx daemon stop
 env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach
 ```
 
-EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. A stopped daemon can also be started explicitly from the sanitized environment above; EPAR does not mutate a running shared daemon as a recovery action. Do not disable this admission check or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
+EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check, use `sbx reset` or `sbx logout`, or forward an agent into a reusable runner template. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
 
 ## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
 
@@ -208,6 +229,8 @@ First verify only metadata, never credential contents: the listener should run a
 Inspect the host Docker Sandboxes daemon log for a message that the proxy is overriding a client-supplied registry credential with a host credential. When that message is present, the workflow credential was written correctly but dockerd used the credential-injecting forward path. An explicit guest config path cannot bypass that path.
 
 On a Windows controller with `image.hostTrustMode: overlay`, `/run/epar/egress-relay-active` must be a root-owned regular marker, `docker info` must report `http://127.0.0.1:3129` as its HTTPS proxy and an empty HTTP proxy, and `sbx policy log <sandbox-name>` must contain a fresh allowed `transparent` record for the controller relay port, normally rendered as `localhost:<port>`. A fresh Docker Hub `forward` record during activation is an admission failure. `NoProxy=*` is only the pre-activation bootstrap contract or the runtime contract for configurations that do not require the Windows relay; a Windows overlay job never falls back to that route. In either mode `/etc/docker/daemon.json` must be root-owned and non-symlinked. Stop the controller, let exact cleanup finish, rebuild, and use a newly created runner after any contract mismatch.
+
+If host-trust relay activation fails, start with `work/logs/epar-last-error.log`. The error includes a fixed stage such as `private-dockerd-contract`, `registry-tls-proof`, or `guest-bridge-health`; use that stage to select the matching guest and Docker Sandboxes diagnostics. These stage messages are intentionally redacted and do not include the relay token or configuration payload.
 
 If a transparent Docker Sandboxes connection presents `Norton Web/Mail Shield Untrusted Root` or another antivirus-generated untrusted issuer, do not add that issuer to EPAR's trust overlay. It is a synthetic error certificate indicating that the inspector rejected Docker Sandboxes' upstream path, not a missing ordinary inspection root. Current Windows overlay runners avoid that path by making the native controller host establish the public TCP connection. Workflow clients retain end-to-end TLS through the raw listener and validate the normal host-approved inspection chain with `/opt/epar/trust/ca-bundle.pem`. The Docker listener terminates daemon TLS with a root-only per-sandbox ephemeral authority and independently verifies the upstream host-approved chain, working around Docker Engine's stalled HelloRetryRequest without exposing registry credentials to the host relay. Failure of either listener, daemon restart/readback, Registry TLS proof, or fresh relay policy evidence blocks registration.
 
