@@ -2,8 +2,8 @@ name: Docker Sandboxes prebuilt images
 
 on:
   schedule:
-    - cron: '37 */6 * * *'
-    - cron: '7 1,7,13,19 * * *'
+    - cron: '37 23 */7 * *'
+    - cron: '57 23 */7 * *'
   push:
     branches:
       - main
@@ -137,6 +137,7 @@ jobs:
       runner_amd64_digest: ${{ steps.runner.outputs.amd64_digest }}
       runner_arm64_url: ${{ steps.runner.outputs.arm64_url }}
       runner_arm64_digest: ${{ steps.runner.outputs.arm64_digest }}
+      catalog_manifest_digest: ${{ steps.catalog.outputs.catalog_manifest_digest }}
       noop: ${{ steps.noop.outputs.noop }}
     steps:
       - name: Check out source
@@ -171,8 +172,8 @@ jobs:
           profile="${DISPATCH_PROFILE:-act}"
           if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
             case "$SCHEDULE_EXPRESSION" in
-              '37 */6 * * *') profile=act ;;
-              '7 1,7,13,19 * * *') profile=full ;;
+              '37 23 */7 * *') profile=full ;;
+              '57 23 */7 * *') profile=act ;;
               *) echo "unsupported schedule expression: $SCHEDULE_EXPRESSION" >&2; exit 1 ;;
             esac
           fi
@@ -276,6 +277,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Fetch current signed catalog state or initialize an empty ledger
+        id: catalog
         shell: bash
         env:
           PROFILE: ${{ steps.select.outputs.profile }}
@@ -294,6 +296,7 @@ jobs:
           if catalog_digest="$(oras resolve "$catalog_reference" 2>"$catalog_error")"; then
             [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${catalog_digest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog_dir/catalog-state.json"
+            echo "catalog_manifest_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
           else
             if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_error"; then
               cat "$catalog_error" >&2
@@ -313,6 +316,7 @@ jobs:
             "transitions": []
           }
           JSON
+            echo 'catalog_manifest_digest=' >> "$GITHUB_OUTPUT"
           fi
           jq -e . "$catalog_dir/catalog-state.json" >/dev/null
 
@@ -321,9 +325,26 @@ jobs:
         shell: bash
         env:
           PROFILE: ${{ steps.select.outputs.profile }}
+          EXPECTED_CATALOG_MANIFEST: ${{ steps.catalog.outputs.catalog_manifest_digest }}
         run: |
           set -euo pipefail
           catalog="$RUNNER_TEMP/epar-catalog/catalog-state.json"
+          expected_catalog_manifest="${EXPECTED_CATALOG_MANIFEST:-}"
+          current_catalog_manifest=''
+          catalog_cas_error="$RUNNER_TEMP/epar-catalog/catalog-reconcile-cas.error"
+          if current_catalog_manifest="$(oras resolve "${PACKAGE_REPOSITORY}:catalog-v1" 2>"$catalog_cas_error")"; then
+            [[ "$current_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_cas_error"; then
+              cat "$catalog_cas_error" >&2
+              exit 1
+            fi
+            current_catalog_manifest=''
+          fi
+          [[ "$current_catalog_manifest" == "$expected_catalog_manifest" ]] || {
+            echo "catalog-v1 changed while preparing alias reconciliation (expected ${expected_catalog_manifest:-missing}, observed ${current_catalog_manifest:-missing})" >&2
+            exit 1
+          }
           alias_ref="${PACKAGE_REPOSITORY}:${PROFILE}-latest"
           observed=''
           alias_error="$RUNNER_TEMP/epar-catalog/alias-reconcile.error"
@@ -338,6 +359,21 @@ jobs:
           if [[ "$(jq -r '.needsRepair' "$plan")" == true ]]; then
             target="$(jq -er '.targetDigest' "$plan")"
             [[ "$(oras resolve "${PACKAGE_REPOSITORY}@${target}")" == "$target" ]]
+            alias_cas_error="$RUNNER_TEMP/epar-catalog/alias-reconcile-cas.error"
+            current_alias_digest=''
+            if current_alias_digest="$(oras resolve "$alias_ref" 2>"$alias_cas_error")"; then
+              [[ "$current_alias_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            else
+              if ! grep -Eqi 'manifest unknown|not found|404' "$alias_cas_error"; then
+                cat "$alias_cas_error" >&2
+                exit 1
+              fi
+              current_alias_digest=''
+            fi
+            [[ "$current_alias_digest" == "$observed" ]] || {
+              echo "${PROFILE}-latest changed while preparing alias reconciliation (expected ${observed:-missing}, observed ${current_alias_digest:-missing})" >&2
+              exit 1
+            }
             oras tag "${PACKAGE_REPOSITORY}@${target}" "${PROFILE}-latest"
             [[ "$(oras resolve "$alias_ref")" == "$target" ]]
             echo "Recovered interrupted ${PROFILE} alias promotion to ${target}." >> "$GITHUB_STEP_SUMMARY"
@@ -362,18 +398,75 @@ jobs:
         run: |
           set -euo pipefail
           catalog="$RUNNER_TEMP/epar-catalog/catalog-state.json"
+          matching_entries="$RUNNER_TEMP/epar-catalog/matching-entries.json"
+          matching_entry="$RUNNER_TEMP/epar-catalog/matching-entry.json"
           noop=false
           if [[ "$FORCE_CANDIDATE" != true ]]; then
-            # A retained candidate is also a no-op: rebuilding it can produce a
-            # different index digest and make the immutable catalog reject the
-            # same complete tuple. Only revoked/critical entries are ignored.
-            jq -e --arg profile "$PROFILE" --arg source "$SOURCE_INDEX_DIGEST" \
+            # Only a complete candidate or active entry can suppress a build.
+            # Superseded entries must not suppress a build because their package
+            # is no longer the catalog's current accepted result.
+            jq -c --arg profile "$PROFILE" --arg source "$SOURCE_INDEX_DIGEST" \
               --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" \
               --arg recipe "$RECIPE_DIGEST" --arg revision "$RECIPE_REVISION" --arg sourceLock "$SOURCE_LOCK_DIGEST" --arg tool "$TOOL_DIGEST" \
               --arg runtime "$RUNTIME_CONTRACT" --arg schema "$TEMPLATE_SCHEMA" --arg runner "$RUNNER_VERSION" \
               --arg amd64 "$RUNNER_AMD64_DIGEST" --arg arm64 "$RUNNER_ARM64_DIGEST" \
-              '.entries[] as $entry | (([.transitions[]? | select(.packageIndexDigest == $entry.packageIndexDigest) | .toStatus] | last) // $entry.status) as $effectiveStatus | select(($effectiveStatus == "candidate" or $effectiveStatus == "active" or $effectiveStatus == "superseded") and $entry.profile == $profile and $entry.source.indexDigest == $source and $entry.source.platformDigests["linux/amd64"] == $sourceAmd64 and $entry.source.platformDigests["linux/arm64"] == $sourceArm64 and $entry.recipe.digest == $recipe and $entry.recipe.recipeRevision == $revision and $entry.recipe.sourceLockDigest == $sourceLock and $entry.recipe.toolDigest == $tool and $entry.recipe.runtimeContract == $runtime and ($entry.recipe.templateSchema | tostring) == $schema and $entry.runner.version == $runner and $entry.runner.assetDigests["linux/amd64"] == $amd64 and $entry.runner.assetDigests["linux/arm64"] == $arm64)' \
-              "$catalog" >/dev/null && noop=true || true
+              '. as $catalog | [
+                $catalog.entries[] as $entry
+                | (([$catalog.transitions[]? | select(.packageIndexDigest == $entry.packageIndexDigest) | .toStatus] | last) // $entry.status) as $effectiveStatus
+                | select(
+                    ($effectiveStatus == "candidate" or $effectiveStatus == "active")
+                    and $entry.profile == $profile
+                    and $entry.source.indexDigest == $source
+                    and $entry.source.platformDigests["linux/amd64"] == $sourceAmd64
+                    and $entry.source.platformDigests["linux/arm64"] == $sourceArm64
+                    and $entry.recipe.digest == $recipe
+                    and $entry.recipe.recipeRevision == $revision
+                    and $entry.recipe.sourceLockDigest == $sourceLock
+                    and $entry.recipe.toolDigest == $tool
+                    and $entry.recipe.runtimeContract == $runtime
+                    and ($entry.recipe.templateSchema | tostring) == $schema
+                    and $entry.runner.version == $runner
+                    and $entry.runner.assetDigests["linux/amd64"] == $amd64
+                    and $entry.runner.assetDigests["linux/arm64"] == $arm64
+                    and $entry.gates.sourceResolved == true
+                    and $entry.gates.sourceRechecked == true
+                    and $entry.gates.buildSucceeded == true
+                    and $entry.gates.platformsValidated == true
+                    and $entry.gates.provenanceGenerated == true
+                    and $entry.gates.sbomGenerated == true
+                    and $entry.gates.attestationVerified == true
+                    and ($effectiveStatus != "active" or $catalog.aliases[$profile].packageIndexDigest == $entry.packageIndexDigest)
+                  )
+                | $entry
+              ]' "$catalog" > "$matching_entries"
+
+            match_count="$(jq 'length' "$matching_entries")"
+            case "$match_count" in
+              0)
+                echo 'No complete matching catalog entry; the hosted build will proceed.'
+                ;;
+              1)
+                jq -e '.[0]' "$matching_entries" > "$matching_entry"
+                package_reference="$(jq -er '.packageReference' "$matching_entry")"
+                [[ "$package_reference" == "${PACKAGE_REPOSITORY}@sha256:"* ]]
+                # Verify the immutable package and its signed evidence before
+                # suppressing work. This is metadata-only and does not pull
+                # image layers. A failed verification is fail-closed.
+                go run ./cmd/epar-prebuilt-publisher verify-package \
+                  --reference "$package_reference" \
+                  --entry "$matching_entry" \
+                  --repository "$PACKAGE_REPOSITORY" \
+                  --ref refs/heads/main \
+                  --allowed-events schedule,workflow_dispatch,push \
+                  > "$RUNNER_TEMP/epar-catalog/package-verification.json"
+                noop=true
+                echo "Verified immutable package metadata for $package_reference; skipping hosted builds."
+                ;;
+              *)
+                echo "Catalog contains $match_count complete matching entries; refusing an ambiguous no-op." >&2
+                exit 1
+                ;;
+            esac
           fi
           echo "noop=$noop" >> "$GITHUB_OUTPUT"
 
@@ -1118,6 +1211,7 @@ jobs:
           PACKAGE_REF: ${{ needs.publish.outputs.package_ref }}
           SOURCE_RECHECKED: ${{ needs.publish.outputs.source_rechecked }}
           ALLOW_ALIAS: ${{ github.ref == 'refs/heads/main' }}
+          EXPECTED_CATALOG_MANIFEST: ${{ needs.resolve.outputs.catalog_manifest_digest }}
         run: |
           set -euo pipefail
           immutable_catalog_ref="${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}"
@@ -1134,6 +1228,11 @@ jobs:
               exit 1
             fi
             old_catalog_digest=''
+          fi
+          expected_catalog_manifest="${EXPECTED_CATALOG_MANIFEST:-}"
+          if [[ "$old_catalog_digest" != "$expected_catalog_manifest" ]]; then
+            echo "catalog-v1 moved since resolve (expected ${expected_catalog_manifest:-missing}, observed ${old_catalog_digest:-missing}); refusing to publish stale catalog state" >&2
+            exit 1
           fi
           plan_action="$(jq -r '.action' "$PLAN")"
           move_alias=false
@@ -1162,26 +1261,36 @@ jobs:
             trap - EXIT
             set +e
             if [[ "$alias_moved" == true ]]; then
-              if [[ -n "$old_alias_digest" ]]; then
+              actual_alias_digest="$(oras resolve "$alias_ref" 2>/dev/null || true)"
+              if [[ "$actual_alias_digest" == "${PACKAGE_REF##*@}" && -n "$old_alias_digest" ]]; then
                 oras tag "${PACKAGE_REPOSITORY}@${old_alias_digest}" "${PROFILE}-latest" >/dev/null
                 [[ "$(oras resolve "$alias_ref")" == "$old_alias_digest" ]] || echo 'alias rollback readback failed' >&2
-              else
+              elif [[ "$actual_alias_digest" == "${PACKAGE_REF##*@}" ]]; then
                 echo 'alias rollback cannot remove a first-publication alias; catalog rollback remains authoritative' >&2
+              else
+                echo 'alias rollback skipped because the alias changed after this publication' >&2
               fi
             fi
-            if [[ "$catalog_moved" == true && -n "$old_catalog_digest" ]]; then
-              oras tag "${PACKAGE_REPOSITORY}@${old_catalog_digest}" catalog-v1 >/dev/null
-              [[ "$(oras resolve "$catalog_moving")" == "$old_catalog_digest" ]] || echo 'catalog rollback readback failed' >&2
-            elif [[ "$catalog_moved" == true ]]; then
-              echo 'catalog rollback cannot remove a first-publication catalog pointer; it remains signed with no trusted alias' >&2
+            if [[ "$catalog_moved" == true ]]; then
+              actual_catalog_digest="$(oras resolve "$catalog_moving" 2>/dev/null || true)"
+              if [[ "$actual_catalog_digest" == "$CATALOG_MANIFEST" && -n "$old_catalog_digest" ]]; then
+                oras tag "${PACKAGE_REPOSITORY}@${old_catalog_digest}" catalog-v1 >/dev/null
+                [[ "$(oras resolve "$catalog_moving")" == "$old_catalog_digest" ]] || echo 'catalog rollback readback failed' >&2
+              elif [[ "$actual_catalog_digest" == "$CATALOG_MANIFEST" ]]; then
+                echo 'catalog rollback cannot remove a first-publication catalog pointer; it remains signed with no trusted alias' >&2
+              else
+                echo 'catalog rollback skipped because the catalog pointer changed after this publication' >&2
+              fi
             fi
             exit "$rc"
           }
-          if [[ "$move_alias" == true ]]; then
+          if [[ "$ALLOW_ALIAS" == true ]]; then
             trap rollback_pointers EXIT
             oras tag "${PACKAGE_REPOSITORY}:catalog-v1-pkg-${CATALOG_DIGEST#sha256:}" catalog-v1
             catalog_moved=true
             [[ "$(oras resolve "$catalog_moving")" == "$CATALOG_MANIFEST" ]]
+          fi
+          if [[ "$move_alias" == true ]]; then
             alias_cas_error="$RUNNER_TEMP/epar-promotion/alias-cas-resolve.error"
             if actual_alias_digest="$(oras resolve "$alias_ref" 2>"$alias_cas_error")"; then
               [[ -z "$expected_alias" || "$actual_alias_digest" == "$expected_alias" ]]
@@ -1197,6 +1306,10 @@ jobs:
             [[ "$(oras resolve "$alias_ref")" == "${PACKAGE_REF##*@}" ]]
             trap - EXIT
             echo 'Signed catalog was moved before the authorized source-only profile alias; pointer rollback was armed until both readbacks passed.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$ALLOW_ALIAS" == true ]]; then
+            trap - EXIT
+            echo "Signed immutable candidate catalog: ${immutable_catalog_ref}" >> "$GITHUB_STEP_SUMMARY"
+            echo 'catalog-v1 was moved; the profile alias was not moved; protected EPAR acceptance remains required.' >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Signed immutable candidate catalog: ${immutable_catalog_ref}" >> "$GITHUB_STEP_SUMMARY"
             echo 'catalog-v1 and the profile alias were not moved; protected EPAR acceptance remains required.' >> "$GITHUB_STEP_SUMMARY"
@@ -1211,6 +1324,8 @@ jobs:
       attestations: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      catalog_manifest: ${{ steps.review.outputs.catalog_manifest }}
     steps:
       - name: Check out source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1227,6 +1342,7 @@ jobs:
           version: 1.3.3
 
       - name: Verify candidate identities and prepare the reviewer checklist
+        id: review
         shell: bash
         env:
           PROFILE: ${{ inputs.profile }}
@@ -1288,6 +1404,23 @@ jobs:
           package_arm64="$(jq -er '.platforms[] | select(.platform == "linux/arm64") | .packageManifestDigest' "$entry")"
           source_amd64="$(jq -er '.source.platformDigests["linux/amd64"]' "$entry")"
           source_arm64="$(jq -er '.source.platformDigests["linux/arm64"]' "$entry")"
+          catalog_moving="${PACKAGE_REPOSITORY}:catalog-v1"
+          catalog_pointer_error="$RUNNER_TEMP/promotion-review-catalog-pointer.error"
+          expected_catalog_manifest=''
+          if expected_catalog_manifest="$(oras resolve "$catalog_moving" 2>"$catalog_pointer_error")"; then
+            [[ "$expected_catalog_manifest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_pointer_error"; then
+              cat "$catalog_pointer_error" >&2
+              exit 1
+            fi
+            expected_catalog_manifest=''
+          fi
+          [[ -n "$expected_catalog_manifest" && "$candidate_catalog_manifest" == "$expected_catalog_manifest" ]] || {
+            echo "candidate catalog ${candidate_catalog_manifest} is not the current catalog-v1 head (${expected_catalog_manifest:-missing}); refusing to promote a stale ledger snapshot" >&2
+            exit 1
+          }
+          echo "catalog_manifest=$expected_catalog_manifest" >> "$GITHUB_OUTPUT"
           {
             echo '## EPAR prebuilt promotion review'
             echo
@@ -1300,6 +1433,7 @@ jobs:
             echo "| Package index | \`${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}\` |"
             echo "| Candidate catalog | \`${CANDIDATE_CATALOG_REFERENCE}\` |"
             echo "| Catalog manifest | \`${candidate_catalog_manifest}\` |"
+            echo "| Current catalog-v1 manifest at review | \`${expected_catalog_manifest:-missing}\` |"
             echo "| Upstream source | \`${source_reference}\` |"
             echo "| Upstream index | \`${source_digest}\` |"
             echo "| Recipe | \`${recipe_digest}\` at \`${recipe_revision}\` |"
@@ -1518,6 +1652,7 @@ jobs:
           PACKAGE_REPOSITORY: ${{ env.PACKAGE_REPOSITORY }}
           CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
           PLAN: ${{ steps.verify.outputs.plan }}
+          EXPECTED_CATALOG_MANIFEST: ${{ needs.prepare-promotion-review.outputs.catalog_manifest }}
         run: |
           set -euo pipefail
           [[ "$(oras resolve "$IMMUTABLE_REF")" == "$CATALOG_MANIFEST" ]]
@@ -1533,6 +1668,11 @@ jobs:
               exit 1
             fi
             old_catalog_digest=''
+          fi
+          expected_catalog_manifest="${EXPECTED_CATALOG_MANIFEST:-}"
+          if [[ "$old_catalog_digest" != "$expected_catalog_manifest" ]]; then
+            echo "catalog-v1 changed after reviewer preparation (expected ${expected_catalog_manifest:-missing}, observed ${old_catalog_digest:-missing}); refusing stale manual promotion" >&2
+            exit 1
           fi
           alias_tag="${PROFILE}-latest"
           alias_ref="${PACKAGE_REPOSITORY}:${alias_tag}"
@@ -1557,22 +1697,45 @@ jobs:
             trap - EXIT
             set +e
             if [[ "$alias_moved" == true ]]; then
-              if [[ -n "$old_alias_digest" ]]; then
+              actual_alias_digest="$(oras resolve "$alias_ref" 2>/dev/null || true)"
+              if [[ "$actual_alias_digest" == "$CANDIDATE_DIGEST" && -n "$old_alias_digest" ]]; then
                 oras tag "${PACKAGE_REPOSITORY}@${old_alias_digest}" "$alias_tag" >/dev/null
                 [[ "$(oras resolve "$alias_ref")" == "$old_alias_digest" ]] || echo 'manual alias rollback readback failed' >&2
-              else
+              elif [[ "$actual_alias_digest" == "$CANDIDATE_DIGEST" ]]; then
                 echo 'manual alias rollback cannot remove a first-publication alias; catalog rollback remains authoritative' >&2
+              else
+                echo 'manual alias rollback skipped because the alias changed after this promotion' >&2
               fi
             fi
-            if [[ "$catalog_moved" == true && -n "$old_catalog_digest" ]]; then
-              oras tag "${PACKAGE_REPOSITORY}@${old_catalog_digest}" catalog-v1 >/dev/null
-              [[ "$(oras resolve "$catalog_moving")" == "$old_catalog_digest" ]] || echo 'manual catalog rollback readback failed' >&2
-            elif [[ "$catalog_moved" == true ]]; then
-              echo 'manual catalog rollback cannot remove a first-publication catalog pointer; it remains signed with no trusted alias' >&2
+            if [[ "$catalog_moved" == true ]]; then
+              actual_catalog_digest="$(oras resolve "$catalog_moving" 2>/dev/null || true)"
+              if [[ "$actual_catalog_digest" == "$CATALOG_MANIFEST" && -n "$old_catalog_digest" ]]; then
+                oras tag "${PACKAGE_REPOSITORY}@${old_catalog_digest}" catalog-v1 >/dev/null
+                [[ "$(oras resolve "$catalog_moving")" == "$old_catalog_digest" ]] || echo 'manual catalog rollback readback failed' >&2
+              elif [[ "$actual_catalog_digest" == "$CATALOG_MANIFEST" ]]; then
+                echo 'manual catalog rollback cannot remove a first-publication catalog pointer; it remains signed with no trusted alias' >&2
+              else
+                echo 'manual catalog rollback skipped because the catalog pointer changed after this promotion' >&2
+              fi
             fi
             exit "$rc"
           }
           trap rollback_manual_pointers EXIT
+          manual_catalog_cas_error="$RUNNER_TEMP/manual-catalog-cas-resolve.error"
+          current_catalog_digest=''
+          if current_catalog_digest="$(oras resolve "$catalog_moving" 2>"$manual_catalog_cas_error")"; then
+            [[ "$current_catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            if ! grep -Eqi 'manifest unknown|not found|404' "$manual_catalog_cas_error"; then
+              cat "$manual_catalog_cas_error" >&2
+              exit 1
+            fi
+            current_catalog_digest=''
+          fi
+          [[ "$current_catalog_digest" == "$old_catalog_digest" ]] || {
+            echo "catalog-v1 changed while preparing manual promotion (expected ${old_catalog_digest:-missing}, observed ${current_catalog_digest:-missing})" >&2
+            exit 1
+          }
           oras tag "$IMMUTABLE_REF" catalog-v1
           catalog_moved=true
           [[ "$(oras resolve "$catalog_moving")" == "$CATALOG_MANIFEST" ]]
@@ -1602,4 +1765,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo 'Upstream source, recipe, runner, and locked-tool tuple is unchanged; no package or catalog mutation was attempted.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Upstream source, recipe, runner, and locked-tool tuple is unchanged; the matching immutable package and signed evidence were verified from the catalog, so no hosted build or package mutation was attempted.' >> "$GITHUB_STEP_SUMMARY"
