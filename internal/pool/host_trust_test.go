@@ -372,10 +372,9 @@ func TestHostTrustReconciliationPreservesRunnerDuringGitHub503(t *testing.T) {
 
 func TestHostTrustReconciliationFencesWhenTransportVerificationFails(t *testing.T) {
 	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
-	activator := &activatingLifecycle{
-		Lifecycle: provider.AdaptLegacy(fake, false),
-		err:       errors.New("relay unavailable"),
-		verifyErr: errors.New("relay marker unavailable"),
+	activator := &hostTrustVerifyingLifecycle{
+		activatingLifecycle: &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)},
+		verifyHostTrustErr:  errors.New("relay marker unavailable"),
 	}
 	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online"}, found: true}
 	manager := Manager{
@@ -400,6 +399,9 @@ func TestHostTrustReconciliationFencesWhenTransportVerificationFails(t *testing.
 	if activator.verifyCalls != 1 {
 		t.Fatalf("runtime verification calls = %d, want one before fencing the unhealthy registered runner", activator.verifyCalls)
 	}
+	if activator.verifyHostTrustCalls != 1 {
+		t.Fatalf("provider host-trust verification calls = %d, want one before fencing the unhealthy registered runner", activator.verifyHostTrustCalls)
+	}
 	if got := atomic.LoadInt32(&github.runnerByNameCalls); got != 2 {
 		t.Fatalf("GitHub status calls = %d, want status lookup plus exact registration fence lookup", got)
 	}
@@ -416,7 +418,7 @@ func TestHostTrustReconciliationFencesWhenTransportVerificationFails(t *testing.
 
 func TestHostTrustReconciliationDoesNotReactivateHealthyTransport(t *testing.T) {
 	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
-	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
+	activator := &hostTrustVerifyingLifecycle{activatingLifecycle: &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}}
 	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: false}, found: true}
 	manager := Manager{
 		Config: config.Config{
@@ -439,6 +441,9 @@ func TestHostTrustReconciliationDoesNotReactivateHealthyTransport(t *testing.T) 
 	if activator.verifyCalls != 1 {
 		t.Fatalf("runtime verification calls = %d, want one for healthy current-generation transport", activator.verifyCalls)
 	}
+	if activator.verifyHostTrustCalls != 1 {
+		t.Fatalf("provider host-trust verification calls = %d, want one for healthy current-generation transport", activator.verifyHostTrustCalls)
+	}
 	if got := len(hostTrustLeaseInputs(fake)); got != 1 {
 		t.Fatalf("host trust lease writes = %d, want one refresh without relay reactivation", got)
 	}
@@ -449,9 +454,9 @@ func TestHostTrustReconciliationDoesNotReactivateHealthyTransport(t *testing.T) 
 
 func TestHostTrustReconciliationFencesBusyRunnerWhenTransportVerificationFails(t *testing.T) {
 	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
-	activator := &activatingLifecycle{
-		Lifecycle: provider.AdaptLegacy(fake, false),
-		verifyErr: errors.New("relay marker unavailable"),
+	activator := &hostTrustVerifyingLifecycle{
+		activatingLifecycle: &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)},
+		verifyHostTrustErr:  errors.New("relay marker unavailable"),
 	}
 	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: true}, found: true}
 	manager := Manager{
@@ -475,6 +480,9 @@ func TestHostTrustReconciliationFencesBusyRunnerWhenTransportVerificationFails(t
 	}
 	if activator.verifyCalls != 1 {
 		t.Fatalf("runtime verification calls = %d, want one before fencing the busy runner", activator.verifyCalls)
+	}
+	if activator.verifyHostTrustCalls != 1 {
+		t.Fatalf("provider host-trust verification calls = %d, want one before fencing the busy runner", activator.verifyHostTrustCalls)
 	}
 	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
 		t.Fatalf("GitHub registration fence calls = %d, want 1", got)

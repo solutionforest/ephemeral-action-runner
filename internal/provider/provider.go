@@ -322,13 +322,23 @@ type InstanceAdmissionVerifier interface {
 // that need provider-specific transport work after the common host CA overlay
 // has been installed. The pool invokes it before registration and when a
 // fresh runtime must be prepared after replacement or controller restart.
-// Steady-state reconciliation uses VerifyRuntime instead of invoking this
-// mutating capability on an already registered runner. Implementations must
-// fail closed: returning nil
-// means every provider-owned trust transport needed by the runtime is active
-// and verified for the exact instance.
+// Steady-state reconciliation never invokes this mutating capability on an
+// already registered runner. Providers that need a transport-specific
+// steady-state check should also implement HostTrustRuntimeVerifier; otherwise
+// the pool falls back to the common VerifyRuntime check.
 type HostTrustRuntimeActivator interface {
 	ActivateHostTrustRuntime(ctx context.Context, instance Instance) error
+}
+
+// HostTrustRuntimeVerifier is an optional provider capability for read-only
+// verification of transport state needed by an already registered runtime.
+// The pool invokes it during steady-state reconciliation after the common
+// VerifyRuntime check. Implementations must fail closed and must not mutate
+// network policy, restart a daemon, reconfigure the guest, or expose
+// credentials; returning nil means the exact instance's provider-owned trust
+// transport is active and verified.
+type HostTrustRuntimeVerifier interface {
+	VerifyHostTrustRuntime(ctx context.Context, instance Instance) error
 }
 
 type NetworkPolicyDecision string

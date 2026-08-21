@@ -67,25 +67,27 @@ docker info --format '{{json .ServerVersion}}'`
 type Provider struct {
 	Binary string
 
-	runCommand            runCommandFunc
-	wait                  func(context.Context, time.Duration) error
-	controlPlaneGate      controlPlaneCommandGate
-	recoverySlotOnce      sync.Once
-	recoverySlot          chan struct{}
-	activationMu          sync.RWMutex
-	admissionBlockReason  string
-	activeMu              sync.RWMutex
-	activeTemplate        provider.TemplateArtifact
-	dryRun                bool
-	architectureEmulation architectureEmulationEnabler
-	architectureLogged    sync.Map
-	logger                *slog.Logger
-	relayMu               sync.Mutex
-	relay                 *egressRelay
-	relayTokens           map[string]string
-	relayConnections      map[string]map[net.Conn]struct{}
-	hostTrustRelayEnabled bool
-	hostTrustRelayPort    int
+	runCommand             runCommandFunc
+	wait                   func(context.Context, time.Duration) error
+	controlPlaneGate       controlPlaneCommandGate
+	recoverySlotOnce       sync.Once
+	recoverySlot           chan struct{}
+	activationMu           sync.RWMutex
+	admissionBlockReason   string
+	activeMu               sync.RWMutex
+	activeTemplate         provider.TemplateArtifact
+	dryRun                 bool
+	architectureEmulation  architectureEmulationEnabler
+	architectureLogged     sync.Map
+	logger                 *slog.Logger
+	instanceOperationGates [64]sync.Mutex
+	relayMu                sync.Mutex
+	relay                  *egressRelay
+	relayTokens            map[string]relayTokenBinding
+	relayEpoch             uint64
+	relayConnections       map[string]map[net.Conn]struct{}
+	hostTrustRelayEnabled  bool
+	hostTrustRelayPort     int
 }
 
 type instanceReceipt struct {
@@ -169,7 +171,7 @@ func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectu
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary, wait: waitForContext, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]string), relayConnections: make(map[string]map[net.Conn]struct{})}
+	return &Provider{Binary: binary, wait: waitForContext, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]relayTokenBinding), relayConnections: make(map[string]map[net.Conn]struct{})}
 }
 
 // ConfigureHostTrustRelay enables the Windows-host trust transport used by
@@ -187,6 +189,20 @@ func (p *Provider) ConfigureHostTrustRelay(enabled bool, stableIdentity ...strin
 // lifecycle operations begin. Standalone provider consumers may omit it.
 func (p *Provider) SetLogger(logger *slog.Logger) {
 	p.logger = logger
+}
+
+// lockInstanceOperation serializes provider mutations and identity-sensitive
+// verification for one sandbox name. The relay server never acquires these
+// gates, so guest relay traffic remains independent from lifecycle ordering.
+func (p *Provider) lockInstanceOperation(name string) func() {
+	var hash uint32 = 2166136261
+	for index := 0; index < len(name); index++ {
+		hash ^= uint32(name[index])
+		hash *= 16777619
+	}
+	gate := &p.instanceOperationGates[hash%uint32(len(p.instanceOperationGates))]
+	gate.Lock()
+	return gate.Unlock
 }
 
 // StartDaemon asks Docker Sandboxes to start its host daemon in the
@@ -365,6 +381,8 @@ func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, erro
 }
 
 func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (provider.Instance, error) {
+	releaseInstanceOperation := p.lockInstanceOperation(request.Name)
+	defer releaseInstanceOperation()
 	if p.dryRun {
 		return provider.Instance{}, fmt.Errorf("docker-sandboxes does not support dry-run instance creation because exact sandbox and template-cache readback is required")
 	}
@@ -1137,7 +1155,9 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 	if err := validateInstance(instance, true); err != nil {
 		return err
 	}
-	defer p.releaseRelayToken(instance.Name)
+	releaseInstanceOperation := p.lockInstanceOperation(instance.Name)
+	defer releaseInstanceOperation()
+	defer p.releaseRelayTokenForInstance(instance)
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		return err
@@ -1153,7 +1173,9 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 	if err := validateInstance(instance, true); err != nil {
 		return err
 	}
-	defer p.releaseRelayToken(instance.Name)
+	releaseInstanceOperation := p.lockInstanceOperation(instance.Name)
+	defer releaseInstanceOperation()
+	defer p.releaseRelayTokenForInstance(instance)
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		return err

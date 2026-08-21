@@ -660,7 +660,7 @@ func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
 	}
 }
 
-func TestRunPoolRefreshesHostTrustTransportOnLeaseCadence(t *testing.T) {
+func TestRunPoolVerifiesHostTrustTransportWithoutReactivationOnLeaseCadence(t *testing.T) {
 	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
 	marker, err := hostTrustMarkerJSON(snapshot)
 	if err != nil {
@@ -682,7 +682,14 @@ func TestRunPoolRefreshesHostTrustTransportOnLeaseCadence(t *testing.T) {
 		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
 	}
 	activation := make(chan struct{}, 4)
-	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false), onActivate: func(provider.Instance) { activation <- struct{}{} }}
+	verification := make(chan struct{}, 4)
+	activator := &hostTrustVerifyingLifecycle{
+		activatingLifecycle: &activatingLifecycle{
+			Lifecycle:  provider.AdaptLegacy(fake, false),
+			onActivate: func(provider.Instance) { activation <- struct{}{} },
+		},
+		onVerifyHostTrust: func(provider.Instance) { verification <- struct{}{} },
+	}
 	manager := newRegisteredTestManager(t, fake, github)
 	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
 	manager.Config.Image.HostTrustScopes = []string{"system"}
@@ -695,18 +702,22 @@ func TestRunPoolRefreshesHostTrustTransportOnLeaseCadence(t *testing.T) {
 	go func() {
 		done <- manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true})
 	}()
-	for i := 0; i < 2; i++ {
-		select {
-		case <-activation:
-		case <-time.After(2 * time.Second):
-			cancel()
-			t.Fatalf("host trust activation %d did not occur", i+1)
-		}
+	select {
+	case <-activation:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("initial host trust activation did not occur")
+	}
+	select {
+	case <-verification:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("steady-state host trust verification did not occur")
 	}
 	select {
 	case <-activation:
 		cancel()
-		t.Fatal("host trust transport was refreshed again before the lease refresh cadence elapsed")
+		t.Fatal("host trust transport was reactivated during steady-state lease reconciliation")
 	case <-time.After(25 * time.Millisecond):
 	}
 	cancel()
@@ -1491,6 +1502,21 @@ func (l *activatingLifecycle) VerifyRuntime(ctx context.Context, instance provid
 		return provider.RuntimeInfo{}, l.verifyErr
 	}
 	return l.Lifecycle.VerifyRuntime(ctx, instance)
+}
+
+type hostTrustVerifyingLifecycle struct {
+	*activatingLifecycle
+	verifyHostTrustCalls int
+	verifyHostTrustErr   error
+	onVerifyHostTrust    func(provider.Instance)
+}
+
+func (l *hostTrustVerifyingLifecycle) VerifyHostTrustRuntime(_ context.Context, instance provider.Instance) error {
+	l.verifyHostTrustCalls++
+	if l.onVerifyHostTrust != nil {
+		l.onVerifyHostTrust(instance)
+	}
+	return l.verifyHostTrustErr
 }
 
 type partialCreateLifecycle struct {

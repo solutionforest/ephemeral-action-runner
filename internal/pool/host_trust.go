@@ -543,7 +543,10 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			// current transport read-only first; if it is unhealthy, fence this
 			// registration and let normal replacement activate a fresh candidate
 			// before GitHub can assign it work.
-			if _, requiresTransport := m.providerLifecycle().(provider.HostTrustRuntimeActivator); requiresTransport {
+			lifecycle := m.providerLifecycle()
+			_, requiresTransportActivation := lifecycle.(provider.HostTrustRuntimeActivator)
+			_, hasTransportVerifier := lifecycle.(provider.HostTrustRuntimeVerifier)
+			if requiresTransportActivation || hasTransportVerifier {
 				providerInstance, providerErr := m.providerInstance(ctx, name)
 				if providerErr != nil {
 					m.warnf("[%s] host trust transport identity warning; lease not refreshed: %v\n", name, providerErr)
@@ -554,7 +557,7 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 					active[name] = instance
 					continue
 				}
-				if verifyErr := m.verifyProviderRuntime(ctx, providerInstance); verifyErr != nil {
+				if verifyErr := m.verifyProviderHostTrustRuntime(ctx, providerInstance); verifyErr != nil {
 					transportErr := fmt.Errorf("host trust transport verification failed: %w", verifyErr)
 					m.warnf("[%s] host trust transport verification warning; lease not refreshed: %v\n", name, transportErr)
 					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, transportErr); fenceErr != nil {

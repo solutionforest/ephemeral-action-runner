@@ -17,6 +17,12 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
+const testRelayPolicyRule = "host relay"
+
+func relayTestInstance(name string) provider.Instance {
+	return provider.Instance{Name: name, ProviderID: "12345678-1234-1234-1234-123456789abc"}
+}
+
 func TestReadRelayHeaderDoesNotLimitTunnelPayload(t *testing.T) {
 	payload := bytes.Repeat([]byte("tls-payload-"), relayHeaderLimit)
 	reader := bufio.NewReader(bytes.NewReader(append([]byte("EPAR1 token target:443\n"), payload...)))
@@ -38,11 +44,13 @@ func TestReadRelayHeaderDoesNotLimitTunnelPayload(t *testing.T) {
 
 func TestEgressRelayAuthenticatesHealthWithoutExposingToken(t *testing.T) {
 	p := NewWithDryRun("sbx", false)
-	relay, token, err := p.ensureRelayToken("sandbox-one")
+	binding, err := p.ensureRelayToken(relayTestInstance("sandbox-one"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.releaseRelayToken("sandbox-one")
+	defer p.releaseRelayToken(binding)
+	relay := binding.Relay
+	token := binding.Token
 	if len(token) != 43 {
 		t.Fatalf("token length = %d, want 43", len(token))
 	}
@@ -68,11 +76,12 @@ func TestEgressRelayAuthenticatesHealthWithoutExposingToken(t *testing.T) {
 
 func TestEgressRelayRejectsUnknownToken(t *testing.T) {
 	p := NewWithDryRun("sbx", false)
-	relay, _, err := p.ensureRelayToken("sandbox-one")
+	binding, err := p.ensureRelayToken(relayTestInstance("sandbox-one"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer p.releaseRelayToken("sandbox-one")
+	defer p.releaseRelayToken(binding)
+	relay := binding.Relay
 	connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", relay.port), 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -88,15 +97,16 @@ func TestEgressRelayRejectsUnknownToken(t *testing.T) {
 
 func TestRelayTokenRevocationClosesAuthenticatedConnections(t *testing.T) {
 	p := NewWithDryRun("sbx", false)
-	if _, _, err := p.ensureRelayToken("sandbox-one"); err != nil {
+	binding, err := p.ensureRelayToken(relayTestInstance("sandbox-one"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	server, client := net.Pipe()
 	defer client.Close()
-	if !p.registerRelayConnection("sandbox-one", server) {
+	if !p.registerRelayConnection("sandbox-one", binding.Epoch, server) {
 		t.Fatal("registerRelayConnection() = false")
 	}
-	p.releaseRelayToken("sandbox-one")
+	p.releaseRelayToken(binding)
 	_ = client.SetWriteDeadline(time.Now().Add(time.Second))
 	if _, err := client.Write([]byte("probe")); err == nil {
 		t.Fatal("revoked relay connection remained writable")
@@ -219,7 +229,7 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 	if err := p.ActivateHostTrustRuntime(context.Background(), testInstance); err != nil {
 		t.Fatal(err)
 	}
-	defer p.releaseRelayToken(testName)
+	defer p.releaseRelayTokenForInstance(testInstance)
 	if !committed || !rulePresent || len(p.relayTokens) != 1 || p.relay == nil {
 		t.Fatalf("committed activation state = commit %t policy %t tokens %d relay %v", committed, rulePresent, len(p.relayTokens), p.relay)
 	}
@@ -237,6 +247,170 @@ func TestHostTrustRelayDebugDiagnosticsCanBeEnabled(t *testing.T) {
 	}
 	if !strings.Contains(logOutput.String(), "host-trust relay activation skipped") {
 		t.Fatalf("debug logger did not emit relay diagnostic: %s", logOutput.String())
+	}
+}
+
+func TestHostTrustRelayVerificationIsReadOnlyAndExact(t *testing.T) {
+	p := NewWithDryRun("sbx", false)
+	p.ConfigureHostTrustRelay(true, "verify-test")
+	binding, err := p.ensureRelayToken(testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err = p.bindRelayPolicyRules(binding, []string{testRelayPolicyRule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.releaseRelayToken(binding)
+	relay := binding.Relay
+	token := binding.Token
+	guestProbeSeen := false
+	policyLogSeen := false
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		args := strings.Join(request.args, " ")
+		switch {
+		case args == "ls --json":
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc "):
+			guestProbeSeen = true
+			if strings.Contains(args, "configure-egress-relay.sh") {
+				t.Fatal("read-only relay verification invoked guest relay configuration")
+			}
+			if strings.Contains(args, token) {
+				t.Fatal("read-only relay verification placed the relay token in the guest command")
+			}
+			if len(request.sensitiveValues) != 1 || request.sensitiveValues[0] != token {
+				t.Fatal("read-only relay verification did not mark the relay token as sensitive")
+			}
+			return provider.ExecResult{}, nil
+		case args == "policy log "+testName+" --json":
+			policyLogSeen = true
+			lastSeen := time.Now().UTC()
+			entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(relay.port)), testName, "transparent", lastSeen)
+			return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)}, nil
+		default:
+			t.Fatalf("unexpected read-only relay verification command: %v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+
+	if err := p.VerifyHostTrustRuntime(context.Background(), testInstance); err != nil {
+		t.Fatal(err)
+	}
+	if !guestProbeSeen || !policyLogSeen {
+		t.Fatalf("read-only relay proof = guest probe %t policy log %t, want both", guestProbeSeen, policyLogSeen)
+	}
+	stored := p.relayTokens[testName]
+	if stored.ProviderID != testInstance.ProviderID || stored.Token != token || stored.Epoch != binding.Epoch {
+		t.Fatal("read-only relay verification changed the exact relay credential")
+	}
+}
+
+func TestHostTrustRelayVerificationFailsClosedWithoutExactControllerBinding(t *testing.T) {
+	p := NewWithDryRun("sbx", false)
+	p.ConfigureHostTrustRelay(true, "missing-binding-test")
+	commands := 0
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		commands++
+		if strings.Join(request.args, " ") != "ls --json" {
+			t.Fatalf("unexpected command before exact relay binding failure: %v", request.args)
+		}
+		return provider.ExecResult{Stdout: readyListJSON}, nil
+	}
+
+	err := p.VerifyHostTrustRuntime(context.Background(), testInstance)
+	if err == nil || !strings.Contains(err.Error(), "not bound to the exact instance") {
+		t.Fatalf("verification error = %v, want exact relay binding failure", err)
+	}
+	if commands != 1 {
+		t.Fatalf("commands before exact relay binding failure = %d, want identity readback only", commands)
+	}
+}
+
+func TestHostTrustRelayVerificationFailsWhenBindingRebindsDuringGuestProbe(t *testing.T) {
+	p := NewWithDryRun("sbx", false)
+	p.ConfigureHostTrustRelay(true, "rebind-test")
+	original, err := p.ensureRelayToken(testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err = p.bindRelayPolicyRules(original, []string{testRelayPolicyRule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := testInstance
+	replacement.ProviderID = "87654321-4321-4321-4321-cba987654321"
+	var replacementBinding relayBindingSnapshot
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		args := strings.Join(request.args, " ")
+		switch {
+		case args == "ls --json":
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc "):
+			var bindErr error
+			replacementBinding, bindErr = p.ensureRelayToken(replacement)
+			if bindErr != nil {
+				t.Fatal(bindErr)
+			}
+			return provider.ExecResult{}, nil
+		default:
+			t.Fatalf("unexpected command after relay rebind: %v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+
+	err = p.VerifyHostTrustRuntime(context.Background(), testInstance)
+	if err == nil || !strings.Contains(err.Error(), "binding changed") {
+		t.Fatalf("verification error = %v, want exact binding epoch failure", err)
+	}
+	defer p.releaseRelayToken(replacementBinding)
+	p.releaseRelayToken(original)
+	current, currentErr := p.currentRelayBinding(replacement)
+	if currentErr != nil {
+		t.Fatalf("stale verification cleanup revoked replacement binding: %v", currentErr)
+	}
+	if current.Epoch != replacementBinding.Epoch || current.Token != replacementBinding.Token {
+		t.Fatal("stale verification cleanup changed the replacement binding")
+	}
+}
+
+func TestStaleStopDoesNotReleaseReplacementRelayBinding(t *testing.T) {
+	p := NewWithDryRun("sbx", false)
+	replacement, err := p.ensureRelayToken(testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.releaseRelayToken(replacement)
+	stale := testInstance
+	stale.ProviderID = "87654321-4321-4321-4321-cba987654321"
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		if strings.Join(request.args, " ") != "ls --json" {
+			t.Fatalf("stale stop reached a mutating command: %v", request.args)
+		}
+		return provider.ExecResult{Stdout: readyListJSON}, nil
+	}
+
+	err = p.Stop(context.Background(), stale)
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("stale stop error = %v, want exact identity mismatch", err)
+	}
+	current, currentErr := p.currentRelayBinding(testInstance)
+	if currentErr != nil {
+		t.Fatalf("stale stop revoked replacement binding: %v", currentErr)
+	}
+	if current.Epoch != replacement.Epoch || current.Token != replacement.Token {
+		t.Fatal("stale stop changed the replacement binding")
+	}
+}
+
+func TestHostTrustRelayGuestProbeFitsMaintenanceBudget(t *testing.T) {
+	if guestRelayProbeTimeout >= 15*time.Second {
+		t.Fatalf("guest relay probe timeout = %s, want less than the complete maintenance budget", guestRelayProbeTimeout)
+	}
+	for _, forbidden := range []string{"--max-time 15", "--max-time 30"} {
+		if strings.Contains(hostTrustRelayVerificationScript, forbidden) {
+			t.Fatalf("guest relay verification retained over-budget curl timeout %q", forbidden)
+		}
 	}
 }
 
@@ -280,7 +454,7 @@ func TestSelectPublicTLSDestinationPrefersIPv4WithIPv6Fallback(t *testing.T) {
 }
 
 func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.T) {
-	started := time.Now().UTC().Truncate(time.Microsecond)
+	started := time.Now().UTC().Truncate(time.Second)
 	instance := provider.Instance{Name: "sandbox-one", ProviderID: "12345678-1234-1234-1234-123456789abc"}
 	for _, test := range []struct {
 		name    string
@@ -289,20 +463,23 @@ func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.
 		wantErr string
 	}{
 		{name: "accepted", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), blocked: ""},
-		{name: "stale", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started.Add(-time.Minute)), wantErr: "did not confirm"},
+		{name: "stale", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started.Add(-time.Nanosecond)), wantErr: "did not confirm"},
+		{name: "wrong port", allowed: policyLogEntry("localhost:43124", "sandbox-one", "transparent", started), wantErr: "did not confirm"},
 		{name: "wrong route", allowed: policyLogEntry("localhost:43123", "sandbox-one", "forward", started), wantErr: "unexpected"},
+		{name: "wrong rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started), wantErr: "unexpected policy rule"},
 		{name: "blocked", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), blocked: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), wantErr: "blocked"},
 		{name: "credential forward", allowed: policyLogEntry("registry-1.docker.io:443", "sandbox-one", "forward", started) + "," + policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), wantErr: "credential-bearing"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			p := NewWithDryRun("sbx", false)
+			binding := relayBindingSnapshot{Instance: instance, Port: 43123, PolicyRules: map[string]struct{}{testRelayPolicyRule: {}}}
 			p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 				if strings.Join(request.args, " ") != "policy log sandbox-one --json" {
 					t.Fatalf("unexpected command: %v", request.args)
 				}
 				return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[%s]}`, test.blocked, test.allowed)}, nil
 			}
-			err := p.verifyHostTrustRelayPolicy(context.Background(), instance, 43123, started)
+			err := p.verifyBoundHostTrustRelayPolicy(context.Background(), binding, started)
 			if test.wantErr == "" && err != nil {
 				t.Fatal(err)
 			}
@@ -314,7 +491,11 @@ func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.
 }
 
 func policyLogEntry(host, vmName, proxyType string, lastSeen time.Time) string {
-	return fmt.Sprintf(`{"host":%q,"vm_name":%q,"proxy_type":%q,"rule":"","last_seen":%q,"since":%q,"count_since":1}`, host, vmName, proxyType, lastSeen.Format(time.RFC3339Nano), lastSeen.Format(time.RFC3339Nano))
+	return policyLogEntryWithRule(host, vmName, proxyType, testRelayPolicyRule, lastSeen)
+}
+
+func policyLogEntryWithRule(host, vmName, proxyType, rule string, lastSeen time.Time) string {
+	return fmt.Sprintf(`{"host":%q,"vm_name":%q,"proxy_type":%q,"rule":%q,"last_seen":%q,"since":%q,"count_since":1}`, host, vmName, proxyType, rule, lastSeen.Format(time.RFC3339Nano), lastSeen.Format(time.RFC3339Nano))
 }
 
 func TestValidatePolicyCommandRejectsBroadPolicyAccess(t *testing.T) {
