@@ -23,6 +23,94 @@ func TestWorkflowRepairsCatalogFirstPromotionBeforeNoop(t *testing.T) {
 	}
 }
 
+func TestWorkflowVerifiesMatchingPackageBeforeNoop(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	noop := strings.Index(workflow, "      - name: Determine whether the immutable tuple is already active\n")
+	build := strings.Index(workflow, "\n  build:\n")
+	if noop < 0 || build <= noop {
+		t.Fatalf("cannot isolate metadata-first no-op step: noop=%d build=%d", noop, build)
+	}
+	noopStep := workflow[noop:build]
+	for _, required := range []string{
+		`matching_entries="$RUNNER_TEMP/epar-catalog/matching-entries.json"`,
+		`matching_entry="$RUNNER_TEMP/epar-catalog/matching-entry.json"`,
+		`($effectiveStatus == "candidate" or $effectiveStatus == "active")`,
+		`$entry.gates.sourceRechecked == true`,
+		`$entry.gates.attestationVerified == true`,
+		`go run ./cmd/epar-prebuilt-publisher verify-package`,
+		`--reference "$package_reference"`,
+		`> "$RUNNER_TEMP/epar-catalog/package-verification.json"`,
+		`Catalog contains $match_count complete matching entries; refusing an ambiguous no-op.`,
+	} {
+		if !strings.Contains(noopStep, required) {
+			t.Fatalf("metadata-first no-op contract is missing %q", required)
+		}
+	}
+	if strings.Contains(noopStep, `$effectiveStatus == "superseded"`) {
+		t.Fatal("superseded catalog entries must not suppress a rebuild")
+	}
+	verify := strings.Index(noopStep, `go run ./cmd/epar-prebuilt-publisher verify-package`)
+	noOpAssignment := strings.Index(noopStep, "noop=true")
+	if verify < 0 || noOpAssignment < 0 || verify >= noOpAssignment {
+		t.Fatalf("immutable package verification must precede noop=true: verify=%d noop=%d", verify, noOpAssignment)
+	}
+}
+
+func TestWorkflowGuardsCatalogPointerAndPublishesCandidateLedgerOnMain(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	promote := strings.Index(workflow, "      - name: Verify signed catalog and move only authorized aliases\n")
+	manual := strings.Index(workflow, "\n  prepare-promotion-review:\n")
+	if promote < 0 || manual <= promote {
+		t.Fatalf("cannot isolate automatic catalog publication step: promote=%d manual=%d", promote, manual)
+	}
+	promoteStep := workflow[promote:manual]
+	for _, required := range []string{
+		`EXPECTED_CATALOG_MANIFEST: ${{ needs.resolve.outputs.catalog_manifest_digest }}`,
+		`old_catalog_digest" != "$expected_catalog_manifest"`,
+		`if [[ "$ALLOW_ALIAS" == true ]]; then`,
+		`catalog-v1 was moved; the profile alias was not moved`,
+		`catalog rollback skipped because the catalog pointer changed after this publication`,
+	} {
+		if !strings.Contains(promoteStep, required) {
+			t.Fatalf("catalog publication safety contract is missing %q", required)
+		}
+	}
+	reconcile := strings.Index(workflow, "      - name: Reconcile an interrupted catalog-first alias promotion\n")
+	noop := strings.Index(workflow, "      - name: Determine whether the immutable tuple is already active\n")
+	if reconcile < 0 || noop <= reconcile || !strings.Contains(workflow[reconcile:noop], `current_alias_digest" == "$observed"`) {
+		t.Fatal("alias reconciliation must compare the observed alias head again before repair")
+	}
+}
+
+func TestWorkflowCarriesManualCatalogHeadThroughProtectedPromotion(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	prepare := strings.Index(workflow, "  prepare-promotion-review:\n")
+	manual := strings.Index(workflow, "\n  manual-promote:\n")
+	if prepare < 0 || manual <= prepare {
+		t.Fatalf("cannot isolate protected promotion preparation: prepare=%d manual=%d", prepare, manual)
+	}
+	prepareJob := workflow[prepare:manual]
+	manualJob := workflow[manual:]
+	for _, required := range []string{
+		`catalog_manifest: ${{ steps.review.outputs.catalog_manifest }}`,
+		`echo "catalog_manifest=$expected_catalog_manifest" >> "$GITHUB_OUTPUT"`,
+		`Current catalog-v1 manifest at review`,
+	} {
+		if !strings.Contains(prepareJob, required) {
+			t.Fatalf("protected review must record the catalog head: missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		`EXPECTED_CATALOG_MANIFEST: ${{ needs.prepare-promotion-review.outputs.catalog_manifest }}`,
+		`catalog-v1 changed after reviewer preparation`,
+		`[[ "$current_catalog_digest" == "$old_catalog_digest" ]]`,
+	} {
+		if !strings.Contains(manualJob, required) {
+			t.Fatalf("protected promotion must guard the reviewed catalog head: missing %q", required)
+		}
+	}
+}
+
 func TestWorkflowForceCandidatePreservesVerifiedEvidence(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{
@@ -62,7 +150,7 @@ func TestWorkflowUsesHostedBuildsAndExternalEPARAcceptance(t *testing.T) {
 		`runnerName:$amd64DockerHubRunner`,
 		`runnerName:$arm64PlaywrightRunner`,
 		`runnerName:$arm64DockerHubRunner`,
-		`catalog-v1 and the profile alias were not moved`,
+		`catalog-v1 was moved; the profile alias was not moved`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("publisher candidate acceptance contract is missing %q", required)
@@ -217,10 +305,10 @@ func TestWorkflowPreparesReviewSummaryBeforeProtectedPromotion(t *testing.T) {
 func TestWorkflowBuildsAndPromotesFullWithoutPersistentNativeRunners(t *testing.T) {
 	workflow := readPublisherWorkflow(t)
 	for _, required := range []string{
-		`- cron: '37 */6 * * *'`,
-		`- cron: '7 1,7,13,19 * * *'`,
-		`'37 */6 * * *') profile=act`,
-		`'7 1,7,13,19 * * *') profile=full`,
+		`- cron: '37 23 */7 * *'`,
+		`- cron: '57 23 */7 * *'`,
+		`'37 23 */7 * *') profile=full`,
+		`'57 23 */7 * *') profile=act`,
 		`act|full) ;;`,
 		`if: needs.resolve.outputs.profile == 'full'`,
 		`Full publication requires at least 40 GiB free`,
