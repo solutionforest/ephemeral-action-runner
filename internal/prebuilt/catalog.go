@@ -18,10 +18,14 @@ import (
 )
 
 const (
-	// CatalogSchemaVersion is bumped when catalog semantics, rather than a
-	// package entry, change.  Entries are append-only and can be retained by
-	// registry clients that understand an older schema.
-	CatalogSchemaVersion = 1
+	// LegacyCatalogSchemaVersion remains readable so existing signed catalogs
+	// and source-only promotions retain their canonical identity.
+	LegacyCatalogSchemaVersion = 1
+	// CatalogSchemaVersion adds compatible-v1 hosted promotion records. Older
+	// readers must fail closed instead of silently dropping that authority.
+	CatalogSchemaVersion = 2
+	// EntrySchemaVersion is independent of catalog-ledger semantics.
+	EntrySchemaVersion = 1
 
 	// CatalogArtifactKind identifies the OCI artifact represented by an entry.
 	CatalogArtifactKind = "docker-sandboxes-template"
@@ -59,8 +63,21 @@ const (
 )
 
 var (
-	digestPattern  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	profilePattern = regexp.MustCompile(`^[a-z][a-z0-9.-]{0,31}$`)
+	digestPattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	profilePattern  = regexp.MustCompile(`^[a-z][a-z0-9.-]{0,31}$`)
+	revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+)
+
+const (
+	compatibleRuntimeContract = "docker-sandboxes-v1"
+	upstreamRepository        = "catthehacker/docker_images"
+	upstreamFullWorkflow      = ".github/workflows/copy-full-image.yml"
+	upstreamActWorkflow       = ".github/workflows/build-ubuntu.yml"
+	upstreamActGateJob        = "Build base 24.04"
+	upstreamFull24Job         = "copy image ghcr.io/christopherhx/runner-images:ubuntu24-runner-large-latest"
+	upstreamFull22Job         = "copy image ghcr.io/christopherhx/runner-images:ubuntu22-runner-large-latest"
+	upstreamFull20Job         = "copy image ghcr.io/christopherhx/runner-images:ubuntu20-runner-large-latest"
+	upstreamEvidenceMaxAge    = 10 * 24 * time.Hour
 )
 
 // ProfileEnabled reports whether a profile is supported by the publication
@@ -184,8 +201,8 @@ type ToolDescriptor struct {
 }
 
 // RecipeDescriptor binds package output to the committed EPAR recipe and
-// runtime contract. A controller can reject a package from a newer recipe
-// even if the source image itself is compatible.
+// runtime contract. Exact recipe and tool identities are provenance; runtime
+// compatibility is defined by RuntimeContract and TemplateSchema.
 type RecipeDescriptor struct {
 	Digest           string `json:"digest"`
 	RuntimeContract  string `json:"runtimeContract"`
@@ -239,8 +256,8 @@ func (g GateResults) HostedPass() bool {
 	return g.SourceResolved && g.SourceRechecked && g.BuildSucceeded && g.PlatformsValidated && g.ProvenanceGenerated && g.SBOMGenerated && g.AttestationVerified
 }
 
-// ProfilePolicy controls promotion and wizard exposure. Full remains present
-// in the schema but disabled until its independent gates are promoted.
+// ProfilePolicy controls compatible promotion and wizard exposure for each
+// profile. Runtime-major candidates still require protected promotion.
 type ProfilePolicy struct {
 	Enabled       bool   `json:"enabled"`
 	WizardDefault bool   `json:"wizardDefault"`
@@ -356,6 +373,36 @@ type SourceOnlyPromotion struct {
 	At                 time.Time `json:"at"`
 }
 
+// UpstreamWorkflowEvidence records the public upstream workflow observation
+// that authorized one compatible hosted promotion. It is kept in the signed
+// catalog so the profile alias does not depend on an ephemeral workflow log.
+type UpstreamWorkflowEvidence struct {
+	Repository     string    `json:"repository"`
+	Workflow       string    `json:"workflow"`
+	RunID          int64     `json:"runId"`
+	RunAttempt     int       `json:"runAttempt"`
+	Event          string    `json:"event"`
+	Branch         string    `json:"branch"`
+	HeadSHA        string    `json:"headSha"`
+	RunConclusion  string    `json:"runConclusion,omitempty"`
+	Conclusion     string    `json:"conclusion"`
+	GateJob        string    `json:"gateJob,omitempty"`
+	TestConclusion string    `json:"testConclusion,omitempty"`
+	CompletedAt    time.Time `json:"completedAt"`
+}
+
+// CompatiblePromotion records automatic movement of a stable profile alias
+// after hosted gates pass for a supported runtime contract. It deliberately
+// does not imply Docker Sandboxes import readback or runtime validation.
+type CompatiblePromotion struct {
+	PackageIndexDigest string                   `json:"packageIndexDigest"`
+	PreviousDigest     string                   `json:"previousDigest,omitempty"`
+	RuntimeContract    string                   `json:"runtimeContract"`
+	Upstream           UpstreamWorkflowEvidence `json:"upstream"`
+	Reason             string                   `json:"reason"`
+	At                 time.Time                `json:"at"`
+}
+
 // Catalog is an append-only publication ledger. Aliases are a projection of
 // the latest successful promotion and can be regenerated from Entries.
 type Catalog struct {
@@ -369,6 +416,7 @@ type Catalog struct {
 	Transitions          []StatusTransition       `json:"transitions"`
 	Acceptances          []PlatformAcceptance     `json:"acceptances,omitempty"`
 	SourceOnlyPromotions []SourceOnlyPromotion    `json:"sourceOnlyPromotions,omitempty"`
+	CompatiblePromotions []CompatiblePromotion    `json:"compatiblePromotions,omitempty"`
 }
 
 // PlanAliasReconciliation compares the observed registry alias with the
@@ -407,9 +455,9 @@ func (c Catalog) PlanAliasReconciliation(profile, observedDigest string) (AliasR
 	return plan, nil
 }
 
-// SourceTupleUnchanged reports whether a source-only upstream movement can
-// reuse the same EPAR recipe/runtime/runner/tool contract. Source digests and
-// package/publication identities intentionally do not participate.
+// SourceTupleUnchanged compares the exact EPAR build/provenance tuple. It is
+// retained for legacy source-only records and nondeterminism detection; v1
+// compatibility itself is defined only by runtime contract and schema.
 func SourceTupleUnchanged(a, b Entry) bool {
 	return a.Profile == b.Profile &&
 		a.Recipe == b.Recipe &&
@@ -419,8 +467,8 @@ func SourceTupleUnchanged(a, b Entry) bool {
 
 // SourceIdentityEqual reports whether the immutable upstream source index and
 // every normalized platform descriptor are unchanged. It is kept separate
-// from SourceTupleUnchanged so auto-advance cannot accidentally rebuild and
-// move an alias for the same complete tuple.
+// from SourceTupleUnchanged so unexplained output nondeterminism for one
+// complete tuple can fail closed.
 func SourceIdentityEqual(a, b Entry) bool {
 	if a.Source.IndexDigest != b.Source.IndexDigest || len(a.Source.PlatformDigests) != len(b.Source.PlatformDigests) {
 		return false
@@ -472,12 +520,93 @@ func ToolsEqual(a, b []ToolDescriptor) bool {
 	return true
 }
 
+func validateUpstreamWorkflowEvidence(profile string, evidence UpstreamWorkflowEvidence, promotedAt time.Time) error {
+	if evidence.Repository != upstreamRepository || evidence.RunID <= 0 || evidence.RunAttempt <= 0 || evidence.Event != "schedule" || evidence.Branch != "master" || evidence.Conclusion != "success" || !revisionPattern.MatchString(evidence.HeadSHA) || evidence.CompletedAt.IsZero() {
+		return errors.New("upstream workflow evidence is incomplete or not a successful scheduled master run")
+	}
+	switch profile {
+	case ProfileAct:
+		if evidence.Workflow != upstreamActWorkflow || evidence.GateJob != upstreamActGateJob || (evidence.TestConclusion != "success" && evidence.TestConclusion != "skipped") {
+			return errors.New("Act upstream evidence does not identify the tag-producing base job")
+		}
+	case ProfileFull:
+		if evidence.Workflow != upstreamFullWorkflow || evidence.GateJob != "four Full copy jobs" || evidence.RunConclusion != "success" {
+			return errors.New("Full upstream evidence does not identify the copy workflow")
+		}
+	default:
+		return fmt.Errorf("unsupported upstream evidence profile %q", profile)
+	}
+	completedAt := evidence.CompletedAt.UTC()
+	promotedAt = promotedAt.UTC()
+	if promotedAt.IsZero() || completedAt.After(promotedAt) || promotedAt.Sub(completedAt) > upstreamEvidenceMaxAge {
+		return errors.New("upstream workflow evidence is stale or newer than the promotion")
+	}
+	return nil
+}
+
+func (c Catalog) validateCompatiblePromotion(promotion CompatiblePromotion) error {
+	targetDigest, err := NormalizeDigest(promotion.PackageIndexDigest)
+	if err != nil {
+		return err
+	}
+	target, ok := c.EntryByDigest(targetDigest)
+	if !ok {
+		return errors.New("compatible promotion references unknown package digest")
+	}
+	if target.Recipe.RuntimeContract != compatibleRuntimeContract || target.Recipe.TemplateSchema != 2 || promotion.RuntimeContract != target.Recipe.RuntimeContract {
+		return errors.New("compatible promotion requires docker-sandboxes-v1 and template schema 2")
+	}
+	if !target.Gates.HostedPass() {
+		return errors.New("compatible promotion target has incomplete hosted gates")
+	}
+	if strings.TrimSpace(promotion.Reason) == "" || promotion.At.IsZero() {
+		return errors.New("compatible promotion requires a reason and timestamp")
+	}
+	if promotion.PreviousDigest != "" {
+		previousDigest, normalizeErr := NormalizeDigest(promotion.PreviousDigest)
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		if previousDigest == targetDigest {
+			return errors.New("compatible promotion requires distinct package digests")
+		}
+		previous, previousOK := c.EntryByDigest(previousDigest)
+		if !previousOK || previous.Profile != target.Profile || previous.Recipe.RuntimeContract != target.Recipe.RuntimeContract {
+			return errors.New("compatible promotion previous package is missing or runtime-incompatible")
+		}
+	}
+	return validateUpstreamWorkflowEvidence(target.Profile, promotion.Upstream, promotion.At)
+}
+
+func (c Catalog) hasCompatiblePromotion(packageDigest string) bool {
+	for _, promotion := range c.CompatiblePromotions {
+		if promotion.PackageIndexDigest == packageDigest && c.validateCompatiblePromotion(promotion) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Catalog) stableAliasEligible(packageDigest string) (bool, error) {
+	gates, err := c.EffectiveGates(packageDigest)
+	if err != nil {
+		return false, err
+	}
+	if gates.AllPass() {
+		return true, nil
+	}
+	return gates.HostedPass() && c.hasCompatiblePromotion(packageDigest), nil
+}
+
 // Validate performs structural and policy validation. It does not perform
 // network or signature checks; those are intentionally separate publisher
 // gates.
 func (c Catalog) Validate() error {
-	if c.SchemaVersion != CatalogSchemaVersion {
+	if c.SchemaVersion != LegacyCatalogSchemaVersion && c.SchemaVersion != CatalogSchemaVersion {
 		return fmt.Errorf("unsupported prebuilt catalog schema %d", c.SchemaVersion)
+	}
+	if c.SchemaVersion == LegacyCatalogSchemaVersion && len(c.CompatiblePromotions) != 0 {
+		return errors.New("compatible promotions require prebuilt catalog schema 2")
 	}
 	if c.ArtifactKind != CatalogArtifactKind {
 		return fmt.Errorf("unexpected prebuilt catalog artifact kind %q", c.ArtifactKind)
@@ -550,6 +679,16 @@ func (c Catalog) Validate() error {
 			return fmt.Errorf("catalog source-only promotion %d has incomplete effective gates", i)
 		}
 	}
+	compatiblePromotionKeys := make(map[string]struct{}, len(c.CompatiblePromotions))
+	for i, promotion := range c.CompatiblePromotions {
+		if err := c.validateCompatiblePromotion(promotion); err != nil {
+			return fmt.Errorf("catalog compatible promotion %d: %w", i, err)
+		}
+		if _, exists := compatiblePromotionKeys[promotion.PackageIndexDigest]; exists {
+			return fmt.Errorf("duplicate compatible promotion for %s", promotion.PackageIndexDigest)
+		}
+		compatiblePromotionKeys[promotion.PackageIndexDigest] = struct{}{}
+	}
 	for key, alias := range c.Aliases {
 		profile, err := NormalizeProfile(key)
 		if err != nil {
@@ -581,12 +720,19 @@ func (c Catalog) Validate() error {
 		if status != StatusActive {
 			return fmt.Errorf("catalog alias %q points to package with status %s", key, status)
 		}
+		eligible, eligibilityErr := c.stableAliasEligible(alias.PackageIndexDigest)
+		if eligibilityErr != nil {
+			return fmt.Errorf("catalog alias %q eligibility: %w", key, eligibilityErr)
+		}
+		if !eligible {
+			return fmt.Errorf("catalog alias %q points to package without reviewed or compatible hosted promotion evidence", key)
+		}
 	}
 	return nil
 }
 
 func (e Entry) Validate(packageRepository string) error {
-	if e.SchemaVersion != CatalogSchemaVersion {
+	if e.SchemaVersion != EntrySchemaVersion {
 		return fmt.Errorf("unsupported entry schema %d", e.SchemaVersion)
 	}
 	if e.ArtifactKind != CatalogArtifactKind {
@@ -961,6 +1107,51 @@ func (c *Catalog) AppendSourceOnlyPromotion(packageDigest, acceptedFromDigest, r
 	return true, nil
 }
 
+// AppendCompatiblePromotion records hosted-only automatic promotion for a
+// supported runtime contract without claiming Docker Sandboxes readback or
+// runtime validation.
+func (c *Catalog) AppendCompatiblePromotion(packageDigest, previousDigest, reason string, upstream UpstreamWorkflowEvidence, at time.Time) (bool, error) {
+	if c == nil {
+		return false, errors.New("nil prebuilt catalog")
+	}
+	target, ok := c.EntryByDigest(packageDigest)
+	if !ok {
+		return false, errors.New("compatible promotion references unknown package digest")
+	}
+	if previousDigest == "" {
+		if _, exists := c.Aliases[target.Profile]; exists {
+			return false, fmt.Errorf("compatible promotion for %s omitted the current %s alias digest", packageDigest, target.Profile)
+		}
+	} else {
+		alias, exists := c.Aliases[target.Profile]
+		if !exists || alias.PackageIndexDigest != previousDigest {
+			return false, fmt.Errorf("compatible promotion for %s does not match the current %s alias", packageDigest, target.Profile)
+		}
+	}
+	promotion := CompatiblePromotion{
+		PackageIndexDigest: packageDigest,
+		PreviousDigest:     previousDigest,
+		RuntimeContract:    target.Recipe.RuntimeContract,
+		Upstream:           upstream,
+		Reason:             strings.TrimSpace(reason),
+		At:                 at.UTC(),
+	}
+	if err := c.validateCompatiblePromotion(promotion); err != nil {
+		return false, err
+	}
+	for _, existing := range c.CompatiblePromotions {
+		if existing.PackageIndexDigest == packageDigest {
+			if existing.PreviousDigest == previousDigest && existing.Upstream == upstream {
+				return false, nil
+			}
+			return false, fmt.Errorf("compatible promotion for %s already has different evidence", packageDigest)
+		}
+	}
+	c.SchemaVersion = CatalogSchemaVersion
+	c.CompatiblePromotions = append(c.CompatiblePromotions, promotion)
+	return true, nil
+}
+
 // EffectiveStatus applies the append-only transition ledger to an immutable
 // entry. Runtime consumers must use this rather than Entry.Status alone.
 func (c Catalog) EffectiveStatus(digest string) (string, error) {
@@ -1034,7 +1225,7 @@ func (c *Catalog) AppendEntry(entry Entry) (bool, error) {
 		return false, errors.New("nil prebuilt catalog")
 	}
 	if c.SchemaVersion == 0 {
-		c.SchemaVersion = CatalogSchemaVersion
+		c.SchemaVersion = LegacyCatalogSchemaVersion
 	}
 	if c.ArtifactKind == "" {
 		c.ArtifactKind = CatalogArtifactKind
@@ -1081,6 +1272,7 @@ func cloneCatalog(value Catalog) Catalog {
 	clone.Transitions = append([]StatusTransition(nil), value.Transitions...)
 	clone.Acceptances = append([]PlatformAcceptance(nil), value.Acceptances...)
 	clone.SourceOnlyPromotions = append([]SourceOnlyPromotion(nil), value.SourceOnlyPromotions...)
+	clone.CompatiblePromotions = append([]CompatiblePromotion(nil), value.CompatiblePromotions...)
 	clone.Aliases = make(map[string]Alias, len(value.Aliases))
 	for key, alias := range value.Aliases {
 		clone.Aliases[key] = alias
@@ -1114,10 +1306,15 @@ func (c *Catalog) moveAliasInPlace(profile, reference, packageDigest, channel, e
 		if existing, ok := c.Aliases[profile]; !ok || existing.PackageIndexDigest != expectedDigest {
 			return fmt.Errorf("alias %s moved concurrently", profile)
 		}
+	} else if _, exists := c.Aliases[profile]; exists {
+		return fmt.Errorf("alias %s appeared concurrently", profile)
 	}
 	known := false
 	for _, entry := range c.Entries {
 		if entry.PackageIndexDigest == packageDigest {
+			if entry.Profile != profile {
+				return fmt.Errorf("alias %s cannot point to package owned by profile %s", profile, entry.Profile)
+			}
 			status, statusErr := c.EffectiveStatus(packageDigest)
 			if statusErr != nil {
 				return statusErr
@@ -1125,12 +1322,12 @@ func (c *Catalog) moveAliasInPlace(profile, reference, packageDigest, channel, e
 			if status == StatusRevoked || status == StatusCriticalRevoked {
 				return fmt.Errorf("alias %s cannot point to revoked package digest %s", profile, packageDigest)
 			}
-			gates, gateErr := c.EffectiveGates(packageDigest)
-			if gateErr != nil {
-				return gateErr
+			eligible, eligibilityErr := c.stableAliasEligible(packageDigest)
+			if eligibilityErr != nil {
+				return eligibilityErr
 			}
-			if !gates.AllPass() {
-				return fmt.Errorf("alias %s cannot point to package digest %s with incomplete gates", profile, packageDigest)
+			if !eligible {
+				return fmt.Errorf("alias %s cannot point to package digest %s without reviewed or compatible hosted promotion evidence", profile, packageDigest)
 			}
 			if status == StatusCandidate || status == StatusSuperseded {
 				if _, err := c.AppendStatusTransition(packageDigest, StatusActive, "promoted by alias move", now); err != nil {
@@ -1167,6 +1364,7 @@ func (c Catalog) MarshalCanonical() ([]byte, error) {
 	clone.Entries = append([]Entry(nil), c.Entries...)
 	clone.Acceptances = append([]PlatformAcceptance(nil), c.Acceptances...)
 	clone.SourceOnlyPromotions = append([]SourceOnlyPromotion(nil), c.SourceOnlyPromotions...)
+	clone.CompatiblePromotions = append([]CompatiblePromotion(nil), c.CompatiblePromotions...)
 	clone.Aliases = make(map[string]Alias, len(c.Aliases))
 	for key, value := range c.Aliases {
 		clone.Aliases[key] = value
@@ -1189,6 +1387,9 @@ func (c Catalog) MarshalCanonical() ([]byte, error) {
 	})
 	sort.SliceStable(clone.SourceOnlyPromotions, func(i, j int) bool {
 		return clone.SourceOnlyPromotions[i].PackageIndexDigest < clone.SourceOnlyPromotions[j].PackageIndexDigest
+	})
+	sort.SliceStable(clone.CompatiblePromotions, func(i, j int) bool {
+		return clone.CompatiblePromotions[i].PackageIndexDigest < clone.CompatiblePromotions[j].PackageIndexDigest
 	})
 	return json.MarshalIndent(clone, "", "  ")
 }

@@ -25,7 +25,7 @@ function Assert-Contains {
     }
 }
 
-Assert-Equal 'prebuilt lock schema' $lock.schemaVersion 2
+Assert-Equal 'prebuilt lock schema' $lock.schemaVersion 3
 Assert-Equal 'prebuilt artifact kind' $lock.artifactKind 'docker-sandboxes-template-base'
 Assert-Equal 'runtime contract' $lock.runtimeContract 'docker-sandboxes-v1'
 Assert-Equal 'template schema' $lock.templateSchema 2
@@ -54,16 +54,19 @@ Assert-Equal 'runner selector' $lock.runner.selector 'latest'
 Assert-Equal 'runner resolution' $lock.runner.assetResolution 'actions-release-descriptor'
 Assert-Equal 'runner source' $lock.runner.assetSource 'github-actions-runner-release'
 Assert-Equal 'runner overlay' $lock.runner.overlayRequired $false
-Assert-Equal 'runner promotion' $lock.runner.promotion 'manual-on-tuple-change'
+Assert-Equal 'runner promotion' $lock.runner.promotion 'automatic-on-compatible-v1'
 
 $sourceLockPath = Join-Path $templateDirectory $lock.sourceLock
 if (-not (Test-Path -LiteralPath $sourceLockPath -PathType Leaf)) {
     throw "static source lock is missing: $sourceLockPath"
 }
-foreach ($requiredEvidence in @('provenance', 'sbom', 'attestation', 'platform-runtime', 'sandbox-import-readback')) {
+foreach ($requiredEvidence in @('provenance', 'sbom', 'attestation', 'platform-runtime', 'upstream-workflow')) {
     if (-not @($lock.requiredEvidence) -contains $requiredEvidence) {
         throw "required evidence is missing: $requiredEvidence"
     }
+}
+if (-not @($lock.protectedPromotionEvidence) -contains 'sandbox-import-readback') {
+    throw 'protected promotion evidence is missing: sandbox-import-readback'
 }
 
 $dockerfilePath = Join-Path $templateDirectory 'Dockerfile.prebuilt'

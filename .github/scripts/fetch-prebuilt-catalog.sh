@@ -72,6 +72,6 @@ if [[ "$actual_digest" != "$layer_digest" ]]; then
   echo "catalog layer digest mismatch: expected $layer_digest, got $actual_digest" >&2
   exit 1
 fi
-jq -e '(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")' "$catalog_file" >/dev/null
+jq -e '((.schemaVersion == 1) or (.schemaVersion == 2)) and (.artifactKind == "docker-sandboxes-template")' "$catalog_file" >/dev/null
 
 mv -f -- "$catalog_file" "$output_file"

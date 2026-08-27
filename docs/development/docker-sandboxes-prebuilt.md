@@ -4,13 +4,13 @@ EPAR publishes its Docker Sandboxes template as an immutable multi-platform OCI 
 
 The canonical source is `ghcr.io/catthehacker/ubuntu`. The public package is `ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template`. Docker Hub is never used as a source fallback because its OCI identities may differ from GHCR even when the logical image content matches.
 
-Act (`act-latest`) and Full (`full-latest`) use the same publication, verification, and runtime contracts. The signed catalog records candidates before acceptance; runtime resolution follows only an active profile alias.
+Act (`act-latest`) and Full (`full-latest`) use the same publication, verification, and runtime contracts. A package declaring `docker-sandboxes-v1` and template schema 2 is compatible regardless of its exact recipe, source lock, runner, or tool identities; those identities remain signed provenance and must agree exactly across labels, catalog, provenance, SBOM, attestations, and receipts. The signed catalog records every package and runtime resolution follows only an active profile alias.
 
 ## Workflow triggers and hosted build gates
 
-`.github/workflows/docker-sandboxes-images.yml` checks the Catthehacker day-of-month cadence at 23:37 UTC for Full and 23:57 UTC for Act, approximately 6–12 hours after the upstream 12:00 UTC schedule, supports manual dispatch, and publishes for recipe-related pushes only on `main`. The `*/7` day-of-month expression mirrors the upstream calendar pattern rather than one fixed weekday. GitHub executes both cron expressions only from the default branch and may delay scheduled starts under load. Pull requests to `develop` or `main` that change a publisher, recipe, or committed-asset path run publisher, signed-evidence, and asset validation without logging in to GHCR, building a package, or pushing any manifest. This prevents a normal `develop` to `main` promotion from publishing the same source change twice.
+`.github/workflows/docker-sandboxes-images.yml` checks the Catthehacker day-of-month cadence at 23:37 UTC for Full and 23:57 UTC for Act, approximately 6–12 hours after the upstream 12:00 UTC schedule, supports manual dispatch, and publishes for recipe-related pushes only on `main`. Before source resolution or any GHCR write, it inspects the newest tag-moving upstream run on `master`. Full requires a fresh successful scheduled `copy-full-image.yml` run and the exact successful four-job GHCR copy matrix that contains `full-latest`. Act requires a fresh scheduled `build-ubuntu.yml` run with one successful `Build base 24.04` job, a successful `Build and push ubuntu:act-24.04` step, and the expected Act test path; the signed evidence records whether that upstream test path succeeded or was skipped, because the current upstream workflow condition skips it. Unrelated flavor failures do not block Act, and EPAR's unchanged two-platform package smoke checks remain the automatic image-health gate. A newer manual run, pending/failed/stale/malformed state, missing job or step, API error, or evidence older than ten days exits successfully as publication skipped and records the reason only in the GitHub Actions summary. The `*/7` day-of-month expression mirrors the upstream calendar pattern rather than one fixed weekday. GitHub executes both cron expressions only from the default branch and may delay scheduled starts under load. Pull requests to `develop` or `main` that change a publisher, recipe, or committed-asset path run publisher, signed-evidence, and asset validation without logging in to GHCR, building a package, or pushing any manifest.
 
-Before allocating hosted build runners, the resolve job reads the signed moving catalog and compares the complete source, recipe, runtime, schema, runner, and locked-tool tuple. A candidate or active entry must also have all hosted build and signed-evidence gates set, and an active entry must still be the selected profile alias. When exactly one entry matches, the job runs `verify-package` against that entry's immutable package reference; this checks registry metadata, signed referrers, and claims without pulling image layers. Only a successful verification produces a no-op. No match starts a hosted build, an ambiguous match fails closed, and a package or evidence verification failure never silently falls back to rebuilding.
+Before allocating hosted build runners, the resolve job reads the signed moving catalog and compares the complete source, recipe, runtime, schema, runner, and locked-tool tuple. Only a verified active entry at the selected profile alias may suppress a build. A matching candidate is deliberately re-evaluated so a later run with fresh upstream evidence can promote it. Package verification checks registry metadata, signed referrers, and claims without pulling image layers; an ambiguous match fails closed and a package or evidence verification failure never silently falls back to rebuilding.
 
 The amd64 build runs on GitHub-hosted `ubuntu-latest`; the arm64 build runs on GitHub-hosted `ubuntu-24.04-arm`. The workflow has no persistent self-hosted runner dependency and no `EPAR_PREBUILT_LIVE` switch. Full jobs first reclaim disposable hosted-runner tool caches, require at least 40 GiB free before allocating 8 GiB of swap, serialize BuildKit execution, and allow a three-hour timeout; failing that capacity gate leaves Full unpublished rather than silently changing its recipe or dropping a platform. Hosted jobs resolve the GHCR source descriptor, build from its immutable digest, inspect both runnable platform manifests by digest, assemble an index from those exact digests, require exactly two descriptors, run package smoke checks, generate and sign one index-level SLSA provenance statement and one index-level SPDX SBOM, verify their referrers, and publish an immutable signed candidate catalog. Platform builds disable BuildKit's additional per-platform SBOM/provenance indexes because EPAR's trust decision uses the separately signed index-level evidence and catalog. The index-level SPDX document records the package, recipe, and exact platform identities rather than reproducing BuildKit's more detailed component inventory; this deliberate narrower audit scope avoids four additional per-publication GHCR version rows without weakening the evidence enforced by EPAR.
 
@@ -18,14 +18,14 @@ The workflow grants `contents: read`, `packages: write`, `attestations: write`, 
 
 ## Candidate publication contract
 
-Every new package is first recorded as `candidate`. Before manual acceptance, publication may create:
+Every new package is first assembled with an immutable candidate identity. After the hosted and upstream gates complete, a compatible v1/schema-2 package may be recorded and activated automatically; `force_candidate` retains it as a candidate and never moves an alias. Publication may create:
 
 - an immutable package index and canonical tag such as `<profile>-latest-pkg-<64 hex index digest>`;
 - exact amd64 and arm64 platform manifests;
 - signed SLSA provenance and SPDX SBOM referrers;
 - an immutable catalog object and canonical tag such as `catalog-v1-pkg-<64 hex catalog digest>`.
 
-On trusted `main`, candidate publication moves the signed `catalog-v1` ledger pointer but does not move the profile's `*-latest` alias. This makes a complete candidate discoverable to later metadata checks without activating it. Non-main candidate publication remains immutable-only, and first-catalog bootstrap still uses the exact signed immutable catalog.
+On trusted `main`, publication writes and verifies the immutable catalog, then moves `catalog-v1`, and moves the matching profile alias last only for an authorized compatible-v1 plan. Catalog and alias compare-and-swap, source recheck, readback, rollback, and interrupted-promotion reconciliation remain mandatory. A runtime-major mismatch, `force_candidate`, non-main run, source race, or incomplete gate may publish only immutable candidate state and cannot move the profile alias.
 
 Catalog readers resolve an exact catalog manifest, validate its artifact/config/single-layer media contract, and fetch that layer by descriptor digest into a caller-chosen file. They never extract the publisher-supplied OCI layer title as a filesystem path. New catalogs are published from controlled relative filenames, while this descriptor path remains compatible with the initial catalogs that recorded absolute runner-temporary titles.
 
@@ -35,7 +35,9 @@ GitHub Packages displays every OCI manifest as a package version, so one logical
 
 Production builds always use the resolved immutable upstream digest. The upstream tag is re-resolved before publication. If it moves during the build, the package remains an immutable candidate and no moving alias advances.
 
-The stable tuple is `(source index and platform digests, recipe digest and revision, runtime contract, template schema, runner version and asset digests, locked tool digests)`. Recipe, runtime, runner, tooling, schema, or platform changes always require fresh manual acceptance. After one profile tuple has completed two-platform acceptance, a later source-only Catthehacker digest change may auto-promote that profile only when the EPAR-controlled tuple is identical and every hosted package/evidence gate passes. Full never auto-promotes while disabled; its first protected acceptance enables later source-only auto-advancement.
+The runtime compatibility contract is `(runtime contract, template schema)`. Under `docker-sandboxes-v1` and schema 2, source, recipe, helper, runner, source-lock, and locked-tool changes are compatible by default and may auto-promote after fresh upstream evidence and all hosted package/evidence gates pass. Their exact values remain immutable signed provenance and unexplained package nondeterminism for an unchanged complete build tuple still fails closed. A breaking controller/template contract must declare a new runtime major such as `docker-sandboxes-v2`; it remains candidate-only until real Docker Sandboxes acceptance and protected manual promotion.
+
+The recipe digest includes only inputs that can affect the published artifact: `Dockerfile.prebuilt`, relevant `.dockerignore` behavior, guest and prebuilt runtime files, production Go sources compiled into the image, `helpers.sha256`, and the prebuilt compatibility profile. Tests, host-only validators, local-build profiles, publisher/catalog implementation, and policy files are excluded.
 
 `templates/docker-sandboxes/prebuilt.lock.json` commits only stable recipe and profile identities. Mutable profile enablement, wizard-default, automatic-advancement, acceptance, and revocation state belongs exclusively to the signed catalog, so protected Full promotion does not make a committed lock file stale.
 
@@ -103,11 +105,11 @@ For every run, the human reviewer verifies the private repository, exact workflo
 
 After both workflows pass on both platforms, stop both EPAR controllers. Verify that their GitHub runner records, exact Sandboxes, candidate staging directories, and unreferenced obsolete template generations are cleaned up. Hash each reviewed `active.json` receipt with SHA-256 and retain the two hashes with the four GitHub run IDs/URLs.
 
-No cross-repository PAT or GitHub App secret is added. The protected promotion reviewer uses authenticated GitHub access to inspect the four private-repository runs before approving the environment and entering their evidence into the workflow dispatch.
+No cross-repository PAT or GitHub App secret is required for protected private-repository acceptance review. The automatic upstream gate first uses the workflow's built-in token after feature-branch API validation; if that token cannot reliably read public upstream Actions metadata and anonymous access is also unreliable, the repository must provide `UPSTREAM_ACTIONS_READ_TOKEN` with read-only public Actions access. Missing or invalid access fails closed as publication skipped.
 
-## Protected promotion
+## Protected promotion and break-glass recovery
 
-Stable promotion must run from `main`, and the package evidence must have been produced from `refs/heads/main`. Feature-branch acceptance may be reused only when the main publication has the identical package index digest and complete tuple.
+Protected promotion is retained for runtime-major transitions and break-glass recovery. It must run from `main`, and the package evidence must have been produced from `refs/heads/main`. Feature-branch acceptance may be reused only when the main publication has the identical package index digest and complete tuple.
 
 Dispatch `docker-sandboxes-images.yml` on `main` with:
 
@@ -133,6 +135,7 @@ Catalog pointer and package-alias updates remain journaled by workflow rollback/
 
 ```text
 go run ./cmd/epar-prebuilt-publisher plan --catalog catalog-state.json --input publication-input.json --output plan.json
+go run ./cmd/epar-prebuilt-publisher upstream-gate --profile act --output upstream-gate.json
 go run ./cmd/epar-prebuilt-publisher accept --catalog catalog-state.json --input acceptance.json
 go run ./cmd/epar-prebuilt-publisher promote --protected --catalog catalog-state.json --plan candidate-plan.json
 go run ./cmd/epar-prebuilt-publisher catalog --catalog catalog-state.json --output catalog.canonical.json
@@ -140,7 +143,7 @@ go run ./cmd/epar-prebuilt-publisher verify-catalog --repository ghcr.io/solutio
 go run ./cmd/epar-prebuilt-publisher verify-package --reference ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template@sha256:<64 hex> --entry publication-entry.json --repository ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push
 ```
 
-`accept` appends immutable human-reviewed platform evidence. It accepts only `playwright-docker.yml` and `dockerhub-private-pull.yml` in `solutionforest/ephemeral-action-runner-test`, requires successful run evidence and exact receipt/runner identity, and does not itself move an alias. `promote --protected` requires complete hosted gates plus both reviewed platform records.
+`upstream-gate` reads public upstream workflow/run/job/step metadata and emits an eligibility result plus exact evidence; an ineligible result is not an error, while unavailable or malformed API data fails closed. `accept` appends immutable human-reviewed platform evidence. It accepts only `playwright-docker.yml` and `dockerhub-private-pull.yml` in `solutionforest/ephemeral-action-runner-test`, requires successful run evidence and exact receipt/runner identity, and does not itself move an alias. `promote --protected` requires complete hosted gates plus both reviewed platform records.
 
 ## Retention and revocation
 
