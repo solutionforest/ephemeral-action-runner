@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Profile to build. Full is candidate-only until its independent gates are enabled.'
+        description: 'Compatible v1 builds automatically advance this profile after its upstream and hosted gates pass.'
         required: true
         type: choice
         options:
@@ -36,7 +36,7 @@ on:
           - full
         default: act
       force_candidate:
-        description: 'Keep the result as a candidate even when the source-only tuple is eligible for alias advancement.'
+        description: 'Keep the result as a candidate even when compatible-v1 automatic promotion is eligible.'
         required: true
         type: boolean
         default: false
@@ -65,6 +65,11 @@ on:
         required: false
         type: string
         default: ''
+      upstream_api_probe:
+        description: 'Temporary feature-branch probe of upstream Actions metadata access; performs no publication.'
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -117,9 +122,143 @@ jobs:
           scripts/docker-sandboxes/validate-prebuilt.ps1 -Platform linux/amd64
           scripts/docker-sandboxes/validate-prebuilt.ps1 -Platform linux/arm64
 
+  probe-upstream-api:
+    name: Probe upstream Actions metadata access without publishing
+    if: github.event_name == 'workflow_dispatch' && inputs.upstream_api_probe == true
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe workflow, run, job, and step endpoints
+        shell: bash
+        env:
+          BUILTIN_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repository=catthehacker/docker_images
+          api=https://api.github.com/repos/$repository
+
+          probe_access() {
+            local method=$1 token=$2 workflow run_id attempt
+            local -a auth=()
+            if [[ -n "$token" ]]; then
+              auth=(-H "Authorization: Bearer $token")
+            fi
+            for workflow in copy-full-image.yml build-ubuntu.yml; do
+              runs="$RUNNER_TEMP/${method}-${workflow}-runs.json"
+              status="$(curl --silent --show-error --location --output "$runs" --write-out '%{http_code}' \
+                -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "${auth[@]}" "$api/actions/workflows/$workflow/runs?branch=master&per_page=20")"
+              [[ "$status" == 200 ]] || return 1
+              jq -e '.workflow_runs | type == "array"' "$runs" >/dev/null
+              run_id="$(jq -er '[.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch")] | sort_by(.created_at) | last | .id' "$runs")"
+              attempt="$(jq -er '[.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch")] | sort_by(.created_at) | last | .run_attempt' "$runs")"
+              jobs="$RUNNER_TEMP/${method}-${workflow}-jobs.json"
+              status="$(curl --silent --show-error --location --output "$jobs" --write-out '%{http_code}' \
+                -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "${auth[@]}" "$api/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100")"
+              [[ "$status" == 200 ]] || return 1
+              jq -e '.jobs | type == "array" and length > 0 and all(.[]; (.steps | type) == "array")' "$jobs" >/dev/null
+              printf '%s\t%s\t%s\t%s\n' "$method" "$workflow" "$run_id" "$(jq '.jobs | length' "$jobs")" >> "$RUNNER_TEMP/upstream-api-probe.tsv"
+            done
+          }
+
+          : > "$RUNNER_TEMP/upstream-api-probe.tsv"
+          if probe_access builtin "$BUILTIN_TOKEN"; then
+            method=builtin
+          elif probe_access anonymous ''; then
+            method=anonymous
+          else
+            echo 'Neither the built-in token nor anonymous access could read valid upstream workflow, run, job, and step metadata.' >&2
+            exit 1
+          fi
+          {
+            echo '## Upstream Actions API feasibility probe'
+            echo
+            echo "- Selected access method: \`$method\`"
+            echo '- Publication and package permissions: disabled for this job.'
+            echo '- GHCR/catalog/profile aliases: untouched.'
+            echo
+            echo '| Method | Workflow | Run ID | Jobs read |'
+            echo '| --- | --- | ---: | ---: |'
+            awk -F '\t' '{printf "| `%s` | `%s` | %s | %s |\n", $1, $2, $3, $4}' "$RUNNER_TEMP/upstream-api-probe.tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upstream-gate:
+    name: Verify fresh upstream tag-producing workflow evidence
+    if: github.event_name != 'pull_request' && inputs.promote_candidate != true && inputs.upstream_api_probe != true
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      profile: ${{ steps.gate.outputs.profile }}
+      eligible: ${{ steps.gate.outputs.eligible }}
+      evidence: ${{ steps.gate.outputs.evidence }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Evaluate upstream workflow, job, and step evidence
+        id: gate
+        shell: bash
+        env:
+          DISPATCH_PROFILE: ${{ inputs.profile }}
+          SCHEDULE_EXPRESSION: ${{ github.event.schedule }}
+          UPSTREAM_ACTIONS_READ_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_READ_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          profile="${DISPATCH_PROFILE:-act}"
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            case "$SCHEDULE_EXPRESSION" in
+              '37 23 */7 * *') profile=full ;;
+              '57 23 */7 * *') profile=act ;;
+              *) echo "unsupported schedule expression: $SCHEDULE_EXPRESSION" >&2; exit 1 ;;
+            esac
+          fi
+          case "$profile" in
+            act|full) ;;
+            *) echo "unsupported profile: $profile" >&2; exit 1 ;;
+          esac
+          result="$RUNNER_TEMP/upstream-gate.json"
+          if ! go run ./cmd/epar-prebuilt-publisher upstream-gate --profile "$profile" --output "$result"; then
+            jq -n --arg reason 'GitHub Actions metadata was unavailable or invalid; publication skipped without building or writing GHCR/catalog state' '{eligible:false,reason:$reason}' > "$result"
+          fi
+          eligible="$(jq -r 'if (.eligible | type) == "boolean" then (.eligible | tostring) else error("eligible must be boolean") end' "$result")"
+          reason="$(jq -er '.reason' "$result")"
+          evidence="$(jq -c '.evidence // {}' "$result")"
+          {
+            echo "profile=$profile"
+            echo "eligible=$eligible"
+            echo "evidence=$evidence"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '## Docker Sandboxes upstream publication gate'
+            echo
+            echo "- Profile: \`$profile\`"
+            echo "- Eligible: \`$eligible\`"
+            echo "- Reason: $reason"
+            if [[ "$eligible" == true ]]; then
+              echo "- Upstream run: \`$(jq -r '.evidence.repository + "/actions/runs/" + (.evidence.runId | tostring)' "$result")\`"
+              echo "- Completed: \`$(jq -r '.evidence.completedAt' "$result")\`"
+            else
+              echo '- No source resolution, build, package push, catalog publication, or profile-tag movement was attempted.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   resolve:
     name: Resolve immutable upstream and publication state
-    if: github.event_name != 'pull_request' && inputs.promote_candidate != true
+    needs: upstream-gate
+    if: needs.upstream-gate.outputs.eligible == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -139,6 +278,7 @@ jobs:
       runner_arm64_digest: ${{ steps.runner.outputs.arm64_digest }}
       catalog_manifest_digest: ${{ steps.catalog.outputs.catalog_manifest_digest }}
       noop: ${{ steps.noop.outputs.noop }}
+      upstream_evidence: ${{ needs.upstream-gate.outputs.evidence }}
     steps:
       - name: Check out source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -257,16 +397,14 @@ jobs:
           tool_digest="sha256:$(jq -cS '{dockerfileFrontend,sbomGenerator,goBuilder,emulation,tini}' templates/docker-sandboxes/sources.lock.json | sha256sum | awk '{print $1}')"
           mapfile -t recipe_files < <(
             git ls-files --cached -- \
+              'templates/docker-sandboxes/.dockerignore' \
               'templates/docker-sandboxes/Dockerfile.prebuilt' \
               'templates/docker-sandboxes/helpers.sha256' \
-              'templates/docker-sandboxes/prebuilt.lock.json' \
               'templates/docker-sandboxes/prebuilt/**' \
               'templates/docker-sandboxes/guest/**' \
-              'templates/docker-sandboxes/hook-launcher/**' \
-              'templates/docker-sandboxes/egress-bridge/**' \
-              'templates/docker-sandboxes/profiles/**' \
-              'scripts/docker-sandboxes/**' \
-              'internal/prebuilt/**' | sort
+              'templates/docker-sandboxes/hook-launcher/main.go' \
+              'templates/docker-sandboxes/egress-bridge/main.go' \
+              'templates/docker-sandboxes/profiles/prebuilt.compatibility.json' | sort
           )
           ((${#recipe_files[@]} > 0))
           recipe_digest="sha256:$(printf '%s\n' "${recipe_files[@]}" | xargs sha256sum | sha256sum | awk '{print $1}')"
@@ -309,7 +447,7 @@ jobs:
             "packageRepository": "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template",
             "policies": {
               "act": {"enabled": true, "wizardDefault": false, "autoAdvance": true},
-              "full": {"enabled": false, "wizardDefault": false, "autoAdvance": false, "reason": "Full remains gated until independent two-platform EPAR acceptance passes"}
+              "full": {"enabled": true, "wizardDefault": true, "autoAdvance": true}
             },
             "entries": [],
             "aliases": {},
@@ -318,6 +456,8 @@ jobs:
           JSON
             echo 'catalog_manifest_digest=' >> "$GITHUB_OUTPUT"
           fi
+          jq '.policies.act = {enabled:true,wizardDefault:false,autoAdvance:true} | .policies.full = {enabled:true,wizardDefault:true,autoAdvance:true}' "$catalog_dir/catalog-state.json" > "$catalog_dir/catalog-state.tmp"
+          mv "$catalog_dir/catalog-state.tmp" "$catalog_dir/catalog-state.json"
           jq -e . "$catalog_dir/catalog-state.json" >/dev/null
 
       - name: Reconcile an interrupted catalog-first alias promotion
@@ -402,9 +542,8 @@ jobs:
           matching_entry="$RUNNER_TEMP/epar-catalog/matching-entry.json"
           noop=false
           if [[ "$FORCE_CANDIDATE" != true ]]; then
-            # Only a complete candidate or active entry can suppress a build.
-            # Superseded entries must not suppress a build because their package
-            # is no longer the catalog's current accepted result.
+            # Only an active entry can suppress a build. A matching candidate
+            # must be re-evaluated so a later fresh upstream gate can promote it.
             jq -c --arg profile "$PROFILE" --arg source "$SOURCE_INDEX_DIGEST" \
               --arg sourceAmd64 "$SOURCE_AMD64_DIGEST" --arg sourceArm64 "$SOURCE_ARM64_DIGEST" \
               --arg recipe "$RECIPE_DIGEST" --arg revision "$RECIPE_REVISION" --arg sourceLock "$SOURCE_LOCK_DIGEST" --arg tool "$TOOL_DIGEST" \
@@ -414,7 +553,7 @@ jobs:
                 $catalog.entries[] as $entry
                 | (([$catalog.transitions[]? | select(.packageIndexDigest == $entry.packageIndexDigest) | .toStatus] | last) // $entry.status) as $effectiveStatus
                 | select(
-                    ($effectiveStatus == "candidate" or $effectiveStatus == "active")
+                    $effectiveStatus == "active"
                     and $entry.profile == $profile
                     and $entry.source.indexDigest == $source
                     and $entry.source.platformDigests["linux/amd64"] == $sourceAmd64
@@ -1003,6 +1142,7 @@ jobs:
           IMPORT_READBACK: ${{ steps.gates.outputs.import_readback }}
           PROVENANCE_DIGEST: ${{ steps.gates.outputs.provenance_digest }}
           SBOM_DIGEST: ${{ steps.gates.outputs.sbom_digest }}
+          UPSTREAM_EVIDENCE: ${{ needs.resolve.outputs.upstream_evidence }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/epar-publisher"
@@ -1015,9 +1155,9 @@ jobs:
             --arg recipeDigest "$RECIPE_DIGEST" --arg recipeRevision "$RECIPE_REVISION" --arg sourceLockDigest "$SOURCE_LOCK_DIGEST" --arg toolDigest "$TOOL_DIGEST" --arg runtime "$RUNTIME_CONTRACT" \
             --arg runnerVersion "$RUNNER_VERSION" --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" \
             --arg provenanceDigest "$PROVENANCE_DIGEST" --arg sbomDigest "$SBOM_DIGEST" --arg attestationDigest "$PROVENANCE_DIGEST" \
-            --arg candidateId "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PROFILE}-${PACKAGE_INDEX_DIGEST#sha256:}" --argjson platforms "$package_platforms" --argjson tools "$tools_json" \
+            --arg candidateId "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PROFILE}-${PACKAGE_INDEX_DIGEST#sha256:}" --argjson platforms "$package_platforms" --argjson tools "$tools_json" --argjson upstream "$UPSTREAM_EVIDENCE" \
             --arg sourceRechecked "$SOURCE_RECHECKED" --arg provenanceGenerated "$PROVENANCE_GENERATED" --arg sbomGenerated "$SBOM_GENERATED" --arg attestationVerified "$ATTESTATION_VERIFIED" --arg runtimeValidated "$RUNTIME_VALIDATED" --arg importReadback "$IMPORT_READBACK" \
-            '{profile:$profile,channel:"stable",sourceReference:$sourceReference,sourceTag:$sourceTag,packageRepository:$packageRepository,packageReference:$packageReference,packageIndexDigest:$packageDigest,packagePlatforms:$platforms,recipe:{digest:$recipeDigest,runtimeContract:$runtime,templateSchema:2,recipeRevision:$recipeRevision,sourceLockDigest:$sourceLockDigest,toolDigest:$toolDigest},runner:{selector:"latest",version:$runnerVersion,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64},overlayRequired:false},tools:$tools,evidence:{provenanceDigest:$provenanceDigest,sbomDigest:$sbomDigest,attestationDigest:$attestationDigest},gates:{sourceResolved:true,sourceRechecked:($sourceRechecked == "true"),buildSucceeded:true,platformsValidated:true,importReadback:($importReadback == "true"),runtimeValidated:($runtimeValidated == "true"),provenanceGenerated:($provenanceGenerated == "true"),sbomGenerated:($sbomGenerated == "true"),attestationVerified:($attestationVerified == "true")},candidateId:$candidateId}' > "$input"
+            '{profile:$profile,channel:"stable",sourceReference:$sourceReference,sourceTag:$sourceTag,packageRepository:$packageRepository,packageReference:$packageReference,packageIndexDigest:$packageDigest,packagePlatforms:$platforms,recipe:{digest:$recipeDigest,runtimeContract:$runtime,templateSchema:2,recipeRevision:$recipeRevision,sourceLockDigest:$sourceLockDigest,toolDigest:$toolDigest},runner:{selector:"latest",version:$runnerVersion,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64},overlayRequired:false},tools:$tools,evidence:{provenanceDigest:$provenanceDigest,sbomDigest:$sbomDigest,attestationDigest:$attestationDigest},gates:{sourceResolved:true,sourceRechecked:($sourceRechecked == "true"),buildSucceeded:true,platformsValidated:true,importReadback:($importReadback == "true"),runtimeValidated:($runtimeValidated == "true"),provenanceGenerated:($provenanceGenerated == "true"),sbomGenerated:($sbomGenerated == "true"),attestationVerified:($attestationVerified == "true")},upstream:$upstream,candidateId:$candidateId}' > "$input"
           if [[ "$SOURCE_RECHECKED" != true ]]; then
             jq --arg immutable "${SOURCE_REPOSITORY}@${SOURCE_INDEX_DIGEST}" '.sourceReference = $immutable' "$input" > "$input.tmp"
             mv "$input.tmp" "$input"
@@ -1050,7 +1190,7 @@ jobs:
             echo "- Profile: \`${{ needs.resolve.outputs.profile }}\`"
             echo "- Package: \`${PACKAGE_REF}\`"
             echo "- Index digest: \`${INDEX_DIGEST}\`"
-            echo '- Candidate assembly, immutable package tagging, hosted two-platform smoke checks, and OCI evidence completed; real Sandbox acceptance is performed later through temporary EPAR pools.'
+            echo '- Candidate assembly, immutable package tagging, hosted two-platform smoke checks, and OCI evidence completed. Compatible v1 packages may be promoted automatically; real Sandbox acceptance remains factual only when separately performed.'
             echo '- This workflow has contents:read and does not commit, tag, release, open a pull request, or push Git refs.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1059,7 +1199,7 @@ jobs:
     needs:
       - resolve
       - publish
-    if: always() && needs.resolve.outputs.noop != 'true' && needs.publish.result == 'success'
+    if: always() && needs.resolve.result == 'success' && needs.resolve.outputs.noop != 'true' && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -1305,7 +1445,7 @@ jobs:
             alias_moved=true
             [[ "$(oras resolve "$alias_ref")" == "${PACKAGE_REF##*@}" ]]
             trap - EXIT
-            echo 'Signed catalog was moved before the authorized source-only profile alias; pointer rollback was armed until both readbacks passed.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Signed catalog was moved before the authorized compatible-v1 profile alias; pointer rollback was armed until both readbacks passed.' >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$ALLOW_ALIAS" == true ]]; then
             trap - EXIT
             echo "Signed immutable candidate catalog: ${immutable_catalog_ref}" >> "$GITHUB_STEP_SUMMARY"
