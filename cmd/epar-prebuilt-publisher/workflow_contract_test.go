@@ -34,7 +34,7 @@ func TestWorkflowVerifiesMatchingPackageBeforeNoop(t *testing.T) {
 	for _, required := range []string{
 		`matching_entries="$RUNNER_TEMP/epar-catalog/matching-entries.json"`,
 		`matching_entry="$RUNNER_TEMP/epar-catalog/matching-entry.json"`,
-		`($effectiveStatus == "candidate" or $effectiveStatus == "active")`,
+		`$effectiveStatus == "active"`,
 		`$entry.gates.sourceRechecked == true`,
 		`$entry.gates.attestationVerified == true`,
 		`go run ./cmd/epar-prebuilt-publisher verify-package`,
@@ -53,6 +53,61 @@ func TestWorkflowVerifiesMatchingPackageBeforeNoop(t *testing.T) {
 	noOpAssignment := strings.Index(noopStep, "noop=true")
 	if verify < 0 || noOpAssignment < 0 || verify >= noOpAssignment {
 		t.Fatalf("immutable package verification must precede noop=true: verify=%d noop=%d", verify, noOpAssignment)
+	}
+}
+
+func TestWorkflowSkipsAllPublicationWorkWhenUpstreamGateIsNotGreen(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	gate := strings.Index(workflow, "  upstream-gate:\n")
+	resolve := strings.Index(workflow, "\n  resolve:\n")
+	build := strings.Index(workflow, "\n  build:\n")
+	if gate < 0 || resolve <= gate || build <= resolve {
+		t.Fatalf("upstream gate must precede resolve and build: gate=%d resolve=%d build=%d", gate, resolve, build)
+	}
+	gateJob := workflow[gate:resolve]
+	resolveJob := workflow[resolve:build]
+	for _, required := range []string{
+		`go run ./cmd/epar-prebuilt-publisher upstream-gate --profile "$profile" --output "$result"`,
+		`UPSTREAM_ACTIONS_READ_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_READ_TOKEN || github.token }}`,
+		`if (.eligible | type) == "boolean" then (.eligible | tostring)`,
+		`publication skipped without building or writing GHCR/catalog state`,
+		`No source resolution, build, package push, catalog publication, or profile-tag movement was attempted.`,
+	} {
+		if !strings.Contains(gateJob, required) {
+			t.Fatalf("upstream gate is missing %q", required)
+		}
+	}
+	if !strings.Contains(resolveJob, "needs: upstream-gate") || !strings.Contains(resolveJob, "if: needs.upstream-gate.outputs.eligible == 'true'") {
+		t.Fatal("resolve is not fail-closed behind the upstream gate")
+	}
+	if !strings.Contains(workflow, "if: always() && needs.resolve.result == 'success' && needs.resolve.outputs.noop != 'true' && needs.publish.result == 'success'") {
+		t.Fatal("automatic promotion can bypass a skipped or failed gated resolve job")
+	}
+	if strings.Contains(gateJob, "docker/login-action") || strings.Contains(gateJob, "oras tag") || strings.Contains(gateJob, "docker/build-push-action") {
+		t.Fatal("upstream gate must not write package or catalog state")
+	}
+}
+
+func TestWorkflowRecipeDigestIncludesOnlyArtifactInputs(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	start := strings.Index(workflow, "      - name: Compute immutable recipe and tool identities\n")
+	if start < 0 {
+		t.Fatal("cannot find recipe digest step")
+	}
+	end := strings.Index(workflow[start:], "      - name: Fetch current signed catalog state")
+	if end < 0 {
+		t.Fatalf("cannot isolate recipe digest step: start=%d end=%d", start, end)
+	}
+	recipe := workflow[start : start+end]
+	for _, required := range []string{"Dockerfile.prebuilt", "helpers.sha256", "prebuilt/**", "guest/**", "hook-launcher/main.go", "egress-bridge/main.go", "prebuilt.compatibility.json"} {
+		if !strings.Contains(recipe, required) {
+			t.Fatalf("artifact recipe is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"prebuilt.lock.json", "internal/prebuilt", "scripts/docker-sandboxes", "profiles/*.compatibility.json", "_test.go"} {
+		if strings.Contains(recipe, forbidden) {
+			t.Fatalf("artifact recipe includes host/policy input %q", forbidden)
+		}
 	}
 }
 
@@ -247,7 +302,7 @@ func TestCatalogFetcherRejectsLayerPathsAndValidatesExactBlob(t *testing.T) {
 		`select((.layers | length) == 1)`,
 		`oras blob fetch --output "$catalog_file" "${repository}@${layer_digest}"`,
 		`actual_digest="sha256:$(sha256sum "$catalog_file"`,
-		`(.schemaVersion == 1) and (.artifactKind == "docker-sandboxes-template")`,
+		`((.schemaVersion == 1) or (.schemaVersion == 2)) and (.artifactKind == "docker-sandboxes-template")`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("catalog fetcher is missing %q", required)
@@ -319,6 +374,7 @@ func TestWorkflowBuildsAndPromotesFullWithoutPersistentNativeRunners(t *testing.
 		`epar-prebuilt-${PROFILE}-${digest_prefix}-arm64`,
 		`alias_tag="${PROFILE}-latest"`,
 		`oras tag "${PACKAGE_REPOSITORY}@${CANDIDATE_DIGEST}" "$alias_tag"`,
+		`.policies.full = {enabled:true,wizardDefault:true,autoAdvance:true}`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("Full publication/acceptance contract is missing %q", required)

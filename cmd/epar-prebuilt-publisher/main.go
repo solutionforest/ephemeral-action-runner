@@ -10,9 +10,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/solutionforest/ephemeral-action-runner/internal/prebuilt"
@@ -20,10 +22,12 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: epar-prebuilt-publisher <plan|accept|promote|catalog|reconcile-alias|verify-catalog|verify-package> [flags]"))
+		fatal(errors.New("usage: epar-prebuilt-publisher <upstream-gate|plan|accept|promote|catalog|reconcile-alias|verify-catalog|verify-package> [flags]"))
 	}
 	var err error
 	switch os.Args[1] {
+	case "upstream-gate":
+		err = upstreamGateCommand(os.Args[2:])
 	case "plan":
 		err = planCommand(os.Args[2:])
 	case "accept":
@@ -44,6 +48,37 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+}
+
+func upstreamGateCommand(args []string) error {
+	flags := flag.NewFlagSet("upstream-gate", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	profile := flags.String("profile", "", "Act or Full profile to evaluate")
+	outputPath := flags.String("output", "", "upstream gate result JSON path")
+	baseURL := flags.String("base-url", "", "GitHub API base URL")
+	anonymous := flags.Bool("anonymous", false, "do not send a GitHub API token")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *profile == "" || *outputPath == "" {
+		return errors.New("upstream-gate requires --profile and --output")
+	}
+	token := ""
+	if !*anonymous {
+		token = strings.TrimSpace(os.Getenv("UPSTREAM_ACTIONS_READ_TOKEN"))
+		if token == "" {
+			token = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+		}
+	}
+	result, err := (prebuilt.UpstreamGateClient{HTTPClient: &http.Client{Timeout: 30 * time.Second}, BaseURL: *baseURL, Token: token}).Evaluate(context.Background(), *profile)
+	if err != nil {
+		return fmt.Errorf("evaluate upstream workflow gate: %w", err)
+	}
+	if err := writeJSON(*outputPath, result); err != nil {
+		return fmt.Errorf("write upstream gate result: %w", err)
+	}
+	fmt.Printf("eligible=%t\nreason=%s\n", result.Eligible, result.Reason)
+	return nil
 }
 
 func acceptCommand(args []string) error {

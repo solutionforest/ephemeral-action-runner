@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestPublisherAutoAdvancesOnlyForSourceOnlyChange(t *testing.T) {
+func TestPublisherAutoAdvancesCompatibleV1Change(t *testing.T) {
 	oldDigest := "sha256:" + strings.Repeat("a", 64)
 	newDigest := "sha256:" + strings.Repeat("b", 64)
 	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(newDigest), sourceObservation(newDigest)}}
@@ -43,12 +43,13 @@ func TestPublisherAutoAdvancesOnlyForSourceOnlyChange(t *testing.T) {
 func TestPublisherNoopForCompleteTuple(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	previous := validEntry(ProfileAct, "a", StatusActive)
-	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: digest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
 	input := publicationInput(digest)
+	input.Gates = previous.Gates
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: digest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
 	input.SourceReference = "ghcr.io/catthehacker/ubuntu:act-latest"
 	input.SourceTag = "act-latest"
 	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest)}}
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	plan, err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +71,7 @@ func TestPublisherAutoAdvancesWhenUpstreamIndexChanges(t *testing.T) {
 	input.SourceTag = "act-latest"
 	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(newDigest)}}
 	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: oldDigest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	plan, err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +80,7 @@ func TestPublisherAutoAdvancesWhenUpstreamIndexChanges(t *testing.T) {
 	}
 }
 
-func TestPublisherLeavesRecipeChangeAsCandidate(t *testing.T) {
+func TestPublisherAutoAdvancesRecipeChangeWithinV1(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	previous := validEntry(ProfileAct, "a", StatusActive)
 	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: digest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
@@ -90,12 +91,67 @@ func TestPublisherLeavesRecipeChangeAsCandidate(t *testing.T) {
 	input.Recipe.Digest = "sha256:" + strings.Repeat("b", 64)
 	input.PackageIndexDigest = "sha256:" + strings.Repeat("c", 64)
 	input.PackageReference = DefaultPackageRepository + "@" + input.PackageIndexDigest
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	plan, err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Action != PlanAdvanceAlias {
+		t.Fatalf("action = %q, want compatible v1 alias advancement", plan.Action)
+	}
+}
+
+func TestPublisherRuntimeMajorChangeRemainsCandidate(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	previous := validEntry(ProfileAct, "a", StatusActive)
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: digest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
+	input := publicationInput(digest)
+	input.Recipe.RuntimeContract = "docker-sandboxes-v2"
+	input.PackageIndexDigest = "sha256:" + strings.Repeat("c", 64)
+	input.PackageReference = DefaultPackageRepository + "@" + input.PackageIndexDigest
+	plan, err := (Publisher{Resolver: &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest)}}, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plan.Action != PlanCandidate {
-		t.Fatalf("action = %q, want candidate", plan.Action)
+		t.Fatalf("runtime v2 action = %q, want candidate", plan.Action)
+	}
+}
+
+func TestPublisherTreatsV1ProvenanceIdentityChangesAsCompatible(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	changedDigest := "sha256:" + strings.Repeat("b", 64)
+	cases := []struct {
+		name string
+		edit func(*PublicationInput)
+	}{
+		{name: "recipe helper", edit: func(input *PublicationInput) { input.Recipe.Digest = changedDigest }},
+		{name: "recipe revision", edit: func(input *PublicationInput) { input.Recipe.RecipeRevision = strings.Repeat("b", 40) }},
+		{name: "source lock", edit: func(input *PublicationInput) { input.Recipe.SourceLockDigest = changedDigest }},
+		{name: "tool lock", edit: func(input *PublicationInput) {
+			input.Recipe.ToolDigest = changedDigest
+			input.Tools[0].Digest = changedDigest
+		}},
+		{name: "runner", edit: func(input *PublicationInput) {
+			input.Runner.Version = "2.999.0"
+			input.Runner.AssetDigests["linux/amd64"] = changedDigest
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			previous := validEntry(ProfileAct, "a", StatusActive)
+			catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: digest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
+			input := publicationInput(digest)
+			input.PackageIndexDigest = "sha256:" + strings.Repeat("c", 64)
+			input.PackageReference = DefaultPackageRepository + "@" + input.PackageIndexDigest
+			tc.edit(&input)
+			plan, err := (Publisher{Resolver: &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest)}}, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Action != PlanAdvanceAlias {
+				t.Fatalf("action = %q, want compatible v1 advancement", plan.Action)
+			}
+		})
 	}
 }
 
@@ -153,7 +209,7 @@ func TestPublisherProtectedPromotionBootstrapsAcceptedFull(t *testing.T) {
 	if err := publisher.Promote(context.Background(), &catalog, plan); err != nil {
 		t.Fatal(err)
 	}
-	if err := publisher.PromoteProtected(context.Background(), &catalog, plan); err == nil || !strings.Contains(err.Error(), "acceptance") {
+	if err := publisher.PromoteProtected(context.Background(), &catalog, plan); err == nil || (!strings.Contains(err.Error(), "acceptance") && !strings.Contains(err.Error(), "incomplete")) {
 		t.Fatalf("unaccepted Full promotion error = %v", err)
 	}
 	if _, err := catalog.AppendAcceptance(validAcceptanceForProfile(ProfileFull, digest, "linux/amd64", 101, 102)); err != nil {
@@ -176,6 +232,28 @@ func TestPublisherProtectedPromotionBootstrapsAcceptedFull(t *testing.T) {
 	}
 }
 
+func TestPublisherAutomaticallyPromotesCompatibleFull(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	input := publicationInput(digest)
+	input.Profile = ProfileFull
+	input.SourceReference = "ghcr.io/catthehacker/ubuntu:full-latest"
+	input.SourceTag = "full-latest"
+	input.Upstream = validUpstreamEvidence(ProfileFull, time.Unix(1, 0))
+	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest), sourceObservation(digest)}}
+	catalog := Catalog{SchemaVersion: LegacyCatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileFull: {Enabled: true, WizardDefault: true, AutoAdvance: true}}, Aliases: map[string]Alias{}}
+	publisher := Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}
+	plan, err := publisher.Plan(context.Background(), catalog, input)
+	if err != nil || plan.Action != PlanAdvanceAlias {
+		t.Fatalf("Full plan = %#v, %v", plan, err)
+	}
+	if err := publisher.Promote(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Aliases[ProfileFull].PackageIndexDigest != digest || len(catalog.CompatiblePromotions) != 1 {
+		t.Fatalf("Full automatic promotion = %#v", catalog)
+	}
+}
+
 func TestPublisherProtectedPromotionRejectsIncompleteCandidate(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest)}}
@@ -184,7 +262,7 @@ func TestPublisherProtectedPromotionRejectsIncompleteCandidate(t *testing.T) {
 	input.SourceReference = resolver.observations[0].Reference
 	input.SourceTag = "act-latest"
 	input.Gates.RuntimeValidated = false
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	plan, err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,12 +327,13 @@ func TestPublisherRejectsRebuildWithSameCompleteTuple(t *testing.T) {
 	}
 }
 
-func TestPublisherRerunOfUnpromotedCandidateIsNoop(t *testing.T) {
+func TestPublisherReevaluatesAndPromotesExistingCompatibleCandidate(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	input := publicationInput(digest)
+	input.Upstream = UpstreamWorkflowEvidence{}
 	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest), sourceObservation(digest)}}
 	publisher := Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}
-	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository}
+	catalog := Catalog{SchemaVersion: LegacyCatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Aliases: map[string]Alias{}}
 	first, err := publisher.Plan(context.Background(), catalog, input)
 	if err != nil || first.Action != PlanCandidate {
 		t.Fatalf("first plan = %#v, %v", first, err)
@@ -262,12 +341,45 @@ func TestPublisherRerunOfUnpromotedCandidateIsNoop(t *testing.T) {
 	if err := publisher.Promote(context.Background(), &catalog, first); err != nil {
 		t.Fatal(err)
 	}
+	input.Upstream = validUpstreamEvidence(ProfileAct, time.Unix(1, 0))
 	second, err := publisher.Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Action != PlanNoop {
+	if second.Action != PlanAdvanceAlias {
 		t.Fatalf("rerun action = %q, reason %s", second.Action, second.Reason)
+	}
+	if err := publisher.Promote(context.Background(), &catalog, second); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Entries) != 1 || catalog.Aliases[ProfileAct].PackageIndexDigest != digest || catalog.SchemaVersion != CatalogSchemaVersion {
+		t.Fatalf("reevaluated catalog = %#v", catalog)
+	}
+}
+
+func TestPublisherPromotionRechecksAutoAdvancePolicy(t *testing.T) {
+	oldDigest := "sha256:" + strings.Repeat("a", 64)
+	newDigest := "sha256:" + strings.Repeat("b", 64)
+	previous := validEntry(ProfileAct, "a", StatusActive)
+	previous.PackageIndexDigest = oldDigest
+	previous.PackageReference = DefaultPackageRepository + "@" + oldDigest
+	previous.Source.IndexDigest = oldDigest
+	previous.Source.Reference = previous.Source.Repository + "@" + oldDigest
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{previous}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, PackageIndexDigest: oldDigest, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", Channel: ChannelStable, Status: StatusActive}}}
+	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(newDigest), sourceObservation(newDigest)}}
+	publisher := Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}
+	plan, err := publisher.Plan(context.Background(), catalog, publicationInput(newDigest))
+	if err != nil || plan.Action != PlanAdvanceAlias {
+		t.Fatalf("plan = %#v, %v", plan, err)
+	}
+	policy := catalog.Policies[ProfileAct]
+	policy.AutoAdvance = false
+	catalog.Policies[ProfileAct] = policy
+	if err := publisher.Promote(context.Background(), &catalog, plan); err == nil || !strings.Contains(err.Error(), "no longer enabled") {
+		t.Fatalf("policy race error = %v", err)
+	}
+	if _, exists := catalog.EntryByDigest(newDigest); exists || catalog.Aliases[ProfileAct].PackageIndexDigest != oldDigest {
+		t.Fatal("policy race mutated the catalog")
 	}
 }
 
@@ -328,11 +440,11 @@ func TestPublisherPromotionRejectsSourceMove(t *testing.T) {
 	input := publicationInput(newDigest)
 	input.SourceReference = resolver.observations[0].Reference
 	input.SourceTag = "act-latest"
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	plan, err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := (Publisher{Resolver: resolver}).Promote(context.Background(), &catalog, plan); err == nil {
+	if err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Promote(context.Background(), &catalog, plan); err == nil {
 		t.Fatal("source race unexpectedly promoted alias")
 	}
 	if got := catalog.Aliases[ProfileAct].PackageIndexDigest; got != oldDigest {
@@ -356,7 +468,7 @@ func TestPublisherAliasRaceLeavesCatalogUnchanged(t *testing.T) {
 	input := publicationInput(newDigest)
 	input.SourceReference = resolver.observations[0].Reference
 	input.SourceTag = "act-latest"
-	plan, err := (Publisher{Resolver: resolver}).Plan(context.Background(), catalog, input)
+	plan, err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Plan(context.Background(), catalog, input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +477,7 @@ func TestPublisherAliasRaceLeavesCatalogUnchanged(t *testing.T) {
 	racedAlias.PackageIndexDigest = "sha256:" + strings.Repeat("c", 64)
 	catalog.Aliases[ProfileAct] = racedAlias
 	before := len(catalog.Entries)
-	if err := (Publisher{Resolver: resolver}).Promote(context.Background(), &catalog, plan); err == nil {
+	if err := (Publisher{Resolver: resolver, Now: func() time.Time { return time.Unix(2, 0) }}).Promote(context.Background(), &catalog, plan); err == nil {
 		t.Fatal("alias race unexpectedly promoted")
 	}
 	if len(catalog.Entries) != before {
@@ -396,10 +508,26 @@ func TestStatusTransitionsKeepImmutableEntryAndExposeEffectiveStatus(t *testing.
 }
 
 func publicationInput(packageDigest string) PublicationInput {
+	entry := validEntry(ProfileAct, "a", StatusActive)
+	gates := entry.Gates
+	gates.ImportReadback = false
+	gates.RuntimeValidated = false
 	return PublicationInput{
 		Profile: ProfileAct, Channel: ChannelStable, SourceReference: "ghcr.io/catthehacker/ubuntu:act-latest", SourceTag: "act-latest", PackageRepository: DefaultPackageRepository, PackageReference: DefaultPackageRepository + "@" + packageDigest, PackageIndexDigest: packageDigest,
-		PackagePlatforms: []PlatformPublication{{Platform: "linux/amd64", PackageManifestDigest: packageDigest, SourceManifestDigest: packageDigest, Validated: true}, {Platform: "linux/arm64", PackageManifestDigest: packageDigest, SourceManifestDigest: packageDigest, Validated: true}}, Recipe: validEntry(ProfileAct, "a", StatusActive).Recipe, Runner: validEntry(ProfileAct, "a", StatusActive).Runner, Tools: validEntry(ProfileAct, "a", StatusActive).Tools, Evidence: validEntry(ProfileAct, "a", StatusActive).Evidence, Gates: validEntry(ProfileAct, "a", StatusActive).Gates, PublishedAt: time.Unix(2, 0),
+		PackagePlatforms: []PlatformPublication{{Platform: "linux/amd64", PackageManifestDigest: packageDigest, SourceManifestDigest: packageDigest, Validated: true}, {Platform: "linux/arm64", PackageManifestDigest: packageDigest, SourceManifestDigest: packageDigest, Validated: true}}, Recipe: entry.Recipe, Runner: entry.Runner, Tools: entry.Tools, Evidence: entry.Evidence, Gates: gates, Upstream: validUpstreamEvidence(ProfileAct, time.Unix(1, 0)), PublishedAt: time.Unix(2, 0),
 	}
+}
+
+func validUpstreamEvidence(profile string, completedAt time.Time) UpstreamWorkflowEvidence {
+	evidence := UpstreamWorkflowEvidence{Repository: upstreamRepository, RunID: 123, RunAttempt: 1, Event: "schedule", Branch: "master", HeadSHA: strings.Repeat("a", 40), RunConclusion: "success", Conclusion: "success", TestConclusion: "skipped", CompletedAt: completedAt.UTC()}
+	if profile == ProfileFull {
+		evidence.Workflow = upstreamFullWorkflow
+		evidence.GateJob = "four Full copy jobs"
+	} else {
+		evidence.Workflow = upstreamActWorkflow
+		evidence.GateJob = upstreamActGateJob
+	}
+	return evidence
 }
 
 type sequenceResolver struct {

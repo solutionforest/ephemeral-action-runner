@@ -569,49 +569,31 @@ func TestDockerSandboxesCriticalRevocationAdmissionBlockPersistsButOrdinaryRevoc
 	}
 }
 
-func TestDockerSandboxesPrebuiltCompatibilityGateRejectsUnsupportedContractSchemaAndRecipe(t *testing.T) {
-	missingSourceTree := &Coordinator{ProjectRoot: t.TempDir()}
+func TestDockerSandboxesPrebuiltCompatibilityGateUsesRuntimeContractAndTemplateSchema(t *testing.T) {
+	coordinator := &Coordinator{ProjectRoot: t.TempDir()}
 	for name, recipe := range map[string]prebuilt.RecipeDescriptor{
 		"runtime-contract": {RuntimeContract: "docker-sandboxes-v2", TemplateSchema: 2},
 		"template-schema":  {RuntimeContract: "docker-sandboxes-v1", TemplateSchema: 3},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := missingSourceTree.validateDockerSandboxesPrebuiltRecipe(prebuilt.Entry{Recipe: recipe}); err == nil || !strings.Contains(err.Error(), "unsupported runtime contract") {
+			if err := coordinator.validateDockerSandboxesPrebuiltRecipe(prebuilt.Entry{Recipe: recipe}); err == nil || !strings.Contains(err.Error(), "unsupported runtime contract") {
 				t.Fatalf("unsupported compatibility was not rejected before source/package materialization: %v", err)
 			}
 		})
 	}
-	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
-	}
-	unknownRecipe := dockerSandboxesPrebuiltFixture().Entry
-	unknownRecipe.Recipe.RuntimeContract = "docker-sandboxes-v1"
-	unknownRecipe.Recipe.TemplateSchema = 2
-	unknownRecipe.Recipe.Digest = "sha256:" + strings.Repeat("9", 64)
-	unknownRecipe.Recipe.SourceLockDigest = "sha256:" + strings.Repeat("a", 64)
-	unknownRecipe.Recipe.ToolDigest = "sha256:" + strings.Repeat("b", 64)
-	if err := (&Coordinator{ProjectRoot: repositoryRoot}).validateDockerSandboxesPrebuiltRecipe(unknownRecipe); err == nil || !strings.Contains(err.Error(), "not supported by this controller") {
-		t.Fatalf("unknown prebuilt recipe was not rejected: %v", err)
-	}
-}
-
-func TestDockerSandboxesSupportedPrebuiltToolDigestMatchesPublisherCanonicalJSON(t *testing.T) {
-	lock := []byte(`{
-		"dockerfileFrontend":{"reference":"frontend"},
-		"sbomGenerator":{"reference":"sbom"},
-		"goBuilder":{"version":"1.25"},
-		"emulation":{"backend":"qemu"},
-		"tini":{"version":"0.19.0"},
-		"ignored":{"changes":"do not affect the tool identity"}
-	}`)
-	got, err := dockerSandboxesSupportedPrebuiltToolDigest(lock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const want = "sha256:6ddef591a74f68147acca7a9534bc19a3f1c21c2c70ce4d4dafa0692d379754c"
-	if got != want {
-		t.Fatalf("tool digest = %s, want publisher-compatible %s", got, want)
+	for _, digest := range []string{
+		"sha256:e1758810f0821c68d8dd1d8f34cd08394669683888675df7a870f3a191f969bc",
+		"sha256:7d13940d24b0e8e623aa3803e3ebedd63d9b05cbb5f954b6a9db6bdbd15ce800",
+	} {
+		entry := dockerSandboxesPrebuiltFixture().Entry
+		entry.Recipe.RuntimeContract = "docker-sandboxes-v1"
+		entry.Recipe.TemplateSchema = 2
+		entry.Recipe.Digest = digest
+		entry.Recipe.SourceLockDigest = "sha256:" + strings.Repeat("a", 64)
+		entry.Recipe.ToolDigest = "sha256:" + strings.Repeat("b", 64)
+		if err := coordinator.validateDockerSandboxesPrebuiltRecipe(entry); err != nil {
+			t.Fatalf("compatible recipe %s was rejected: %v", digest, err)
+		}
 	}
 }
 

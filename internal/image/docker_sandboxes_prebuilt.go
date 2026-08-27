@@ -2,9 +2,7 @@ package image
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -470,104 +467,7 @@ func (m *Coordinator) validateDockerSandboxesPrebuiltRecipe(entry prebuilt.Entry
 	if entry.Recipe.RuntimeContract != "docker-sandboxes-v1" || entry.Recipe.TemplateSchema != 2 {
 		return fmt.Errorf("prebuilt package requires unsupported runtime contract %q or template schema %d", entry.Recipe.RuntimeContract, entry.Recipe.TemplateSchema)
 	}
-	sourceLockPath := filepath.Join(m.ProjectRoot, "templates", "docker-sandboxes", "sources.lock.json")
-	sourceLock, err := os.ReadFile(sourceLockPath)
-	if err != nil {
-		return fmt.Errorf("read supported prebuilt source lock: %w", err)
-	}
-	sourceDigest := sha256.Sum256(sourceLock)
-	wantSourceDigest := "sha256:" + hex.EncodeToString(sourceDigest[:])
-	wantToolDigest, err := dockerSandboxesSupportedPrebuiltToolDigest(sourceLock)
-	if err != nil {
-		return err
-	}
-	wantRecipeDigest, err := dockerSandboxesSupportedPrebuiltRecipeDigest(m.ProjectRoot)
-	if err != nil {
-		return err
-	}
-	if entry.Recipe.SourceLockDigest != wantSourceDigest {
-		return fmt.Errorf("prebuilt package source lock identity %s is not supported by this controller (expected %s)", entry.Recipe.SourceLockDigest, wantSourceDigest)
-	}
-	if entry.Recipe.ToolDigest != wantToolDigest {
-		return fmt.Errorf("prebuilt package tool identity %s is not supported by this controller (expected %s)", entry.Recipe.ToolDigest, wantToolDigest)
-	}
-	if entry.Recipe.Digest != wantRecipeDigest {
-		return fmt.Errorf("prebuilt package recipe identity %s is not supported by this controller (expected %s)", entry.Recipe.Digest, wantRecipeDigest)
-	}
 	return nil
-}
-
-func dockerSandboxesSupportedPrebuiltToolDigest(sourceLock []byte) (string, error) {
-	var lock map[string]json.RawMessage
-	if err := json.Unmarshal(sourceLock, &lock); err != nil {
-		return "", fmt.Errorf("parse supported prebuilt source lock: %w", err)
-	}
-	toolMaterial := make(map[string]any)
-	for _, key := range []string{"dockerfileFrontend", "sbomGenerator", "goBuilder", "emulation", "tini"} {
-		value, ok := lock[key]
-		if !ok {
-			return "", fmt.Errorf("supported prebuilt source lock omitted %s", key)
-		}
-		var canonical any
-		if err := json.Unmarshal(value, &canonical); err != nil {
-			return "", fmt.Errorf("canonicalize supported prebuilt tool identity %s: %w", key, err)
-		}
-		toolMaterial[key] = canonical
-	}
-	toolJSON, err := json.Marshal(toolMaterial)
-	if err != nil {
-		return "", err
-	}
-	// The publisher defines this identity with `jq -cS | sha256sum`; jq emits
-	// one trailing newline. Preserve that byte so every controller platform
-	// verifies the same already-attested tool identity.
-	toolJSON = append(toolJSON, '\n')
-	toolDigest := sha256.Sum256(toolJSON)
-	return "sha256:" + hex.EncodeToString(toolDigest[:]), nil
-}
-
-func dockerSandboxesSupportedPrebuiltRecipeDigest(projectRoot string) (string, error) {
-	var paths []string
-	for _, root := range []string{filepath.Join(projectRoot, "templates", "docker-sandboxes"), filepath.Join(projectRoot, "scripts", "docker-sandboxes"), filepath.Join(projectRoot, "internal", "prebuilt")} {
-		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			relative, err := filepath.Rel(projectRoot, path)
-			if err != nil {
-				return err
-			}
-			relative = filepath.ToSlash(relative)
-			if strings.HasPrefix(relative, "templates/docker-sandboxes/") {
-				included := relative == "templates/docker-sandboxes/Dockerfile.prebuilt" || relative == "templates/docker-sandboxes/helpers.sha256" || relative == "templates/docker-sandboxes/prebuilt.lock.json"
-				for _, prefix := range []string{"templates/docker-sandboxes/prebuilt/", "templates/docker-sandboxes/guest/", "templates/docker-sandboxes/hook-launcher/", "templates/docker-sandboxes/egress-bridge/", "templates/docker-sandboxes/profiles/"} {
-					included = included || strings.HasPrefix(relative, prefix)
-				}
-				if !included {
-					return nil
-				}
-			}
-			paths = append(paths, relative)
-			return nil
-		})
-		if err != nil {
-			return "", fmt.Errorf("enumerate supported prebuilt recipe: %w", err)
-		}
-	}
-	sort.Strings(paths)
-	outer := sha256.New()
-	for _, relative := range paths {
-		content, err := os.ReadFile(filepath.Join(projectRoot, filepath.FromSlash(relative)))
-		if err != nil {
-			return "", err
-		}
-		digest := sha256.Sum256(content)
-		fmt.Fprintf(outer, "%s  %s\n", hex.EncodeToString(digest[:]), relative)
-	}
-	return "sha256:" + hex.EncodeToString(outer.Sum(nil)), nil
 }
 
 func (m *Coordinator) dockerSandboxesPrebuiltLocalManifest() (Manifest, error) {
@@ -731,6 +631,20 @@ func (m *Coordinator) activateCurrentDockerSandboxesPrebuilt(ctx context.Context
 	}
 	if receipt.Distribution != dockerSandboxesDistributionPrebuilt || receipt.ManifestHash != wantHash || receipt.Prebuilt == nil {
 		return false, nil
+	}
+	if err := m.validateDockerSandboxesPrebuiltRecipe(receipt.Prebuilt.Entry); err != nil {
+		return false, fmt.Errorf("validate cached prebuilt compatibility: %w", err)
+	}
+	switch receipt.Prebuilt.EffectiveStatus {
+	case prebuilt.StatusActive, prebuilt.StatusSuperseded:
+	case prebuilt.StatusCandidate:
+		if !receipt.Prebuilt.Acceptance {
+			return false, errors.New("cached candidate prebuilt package is not in explicit acceptance mode")
+		}
+	case prebuilt.StatusRevoked, prebuilt.StatusCriticalRevoked:
+		return false, &DockerSandboxesPrebuiltStatusError{Digest: receipt.Prebuilt.PackageIndexDigest, Status: receipt.Prebuilt.EffectiveStatus, Reason: receipt.Prebuilt.Entry.RevocationReason}
+	default:
+		return false, fmt.Errorf("cached prebuilt package has unsupported signed status %q", receipt.Prebuilt.EffectiveStatus)
 	}
 	if err := runtimeProvider.VerifyImportedTemplate(ctx, receipt.Artifact); err != nil {
 		if errors.Is(err, provider.ErrTemplateNotFound) {

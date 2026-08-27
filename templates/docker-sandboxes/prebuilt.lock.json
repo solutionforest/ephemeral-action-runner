@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "artifactKind": "docker-sandboxes-template-base",
   "packageRepository": "ghcr.io/solutionforest/ephemeral-action-runner/docker-sandboxes-template",
   "runtimeContract": "docker-sandboxes-v1",
@@ -30,7 +30,7 @@
     "assetResolution": "actions-release-descriptor",
     "assetSource": "github-actions-runner-release",
     "overlayRequired": false,
-    "promotion": "manual-on-tuple-change"
+    "promotion": "automatic-on-compatible-v1"
   },
   "verifiedBuildInputs": {
     "runnerArchive": "inputs/actions-runner.tar.gz",
@@ -57,6 +57,9 @@
     "sbom",
     "attestation",
     "platform-runtime",
+    "upstream-workflow"
+  ],
+  "protectedPromotionEvidence": [
     "sandbox-import-readback"
   ]
 }

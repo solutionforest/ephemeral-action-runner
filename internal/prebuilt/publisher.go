@@ -19,34 +19,36 @@ const (
 // remain explicit workflow steps. This boundary verifies that the resulting
 // package and evidence can be represented safely in the catalog.
 type PublicationInput struct {
-	Profile            string                `json:"profile"`
-	Channel            string                `json:"channel"`
-	SourceReference    string                `json:"sourceReference"`
-	SourceTag          string                `json:"sourceTag"`
-	PackageRepository  string                `json:"packageRepository"`
-	PackageReference   string                `json:"packageReference"`
-	PackageIndexDigest string                `json:"packageIndexDigest"`
-	PackagePlatforms   []PlatformPublication `json:"packagePlatforms"`
-	Recipe             RecipeDescriptor      `json:"recipe"`
-	Runner             RunnerDescriptor      `json:"runner"`
-	Tools              []ToolDescriptor      `json:"tools"`
-	Evidence           EvidenceDescriptor    `json:"evidence"`
-	Gates              GateResults           `json:"gates"`
-	CandidateID        string                `json:"candidateId,omitempty"`
-	PublishedAt        time.Time             `json:"publishedAt"`
+	Profile            string                   `json:"profile"`
+	Channel            string                   `json:"channel"`
+	SourceReference    string                   `json:"sourceReference"`
+	SourceTag          string                   `json:"sourceTag"`
+	PackageRepository  string                   `json:"packageRepository"`
+	PackageReference   string                   `json:"packageReference"`
+	PackageIndexDigest string                   `json:"packageIndexDigest"`
+	PackagePlatforms   []PlatformPublication    `json:"packagePlatforms"`
+	Recipe             RecipeDescriptor         `json:"recipe"`
+	Runner             RunnerDescriptor         `json:"runner"`
+	Tools              []ToolDescriptor         `json:"tools"`
+	Evidence           EvidenceDescriptor       `json:"evidence"`
+	Gates              GateResults              `json:"gates"`
+	Upstream           UpstreamWorkflowEvidence `json:"upstream"`
+	CandidateID        string                   `json:"candidateId,omitempty"`
+	PublishedAt        time.Time                `json:"publishedAt"`
 }
 
 // PublicationPlan is a deterministic decision after observing the source
 // selector and comparing the new tuple with the catalog. A plan never mutates
 // the catalog until Promote is called.
 type PublicationPlan struct {
-	Entry                Entry  `json:"entry"`
-	Action               string `json:"action"`
-	Reason               string `json:"reason"`
-	ExpectedSourceDigest string `json:"expectedSourceDigest"`
-	ExpectedAliasDigest  string `json:"expectedAliasDigest,omitempty"`
-	SourceReference      string `json:"sourceReference"`
-	ProtectedPromotion   bool   `json:"protectedPromotion,omitempty"`
+	Entry                Entry                    `json:"entry"`
+	Action               string                   `json:"action"`
+	Reason               string                   `json:"reason"`
+	ExpectedSourceDigest string                   `json:"expectedSourceDigest"`
+	ExpectedAliasDigest  string                   `json:"expectedAliasDigest,omitempty"`
+	SourceReference      string                   `json:"sourceReference"`
+	Upstream             UpstreamWorkflowEvidence `json:"upstream"`
+	ProtectedPromotion   bool                     `json:"protectedPromotion,omitempty"`
 }
 
 type Publisher struct {
@@ -63,12 +65,17 @@ func (p Publisher) now() time.Time {
 
 // Plan resolves a mutable upstream source once, validates the package output,
 // and decides whether a catalog entry is a candidate or can auto-advance the
-// profile alias. Recipe/tool/runner changes are always candidates. A source
-// move with an unchanged tuple may auto-advance only when the catalog policy
-// enables that profile and every gate is complete.
+// profile alias. Exact recipe/tool/runner identities are provenance. A package
+// may auto-advance when it preserves the supported runtime contract and both
+// upstream and hosted gates are complete.
 func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationInput) (PublicationPlan, error) {
 	if p.Resolver == nil {
 		return PublicationPlan{}, fmt.Errorf("publisher descriptor resolver is required")
+	}
+	if catalog.SchemaVersion != 0 {
+		if err := catalog.Validate(); err != nil {
+			return PublicationPlan{}, fmt.Errorf("validate publication catalog: %w", err)
+		}
 	}
 	profile, err := NormalizeProfile(input.Profile)
 	if err != nil {
@@ -99,11 +106,14 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 	if _, err := NormalizeDigest(source.Digest); err != nil {
 		return PublicationPlan{}, err
 	}
-	entry, err := entryFromInput(input, profile, source, p.now())
+	now := p.now()
+	entry, err := entryFromInput(input, profile, source, now)
 	if err != nil {
 		return PublicationPlan{}, err
 	}
-	plan := PublicationPlan{Entry: entry, Action: PlanCandidate, Reason: "new immutable package candidate", ExpectedSourceDigest: source.Digest, SourceReference: input.SourceReference}
+	plan := PublicationPlan{Entry: entry, Action: PlanCandidate, Reason: "new immutable package candidate", ExpectedSourceDigest: source.Digest, SourceReference: input.SourceReference, Upstream: input.Upstream}
+	policy, policyOK := catalog.Policies[profile]
+	autoEligible := policyOK && policy.Enabled && policy.AutoAdvance && entry.Recipe.RuntimeContract == compatibleRuntimeContract && entry.Recipe.TemplateSchema == 2 && entry.Gates.HostedPass() && validateUpstreamWorkflowEvidence(profile, input.Upstream, now) == nil
 	if existing, ok := catalog.EntryByDigest(entry.PackageIndexDigest); ok {
 		status, statusErr := catalog.EffectiveStatus(entry.PackageIndexDigest)
 		if statusErr != nil {
@@ -113,18 +123,38 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 			return PublicationPlan{}, fmt.Errorf("package index digest %s is %s and cannot be republished; use a new package digest with a changed source or EPAR tuple", entry.PackageIndexDigest, status)
 		}
 		if publicationEntriesEqual(existing, entry) {
-			plan.Action = PlanNoop
-			plan.Reason = "immutable package candidate is already recorded"
 			if alias, aliasOK := catalog.Aliases[profile]; aliasOK {
 				plan.ExpectedAliasDigest = alias.PackageIndexDigest
+				if alias.PackageIndexDigest == entry.PackageIndexDigest {
+					plan.Action = PlanNoop
+					plan.Reason = "package index digest is already active"
+					return plan, nil
+				}
+			}
+			if autoEligible {
+				plan.Action = PlanAdvanceAlias
+				plan.Reason = "existing compatible package passed fresh upstream and hosted gates"
+			} else {
+				plan.Action = PlanNoop
+				plan.Reason = "immutable package candidate is already recorded"
 			}
 			return plan, nil
 		}
 		return PublicationPlan{}, fmt.Errorf("package index digest %s is already recorded with different source, EPAR tuple, evidence, or gates", entry.PackageIndexDigest)
 	}
+	for _, existing := range catalog.Entries {
+		if existing.PackageIndexDigest != entry.PackageIndexDigest && SourceTupleUnchanged(existing, entry) && SourceIdentityEqual(existing, entry) {
+			return PublicationPlan{}, fmt.Errorf("package index digest %s differs from recorded package %s while the complete source and EPAR tuple is unchanged; unexplained package nondeterminism is not promotable", entry.PackageIndexDigest, existing.PackageIndexDigest)
+		}
+	}
 	alias, hasAlias := catalog.Aliases[profile]
 	if !hasAlias {
-		plan.Reason = "first publication requires protected two-platform acceptance"
+		if autoEligible {
+			plan.Action = PlanAdvanceAlias
+			plan.Reason = "first compatible package passed fresh upstream and hosted gates"
+		} else {
+			plan.Reason = "first publication is not eligible for compatible automatic promotion"
+		}
 		return plan, nil
 	}
 	plan.ExpectedAliasDigest = alias.PackageIndexDigest
@@ -140,20 +170,12 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 		plan.Reason = "package index digest is already active"
 		return plan, nil
 	}
-	unchangedEPARTuple := SourceTupleUnchanged(previous, entry)
-	sourceChanged := !SourceIdentityEqual(previous, entry)
-	if unchangedEPARTuple && !sourceChanged {
+	if SourceTupleUnchanged(previous, entry) && SourceIdentityEqual(previous, entry) {
 		return PublicationPlan{}, fmt.Errorf("package index digest %s differs while the complete source and EPAR tuple is unchanged; protected rebuild is required", entry.PackageIndexDigest)
 	}
-	if policy, ok := catalog.Policies[profile]; ok && policy.Enabled && policy.AutoAdvance && sourceChanged && unchangedEPARTuple && entry.Gates.HostedPass() {
-		baselineGates, gateErr := catalog.EffectiveGates(previous.PackageIndexDigest)
-		if gateErr != nil {
-			return PublicationPlan{}, fmt.Errorf("evaluate accepted source-only baseline: %w", gateErr)
-		}
-		if baselineGates.AllPass() {
-			plan.Action = PlanAdvanceAlias
-			plan.Reason = "upstream source digest changed while an accepted recipe/runtime/runner/tool tuple remained unchanged"
-		}
+	if autoEligible && previous.Recipe.RuntimeContract == entry.Recipe.RuntimeContract {
+		plan.Action = PlanAdvanceAlias
+		plan.Reason = "compatible package passed fresh upstream and hosted gates"
 	}
 	return plan, nil
 }
@@ -191,18 +213,37 @@ func (p Publisher) Promote(ctx context.Context, catalog *Catalog, plan Publicati
 	if p.Resolver == nil {
 		return fmt.Errorf("publisher descriptor resolver is required")
 	}
+	policy, ok := catalog.Policies[entry.Profile]
+	if !ok || !policy.Enabled || !policy.AutoAdvance {
+		return fmt.Errorf("profile %s is no longer enabled for compatible automatic promotion", entry.Profile)
+	}
+	if entry.Recipe.RuntimeContract != compatibleRuntimeContract || entry.Recipe.TemplateSchema != 2 || !entry.Gates.HostedPass() {
+		return fmt.Errorf("package %s is not eligible for compatible automatic promotion", entry.PackageIndexDigest)
+	}
+	if plan.ExpectedSourceDigest != entry.Source.IndexDigest {
+		return fmt.Errorf("promotion plan source digest does not match package provenance")
+	}
+	if err := validateUpstreamWorkflowEvidence(entry.Profile, plan.Upstream, p.now()); err != nil {
+		return fmt.Errorf("upstream promotion evidence: %w", err)
+	}
 	if _, err := RecheckUnchanged(ctx, p.Resolver, plan.SourceReference, plan.ExpectedSourceDigest); err != nil {
 		return err
 	}
 	// Build a complete candidate state first. A source or alias race must not
 	// leave an active entry that the moving alias never references.
 	clone := cloneCatalog(*catalog)
-	if _, err := clone.AppendEntry(entry); err != nil {
-		return err
+	if existing, found := clone.EntryByDigest(entry.PackageIndexDigest); found {
+		if !publicationEntriesEqual(existing, entry) {
+			return fmt.Errorf("existing package %s differs from compatible promotion plan", entry.PackageIndexDigest)
+		}
+	} else {
+		if _, err := clone.AppendEntry(entry); err != nil {
+			return err
+		}
 	}
 	profile := entry.Profile
 	previousDigest := plan.ExpectedAliasDigest
-	if _, err := clone.AppendSourceOnlyPromotion(entry.PackageIndexDigest, previousDigest, plan.Reason, p.now()); err != nil {
+	if _, err := clone.AppendCompatiblePromotion(entry.PackageIndexDigest, previousDigest, plan.Reason, plan.Upstream, p.now()); err != nil {
 		return err
 	}
 	tag, _ := AliasTag(profile)
@@ -214,12 +255,10 @@ func (p Publisher) Promote(ctx context.Context, catalog *Catalog, plan Publicati
 }
 
 // PromoteProtected performs an explicitly approved manual promotion of a
-// candidate produced by Plan. It is deliberately separate from Promote so a
-// recipe/runner/tool change can never auto-advance an alias merely because all
-// build gates happen to pass. The same mutable-source recheck and alias CAS
-// rules apply. Full is the one bootstrap exception: its first independently
-// accepted protected promotion enables its stable policy atomically with the
-// alias move, so it cannot become a wizard default before the gates pass.
+// candidate produced by Plan. It remains the runtime-major and break-glass
+// path and requires factual Docker Sandboxes acceptance. The same mutable-
+// source recheck and alias CAS rules apply. Legacy catalogs may still use the
+// Full bootstrap behavior below.
 func (p Publisher) PromoteProtected(ctx context.Context, catalog *Catalog, plan PublicationPlan) error {
 	if catalog == nil {
 		return fmt.Errorf("nil prebuilt catalog")
@@ -312,7 +351,7 @@ func entryFromInput(input PublicationInput, profile string, source ResolvedRefer
 		sourceDescriptor.PlatformDigests[platform] = descriptor.Digest
 	}
 	entry := Entry{
-		SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, Profile: profile, Channel: input.Channel, Status: StatusCandidate,
+		SchemaVersion: EntrySchemaVersion, ArtifactKind: CatalogArtifactKind, Profile: profile, Channel: input.Channel, Status: StatusCandidate,
 		PackageRepository: input.PackageRepository, PackageReference: input.PackageReference, PackageIndexDigest: packageDigest,
 		Source: sourceDescriptor, Recipe: input.Recipe, Runner: input.Runner, Tools: input.Tools, Platforms: input.PackagePlatforms,
 		Evidence: input.Evidence, Gates: input.Gates, PublishedAt: input.PublishedAt, CandidateID: input.CandidateID,

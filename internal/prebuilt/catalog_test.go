@@ -114,7 +114,7 @@ func TestCatalogAcceptanceCompletesCandidateGatesOnlyAfterBothPlatforms(t *testi
 	if gates, err := catalog.EffectiveGates(entry.PackageIndexDigest); err != nil || gates.AllPass() {
 		t.Fatalf("one-platform effective gates = %+v, %v; want incomplete", gates, err)
 	}
-	if err := catalog.MoveAlias(ProfileAct, DefaultPackageRepository+":act-latest", entry.PackageIndexDigest, ChannelStable, "", time.Unix(3, 0)); err == nil || !strings.Contains(err.Error(), "incomplete gates") {
+	if err := catalog.MoveAlias(ProfileAct, DefaultPackageRepository+":act-latest", entry.PackageIndexDigest, ChannelStable, "", time.Unix(3, 0)); err == nil || !strings.Contains(err.Error(), "without reviewed") {
 		t.Fatalf("one-platform alias move error = %v", err)
 	}
 	if _, err := catalog.AppendAcceptance(validAcceptance(entry.PackageIndexDigest, "linux/arm64", 201, 202)); err != nil {
@@ -128,6 +128,50 @@ func TestCatalogAcceptanceCompletesCandidateGatesOnlyAfterBothPlatforms(t *testi
 	}
 	if err := catalog.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCompatiblePromotionAuthorizesAliasWithoutSynthesizingRuntimeGates(t *testing.T) {
+	entry := validEntry(ProfileAct, "a", StatusCandidate)
+	entry.Gates.ImportReadback = false
+	entry.Gates.RuntimeValidated = false
+	catalog := Catalog{SchemaVersion: LegacyCatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Aliases: map[string]Alias{}}
+	if _, err := catalog.AppendEntry(entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.AppendCompatiblePromotion(entry.PackageIndexDigest, "", "hosted compatible v1", validUpstreamEvidence(ProfileAct, time.Unix(1, 0)), time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if catalog.SchemaVersion != CatalogSchemaVersion {
+		t.Fatalf("catalog schema = %d, want %d", catalog.SchemaVersion, CatalogSchemaVersion)
+	}
+	if gates, err := catalog.EffectiveGates(entry.PackageIndexDigest); err != nil || gates.ImportReadback || gates.RuntimeValidated {
+		t.Fatalf("compatible promotion synthesized factual gates: %+v, %v", gates, err)
+	}
+	if err := catalog.MoveAlias(ProfileAct, DefaultPackageRepository+":act-latest", entry.PackageIndexDigest, ChannelStable, "", time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLegacyCatalogRemainsReadableButCannotCarryCompatiblePromotion(t *testing.T) {
+	catalog := Catalog{SchemaVersion: LegacyCatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Entries: []Entry{validEntry(ProfileAct, "a", StatusCandidate)}, Aliases: map[string]Alias{}}
+	if err := catalog.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	catalog.CompatiblePromotions = []CompatiblePromotion{{PackageIndexDigest: catalog.Entries[0].PackageIndexDigest}}
+	if err := catalog.Validate(); err == nil || !strings.Contains(err.Error(), "schema 2") {
+		t.Fatalf("legacy compatible promotion error = %v", err)
+	}
+}
+
+func TestMoveAliasRejectsCrossProfileTarget(t *testing.T) {
+	entry := validEntry(ProfileFull, "a", StatusActive)
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true}, ProfileFull: {Enabled: true}}, Entries: []Entry{entry}, Aliases: map[string]Alias{}}
+	if err := catalog.MoveAlias(ProfileAct, DefaultPackageRepository+":act-latest", entry.PackageIndexDigest, ChannelStable, "", time.Unix(2, 0)); err == nil || !strings.Contains(err.Error(), "owned by profile") {
+		t.Fatalf("cross-profile alias error = %v", err)
 	}
 }
 
@@ -241,7 +285,7 @@ func TestCatalogRejectsDuplicateActiveActPlatform(t *testing.T) {
 func validEntry(profile, hexChar, status string) Entry {
 	digest := "sha256:" + strings.Repeat(hexChar, 64)
 	entry := Entry{
-		SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, Profile: profile, Channel: ChannelStable, Status: status,
+		SchemaVersion: EntrySchemaVersion, ArtifactKind: CatalogArtifactKind, Profile: profile, Channel: ChannelStable, Status: status,
 		PackageRepository: DefaultPackageRepository, PackageReference: DefaultPackageRepository + "@" + digest, PackageIndexDigest: digest,
 		Source: SourceDescriptor{Repository: "ghcr.io/catthehacker/ubuntu", SourceTag: profile + "-latest", Reference: "ghcr.io/catthehacker/ubuntu@" + digest, IndexDigest: digest, PlatformDigests: map[string]string{"linux/amd64": digest, "linux/arm64": digest}},
 		Recipe: RecipeDescriptor{Digest: digest, RuntimeContract: "docker-sandboxes-v1", TemplateSchema: 2, RecipeRevision: strings.Repeat(hexChar, 40), SourceLockDigest: digest, ToolDigest: digest},
