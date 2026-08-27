@@ -173,6 +173,7 @@ jobs:
             echo 'Neither the built-in token nor anonymous access could read valid upstream workflow, run, job, and step metadata.' >&2
             exit 1
           fi
+          echo "Selected upstream Actions API access method: $method"
           {
             echo '## Upstream Actions API feasibility probe'
             echo
