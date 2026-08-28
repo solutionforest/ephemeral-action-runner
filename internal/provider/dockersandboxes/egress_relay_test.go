@@ -149,6 +149,12 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 		case strings.HasPrefix(args, "policy allow network --sandbox "+testName+" host.docker.internal:"):
 			rulePresent = true
 			return provider.ExecResult{}, nil
+		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/dev/tcp/host.docker.internal/"):
+			return provider.ExecResult{}, nil
+		case args == "policy log "+testName+" --json" && !rulePresent:
+			now := time.Now().UTC()
+			entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort)), testName, "transparent", now)
+			return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[]}`, entry)}, nil
 		case args == "policy rm network --sandbox "+testName+" --id "+ruleID:
 			rulePresent = false
 			removed = true
@@ -212,14 +218,29 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 		case args == "policy allow network --sandbox "+testName+" "+resource:
 			rulePresent = true
 			return provider.ExecResult{}, nil
+		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/dev/tcp/host.docker.internal/"):
+			stdin, readErr := io.ReadAll(request.stdin)
+			if readErr != nil || len(request.sensitiveValues) != 1 || string(stdin) != request.sensitiveValues[0]+"\n" {
+				t.Fatal("authenticated pre-rule probe did not pass its token only through redacted stdin")
+			}
+			if strings.Contains(args, request.sensitiveValues[0]) {
+				t.Fatal("authenticated pre-rule probe exposed its token in the command")
+			}
+			return provider.ExecResult{Stdout: "PONG"}, nil
 		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/opt/epar/configure-egress-relay.sh --commit"):
 			committed = true
 			return provider.ExecResult{}, nil
 		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/opt/epar/configure-egress-relay.sh"):
 			return provider.ExecResult{}, nil
+		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc "):
+			return provider.ExecResult{}, nil
 		case args == "policy log "+testName+" --json":
 			now := time.Now().UTC()
-			return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort)), testName, "transparent", now))}, nil
+			entry := policyLogEntryWithRule(net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort)), testName, "transparent", "", now)
+			if !rulePresent {
+				return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)}, nil
+			}
+			return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)}, nil
 		default:
 			t.Fatalf("unexpected command: %v", request.args)
 			return provider.ExecResult{}, nil
@@ -230,11 +251,90 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer p.releaseRelayTokenForInstance(testInstance)
+	if err := p.VerifyHostTrustRuntime(context.Background(), testInstance); err != nil {
+		t.Fatalf("maintenance verification after unattributed activation: %v", err)
+	}
 	if !committed || !rulePresent || len(p.relayTokens) != 1 || p.relay == nil {
 		t.Fatalf("committed activation state = commit %t policy %t tokens %d relay %v", committed, rulePresent, len(p.relayTokens), p.relay)
 	}
 	if strings.Contains(logOutput.String(), "host-trust relay") {
 		t.Fatalf("default info logger emitted relay refresh diagnostics: %s", logOutput.String())
+	}
+}
+
+func TestHostTrustRelayBeforeAllowRequiresConsistentEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		probeOutput string
+		policyLog   func(string, int) string
+		wantErr     string
+	}{
+		{
+			name: "accepted blocked transition",
+			policyLog: func(name string, port int) string {
+				entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(port)), name, "transparent", time.Now().UTC())
+				return fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[]}`, entry)
+			},
+		},
+		{
+			name:        "accepted authenticated open baseline",
+			probeOutput: "PONG",
+			policyLog: func(name string, port int) string {
+				entry := policyLogEntryWithRule(net.JoinHostPort("localhost", fmt.Sprint(port)), name, "transparent", "", time.Now().UTC())
+				return fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)
+			},
+		},
+		{name: "unexpected relay response", probeOutput: "connected", policyLog: func(string, int) string { return `{"blocked_hosts":[],"allowed_hosts":[]}` }, wantErr: "unexpected pre-rule authenticated response"},
+		{name: "missing blocked record", policyLog: func(string, int) string { return `{"blocked_hosts":[],"allowed_hosts":[]}` }, wantErr: "did not confirm"},
+		{
+			name: "endpoint already allowed",
+			policyLog: func(name string, port int) string {
+				entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(port)), name, "transparent", time.Now().UTC())
+				return fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)
+			},
+			wantErr: "consistent pre-rule relay result",
+		},
+		{
+			name: "stale blocked record",
+			policyLog: func(name string, port int) string {
+				entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(port)), name, "transparent", time.Now().UTC().Add(-time.Minute))
+				return fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[]}`, entry)
+			},
+			wantErr: "did not confirm",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := NewWithDryRun("sbx", false)
+			p.ConfigureHostTrustRelay(true, "blocked-proof-"+test.name)
+			binding, err := p.ensureRelayToken(testInstance)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.releaseRelayToken(binding)
+			p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+				args := strings.Join(request.args, " ")
+				switch {
+				case args == "ls --json":
+					return provider.ExecResult{Stdout: readyListJSON}, nil
+				case args == "policy ls "+testName+" --include-inactive --json":
+					return provider.ExecResult{Stdout: policyFixture("[]")}, nil
+				case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/dev/tcp/host.docker.internal/"):
+					return provider.ExecResult{Stdout: test.probeOutput}, nil
+				case args == "policy log "+testName+" --json" && test.policyLog != nil:
+					return provider.ExecResult{Stdout: test.policyLog(testName, binding.Port)}, nil
+				default:
+					t.Fatalf("unexpected command: %v", request.args)
+					return provider.ExecResult{}, nil
+				}
+			}
+			_, err = p.verifyHostTrustRelayBeforeAllow(context.Background(), binding)
+			if test.wantErr == "" && err != nil {
+				t.Fatal(err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want substring %q", err, test.wantErr)
+			}
+		})
 	}
 }
 
@@ -324,6 +424,46 @@ func TestHostTrustRelayVerificationFailsClosedWithoutExactControllerBinding(t *t
 	}
 	if commands != 1 {
 		t.Fatalf("commands before exact relay binding failure = %d, want identity readback only", commands)
+	}
+}
+
+func TestUnattributedRelayPolicyProofRejectsInventoryDrift(t *testing.T) {
+	const ruleID = "33333333-3333-3333-3333-333333333333"
+	p := NewWithDryRun("sbx", false)
+	p.ConfigureHostTrustRelay(true, "inventory-drift-test")
+	binding, err := p.ensureRelayToken(testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := net.JoinHostPort("host.docker.internal", fmt.Sprint(binding.Port))
+	rule := provider.NetworkPolicyRule{
+		ID: ruleID, Name: testRelayPolicyRule, PolicyID: "local", Scope: "sandbox:" + testName, AppliesTo: "sandbox:" + testName,
+		ResourceType: "network", Resources: []string{resource}, Decision: provider.NetworkPolicyAllow, Origin: "scoped", Status: "active", Editable: true, Active: true,
+	}
+	binding, err = p.bindRelayPolicyProof(binding, relayPolicyProof{
+		RuleNames: []string{testRelayPolicyRule}, InventoryDigest: relayPolicyInventoryDigest([]provider.NetworkPolicyRule{rule}), PreAllowProof: relayPolicyPreAllowBlocked,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.releaseRelayToken(binding)
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		args := strings.Join(request.args, " ")
+		switch args {
+		case "ls --json":
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case "policy ls " + testName + " --include-inactive --json":
+			drifted := fmt.Sprintf(`[{"id":%q,"name":"changed relay rule","policy_id":"local","scope":%q,"applies_to":%q,"resource_type":"network","decision":"allow","resources":[%q],"origin":"scoped","status":"active","editable":true,"sandbox_id":%q}]`, ruleID, "sandbox:"+testName, "sandbox:"+testName, resource, testName)
+			return provider.ExecResult{Stdout: policyFixture(drifted)}, nil
+		default:
+			t.Fatalf("unexpected command: %v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+
+	err = p.verifyUnattributedRelayPolicyProof(context.Background(), binding)
+	if err == nil || !strings.Contains(err.Error(), "policy changed") {
+		t.Fatalf("error = %v, want inventory drift failure", err)
 	}
 }
 
@@ -467,6 +607,15 @@ func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.
 		{name: "wrong port", allowed: policyLogEntry("localhost:43124", "sandbox-one", "transparent", started), wantErr: "did not confirm"},
 		{name: "wrong route", allowed: policyLogEntry("localhost:43123", "sandbox-one", "forward", started), wantErr: "unexpected"},
 		{name: "wrong rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started), wantErr: "unexpected policy rule"},
+		{name: "empty rule without causal proof", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "", started), wantErr: "pre-rule policy proof"},
+		{name: "missing rule", allowed: policyLogEntryWithoutRule("localhost:43123", "sandbox-one", "transparent", started), wantErr: "omitted the matched rule identity"},
+		{name: "null rule", allowed: strings.Replace(policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), `"rule":"host relay"`, `"rule":null`, 1), wantErr: "omitted the matched rule identity"},
+		{name: "whitespace rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", " ", started), wantErr: "unexpected policy rule"},
+		{name: "zero count", allowed: strings.Replace(policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), `"count_since":1`, `"count_since":0`, 1), wantErr: "invalid request count"},
+		{name: "empty then wrong rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "", started) + "," + policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started), wantErr: "unexpected policy rule"},
+		{name: "wrong then empty rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started) + "," + policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "", started), wantErr: "unexpected policy rule"},
+		{name: "expected then wrong rule", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started) + "," + policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started), wantErr: "unexpected policy rule"},
+		{name: "wrong then expected rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started) + "," + policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), wantErr: "unexpected policy rule"},
 		{name: "blocked", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), blocked: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), wantErr: "blocked"},
 		{name: "credential forward", allowed: policyLogEntry("registry-1.docker.io:443", "sandbox-one", "forward", started) + "," + policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), wantErr: "credential-bearing"},
 	} {
@@ -496,6 +645,10 @@ func policyLogEntry(host, vmName, proxyType string, lastSeen time.Time) string {
 
 func policyLogEntryWithRule(host, vmName, proxyType, rule string, lastSeen time.Time) string {
 	return fmt.Sprintf(`{"host":%q,"vm_name":%q,"proxy_type":%q,"rule":%q,"last_seen":%q,"since":%q,"count_since":1}`, host, vmName, proxyType, rule, lastSeen.Format(time.RFC3339Nano), lastSeen.Format(time.RFC3339Nano))
+}
+
+func policyLogEntryWithoutRule(host, vmName, proxyType string, lastSeen time.Time) string {
+	return fmt.Sprintf(`{"host":%q,"vm_name":%q,"proxy_type":%q,"last_seen":%q,"since":%q,"count_since":1}`, host, vmName, proxyType, lastSeen.Format(time.RFC3339Nano), lastSeen.Format(time.RFC3339Nano))
 }
 
 func TestValidatePolicyCommandRejectsBroadPolicyAccess(t *testing.T) {
