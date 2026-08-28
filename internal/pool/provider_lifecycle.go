@@ -76,23 +76,21 @@ func (m *Manager) verifyProviderRuntime(ctx context.Context, instance provider.I
 	return nil
 }
 
-// verifyProviderHostTrustRuntime preserves the common runtime check and adds
-// an optional provider-specific read-only trust-transport check. Providers
-// that only implement HostTrustRuntimeActivator therefore retain the common
-// VerifyRuntime fallback, while providers with a transport that needs a
-// stronger proof can implement HostTrustRuntimeVerifier.
+// verifyProviderHostTrustRuntime prefers the provider-specific read-only
+// trust-transport check when one exists. General VerifyRuntime implementations
+// may validate pristine pre-job state that a running workflow is allowed to
+// change, so they are not composed with the dedicated steady-state verifier.
+// Providers that only implement HostTrustRuntimeActivator retain the common
+// VerifyRuntime fallback.
 func (m *Manager) verifyProviderHostTrustRuntime(ctx context.Context, instance provider.Instance) error {
-	if err := m.verifyProviderRuntime(ctx, instance); err != nil {
-		return err
-	}
 	verifier, ok := m.providerLifecycle().(provider.HostTrustRuntimeVerifier)
-	if !ok {
+	if ok {
+		if err := verifier.VerifyHostTrustRuntime(ctx, instance); err != nil {
+			return fmt.Errorf("verify provider host-trust runtime: %w", err)
+		}
 		return nil
 	}
-	if err := verifier.VerifyHostTrustRuntime(ctx, instance); err != nil {
-		return fmt.Errorf("verify provider host-trust runtime: %w", err)
-	}
-	return nil
+	return m.verifyProviderRuntime(ctx, instance)
 }
 
 func (m *Manager) verifyProviderAdmission(ctx context.Context, instance provider.Instance) error {

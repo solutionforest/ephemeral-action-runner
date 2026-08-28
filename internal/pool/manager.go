@@ -1049,6 +1049,34 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			reconciled[name] = vm
 			return reconciled, fmt.Errorf("record GitHub job phase for %s: %w", name, err)
 		}
+		if vm.Phase == LifecycleQuarantined && m.LifecycleState != nil {
+			record, recordErr := m.LifecycleState.Read(ctx, name)
+			if recordErr != nil {
+				reconciled[name] = vm
+				return reconciled, fmt.Errorf("read durable quarantine for %s: %w", name, recordErr)
+			}
+			if record.Phase == poolstate.PhaseQuarantined {
+				if runner.Busy {
+					// A busy GitHub runner cannot be deleted. Keep the exact
+					// capacity quarantined and let its unrefreshed host-trust
+					// lease expire closed instead of re-adopting it and
+					// repeating the same fence on every reconciliation.
+					reconciled[name] = vm
+					continue
+				}
+				if err := m.retireInstance(ctx, vm, "durably quarantined runner became idle"); err != nil {
+					if errors.Is(err, provider.ErrControlPlaneFailure) {
+						return reconciled, err
+					}
+					vm.Phase = LifecycleCleanupPending
+					reconciled[name] = vm
+					m.warnf("[%s] durably quarantined retirement pending: %v\n", name, err)
+				} else {
+					delete(reconciled, name)
+				}
+				continue
+			}
+		}
 		if runner.Status == "online" {
 			vm.Phase = LifecycleReady
 			reconciled[name] = vm
