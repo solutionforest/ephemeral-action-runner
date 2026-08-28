@@ -8,12 +8,14 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,20 +51,40 @@ type guestRelayConfiguration struct {
 }
 
 type relayTokenBinding struct {
-	ProviderID  string
-	Token       string
-	Epoch       uint64
-	PolicyRules map[string]struct{}
+	ProviderID            string
+	Token                 string
+	Epoch                 uint64
+	PolicyRules           map[string]struct{}
+	PolicyInventoryDigest string
+	PolicyPreAllowProof   string
 }
 
 type relayBindingSnapshot struct {
-	Instance    provider.Instance
-	Token       string
-	Epoch       uint64
-	Relay       *egressRelay
-	Port        int
-	PolicyRules map[string]struct{}
+	Instance              provider.Instance
+	Token                 string
+	Epoch                 uint64
+	Relay                 *egressRelay
+	Port                  int
+	PolicyRules           map[string]struct{}
+	PolicyInventoryDigest string
+	PolicyPreAllowProof   string
 }
+
+type relayPolicyProof struct {
+	RuleNames       []string
+	InventoryDigest string
+	PreAllowProof   string
+}
+
+type relayPolicyPrecondition struct {
+	InventoryDigest string
+	Proof           string
+}
+
+const (
+	relayPolicyPreAllowBlocked           = "blocked"
+	relayPolicyPreAllowAuthenticatedOpen = "authenticated-open"
+)
 
 const hostTrustRelayVerificationScript = `set -euo pipefail
 test -f /run/epar/egress-relay-active
@@ -71,6 +93,10 @@ test "$(stat -c '%U:%G:%a' /run/epar/egress-relay-active)" = "root:root:444"
 test "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 1 --max-time 2 http://127.0.0.1:3129/health)" = "204"
 registry_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 5 --proxy http://127.0.0.1:3129 --noproxy '' --cacert /usr/local/share/ca-certificates/epar/epar-egress-relay.crt https://registry-1.docker.io/v2/)"
 test "${registry_status}" = "401"`
+
+func hostTrustRelayBlockedProbeScript(port int) string {
+	return fmt.Sprintf(`output="$(timeout 3 bash -c 'IFS= read -r token; response=""; if exec 3<>/dev/tcp/host.docker.internal/%d 2>/dev/null; then printf "EPAR1 %%s PING\n" "${token}" >&3; IFS= read -r response <&3 || true; fi; printf "%%s" "${response}"' || true)"; printf '%%s' "${output}"`, port)
+}
 
 func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provider.Instance) (activationErr error) {
 	if !p.hostTrustRelayEnabled {
@@ -126,16 +152,20 @@ func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provid
 	}()
 
 	resource := net.JoinHostPort("host.docker.internal", strconv.Itoa(relay.port))
-	var policyRuleNames []string
-	addedPolicyRules, policyRuleNames, err = p.applyHostTrustRelayPolicy(ctx, instance, provider.NetworkPolicyRule{
+	precondition, err := p.verifyHostTrustRelayBeforeAllow(ctx, binding)
+	if err != nil {
+		return err
+	}
+	var policyProof relayPolicyProof
+	addedPolicyRules, policyProof, err = p.applyHostTrustRelayPolicy(ctx, instance, provider.NetworkPolicyRule{
 		Name:      "epar-host-trust-relay",
 		Decision:  provider.NetworkPolicyAllow,
 		Resources: []string{resource},
-	})
+	}, precondition)
 	if err != nil {
 		return fmt.Errorf("allow exact Docker Sandboxes host-trust relay endpoint: %w", err)
 	}
-	binding, err = p.bindRelayPolicyRules(binding, policyRuleNames)
+	binding, err = p.bindRelayPolicyProof(binding, policyProof)
 	if err != nil {
 		return err
 	}
@@ -244,10 +274,13 @@ func (p *Provider) finalizeGuestRelay(ctx context.Context, instance provider.Ins
 	return err
 }
 
-func (p *Provider) applyHostTrustRelayPolicy(ctx context.Context, instance provider.Instance, rule provider.NetworkPolicyRule) ([]provider.NetworkPolicyRule, []string, error) {
+func (p *Provider) applyHostTrustRelayPolicy(ctx context.Context, instance provider.Instance, rule provider.NetworkPolicyRule, precondition relayPolicyPrecondition) ([]provider.NetworkPolicyRule, relayPolicyProof, error) {
 	before, err := p.ReadNetworkPolicy(ctx, instance)
 	if err != nil {
-		return nil, nil, err
+		return nil, relayPolicyProof{}, err
+	}
+	if relayPolicyInventoryDigest(before) != precondition.InventoryDigest {
+		return nil, relayPolicyProof{}, fmt.Errorf("Docker Sandboxes policy changed between blocked relay proof and exact allow application")
 	}
 	beforeIDs := make(map[string]struct{}, len(before))
 	for _, existing := range before {
@@ -258,7 +291,7 @@ func (p *Provider) applyHostTrustRelayPolicy(ctx context.Context, instance provi
 	after, readErr := p.ReadNetworkPolicy(readbackCtx, instance)
 	cancel()
 	if readErr != nil {
-		return nil, nil, errors.Join(applyErr, fmt.Errorf("read back relay policy delta: %w", readErr))
+		return nil, relayPolicyProof{}, errors.Join(applyErr, fmt.Errorf("read back relay policy delta: %w", readErr))
 	}
 	added := make([]provider.NetworkPolicyRule, 0, 1)
 	policyRuleNames := make([]string, 0, 1)
@@ -272,9 +305,20 @@ func (p *Provider) applyHostTrustRelayPolicy(ctx context.Context, instance provi
 		added = append(added, candidate)
 	}
 	if len(policyRuleNames) == 0 {
-		return added, nil, errors.Join(applyErr, fmt.Errorf("Docker Sandboxes policy readback did not identify the exact active relay allow rule"))
+		return added, relayPolicyProof{}, errors.Join(applyErr, fmt.Errorf("Docker Sandboxes policy readback did not identify the exact active relay allow rule"))
 	}
-	return added, policyRuleNames, applyErr
+	if len(added) != 1 || len(policyRuleNames) != 1 {
+		return added, relayPolicyProof{}, errors.Join(applyErr, fmt.Errorf("Docker Sandboxes policy readback did not identify one newly added exact relay allow rule"))
+	}
+	expectedAfter := append(append([]provider.NetworkPolicyRule(nil), before...), added[0])
+	if relayPolicyInventoryDigest(expectedAfter) != relayPolicyInventoryDigest(after) {
+		return added, relayPolicyProof{}, errors.Join(applyErr, fmt.Errorf("Docker Sandboxes policy changed outside the exact relay allow application"))
+	}
+	return added, relayPolicyProof{
+		RuleNames:       policyRuleNames,
+		InventoryDigest: relayPolicyInventoryDigest(after),
+		PreAllowProof:   precondition.Proof,
+	}, applyErr
 }
 
 func hostTrustRelayPolicyProbeStart() time.Time {
@@ -283,29 +327,114 @@ func hostTrustRelayPolicyProbeStart() time.Time {
 	return time.Now().UTC().Truncate(time.Second)
 }
 
-func (p *Provider) verifyBoundHostTrustRelayPolicy(ctx context.Context, binding relayBindingSnapshot, startedAt time.Time) error {
-	if binding.Port <= 0 || len(binding.PolicyRules) == 0 {
-		return fmt.Errorf("Docker Sandboxes host-trust relay policy proof is not bound to the exact instance")
+func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding relayBindingSnapshot) (relayPolicyPrecondition, error) {
+	if binding.Port <= 0 {
+		return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes host-trust relay precondition is not bound to the exact instance")
 	}
+	if err := p.verifyRelayBinding(binding); err != nil {
+		return relayPolicyPrecondition{}, err
+	}
+	rules, err := p.ReadNetworkPolicy(ctx, binding.Instance)
+	if err != nil {
+		return relayPolicyPrecondition{}, fmt.Errorf("read Docker Sandboxes policy before relay proof: %w", err)
+	}
+	resource := net.JoinHostPort("host.docker.internal", strconv.Itoa(binding.Port))
+	for _, rule := range rules {
+		if rule.Active && rule.Decision == provider.NetworkPolicyAllow && rule.ResourceType == "network" && isSandboxPolicyTarget(rule.Scope, rule.AppliesTo, binding.Instance.Name) {
+			for _, candidate := range rule.Resources {
+				if candidate == resource {
+					return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes host-trust relay endpoint already had an exact allow rule before activation")
+				}
+			}
+		}
+	}
+	inventoryDigest := relayPolicyInventoryDigest(rules)
+	startedAt := hostTrustRelayPolicyProbeStart()
+	probeCtx, cancelProbe := context.WithTimeout(ctx, guestRelayProbeTimeout)
+	result, probeErr := p.Exec(probeCtx, binding.Instance, provider.ShellCommand(hostTrustRelayBlockedProbeScript(binding.Port)), provider.ExecOptions{
+		Stdin:              binding.Token + "\n",
+		SensitiveValues:    []string{binding.Token},
+		SuppressTranscript: true,
+	})
+	cancelProbe()
+	if probeErr != nil {
+		return relayPolicyPrecondition{}, fmt.Errorf("probe Docker Sandboxes host-trust relay before exact allow: %w", probeErr)
+	}
+	document, err := p.readHostTrustRelayPolicyLog(ctx, binding.Instance)
+	if err != nil {
+		return relayPolicyPrecondition{}, err
+	}
+	relayHosts := hostTrustRelayPolicyHosts(binding.Port)
+	foundBlocked := false
+	foundAllowed := false
+	for _, record := range document.Allowed {
+		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
+			continue
+		}
+		if _, exactRelay := relayHosts[record.Host]; !exactRelay {
+			continue
+		}
+		if record.ProxyType != "transparent" || record.Count <= 0 || record.Rule == nil {
+			return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes returned invalid allowed evidence for the pre-rule relay proof")
+		}
+		foundAllowed = true
+	}
+	for _, record := range document.Blocked {
+		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) || record.Count <= 0 {
+			continue
+		}
+		if _, exactRelay := relayHosts[record.Host]; exactRelay {
+			foundBlocked = true
+		}
+	}
+	probeOutput := strings.TrimSpace(result.Stdout)
+	switch {
+	case probeOutput == "PONG" && foundAllowed && !foundBlocked:
+		return relayPolicyPrecondition{InventoryDigest: inventoryDigest, Proof: relayPolicyPreAllowAuthenticatedOpen}, nil
+	case probeOutput == "" && foundBlocked && !foundAllowed:
+		return relayPolicyPrecondition{InventoryDigest: inventoryDigest, Proof: relayPolicyPreAllowBlocked}, nil
+	case probeOutput != "" && probeOutput != "PONG":
+		return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes host-trust relay returned an unexpected pre-rule authenticated response")
+	default:
+		return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes policy log did not confirm a consistent pre-rule relay result")
+	}
+}
+
+func (p *Provider) readHostTrustRelayPolicyLog(ctx context.Context, instance provider.Instance) (policyLogDocument, error) {
 	result, err := p.run(ctx, commandRequest{
-		args:        []string{"policy", "log", binding.Instance.Name, "--json"},
+		args:        []string{"policy", "log", instance.Name, "--json"},
 		operation:   "verify Docker Sandboxes host-trust relay route",
 		outputLimit: diagnosticOutputLimit,
 		timeout:     providerReadbackTimeout,
 	})
 	if err != nil {
-		return err
+		return policyLogDocument{}, err
 	}
 	decoder := json.NewDecoder(strings.NewReader(result.Stdout))
 	decoder.DisallowUnknownFields()
 	var document policyLogDocument
 	if err := decoder.Decode(&document); err != nil || requireJSONEOF(decoder) != nil {
-		return fmt.Errorf("Docker Sandboxes policy log returned an unsupported json schema")
+		return policyLogDocument{}, fmt.Errorf("Docker Sandboxes policy log returned an unsupported json schema")
 	}
-	relayHosts := map[string]struct{}{
-		net.JoinHostPort("localhost", strconv.Itoa(binding.Port)):            {},
-		net.JoinHostPort("host.docker.internal", strconv.Itoa(binding.Port)): {},
+	return document, nil
+}
+
+func hostTrustRelayPolicyHosts(port int) map[string]struct{} {
+	return map[string]struct{}{
+		net.JoinHostPort("localhost", strconv.Itoa(port)):            {},
+		net.JoinHostPort("host.docker.internal", strconv.Itoa(port)): {},
 	}
+}
+
+func (p *Provider) verifyBoundHostTrustRelayPolicy(ctx context.Context, binding relayBindingSnapshot, startedAt time.Time) error {
+	if binding.Port <= 0 || len(binding.PolicyRules) == 0 {
+		return fmt.Errorf("Docker Sandboxes host-trust relay policy proof is not bound to the exact instance")
+	}
+	document, err := p.readHostTrustRelayPolicyLog(ctx, binding.Instance)
+	if err != nil {
+		return err
+	}
+	relayHosts := hostTrustRelayPolicyHosts(binding.Port)
 	for _, record := range document.Blocked {
 		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
 			continue
@@ -315,6 +444,7 @@ func (p *Provider) verifyBoundHostTrustRelayPolicy(ctx context.Context, binding 
 		}
 	}
 	foundTransparentRelay := false
+	foundUnattributedRelay := false
 	for _, record := range document.Allowed {
 		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
 			continue
@@ -328,15 +458,89 @@ func (p *Provider) verifyBoundHostTrustRelayPolicy(ctx context.Context, binding 
 		if record.ProxyType != "transparent" {
 			return fmt.Errorf("Docker Sandboxes host-trust relay used unexpected %q routing", record.ProxyType)
 		}
-		if _, expectedRule := binding.PolicyRules[record.Rule]; !expectedRule {
-			return fmt.Errorf("Docker Sandboxes host-trust relay matched unexpected policy rule %q", record.Rule)
+		if record.Count <= 0 {
+			return fmt.Errorf("Docker Sandboxes host-trust relay policy record had an invalid request count")
+		}
+		if record.Rule == nil {
+			return fmt.Errorf("Docker Sandboxes host-trust relay policy record omitted the matched rule identity")
+		}
+		if *record.Rule == "" {
+			foundUnattributedRelay = true
+		} else if _, expectedRule := binding.PolicyRules[*record.Rule]; !expectedRule {
+			return fmt.Errorf("Docker Sandboxes host-trust relay matched unexpected policy rule %q", *record.Rule)
 		}
 		foundTransparentRelay = true
 	}
 	if !foundTransparentRelay {
 		return fmt.Errorf("Docker Sandboxes policy log did not confirm fresh transparent routing for the exact EPAR host-trust relay endpoint and bound policy rule")
 	}
+	if foundUnattributedRelay {
+		if err := p.verifyUnattributedRelayPolicyProof(ctx, binding); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (p *Provider) verifyUnattributedRelayPolicyProof(ctx context.Context, binding relayBindingSnapshot) error {
+	if binding.PolicyInventoryDigest == "" || binding.PolicyPreAllowProof != relayPolicyPreAllowBlocked && binding.PolicyPreAllowProof != relayPolicyPreAllowAuthenticatedOpen {
+		return fmt.Errorf("Docker Sandboxes omitted the matched relay rule identity without a bound pre-rule policy proof")
+	}
+	if err := p.verifyRelayBinding(binding); err != nil {
+		return err
+	}
+	rules, err := p.ReadNetworkPolicy(ctx, binding.Instance)
+	if err != nil {
+		return fmt.Errorf("read Docker Sandboxes policy for unattributed relay proof: %w", err)
+	}
+	if relayPolicyInventoryDigest(rules) != binding.PolicyInventoryDigest {
+		return fmt.Errorf("Docker Sandboxes policy changed after the unattributed relay proof was bound")
+	}
+	resource := net.JoinHostPort("host.docker.internal", strconv.Itoa(binding.Port))
+	matched := 0
+	for _, rule := range rules {
+		if !rule.Active || rule.Decision != provider.NetworkPolicyAllow || rule.ResourceType != "network" || len(rule.Resources) != 1 || rule.Resources[0] != resource || !isRemovableSandboxPolicyRule(rule, binding.Instance.Name) {
+			continue
+		}
+		if _, expected := binding.PolicyRules[rule.Name]; expected {
+			matched++
+		}
+	}
+	if matched != 1 {
+		return fmt.Errorf("Docker Sandboxes unattributed relay proof no longer has one exact bound allow rule")
+	}
+	return nil
+}
+
+func relayPolicyInventoryDigest(rules []provider.NetworkPolicyRule) string {
+	type digestRule struct {
+		ID           string
+		Name         string
+		PolicyID     string
+		Scope        string
+		AppliesTo    string
+		ResourceType string
+		Resources    []string
+		Decision     provider.NetworkPolicyDecision
+		Origin       string
+		Status       string
+		Editable     bool
+		Active       bool
+	}
+	normalized := make([]digestRule, 0, len(rules))
+	for _, rule := range rules {
+		resources := append([]string(nil), rule.Resources...)
+		sort.Strings(resources)
+		normalized = append(normalized, digestRule{
+			ID: rule.ID, Name: rule.Name, PolicyID: rule.PolicyID, Scope: rule.Scope, AppliesTo: rule.AppliesTo,
+			ResourceType: rule.ResourceType, Resources: resources, Decision: rule.Decision, Origin: rule.Origin,
+			Status: rule.Status, Editable: rule.Editable, Active: rule.Active,
+		})
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i].ID < normalized[j].ID })
+	payload, _ := json.Marshal(normalized)
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
 }
 
 func (p *Provider) ensureRelayToken(instance provider.Instance) (relayBindingSnapshot, error) {
@@ -398,7 +602,10 @@ func relayBindingSnapshotLocked(instance provider.Instance, binding relayTokenBi
 	if relay != nil {
 		port = relay.port
 	}
-	return relayBindingSnapshot{Instance: instance, Token: binding.Token, Epoch: binding.Epoch, Relay: relay, Port: port, PolicyRules: policyRules}
+	return relayBindingSnapshot{
+		Instance: instance, Token: binding.Token, Epoch: binding.Epoch, Relay: relay, Port: port, PolicyRules: policyRules,
+		PolicyInventoryDigest: binding.PolicyInventoryDigest, PolicyPreAllowProof: binding.PolicyPreAllowProof,
+	}
 }
 
 func (p *Provider) currentRelayBinding(instance provider.Instance) (relayBindingSnapshot, error) {
@@ -412,8 +619,12 @@ func (p *Provider) currentRelayBinding(instance provider.Instance) (relayBinding
 }
 
 func (p *Provider) bindRelayPolicyRules(snapshot relayBindingSnapshot, ruleNames []string) (relayBindingSnapshot, error) {
-	policyRules := make(map[string]struct{}, len(ruleNames))
-	for _, ruleName := range ruleNames {
+	return p.bindRelayPolicyProof(snapshot, relayPolicyProof{RuleNames: ruleNames})
+}
+
+func (p *Provider) bindRelayPolicyProof(snapshot relayBindingSnapshot, proof relayPolicyProof) (relayBindingSnapshot, error) {
+	policyRules := make(map[string]struct{}, len(proof.RuleNames))
+	for _, ruleName := range proof.RuleNames {
 		if ruleName == "" {
 			return relayBindingSnapshot{}, fmt.Errorf("Docker Sandboxes host-trust relay policy readback omitted the matched rule identity")
 		}
@@ -429,6 +640,8 @@ func (p *Provider) bindRelayPolicyRules(snapshot relayBindingSnapshot, ruleNames
 		return relayBindingSnapshot{}, fmt.Errorf("Docker Sandboxes host-trust relay binding changed during activation")
 	}
 	binding.PolicyRules = policyRules
+	binding.PolicyInventoryDigest = proof.InventoryDigest
+	binding.PolicyPreAllowProof = proof.PreAllowProof
 	p.relayTokens[snapshot.Instance.Name] = binding
 	return relayBindingSnapshotLocked(snapshot.Instance, binding, p.relay), nil
 }
@@ -444,7 +657,7 @@ func (p *Provider) verifyRelayBinding(snapshot relayBindingSnapshot) error {
 }
 
 func relayBindingMatchesSnapshot(binding relayTokenBinding, relay *egressRelay, snapshot relayBindingSnapshot) bool {
-	return relay != nil && relay == snapshot.Relay && relay.port == snapshot.Port && binding.ProviderID == snapshot.Instance.ProviderID && binding.Token == snapshot.Token && binding.Epoch == snapshot.Epoch
+	return relay != nil && relay == snapshot.Relay && relay.port == snapshot.Port && binding.ProviderID == snapshot.Instance.ProviderID && binding.Token == snapshot.Token && binding.Epoch == snapshot.Epoch && binding.PolicyInventoryDigest == snapshot.PolicyInventoryDigest && binding.PolicyPreAllowProof == snapshot.PolicyPreAllowProof
 }
 
 func (p *Provider) verifyExactRelayInstance(ctx context.Context, snapshot relayBindingSnapshot) error {

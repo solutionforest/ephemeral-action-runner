@@ -22,6 +22,8 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	gh "github.com/solutionforest/ephemeral-action-runner/internal/github"
 	"github.com/solutionforest/ephemeral-action-runner/internal/hosttrust"
+	"github.com/solutionforest/ephemeral-action-runner/internal/logging"
+	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
@@ -396,8 +398,8 @@ func TestHostTrustReconciliationFencesWhenTransportVerificationFails(t *testing.
 	if activator.calls != 0 {
 		t.Fatalf("activation calls = %d, want zero while fencing the unhealthy registered runner", activator.calls)
 	}
-	if activator.verifyCalls != 1 {
-		t.Fatalf("runtime verification calls = %d, want one before fencing the unhealthy registered runner", activator.verifyCalls)
+	if activator.verifyCalls != 0 {
+		t.Fatalf("common runtime verification calls = %d, want zero when a dedicated host-trust verifier exists", activator.verifyCalls)
 	}
 	if activator.verifyHostTrustCalls != 1 {
 		t.Fatalf("provider host-trust verification calls = %d, want one before fencing the unhealthy registered runner", activator.verifyHostTrustCalls)
@@ -438,8 +440,8 @@ func TestHostTrustReconciliationDoesNotReactivateHealthyTransport(t *testing.T) 
 	if activator.calls != 0 {
 		t.Fatalf("host trust transport activations = %d, want zero for healthy current-generation transport", activator.calls)
 	}
-	if activator.verifyCalls != 1 {
-		t.Fatalf("runtime verification calls = %d, want one for healthy current-generation transport", activator.verifyCalls)
+	if activator.verifyCalls != 0 {
+		t.Fatalf("common runtime verification calls = %d, want zero when a dedicated host-trust verifier exists", activator.verifyCalls)
 	}
 	if activator.verifyHostTrustCalls != 1 {
 		t.Fatalf("provider host-trust verification calls = %d, want one for healthy current-generation transport", activator.verifyHostTrustCalls)
@@ -478,8 +480,8 @@ func TestHostTrustReconciliationFencesBusyRunnerWhenTransportVerificationFails(t
 	if activator.calls != 0 {
 		t.Fatalf("host trust transport activations = %d, want zero for failed verification", activator.calls)
 	}
-	if activator.verifyCalls != 1 {
-		t.Fatalf("runtime verification calls = %d, want one before fencing the busy runner", activator.verifyCalls)
+	if activator.verifyCalls != 0 {
+		t.Fatalf("common runtime verification calls = %d, want zero when a dedicated host-trust verifier exists", activator.verifyCalls)
 	}
 	if activator.verifyHostTrustCalls != 1 {
 		t.Fatalf("provider host-trust verification calls = %d, want one before fencing the busy runner", activator.verifyHostTrustCalls)
@@ -489,6 +491,241 @@ func TestHostTrustReconciliationFencesBusyRunnerWhenTransportVerificationFails(t
 	}
 	if got := len(hostTrustLeaseInputs(fake)); got != 0 {
 		t.Fatalf("host trust lease writes = %d, want zero after failed transport verification", got)
+	}
+}
+
+func TestHostTrustReconciliationBusyRunnerIgnoresJobMutableGeneralRuntimeState(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
+	activator := &hostTrustVerifyingLifecycle{
+		activatingLifecycle: &activatingLifecycle{
+			Lifecycle: provider.AdaptLegacy(fake, false),
+			verifyErr: errors.New("workflow-created Docker client configuration is present"),
+		},
+	}
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: true}, found: true}
+	manager := Manager{
+		Config: config.Config{
+			Provider: config.ProviderConfig{Type: "docker-sandboxes"},
+			Image:    config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
+		},
+		Provider:  fake,
+		Lifecycle: activator,
+		GitHub:    github,
+	}
+	var console bytes.Buffer
+	logDirectory := t.TempDir()
+	manager.Config.Logging.Directory = logDirectory
+	runtime, err := logging.NewRuntime(logging.Options{Directory: logDirectory, ManagerSinks: logging.SinkConsole, Stdout: &console, Stderr: &console})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	manager.Logging = runtime
+	current := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", ProviderID: "fake:runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}
+	busyHandoff := make(map[string]bool)
+
+	manager.reconcileHostTrustRunners(context.Background(), active, current, busyHandoff)
+	manager.reconcileHostTrustRunners(context.Background(), active, current, busyHandoff)
+
+	if got := active["runner-1"].Phase; got != LifecycleReady {
+		t.Fatalf("runner phase = %s, want %s", got, LifecycleReady)
+	}
+	if activator.verifyCalls != 0 {
+		t.Fatalf("common runtime verification calls = %d, want zero for job-mutable runtime state", activator.verifyCalls)
+	}
+	if activator.verifyHostTrustCalls != 2 {
+		t.Fatalf("provider host-trust verification calls = %d, want one read-only transport check per reconciliation", activator.verifyHostTrustCalls)
+	}
+	if got := len(hostTrustLeaseInputs(fake)); got != 1 {
+		t.Fatalf("busy handoff lease writes = %d, want one bounded lease", got)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub registration fence calls = %d, want zero for healthy busy transport", got)
+	}
+	if output := console.String(); strings.Contains(output, "host trust transport verification warning") || strings.Contains(output, "host trust registration fencing warning") {
+		t.Fatalf("healthy busy reconciliation emitted transport or fencing warning: %q", output)
+	}
+}
+
+func TestHostTrustReconciliationActivatorOnlyFallsBackToCommonRuntimeVerification(t *testing.T) {
+	fake := &fakeProvider{instances: []provider.Instance{{Name: "runner-1", ProviderID: "fake:runner-1", State: "running"}}}
+	activator := &activatingLifecycle{
+		Lifecycle: provider.AdaptLegacy(fake, false),
+		verifyErr: errors.New("runtime unavailable"),
+	}
+	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online"}, found: true}
+	manager := Manager{
+		Config: config.Config{
+			Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}},
+		},
+		Provider:  fake,
+		Lifecycle: activator,
+		GitHub:    github,
+	}
+	current := hosttrust.Snapshot{Generation: "g1", HostOS: "linux", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	active := map[string]ProvisionedInstance{"runner-1": {Name: "runner-1", ProviderID: "fake:runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}
+
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
+
+	if activator.verifyCalls != 1 {
+		t.Fatalf("common runtime verification calls = %d, want one fallback verification", activator.verifyCalls)
+	}
+	if got := active["runner-1"].Phase; got != LifecycleQuarantined {
+		t.Fatalf("runner phase = %s, want %s", got, LifecycleQuarantined)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub registration fence calls = %d, want one after fallback verification failure", got)
+	}
+}
+
+func TestDurableHostTrustQuarantineDoesNotRepeatBusyFenceAndRetiresWhenIdle(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	activator := &hostTrustVerifyingLifecycle{
+		activatingLifecycle: &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)},
+		verifyHostTrustErr:  errors.New("relay marker unavailable"),
+	}
+	busyRunner := gh.Runner{Name: name, ID: 42, Status: "online", Busy: true}
+	github := &fakeGitHub{
+		runner:      busyRunner,
+		found:       true,
+		listRunners: []gh.Runner{busyRunner},
+		deleteErr:   errors.New("runner is currently running a job"),
+	}
+	manager.Config.Image = config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}
+	manager.Provider = fake
+	manager.Lifecycle = activator
+	manager.GitHub = github
+	current := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+	active := map[string]ProvisionedInstance{name: {Name: name, ProviderID: "docker:ready-id", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady}}
+
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("initial GitHub registration fence calls = %d, want 1", got)
+	}
+	if got := active[name].Phase; got != LifecycleQuarantined {
+		t.Fatalf("phase after failed busy fence = %s, want %s", got, LifecycleQuarantined)
+	}
+
+	var err error
+	active, err = manager.reconcilePhysicalPool(context.Background(), active, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.reconcileHostTrustRunners(context.Background(), active, current, make(map[string]bool))
+	if got := active[name].Phase; got != LifecycleQuarantined {
+		t.Fatalf("phase after busy reconciliation = %s, want durable quarantine", got)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub registration fence calls after busy reconciliation = %d, want no repeat", got)
+	}
+	if activator.verifyHostTrustCalls != 1 {
+		t.Fatalf("provider host-trust verification calls = %d, want no repeat after durable quarantine", activator.verifyHostTrustCalls)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseQuarantined {
+		t.Fatalf("durable phase = %s, want %s", record.Phase, poolstate.PhaseQuarantined)
+	}
+
+	idleRunner := busyRunner
+	idleRunner.Busy = false
+	github.runner = idleRunner
+	github.listRunners = []gh.Runner{idleRunner}
+	github.deleteErr = nil
+	github.deleteFunc = func(context.Context, int64) error {
+		github.found = false
+		github.listRunners = nil
+		return nil
+	}
+	active, err = manager.reconcilePhysicalPool(context.Background(), active, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := active[name]; found {
+		t.Fatalf("durably quarantined idle runner remains active: %#v", active[name])
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 2 {
+		t.Fatalf("total GitHub deletion calls = %d, want initial busy fence plus idle cleanup", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+		t.Fatalf("provider deletion calls = %d, want one exact idle cleanup", got)
+	}
+	record, err = store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("durable phase after idle cleanup = %s, want %s", record.Phase, poolstate.PhaseTombstoned)
+	}
+}
+
+func TestReconciliationHydratesDurableBusyQuarantineWithoutReAdoption(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionQuarantine, Reason: "host trust transport unavailable"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	busyRunner := gh.Runner{Name: name, ID: 42, Status: "online", Busy: true}
+	github := &fakeGitHub{runner: busyRunner, found: true, listRunners: []gh.Runner{busyRunner}}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake, false)
+	manager.GitHub = github
+
+	active, err := manager.reconcilePhysicalPool(context.Background(), nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := active[name].Phase; got != LifecycleQuarantined {
+		t.Fatalf("hydrated phase = %s, want %s", got, LifecycleQuarantined)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub deletion calls = %d, want zero while hydrated quarantine is busy", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider deletion calls = %d, want zero while hydrated quarantine is busy", got)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseQuarantined {
+		t.Fatalf("durable phase = %s, want %s", record.Phase, poolstate.PhaseQuarantined)
+	}
+}
+
+func TestReconciliationRecoversTransientQuarantineWhenDurableStateIsReady(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	fake := &fakeProvider{instances: []provider.Instance{{Name: name, ProviderID: "docker:ready-id", State: "running"}}}
+	idleRunner := gh.Runner{Name: name, ID: 42, Status: "online"}
+	github := &fakeGitHub{runner: idleRunner, found: true, listRunners: []gh.Runner{idleRunner}}
+	manager.Provider = fake
+	manager.Lifecycle = provider.AdaptLegacy(fake, false)
+	manager.GitHub = github
+	known := map[string]ProvisionedInstance{name: {Name: name, ProviderID: "docker:ready-id", RunnerID: 42, ProviderOwned: true, Phase: LifecycleQuarantined}}
+
+	active, err := manager.reconcilePhysicalPool(context.Background(), known, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := active[name].Phase; got != LifecycleReady {
+		t.Fatalf("recovered phase = %s, want %s", got, LifecycleReady)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
+		t.Fatalf("GitHub deletion calls = %d, want zero for transient quarantine recovery", got)
+	}
+	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+		t.Fatalf("provider deletion calls = %d, want zero for transient quarantine recovery", got)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseReady {
+		t.Fatalf("durable phase = %s, want unchanged %s", record.Phase, poolstate.PhaseReady)
 	}
 }
 

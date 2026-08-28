@@ -332,11 +332,14 @@ type HostTrustRuntimeActivator interface {
 
 // HostTrustRuntimeVerifier is an optional provider capability for read-only
 // verification of transport state needed by an already registered runtime.
-// The pool invokes it during steady-state reconciliation after the common
-// VerifyRuntime check. Implementations must fail closed and must not mutate
-// network policy, restart a daemon, reconfigure the guest, or expose
-// credentials; returning nil means the exact instance's provider-owned trust
-// transport is active and verified.
+// The pool invokes it instead of the common VerifyRuntime check during
+// steady-state host-trust reconciliation because general runtime verification
+// may include pristine pre-job assertions that are invalid after assignment.
+// Implementations must include every transport invariant needed for that
+// steady-state decision, fail closed, and must not mutate network policy,
+// restart a daemon, reconfigure the guest, or expose credentials; returning
+// nil means the exact instance's provider-owned trust transport is active and
+// verified.
 type HostTrustRuntimeVerifier interface {
 	VerifyHostTrustRuntime(ctx context.Context, instance Instance) error
 }

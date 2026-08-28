@@ -18,7 +18,7 @@ type policyLogRecord struct {
 	Host      string    `json:"host"`
 	VMName    string    `json:"vm_name"`
 	ProxyType string    `json:"proxy_type"`
-	Rule      string    `json:"rule"`
+	Rule      *string   `json:"rule"`
 	LastSeen  time.Time `json:"last_seen"`
 	Since     time.Time `json:"since"`
 	Count     int       `json:"count_since"`
