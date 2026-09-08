@@ -740,6 +740,10 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 	for _, expected := range []string{
 		sandboxContainerFailureSignature,
 		"EPAR removes SSH-agent variables when its commands start a stopped daemon",
+		"this generic container-start failure does not prove its cause",
+		"sbx settings get ssh.agentForwardingEnabled",
+		"sbx settings set ssh.agentForwardingEnabled false",
+		"EPAR does not change shared settings automatically",
 		"recoveryMode=exclusive-auto",
 		"recoveryMode=observe never mutates the daemon",
 		"Coordinate with every process using that daemon",
@@ -2243,6 +2247,9 @@ func TestIsMissingSandboxPreservesLegacyAndMatchesOnlyTheRequestedSbx042Name(t *
 		{name: "sbx 0.42 exact name", targetName: testName, message: "sandbox 'epar-sandbox-1' not found", want: true},
 		{name: "sbx 0.42 Error wrapper", targetName: testName, message: "Error: sandbox 'epar-sandbox-1' not found", want: true},
 		{name: "sbx 0.42 error wrapper", targetName: testName, message: "error: sandbox 'epar-sandbox-1' not found", want: true},
+		{name: "live sbx 0.42.1 stop and rm", targetName: testName, message: "ERROR: sandbox 'epar-sandbox-1' not found (run 'sbx ls' to see your sandboxes)", want: true},
+		{name: "live format wrong name", targetName: testName, message: "ERROR: sandbox 'other-sandbox' not found (run 'sbx ls' to see your sandboxes)", want: false},
+		{name: "unknown guidance", targetName: testName, message: "ERROR: sandbox 'epar-sandbox-1' not found (in local cache)", want: false},
 		{name: "uppercase target remains exact", targetName: "EPAR-SANDBOX-1", message: "sandbox 'EPAR-SANDBOX-1' not found", want: true},
 		{name: "uppercase mismatch", targetName: testName, message: "sandbox 'EPAR-SANDBOX-1' not found", want: false},
 		{name: "different sandbox", targetName: testName, message: "sandbox 'other-sandbox' not found", want: false},
@@ -2272,7 +2279,7 @@ func TestStopAndDeleteTreatExactSbx042MissingSandboxErrorsAsIdempotent(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t,
 				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
-				commandStep{args: test.args, result: provider.ExecResult{Stderr: "sandbox '" + testName + "' not found"}, err: errors.New("exit status 1")},
+				commandStep{args: test.args, result: provider.ExecResult{Stderr: "ERROR: sandbox '" + testName + "' not found (run 'sbx ls' to see your sandboxes)"}, err: errors.New("exit status 1")},
 			)
 			if err := test.call(p); err != nil {
 				t.Fatal(err)

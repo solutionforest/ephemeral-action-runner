@@ -34,6 +34,11 @@ type providerRecoveryReservation struct {
 	attempt                int
 }
 
+type providerRecoveryIdentityExpectations struct {
+	identities        map[string]string
+	absenceCandidates map[string]provider.Instance
+}
+
 // recoverProviderControlPlane performs the shared orchestration around a
 // provider-owned recovery operation. The provider performs the exact daemon
 // stop/start sequence and holds cross-process exclusion; the pool owns policy,
@@ -98,6 +103,7 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 		m.warnf("Docker Sandboxes create-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
 		return true, nil
 	}
+	proofOnly := false
 
 	// The timeout may have been caused by a transient runtime stall that
 	// cleared before recovery began. Recheck first so an already-healthy daemon
@@ -111,21 +117,28 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 			if _, evidenceErr := providerInventoryEvidenceSet(items); evidenceErr != nil {
 				return m.providerRecoveryPreInterventionError(ctx, observedGeneration, fmt.Errorf("pre-intervention Docker Sandboxes inventory returned invalid safety evidence: %w", evidenceErr))
 			}
-			if identityErr := providerInventoryExpectedIdentitiesPresent(items, expectedIdentities); identityErr != nil {
+			needsAbsenceVerification, identityErr := providerInventoryNeedsDiscoveryAbsenceVerification(items, expectedIdentities)
+			if identityErr != nil {
 				return m.providerRecoveryPreInterventionError(ctx, observedGeneration, fmt.Errorf("pre-intervention Docker Sandboxes inventory omitted durable safety identity: %w", identityErr))
 			}
-			applied, resetErr := m.resetProviderRecoveryIfGenerationWithContext(ctx, observedGeneration)
-			if resetErr != nil {
-				return m.providerRecoverySupervisorError(ctx, fmt.Errorf("persist Docker Sandboxes inventory recovery reset: %w", resetErr))
-			}
-			if !applied {
-				if refreshErr := m.refreshProviderRecoveryState(ctx); refreshErr != nil {
-					return m.providerRecoverySupervisorError(ctx, fmt.Errorf("refresh Docker Sandboxes control-plane recovery state after stale reset: %w", refreshErr))
+			if !needsAbsenceVerification {
+				applied, resetErr := m.resetProviderRecoveryIfGenerationWithContext(ctx, observedGeneration)
+				if resetErr != nil {
+					return m.providerRecoverySupervisorError(ctx, fmt.Errorf("persist Docker Sandboxes inventory recovery reset: %w", resetErr))
 				}
+				if !applied {
+					if refreshErr := m.refreshProviderRecoveryState(ctx); refreshErr != nil {
+						return m.providerRecoverySupervisorError(ctx, fmt.Errorf("refresh Docker Sandboxes control-plane recovery state after stale reset: %w", refreshErr))
+					}
+					return true, nil
+				}
+				m.infof("Docker Sandboxes inventory recovered before daemon intervention; resuming pool reconciliation\n")
 				return true, nil
 			}
-			m.infof("Docker Sandboxes inventory recovered before daemon intervention; resuming pool reconciliation\n")
-			return true, nil
+			// An otherwise healthy inventory omission is not enough to clear
+			// an append-only discovery. Continue into the host-wide recovery
+			// lease so the provider can prove exact absence independently.
+			proofOnly = true
 		}
 		if ctx.Err() != nil {
 			return true, ctx.Err()
@@ -141,7 +154,7 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 			return callbackErr
 		}
 		callbackInvoked = true
-		callbackHandled, callbackErr = m.recoverProviderControlPlaneUnderLease(coordinatedCtx, cause, admissionFailure, verificationRequired, observedGeneration, expectedIdentities, recoverer)
+		callbackHandled, callbackErr = m.recoverProviderControlPlaneUnderLease(coordinatedCtx, cause, admissionFailure, verificationRequired, proofOnly, observedGeneration, expectedIdentities, recoverer)
 		return callbackErr
 	})
 	if callbackInvoked {
@@ -176,7 +189,7 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 	return m.providerRecoverySupervisorError(ctx, fmt.Errorf("acquire Docker Sandboxes host-wide recovery coordinator: %w", coordinateErr))
 }
 
-func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cause error, admissionFailure, verificationRequired bool, observedGeneration uint64, expectedIdentities map[string]string, recoverer provider.ControlPlaneRecoverer) (handled bool, err error) {
+func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cause error, admissionFailure, verificationRequired, proofOnly bool, observedGeneration uint64, expectedIdentities providerRecoveryIdentityExpectations, recoverer provider.ControlPlaneRecoverer) (handled bool, err error) {
 	if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) {
 		return m.providerRecoverySupervisorError(ctx, errors.New("Docker Sandboxes recovery coordinator did not mark its host-wide lease context; refusing unlocked automatic recovery"))
 	}
@@ -186,13 +199,41 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 	// is persisted atomically with that reservation. Verification-only takeover
 	// uses the already durable census and must never replace it with a fresh,
 	// potentially incomplete snapshot.
-	reservationIdentities := expectedIdentities
+	reservationIdentities := expectedIdentities.identities
 	if !verificationRequired {
+		censusCtx, cancelCensus := context.WithTimeout(ctx, providerRecoveryProbeTimeout)
 		var censusErr error
-		reservationIdentities, censusErr = m.captureProviderRecoveryIdentityCensus(ctx, expectedIdentities)
+		reservationIdentities, censusErr = m.captureProviderRecoveryIdentityCensus(censusCtx, expectedIdentities)
+		cancelCensus()
 		if censusErr != nil {
 			return m.providerRecoveryPreInterventionError(ctx, observedGeneration, censusErr)
 		}
+	} else if len(expectedIdentities.absenceCandidates) != 0 {
+		// The frozen positive census survives a crash, but exclusions of
+		// append-only historical discoveries are not stored. Re-prove those
+		// exclusions before merging expectations on takeover, without ever
+		// dropping a frozen identity or replacing the persisted census.
+		proofCtx, cancelProof := context.WithTimeout(ctx, providerRecoveryProbeTimeout)
+		var proofErr error
+		reservationIdentities, proofErr = m.reproveRecoveryDiscoveryAbsence(proofCtx, expectedIdentities)
+		cancelProof()
+		if proofErr != nil {
+			return m.providerRecoverySupervisorError(ctx, proofErr)
+		}
+	}
+	if proofOnly {
+		applied, resetErr := m.resetProviderRecoveryIfGenerationWithContext(ctx, observedGeneration)
+		if resetErr != nil {
+			return m.providerRecoverySupervisorError(ctx, fmt.Errorf("persist Docker Sandboxes inventory recovery reset after exact discovery absence: %w", resetErr))
+		}
+		if !applied {
+			if refreshErr := m.refreshProviderRecoveryState(ctx); refreshErr != nil {
+				return m.providerRecoverySupervisorError(ctx, fmt.Errorf("refresh Docker Sandboxes control-plane recovery state after stale exact discovery absence: %w", refreshErr))
+			}
+			return true, nil
+		}
+		m.infof("Docker Sandboxes inventory and historical discovery absence were verified under the host-wide recovery lease; resuming pool reconciliation\n")
+		return true, nil
 	}
 
 	recoveryCause := "inventory failure"
@@ -227,7 +268,7 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 	recoveryCtx, cancel := context.WithTimeout(ctx, providerRecoveryBudgetFor(quiescence))
 	defer cancel()
 	reservation := start.reservation
-	expectedIdentities = start.expectedIdentities
+	activeExpectedIdentities := start.expectedIdentities
 	if !start.verificationOnly {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
@@ -262,7 +303,7 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 			// returning an error, including when the caller deadline fired. Fence
 			// every exact identity with a detached context before deciding whether
 			// the recovery attempt can be recorded or retried.
-			if fenceErr := m.markProviderRecoveryInventoryUncertain(context.WithoutCancel(ctx), expectedIdentities); fenceErr != nil {
+			if fenceErr := m.markProviderRecoveryInventoryUncertain(context.WithoutCancel(ctx), activeExpectedIdentities); fenceErr != nil {
 				return m.providerRecoverySupervisorError(ctx, fmt.Errorf("persist provider inventory uncertainty after recovery intervention failure: %w", fenceErr))
 			}
 			if ctx.Err() != nil {
@@ -295,11 +336,11 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 		}
 	}
 
-	if verifyErr := m.verifyProviderInventoryAfterRecoveryWithExpected(recoveryCtx, expectedIdentities); verifyErr != nil {
+	if verifyErr := m.verifyProviderInventoryAfterRecoveryWithExpected(recoveryCtx, activeExpectedIdentities); verifyErr != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
-		if fenceErr := m.markProviderRecoveryInventoryUncertain(context.WithoutCancel(ctx), expectedIdentities); fenceErr != nil {
+		if fenceErr := m.markProviderRecoveryInventoryUncertain(context.WithoutCancel(ctx), activeExpectedIdentities); fenceErr != nil {
 			return m.providerRecoverySupervisorError(ctx, fmt.Errorf("persist post-recovery provider inventory uncertainty: %w", fenceErr))
 		}
 		attempt, next, applied, recordErr := m.recordProviderRecoveryFailureForReservationWithContext(ctx, reservation)
@@ -382,60 +423,76 @@ func (m *Manager) verifyProviderInventoryAfterRecoveryWithExpected(parent contex
 	return nil
 }
 
-func (m *Manager) providerRecoveryExpectedIdentities(ctx context.Context) (map[string]string, error) {
+func (m *Manager) providerRecoveryExpectedIdentities(ctx context.Context) (providerRecoveryIdentityExpectations, error) {
 	m.providerRecoveryMu.Lock()
 	durable := cloneProviderRecoveryIdentities(m.providerRecoveryIdentityCensus)
 	verificationRequired := providerRecoveryReservationNeedsVerification(m.providerRecoveryReservationToken, m.providerRecoveryReservationPhase)
 	m.providerRecoveryMu.Unlock()
 	if verificationRequired && durable == nil {
-		return nil, errors.New("interrupted Docker Sandboxes recovery has no durable host-wide identity census; automatic verification cannot establish safety")
+		return providerRecoveryIdentityExpectations{}, errors.New("interrupted Docker Sandboxes recovery has no durable host-wide identity census; automatic verification cannot establish safety")
 	}
 	expected := durable
 	if expected == nil {
 		expected = make(map[string]string)
 	}
+	expectations := providerRecoveryIdentityExpectations{identities: expected, absenceCandidates: make(map[string]provider.Instance)}
 	if m.LifecycleState == nil {
 		if m.LifecycleStateEnabled {
-			return nil, errors.New("durable lifecycle state is required to establish Docker Sandboxes recovery identities")
+			return providerRecoveryIdentityExpectations{}, errors.New("durable lifecycle state is required to establish Docker Sandboxes recovery identities")
 		}
-		return expected, nil
+		return expectations, nil
 	}
 	records, err := m.LifecycleState.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read lifecycle state for Docker Sandboxes recovery identities: %w", err)
+		return providerRecoveryIdentityExpectations{}, fmt.Errorf("read lifecycle state for Docker Sandboxes recovery identities: %w", err)
 	}
 	byProviderID := make(map[string]string, len(expected))
 	for name, providerID := range expected {
 		byProviderID[providerID] = name
 	}
+	nonterminalLifecycleNames := make(map[string]struct{})
 	for _, record := range records {
-		if record.ProviderType != m.Config.Provider.Type || record.ProviderID == "" {
+		if record.ProviderType != m.Config.Provider.Type {
 			continue
 		}
 		switch record.Phase {
 		case poolstate.PhaseLocalAbsent, poolstate.PhaseTombstoned:
 			continue
 		}
+		nonterminalLifecycleNames[record.Name] = struct{}{}
+		if record.ProviderID == "" {
+			continue
+		}
 		if err := mergeProviderRecoveryIdentity(expected, byProviderID, record.Name, record.ProviderID, "lifecycle state"); err != nil {
-			return nil, err
+			return providerRecoveryIdentityExpectations{}, err
 		}
 	}
 	discoveries, err := m.LifecycleState.Discoveries(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read report-only discovery state for Docker Sandboxes recovery identities: %w", err)
+		return providerRecoveryIdentityExpectations{}, fmt.Errorf("read report-only discovery state for Docker Sandboxes recovery identities: %w", err)
 	}
 	for _, discovery := range discoveries {
 		if discovery.ProviderType != m.Config.Provider.Type {
 			continue
 		}
+		_, alreadyProtected := expected[discovery.ExactName]
 		if err := mergeProviderRecoveryIdentity(expected, byProviderID, discovery.ExactName, discovery.ProviderID, "report-only discovery state"); err != nil {
-			return nil, err
+			return providerRecoveryIdentityExpectations{}, err
+		}
+		if _, nonterminal := nonterminalLifecycleNames[discovery.ExactName]; alreadyProtected || nonterminal {
+			continue
+		}
+		expectations.absenceCandidates[discovery.ExactName] = provider.Instance{
+			Name:           discovery.ExactName,
+			ProviderID:     discovery.ProviderID,
+			ReceiptVersion: discovery.Receipt.Version,
+			Receipt:        append(json.RawMessage(nil), discovery.Receipt.Payload...),
 		}
 	}
-	return expected, nil
+	return expectations, nil
 }
 
-func (m *Manager) captureProviderRecoveryIdentityCensus(ctx context.Context, expected map[string]string) (map[string]string, error) {
+func (m *Manager) captureProviderRecoveryIdentityCensus(ctx context.Context, expected providerRecoveryIdentityExpectations) (map[string]string, error) {
 	items, err := m.probeProviderInventory(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("establish host-wide Docker Sandboxes recovery identity census: inventory failed: %w", err)
@@ -443,14 +500,133 @@ func (m *Manager) captureProviderRecoveryIdentityCensus(ctx context.Context, exp
 	if _, err := providerInventoryEvidenceSet(items); err != nil {
 		return nil, fmt.Errorf("establish host-wide Docker Sandboxes recovery identity census: invalid safety evidence: %w", err)
 	}
-	if err := providerInventoryExpectedIdentitiesPresent(items, expected); err != nil {
+	needsAbsenceVerification, err := providerInventoryNeedsDiscoveryAbsenceVerification(items, expected)
+	if err != nil {
 		return nil, fmt.Errorf("establish host-wide Docker Sandboxes recovery identity census: omitted durable safety identity: %w", err)
+	}
+	if needsAbsenceVerification {
+		if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) {
+			return nil, errors.New("establish host-wide Docker Sandboxes recovery identity census: independent absence verification requires the host-wide recovery coordinator lease")
+		}
+		verifier, ok := m.providerLifecycle().(provider.ControlPlaneIdentityAbsenceVerifier)
+		if !ok {
+			return nil, errors.New("establish host-wide Docker Sandboxes recovery identity census: omitted discovery identities require independent exact absence verification")
+		}
+		observed := make(map[string]string, len(items))
+		for _, item := range items {
+			observed[item.Instance.Name] = item.Instance.ProviderID
+		}
+		names := make([]string, 0, len(expected.absenceCandidates))
+		for name := range expected.absenceCandidates {
+			if _, found := observed[name]; !found {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			identity := expected.absenceCandidates[name]
+			absent, verifyErr := verifier.VerifyControlPlaneIdentityAbsent(ctx, identity)
+			if verifyErr != nil {
+				return nil, fmt.Errorf("establish host-wide Docker Sandboxes recovery identity census: independently verify discovery identity %q id=%q absence: %w", identity.Name, identity.ProviderID, verifyErr)
+			}
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("establish host-wide Docker Sandboxes recovery identity census: independently verify discovery identity %q id=%q absence: %w", identity.Name, identity.ProviderID, ctx.Err())
+			}
+			if !absent {
+				return nil, fmt.Errorf("establish host-wide Docker Sandboxes recovery identity census: discovery identity %q id=%q was omitted and independent exact absence was not established", identity.Name, identity.ProviderID)
+			}
+		}
 	}
 	census := make(map[string]string, len(items))
 	for _, item := range items {
 		census[item.Instance.Name] = item.Instance.ProviderID
 	}
 	return census, nil
+}
+
+func (m *Manager) reproveRecoveryDiscoveryAbsence(ctx context.Context, expected providerRecoveryIdentityExpectations) (map[string]string, error) {
+	if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) {
+		return nil, errors.New("recovery discovery absence takeover requires the host-wide coordinator lease")
+	}
+	verifier, ok := m.providerLifecycle().(provider.ControlPlaneIdentityAbsenceVerifier)
+	if !ok {
+		return nil, errors.New("recovery takeover requires independent exact absence verification for historical discoveries")
+	}
+	m.providerRecoveryMu.Lock()
+	frozen := cloneProviderRecoveryIdentities(m.providerRecoveryIdentityCensus)
+	m.providerRecoveryMu.Unlock()
+	if frozen == nil {
+		return nil, errors.New("recovery takeover has no frozen identity census for historical discovery reconciliation")
+	}
+	items, err := m.probeProviderInventory(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("recovery takeover discovery inventory: %w", err)
+	}
+	if _, err := providerInventoryEvidenceSet(items); err != nil {
+		return nil, fmt.Errorf("recovery takeover discovery inventory evidence: %w", err)
+	}
+	for _, item := range items {
+		for name, candidate := range expected.absenceCandidates {
+			if item.Instance.Name == name || item.Instance.ProviderID == candidate.ProviderID {
+				return nil, fmt.Errorf("historical discovery %q id=%q is present or rebound during recovery takeover; preserving the frozen census", name, candidate.ProviderID)
+			}
+		}
+	}
+	filtered := cloneProviderRecoveryIdentities(expected.identities)
+	names := make([]string, 0, len(expected.absenceCandidates))
+	for name := range expected.absenceCandidates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		identity := expected.absenceCandidates[name]
+		if _, protected := frozen[name]; protected || identity.Name != name || filtered[name] != identity.ProviderID {
+			return nil, fmt.Errorf("refusing to exclude protected or mismatched recovery identity %q", name)
+		}
+		absent, err := verifier.VerifyControlPlaneIdentityAbsent(ctx, identity)
+		if err != nil {
+			return nil, fmt.Errorf("reprove historical discovery %q absence during recovery takeover: %w", name, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !absent {
+			return nil, fmt.Errorf("historical discovery %q absence was not independently established during recovery takeover; preserving the frozen census", name)
+		}
+		delete(filtered, name)
+	}
+	return filtered, nil
+}
+
+func providerInventoryNeedsDiscoveryAbsenceVerification(items []provider.InventoryItem, expected providerRecoveryIdentityExpectations) (bool, error) {
+	observedByName := make(map[string]string, len(items))
+	observedByProviderID := make(map[string]string, len(items))
+	for _, item := range items {
+		observedByName[item.Instance.Name] = item.Instance.ProviderID
+		observedByProviderID[item.Instance.ProviderID] = item.Instance.Name
+	}
+	needsAbsenceVerification := false
+	for name, providerID := range expected.identities {
+		observedID, found := observedByName[name]
+		if found {
+			if observedID != providerID {
+				return false, fmt.Errorf("durable provider identity %q changed from id=%q to id=%q", name, providerID, observedID)
+			}
+			continue
+		}
+		if observedName, rebound := observedByProviderID[providerID]; rebound {
+			return false, fmt.Errorf("durable provider identity %q id=%q was observed with name %q", name, providerID, observedName)
+		}
+		candidate, verifiable := expected.absenceCandidates[name]
+		if !verifiable || candidate.ProviderID != providerID {
+			return false, fmt.Errorf("durable provider identity %q id=%q was not observed", name, providerID)
+		}
+		needsAbsenceVerification = true
+	}
+	return needsAbsenceVerification, nil
 }
 
 func mergeProviderRecoveryIdentity(expected, byProviderID map[string]string, name, providerID, source string) error {

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -394,8 +395,157 @@ func TestDurableReportOnlyCensusOmissionNeverTriggersSecondIntervention(t *testi
 	}
 	lifecycle.mu.Lock()
 	defer lifecycle.mu.Unlock()
-	if lifecycle.recoverCalls != 0 || lifecycle.inventoryCalls != 2 {
-		t.Fatalf("verification-only omission calls = intervention=%d inventory=%d, want two probes and no second intervention", lifecycle.recoverCalls, lifecycle.inventoryCalls)
+	if lifecycle.recoverCalls != 0 || lifecycle.inventoryCalls != 2 || len(lifecycle.absenceCalls) != 0 {
+		t.Fatalf("verification-only omission calls = intervention=%d inventory=%d absence=%d, want two probes, no second intervention, and no historical-absence bypass", lifecycle.recoverCalls, lifecycle.inventoryCalls, len(lifecycle.absenceCalls))
+	}
+}
+
+func TestRecoveryTakeoverRechecksDiscoveryAbsenceBeforeMergingCensus(t *testing.T) {
+	for _, phase := range []provider.RecoveryReservationPhase{provider.RecoveryReservationIntervening, provider.RecoveryReservationVerifying} {
+		for _, scenario := range []string{"unchanged discovery", "newer observation present", "newer observation readback error", "protected active identity", "provider id rebound under another name", "name rebound to another provider id"} {
+			t.Run(string(phase)+"/"+scenario, func(t *testing.T) {
+				t.Setenv("EPAR_STATE_HOME", t.TempDir())
+				ctx := context.Background()
+				store, err := poolstate.Open(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				const name, providerID = "historical-takeover-discovery", "provider:historical-takeover"
+				discovery := poolstate.Discovery{
+					ProviderType: "docker-sandboxes", ProviderID: providerID, ExactName: name,
+					Receipt: poolstate.Receipt{Version: "v1", Payload: []byte(`{"state":"stopped","source":"shell"}`)},
+				}
+				firstObservation, err := store.ReportUnknown(ctx, discovery)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ledger, err := provider.OpenControlPlaneRecoveryLedger()
+				if err != nil {
+					t.Fatal(err)
+				}
+				firstLifecycle := &controlPlaneRecoveryLifecycle{
+					absenceResults: map[string]bool{name: true},
+					recoverErr:     errors.New("intervention interrupted after reservation publication"),
+				}
+				first := Manager{Config: configForRecoveryHardeningTest(), Lifecycle: firstLifecycle, LifecycleState: store, providerRecoveryLedger: ledger}
+				if handled, err := first.recoverProviderControlPlane(ctx, provider.ErrControlPlaneAdmissionFailure); !handled || err != nil {
+					t.Fatalf("initial recovery = handled %t error %v", handled, err)
+				}
+				published, err := ledger.State(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if published.RecoveryReservationToken == 0 || published.ExpectedIdentities == nil || len(published.ExpectedIdentities) != 0 {
+					t.Fatalf("published reservation lacks the empty census established by exact absence: %#v", published)
+				}
+				if firstLifecycle.recoverCalls != 1 || len(firstLifecycle.absenceCalls) != 1 {
+					t.Fatalf("initial intervention/proof calls = %d/%d, want 1/1", firstLifecycle.recoverCalls, len(firstLifecycle.absenceCalls))
+				}
+				switch scenario {
+				case "newer observation present", "newer observation readback error":
+					newObservation, err := store.ReportUnknown(ctx, discovery)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !newObservation.ObservedAt.After(firstObservation.ObservedAt) {
+						t.Fatal("fixture must publish a strictly newer observation")
+					}
+				case "protected active identity":
+					seedRecoveryIdentity(t, store, name, providerID)
+				}
+				beforeDiscoveries, err := store.Discoveries(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				now := time.Now().Add(time.Hour)
+				if _, err := ledger.Update(ctx, func(state *provider.ControlPlaneRecoveryState) error {
+					state.RecoveryReservationPhase = phase
+					state.RecoveryReservationExpiresAt = now.Add(-time.Second)
+					state.NextAttemptAt = now.Add(-time.Second)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				reopenedLedger, err := provider.OpenControlPlaneRecoveryLedger()
+				if err != nil {
+					t.Fatal(err)
+				}
+				reopenedStore, err := poolstate.Open(filepath.Dir(store.Path()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				lifecycle := &controlPlaneRecoveryLifecycle{absenceResults: map[string]bool{name: true}}
+				if scenario == "newer observation present" {
+					lifecycle.absenceResults[name] = false
+				}
+				if scenario == "newer observation readback error" {
+					lifecycle.absenceErrors = map[string]error{name: errors.New("independent inspection unavailable")}
+				}
+				rebound := false
+				switch scenario {
+				case "provider id rebound under another name":
+					lifecycle.inventoryItems = []provider.InventoryItem{recoveryInventoryItem("rebound-takeover-name", providerID)}
+					rebound = true
+				case "name rebound to another provider id":
+					lifecycle.inventoryItems = []provider.InventoryItem{recoveryInventoryItem(name, "provider:rebound-takeover")}
+					rebound = true
+				}
+				restarted := Manager{Config: configForRecoveryHardeningTest(), Lifecycle: lifecycle, LifecycleState: reopenedStore, providerRecoveryLedger: reopenedLedger, now: func() time.Time { return now }}
+				handled, takeoverErr := restarted.recoverProviderControlPlane(ctx, provider.ErrControlPlaneFailure)
+				if !handled || (scenario == "unchanged discovery" && takeoverErr != nil) {
+					t.Fatalf("takeover = handled %t error %v", handled, takeoverErr)
+				}
+				if rebound && (takeoverErr == nil || !strings.Contains(takeoverErr.Error(), name) || !strings.Contains(takeoverErr.Error(), providerID)) {
+					t.Fatalf("rebound takeover error = %v, want exact conflicting discovery identity", takeoverErr)
+				}
+				after, err := reopenedLedger.State(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantAbsenceCalls := 1
+				wantInventoryCalls := 1
+				if scenario == "unchanged discovery" {
+					wantInventoryCalls += providerRecoveryProbeCount
+					if after.RecoveryReservationToken != 0 || len(after.ExpectedIdentities) != 0 {
+						t.Fatalf("unchanged observation reintroduced phantom identity or wedged takeover: %#v", after)
+					}
+				} else {
+					if after.RecoveryReservationToken == 0 {
+						t.Fatalf("new observation or protected identity lost its reservation fence: %#v", after)
+					}
+					if scenario == "protected active identity" {
+						wantAbsenceCalls = 0
+						if after.ExpectedIdentities[name] != providerID {
+							t.Fatalf("protected identity was not retained in the verification census: %#v", after)
+						}
+					} else if len(after.ExpectedIdentities) != 0 {
+						t.Fatalf("failed discovery recheck poisoned the frozen census: %#v", after)
+					}
+					if rebound {
+						wantAbsenceCalls = 0
+						if after.RecoveryReservationToken != published.RecoveryReservationToken || after.RecoveryReservationPhase != phase {
+							t.Fatalf("rebound discovery changed pending reservation: %#v", after)
+						}
+					}
+				}
+				if lifecycle.inventoryCalls != wantInventoryCalls {
+					t.Fatalf("takeover inventory calls = %d, want %d", lifecycle.inventoryCalls, wantInventoryCalls)
+				}
+				if lifecycle.recoverCalls != 0 || len(lifecycle.absenceCalls) != wantAbsenceCalls {
+					t.Fatalf("takeover intervention/proof = %d/%d, want 0/%d", lifecycle.recoverCalls, len(lifecycle.absenceCalls), wantAbsenceCalls)
+				}
+				if lifecycle.absenceOutsideCoordination != 0 || lifecycle.absenceWithoutLeaseMarker != 0 {
+					t.Fatal("takeover absence proof escaped the recovery lease")
+				}
+				afterDiscoveries, err := reopenedStore.Discoveries(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(beforeDiscoveries, afterDiscoveries) {
+					t.Fatal("takeover changed the durable discovery catalog")
+				}
+			})
+		}
 	}
 }
 
@@ -472,8 +622,315 @@ func TestReportOnlyDiscoveryMustAppearInPreInterventionCensus(t *testing.T) {
 	}
 	lifecycle.mu.Lock()
 	defer lifecycle.mu.Unlock()
-	if lifecycle.inventoryCalls != 1 || lifecycle.recoverCalls != 0 {
-		t.Fatalf("report-only census omission calls = inventory=%d intervention=%d, want one census and no intervention", lifecycle.inventoryCalls, lifecycle.recoverCalls)
+	if lifecycle.inventoryCalls != 1 || len(lifecycle.absenceCalls) != 1 || lifecycle.recoverCalls != 0 {
+		t.Fatalf("report-only census omission calls = inventory=%d absence=%d intervention=%d, want one census, one failed exact-absence proof, and no intervention", lifecycle.inventoryCalls, len(lifecycle.absenceCalls), lifecycle.recoverCalls)
+	}
+}
+
+func TestRecoveryReconcilesDiscoveryOnlyIdentityWithIndependentAbsence(t *testing.T) {
+	const (
+		name       = "epar-test-historical-discovery"
+		providerID = "provider:historical-discovery"
+	)
+	for _, test := range []struct {
+		name             string
+		seedRecord       func(*testing.T, *poolstate.Store)
+		absenceResult    bool
+		absenceError     error
+		wantError        bool
+		wantAbsenceCalls int
+		wantRecoverCalls int
+		wantInventory    int
+	}{
+		{
+			name: "independent exact absence resolves post-tombstone discovery",
+			seedRecord: func(t *testing.T, store *poolstate.Store) {
+				t.Helper()
+				if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-sandboxes", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionCreateIntent}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionAbandonCreate}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			absenceResult:    true,
+			wantAbsenceCalls: 1,
+			wantRecoverCalls: 1,
+			wantInventory:    4,
+		},
+		{
+			name: "post-tombstone discovery stays fenced without exact absence",
+			seedRecord: func(t *testing.T, store *poolstate.Store) {
+				t.Helper()
+				if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-sandboxes", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionCreateIntent}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionAbandonCreate}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError:        true,
+			wantAbsenceCalls: 1,
+			wantInventory:    1,
+		},
+		{
+			name: "absence readback failure stays fenced",
+			seedRecord: func(t *testing.T, store *poolstate.Store) {
+				t.Helper()
+				if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-sandboxes", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionCreateIntent}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionAbandonCreate}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			absenceError:     errors.New("exact inspection unavailable"),
+			wantError:        true,
+			wantAbsenceCalls: 1,
+			wantInventory:    1,
+		},
+		{
+			name: "nonterminal exact identity never uses historical absence",
+			seedRecord: func(t *testing.T, store *poolstate.Store) {
+				t.Helper()
+				seedRecoveryIdentity(t, store, name, providerID)
+			},
+			absenceResult:    true,
+			wantError:        true,
+			wantRecoverCalls: 0,
+			wantInventory:    1,
+		},
+		{
+			name: "identityless uncertain create never uses historical absence",
+			seedRecord: func(t *testing.T, store *poolstate.Store) {
+				t.Helper()
+				if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{Name: name, ProviderType: "docker-sandboxes", GitHub: poolstate.GitHubIdentity{ExactName: name}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Transition(context.Background(), name, poolstate.Transition{Action: poolstate.ActionCreateIntent}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			absenceResult: true,
+			wantError:     true,
+			wantInventory: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("EPAR_STATE_HOME", t.TempDir())
+			store, err := poolstate.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.seedRecord(t, store)
+			if _, err := store.ReportUnknown(context.Background(), poolstate.Discovery{
+				ProviderType: "docker-sandboxes",
+				ProviderID:   providerID,
+				ExactName:    name,
+				Receipt:      poolstate.Receipt{Version: "v1", Payload: []byte(`{"state":"stopped","source":"shell"}`)},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := provider.OpenControlPlaneRecoveryLedger()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := &controlPlaneRecoveryLifecycle{
+				absenceResults: map[string]bool{name: test.absenceResult},
+				absenceErrors:  map[string]error{name: test.absenceError},
+			}
+			manager := Manager{
+				Config:                 configForRecoveryHardeningTest(),
+				Lifecycle:              lifecycle,
+				LifecycleState:         store,
+				providerRecoveryLedger: ledger,
+			}
+
+			handled, recoveryErr := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+			if !handled || (recoveryErr != nil) != test.wantError {
+				t.Fatalf("recovery with historical discovery = handled %t error %v, want error=%t", handled, recoveryErr, test.wantError)
+			}
+			if test.wantError && (!strings.Contains(recoveryErr.Error(), name) || !strings.Contains(recoveryErr.Error(), providerID)) {
+				t.Fatalf("recovery error = %v, want exact fenced identity", recoveryErr)
+			}
+			lifecycle.mu.Lock()
+			defer lifecycle.mu.Unlock()
+			if len(lifecycle.absenceCalls) != test.wantAbsenceCalls {
+				t.Fatalf("independent absence calls = %d, want %d", len(lifecycle.absenceCalls), test.wantAbsenceCalls)
+			}
+			for _, deadline := range lifecycle.absenceDeadlines {
+				remaining := time.Until(deadline)
+				if deadline.IsZero() || remaining <= 0 || remaining > providerRecoveryProbeTimeout {
+					t.Fatalf("independent absence deadline remaining = %s, want shared fresh-census bound no greater than %s", remaining, providerRecoveryProbeTimeout)
+				}
+			}
+			if len(lifecycle.absenceCalls) == 1 {
+				identity := lifecycle.absenceCalls[0]
+				var receipt map[string]string
+				if err := json.Unmarshal(identity.Receipt, &receipt); err != nil {
+					t.Fatalf("decode independent absence receipt: %v", err)
+				}
+				if identity.Name != name || identity.ProviderID != providerID || identity.ReceiptVersion != "v1" || !reflect.DeepEqual(receipt, map[string]string{"state": "stopped", "source": "shell"}) {
+					t.Fatalf("independent absence identity = %#v, want exact discovery identity and receipt", identity)
+				}
+			}
+			if lifecycle.absenceOutsideCoordination != 0 || lifecycle.absenceWithoutLeaseMarker != 0 {
+				t.Fatalf("independent absence escaped recovery lease: outside=%d missing-marker=%d", lifecycle.absenceOutsideCoordination, lifecycle.absenceWithoutLeaseMarker)
+			}
+			if lifecycle.recoverCalls != test.wantRecoverCalls || lifecycle.inventoryCalls != test.wantInventory {
+				t.Fatalf("recovery calls = intervention %d inventory %d, want intervention %d inventory %d", lifecycle.recoverCalls, lifecycle.inventoryCalls, test.wantRecoverCalls, test.wantInventory)
+			}
+		})
+	}
+}
+
+func TestRecoveredInventoryUsesUnderLeaseDiscoveryProofWithoutIntervention(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		name       = "epar-test-proof-only-discovery"
+		providerID = "provider:proof-only-discovery"
+	)
+	if _, err := store.ReportUnknown(context.Background(), poolstate.Discovery{
+		ProviderType: "docker-sandboxes",
+		ProviderID:   providerID,
+		ExactName:    name,
+		Receipt:      poolstate.Receipt{Version: "v1", Payload: []byte(`{"state":"stopped","source":"shell"}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := provider.OpenControlPlaneRecoveryLedger()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := &controlPlaneRecoveryLifecycle{absenceResults: map[string]bool{name: true}}
+	manager := Manager{
+		Config:                 configForRecoveryHardeningTest(),
+		Lifecycle:              lifecycle,
+		LifecycleState:         store,
+		providerRecoveryLedger: ledger,
+	}
+
+	handled, recoveryErr := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneFailure)
+	if !handled || recoveryErr != nil {
+		t.Fatalf("proof-only discovery recovery = handled %t error %v", handled, recoveryErr)
+	}
+	state, err := ledger.State(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.RecoveryReservationToken != 0 || state.Attempts != 0 || len(state.ExpectedIdentities) != 0 {
+		t.Fatalf("proof-only recovery state = %#v, want reset without reservation", state)
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.inventoryCalls != 2 || len(lifecycle.absenceCalls) != 1 || lifecycle.recoverCalls != 0 || lifecycle.coordinateCalls != 1 {
+		t.Fatalf("proof-only calls = inventory %d absence %d intervention %d coordinator %d, want 2/1/0/1", lifecycle.inventoryCalls, len(lifecycle.absenceCalls), lifecycle.recoverCalls, lifecycle.coordinateCalls)
+	}
+	if lifecycle.absenceOutsideCoordination != 0 || lifecycle.absenceWithoutLeaseMarker != 0 {
+		t.Fatalf("proof-only absence escaped recovery lease: outside=%d missing-marker=%d", lifecycle.absenceOutsideCoordination, lifecycle.absenceWithoutLeaseMarker)
+	}
+}
+
+func TestDiscoveryIdentityRebindingCannotUseIndependentAbsence(t *testing.T) {
+	const (
+		name       = "epar-test-discovery-rebinding"
+		providerID = "provider:discovery-rebinding"
+	)
+	for _, test := range []struct {
+		name      string
+		inventory provider.InventoryItem
+	}{
+		{
+			name:      "same name changed provider id",
+			inventory: recoveryInventoryItem(name, "provider:replacement"),
+		},
+		{
+			name:      "same provider id changed name",
+			inventory: recoveryInventoryItem("epar-test-rebound-name", providerID),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("EPAR_STATE_HOME", t.TempDir())
+			store, err := poolstate.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ReportUnknown(context.Background(), poolstate.Discovery{
+				ProviderType: "docker-sandboxes",
+				ProviderID:   providerID,
+				ExactName:    name,
+				Receipt:      poolstate.Receipt{Version: "v1", Payload: []byte(`{"state":"stopped","source":"shell"}`)},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := provider.OpenControlPlaneRecoveryLedger()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lifecycle := &controlPlaneRecoveryLifecycle{
+				inventoryItems: []provider.InventoryItem{test.inventory},
+				absenceResults: map[string]bool{name: true},
+			}
+			manager := Manager{
+				Config:                 configForRecoveryHardeningTest(),
+				Lifecycle:              lifecycle,
+				LifecycleState:         store,
+				providerRecoveryLedger: ledger,
+			}
+
+			handled, recoveryErr := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+			if !handled || recoveryErr == nil || !strings.Contains(recoveryErr.Error(), name) || !strings.Contains(recoveryErr.Error(), providerID) {
+				t.Fatalf("rebound discovery recovery = handled %t error %v, want exact identity conflict", handled, recoveryErr)
+			}
+			lifecycle.mu.Lock()
+			defer lifecycle.mu.Unlock()
+			if lifecycle.inventoryCalls != 1 || len(lifecycle.absenceCalls) != 0 || lifecycle.recoverCalls != 0 {
+				t.Fatalf("rebound discovery calls = inventory %d absence %d intervention %d, want 1/0/0", lifecycle.inventoryCalls, len(lifecycle.absenceCalls), lifecycle.recoverCalls)
+			}
+		})
+	}
+}
+
+func TestDiscoveryAbsenceProofCannotOutliveFreshCensusContext(t *testing.T) {
+	const (
+		name       = "epar-test-expired-discovery-proof"
+		providerID = "provider:expired-discovery-proof"
+	)
+	identity := provider.Instance{
+		Name:           name,
+		ProviderID:     providerID,
+		ReceiptVersion: "v1",
+		Receipt:        []byte(`{"state":"stopped","source":"shell"}`),
+	}
+	lifecycle := &controlPlaneRecoveryLifecycle{absenceResults: map[string]bool{name: true}}
+	manager := Manager{Config: configForRecoveryHardeningTest(), Lifecycle: lifecycle}
+	ctx, cancel := context.WithCancel(provider.WithControlPlaneRecoveryCoordinator(context.Background()))
+	cancel()
+
+	_, err := manager.captureProviderRecoveryIdentityCensus(ctx, providerRecoveryIdentityExpectations{
+		identities:        map[string]string{name: providerID},
+		absenceCandidates: map[string]provider.Instance{name: identity},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expired discovery proof error = %v, want context cancellation", err)
+	}
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if len(lifecycle.absenceCalls) != 1 {
+		t.Fatalf("expired discovery proof calls = %d, want one late proof rejected", len(lifecycle.absenceCalls))
 	}
 }
 

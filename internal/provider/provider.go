@@ -285,6 +285,16 @@ type ControlPlaneRecoveryCoordinator interface {
 	CoordinateControlPlaneRecovery(ctx context.Context, operation func(context.Context) error) error
 }
 
+// ControlPlaneIdentityAbsenceVerifier is an optional independent readback used
+// inside a recovery coordinator lease to reconcile historical discoveries.
+// True requires authoritative exact-name absence, not omission from Inventory.
+// It never authorizes deletion, adoption, or dropping a pending recovery census.
+// Unsupported, ambiguous, or failed readback must return false (and an error
+// when the readback failed); callers retain their existing safety fence.
+type ControlPlaneIdentityAbsenceVerifier interface {
+	VerifyControlPlaneIdentityAbsent(ctx context.Context, instance Instance) (bool, error)
+}
+
 // ArtifactManager is an optional provider capability for runtimes whose
 // reusable artifact is not prepared by the shared OCI image pipeline.
 type ArtifactManager interface {

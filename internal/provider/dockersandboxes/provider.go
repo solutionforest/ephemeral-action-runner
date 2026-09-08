@@ -37,9 +37,12 @@ const (
 
 const sandboxContainerFailureSignature = "failed to run sandbox container"
 
-const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may have inherited host SSH-agent forwarding. EPAR removes SSH-agent variables when its commands start a stopped daemon. In recoveryMode=exclusive-auto, the pool may make one bounded stop-wait-start recovery attempt for this create-stage signature; recoveryMode=observe never mutates the daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry."
+const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may expose host SSH-agent forwarding; this generic container-start failure does not prove its cause. EPAR removes SSH-agent variables when its commands start a stopped daemon, but sbx v0.42+ also has persistent SSH forwarding settings. Inspect `sbx settings get ssh.agentForwardingEnabled`; if enabled, coordinate with other local sbx users before running `sbx settings set ssh.agentForwardingEnabled false` and restarting the daemon. EPAR does not change shared settings automatically. In recoveryMode=exclusive-auto, the pool may make one bounded stop-wait-start recovery attempt for this create-stage signature; recoveryMode=observe never mutates the daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry. If creation still fails, inspect the sbx daemon logs and template entrypoint instead of repeating daemon restarts."
 
 const directWorkspaceVerificationScript = `set -euo pipefail
+if [[ "${SSH_AUTH_SOCK:-}" == /run/ssh-agent.sock && -x /run && ! -e /run/ssh-agent.sock && ! -L /run/ssh-agent.sock && -z "${SSH_AUTH_SOCK_GATEWAY:-}" && -z "${SSH_AGENT_PID:-}" ]]; then
+  unset SSH_AUTH_SOCK
+fi
 if test -n "${SSH_AUTH_SOCK:-}" || test -n "${SSH_AUTH_SOCK_GATEWAY:-}" || test -n "${SSH_AGENT_PID:-}" || test -e /run/ssh-agent.sock || test -L /run/ssh-agent.sock; then
   echo "Docker Sandboxes exposed host SSH-agent forwarding; stop the daemon and restart it with SSH_AUTH_SOCK, SSH_AUTH_SOCK_GATEWAY, and SSH_AGENT_PID unset" >&2
   exit 1
@@ -1848,6 +1851,50 @@ func truncate(value string, limit int) string {
 	return value[:limit]
 }
 
+// VerifyControlPlaneIdentityAbsent does not use inventory, so a truncated or
+// stale inventory cannot by itself retire a historical recovery observation.
+func (p *Provider) VerifyControlPlaneIdentityAbsent(ctx context.Context, instance provider.Instance) (bool, error) {
+	if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) || !provider.ControlPlaneLockHeld(ctx) {
+		return false, errors.New("exact Docker Sandboxes absence readback requires the recovery coordinator lease")
+	}
+	if err := validateInstance(instance, true); err != nil {
+		return false, err
+	}
+	result, err := p.run(ctx, commandRequest{args: []string{"inspect", "--json", instance.Name}, operation: "verify historical Docker Sandboxes identity absence", timeout: providerReadbackTimeout, outputLimit: diagnosticOutputLimit})
+	if err == nil {
+		// Any successful response may indicate a live or rebound identity.
+		// Never infer absence from an empty or unfamiliar inspect schema.
+		return false, nil
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false, err
+	}
+	if isOnlyCommandExitOne(err) && strings.TrimSpace(result.Stdout) == "" && isExactMissingSandboxDiagnostic(result.Stderr, instance.Name) {
+		return true, nil
+	}
+	return false, err
+}
+
+func isOnlyCommandExitOne(err error) bool {
+	for err != nil {
+		switch cause := err.(type) {
+		case *exec.ExitError:
+			return cause.ExitCode() == 1
+		case interface{ Unwrap() []error }:
+			children := cause.Unwrap()
+			if len(children) != 1 {
+				return false
+			}
+			err = children[0]
+		case interface{ Unwrap() error }:
+			err = cause.Unwrap()
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func isMissingSandbox(text, name string) bool {
 	lowerText := strings.ToLower(text)
 	legacy := strings.Contains(lowerText, "sandbox not found") || strings.Contains(lowerText, "no such sandbox") || strings.Contains(lowerText, "status 404")
@@ -1857,14 +1904,26 @@ func isMissingSandbox(text, name string) bool {
 	// sbx v0.42 standardizes this as a complete quoted diagnostic line. Keep
 	// the target name case-sensitive and reject arbitrary prefixes/suffixes so
 	// an unrelated resource error cannot make Stop/Delete appear successful.
-	diagnostic := "sandbox '" + name + "' not found"
 	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == diagnostic || line == "Error: "+diagnostic || line == "error: "+diagnostic {
+		if isExactMissingSandboxDiagnostic(line, name) {
 			return true
 		}
 	}
 	return false
+}
+
+func isExactMissingSandboxDiagnostic(text, name string) bool {
+	line := strings.TrimSpace(text)
+	for _, prefix := range []string{"ERROR: ", "Error: ", "error: "} {
+		if strings.HasPrefix(line, prefix) {
+			line = strings.TrimPrefix(line, prefix)
+			break
+		}
+	}
+	// v0.42.1 appends this exact CLI hint to stop/rm diagnostics.
+	// Do not accept arbitrary trailing text (for example cache failures).
+	line = strings.TrimSuffix(line, " (run 'sbx ls' to see your sandboxes)")
+	return line == "sandbox '"+name+"' not found"
 }
 
 func decodeStrictJSON(data []byte, destination any) error {
@@ -1888,6 +1947,7 @@ func decodeStrictJSON(data []byte, destination any) error {
 var _ provider.Lifecycle = (*Provider)(nil)
 var _ provider.ControlPlaneRecoverer = (*Provider)(nil)
 var _ provider.ControlPlaneRecoveryCoordinator = (*Provider)(nil)
+var _ provider.ControlPlaneIdentityAbsenceVerifier = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)

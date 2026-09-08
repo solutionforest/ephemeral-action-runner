@@ -34,6 +34,12 @@ type controlPlaneRecoveryLifecycle struct {
 	coordinateExitInventoryCalls int
 	coordinateExitRecoveryCalls  int
 	recoverHook                  func()
+	absenceResults               map[string]bool
+	absenceErrors                map[string]error
+	absenceCalls                 []provider.Instance
+	absenceDeadlines             []time.Time
+	absenceOutsideCoordination   int
+	absenceWithoutLeaseMarker    int
 }
 
 type uncoordinatedControlPlaneRecoveryLifecycle struct {
@@ -85,6 +91,22 @@ func (lifecycle *controlPlaneRecoveryLifecycle) RecoverControlPlane(_ context.Co
 		hook()
 	}
 	return err
+}
+
+func (lifecycle *controlPlaneRecoveryLifecycle) VerifyControlPlaneIdentityAbsent(ctx context.Context, instance provider.Instance) (bool, error) {
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	instance.Receipt = append([]byte(nil), instance.Receipt...)
+	lifecycle.absenceCalls = append(lifecycle.absenceCalls, instance)
+	deadline, _ := ctx.Deadline()
+	lifecycle.absenceDeadlines = append(lifecycle.absenceDeadlines, deadline)
+	if !lifecycle.coordinationActive {
+		lifecycle.absenceOutsideCoordination++
+	}
+	if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) {
+		lifecycle.absenceWithoutLeaseMarker++
+	}
+	return lifecycle.absenceResults[instance.Name], lifecycle.absenceErrors[instance.Name]
 }
 
 func (lifecycle *controlPlaneRecoveryLifecycle) CoordinateControlPlaneRecovery(ctx context.Context, operation func(context.Context) error) error {

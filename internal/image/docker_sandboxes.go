@@ -1047,6 +1047,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 			"--label", "io.solutionforest.epar.manifest=" + manifestHash,
 		}
 		buildArguments = []string{
+			"SBOM_GENERATOR_IMAGE=" + platformLock.SBOMGeneratorReference,
 			"TEMPLATE_PLATFORM=" + source.Platform,
 			"SOURCE_IMAGE=" + source.ImmutableReference,
 			"GO_BUILDER_IMAGE=" + platformLock.GoBuilderReference,
@@ -1111,7 +1112,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 	attestationArgs := []string{
 		"buildx", "build", "--builder", builder, "--platform", source.Platform, "--progress", "plain",
 		"--target", "software-inventory-export", "--output", "type=local,dest=" + evidenceExportRoot,
-		"--provenance", "mode=max", "--sbom", "generator=" + platformLock.SBOMGeneratorReference,
+		"--provenance", "mode=max", "--sbom=false",
 		"--metadata-file", attestationMetadataPath,
 	}
 	for _, buildArg := range buildArguments {
@@ -1151,14 +1152,7 @@ func (m *Coordinator) buildDockerSandboxesTemplate(ctx context.Context, manifest
 		return err
 	}
 	exportedSBOMPath := filepath.Join(evidenceExportRoot, "sbom-runner-template.spdx.json")
-	exportedSBOM, err := readVerifiedBuildEvidence(exportedSBOMPath, storage.GiB)
-	if err != nil {
-		return fmt.Errorf("read exported Docker Sandboxes runner-template SBOM: %w", err)
-	}
-	if err := writeAtomicFile(sbomPath, exportedSBOM, 0o644); err != nil {
-		return err
-	}
-	if err := validateInTotoSPDX(sbomPath); err != nil {
+	if err := copyDockerSandboxesSBOMStatement(exportedSBOMPath, sbomPath, storage.GiB); err != nil {
 		return fmt.Errorf("validate exported Docker Sandboxes runner-template SBOM: %w", err)
 	}
 	sbomSourceDigest, _, err := hashFile(sbomPath)
@@ -1686,6 +1680,12 @@ func validateInTotoSPDX(path string) error {
 		return err
 	}
 	defer file.Close()
+	if err := checkSBOMJSONLexicalLimits(file); err != nil {
+		return err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(file)
 	open, err := decoder.Token()
 	if err != nil {
@@ -1697,6 +1697,7 @@ func validateInTotoSPDX(path string) error {
 	var statementType string
 	var predicateType string
 	var spdxID string
+	seen := make(map[string]bool)
 	for decoder.More() {
 		key, err := decoder.Token()
 		if err != nil {
@@ -1704,14 +1705,26 @@ func validateInTotoSPDX(path string) error {
 		}
 		switch key {
 		case "_type":
+			if seen["_type"] {
+				return fmt.Errorf("duplicate SBOM statement type")
+			}
+			seen["_type"] = true
 			if err := decoder.Decode(&statementType); err != nil {
 				return err
 			}
 		case "predicateType":
+			if seen["predicateType"] {
+				return fmt.Errorf("duplicate SBOM predicate type")
+			}
+			seen["predicateType"] = true
 			if err := decoder.Decode(&predicateType); err != nil {
 				return err
 			}
 		case "predicate":
+			if seen["predicate"] {
+				return fmt.Errorf("duplicate SBOM predicate")
+			}
+			seen["predicate"] = true
 			spdxID, err = scanSPDXPredicate(decoder)
 			if err != nil {
 				return err
@@ -1752,12 +1765,17 @@ func scanSPDXPredicate(decoder *json.Decoder) (string, error) {
 		return "", fmt.Errorf("SPDX predicate is not a JSON object")
 	}
 	var spdxID string
+	seenID := false
 	for decoder.More() {
 		key, err := decoder.Token()
 		if err != nil {
 			return "", err
 		}
 		if key == "SPDXID" {
+			if seenID {
+				return "", fmt.Errorf("duplicate SPDX document identity")
+			}
+			seenID = true
 			if err := decoder.Decode(&spdxID); err != nil {
 				return "", err
 			}

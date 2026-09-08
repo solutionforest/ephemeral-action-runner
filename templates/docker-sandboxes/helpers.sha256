@@ -12,6 +12,6 @@ eeb1bbb3561e7aa2c9e68b0823d35a5039618673c16598a08052b5e91a129fa2  ./prepare-job-
 9e151afd07b7f642f8aaae0dbe97486723a8fe160b1e98fb263629cc9e3c766a  ./quiesce-apt.sh
 e777e1bca301f950315cf5752b2be2981f1c679be113696686e98d0735e38e82  ./run-runner.sh
 5db2e7267e66d5bc5460a49cc1c6e55b8c0f97071165c15dc3fb2da7dc6e71c8  ./scrub-docker-auth.sh
-11e32d7da2f18f61fb88f7ebfb817c10d36de72a4cf176d8c601ef3431ecdede  ./template-entrypoint.sh
+cb6ed750f1665f1099b90a824358746b945dd8d07f4d1fb414a3adc0bd0b8ba2  ./template-entrypoint.sh
 b2725f5b960d955994866067aebbf1567939d3dc91adda88897df77b5bba425d  ./verify-native-architecture.sh
-37cab814582e5b5ae4222eb4e75f3b4551ea90e0ec688c224cf7f9001519bf01  ./verify-template.sh
+f111bc12fbdf662a6c219ad5bafc3667ef81b4c9bbc6aa2b702eb80aa4fdfc68  ./verify-template.sh
