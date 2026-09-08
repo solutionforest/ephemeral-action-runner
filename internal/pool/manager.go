@@ -51,20 +51,28 @@ type Manager struct {
 	transcriptMu                 sync.Mutex
 	transcripts                  map[string]*logging.Transcript
 
-	hostTrustResolver                  func(context.Context) (hosttrust.Snapshot, error)
-	buildTrustResolver                 func(context.Context) (hosttrust.Snapshot, error)
-	hostTrustImageEnsurer              func(context.Context) error
-	hostTrustImageMu                   sync.Mutex
-	imageEnsureMu                      sync.Mutex
-	imageEnsured                       bool
-	now                                func() time.Time
-	randomFloat64                      func() float64
-	externalOutageMu                   sync.Mutex
-	externalOutage                     *externalOutageRuntime
-	providerRecoveryMu                 sync.Mutex
-	providerRecoveryNext               time.Time
-	providerRecoveryTries              int
-	providerAdmissionRecoveryAttempted bool
+	hostTrustResolver                    func(context.Context) (hosttrust.Snapshot, error)
+	buildTrustResolver                   func(context.Context) (hosttrust.Snapshot, error)
+	hostTrustImageEnsurer                func(context.Context) error
+	hostTrustImageMu                     sync.Mutex
+	imageEnsureMu                        sync.Mutex
+	imageEnsured                         bool
+	now                                  func() time.Time
+	randomFloat64                        func() float64
+	externalOutageMu                     sync.Mutex
+	externalOutage                       *externalOutageRuntime
+	providerRecoveryMu                   sync.Mutex
+	providerRecoveryNext                 time.Time
+	providerRecoveryTries                int
+	providerAdmissionRecoveryAttempted   bool
+	providerRecoveryGeneration           uint64
+	providerRecoveryReservationToken     uint64
+	providerAdmissionRecoveryToken       uint64
+	providerRecoveryReservationPhase     provider.RecoveryReservationPhase
+	providerRecoveryReservationExpiresAt time.Time
+	providerRecoveryIdentityCensus       map[string]string
+	providerRecoveryLedger               *provider.ControlPlaneRecoveryLedger
+	providerRecoveryStateLoaded          bool
 }
 
 func (m *Manager) ConfigureStorageAdmissionOverride(allow bool, command string) {
@@ -112,6 +120,13 @@ const (
 )
 
 const (
+	createOutcomeUncertainReason          = "provider create outcome is uncertain; immutable provider identity was not recorded"
+	interruptedCreateNoIdentityReason     = "create was interrupted before an immutable provider identity was recorded"
+	interruptedCreateGitHubIdentityReason = "create was interrupted and a same-name GitHub runner exists without a recorded immutable id"
+	recoveryInventoryUncertainReason      = "post-recovery provider inventory omitted a durable provider identity"
+)
+
+const (
 	runnerProcessRunningSentinel      = "EPAR_RUNNER_PROCESS=running"
 	runnerProcessStoppedSentinel      = "EPAR_RUNNER_PROCESS=stopped"
 	runnerProcessInactiveReason       = "actions runner process is confirmed inactive"
@@ -128,6 +143,15 @@ type ProvisionedInstance struct {
 	HostTrustGeneration string
 	Phase               LifecyclePhase
 	ProviderOwned       bool
+	// CreateOutcomeUncertain marks a provider-owned create whose client-side
+	// deadline expired before an immutable provider identity was recovered. It
+	// remains a physical, capacity-consuming slot until an exact outcome is
+	// established; ordinary inventory absence must not release it.
+	CreateOutcomeUncertain bool
+	// RecoveryInventoryUncertain marks an identified instance omitted from a
+	// post-recovery inventory proof. It remains capacity-consuming until the
+	// exact provider identity is positively observed again.
+	RecoveryInventoryUncertain bool
 }
 
 var runtimeValidationRetryDelay = 5 * time.Second
@@ -643,11 +667,34 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					livenessCtx, cancelLiveness = context.WithTimeout(ctx, hostTrustRefreshInterval/2)
 				}
 				for name, vm := range active {
+					if !shouldProbeRunnerLiveness(vm) {
+						// Report-only provider resources are retained in active so
+						// they continue to fence capacity, but they have no
+						// lifecycle identity that runner health probing can safely
+						// use. Reconciliation remains responsible for reporting
+						// them; never turn them into liveness failures.
+						delete(confirmedInactiveChecks, name)
+						continue
+					}
 					alive, reason, err := m.runnerAlive(livenessCtx, vm)
 					if err != nil {
 						if ctx.Err() != nil {
 							cancelLiveness()
 							return cleanup()
+						}
+						handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+						if handled {
+							if recoveryErr != nil {
+								if ctx.Err() != nil {
+									cancelLiveness()
+									return cleanup()
+								}
+								m.warnf("Docker Sandboxes control-plane recovery supervisor warning after runner health failure; preserving exact capacity and retrying: %v\n", recoveryErr)
+							}
+							// A recovery attempt changes the provider-wide control
+							// plane. Stop this sweep so another unhealthy runner
+							// cannot trigger a second restart in the same tick.
+							break
 						}
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
 						m.warnf("[%s] runner health is temporarily unknown; keeping the runner and retrying: %v\n", name, err)
@@ -958,7 +1005,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 	}
 	if !register {
 		for name, vm := range reconciled {
-			if vm.ProviderOwned && vm.Phase != LifecycleCleanupPending {
+			if vm.ProviderOwned && vm.Phase != LifecycleCleanupPending && !vm.CreateOutcomeUncertain && !vm.RecoveryInventoryUncertain {
 				vm.Phase = LifecycleReady
 				reconciled[name] = vm
 			}
@@ -1008,7 +1055,23 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				return reconciled, lookupErr
 			}
 		}
+		if vm.RecoveryInventoryUncertain {
+			// The provider inventory was not sufficient to prove this durable
+			// identity absent after recovery. Keep the exact slot quarantined and
+			// skip GitHub deletion, provider cleanup, and liveness probing.
+			reconciled[name] = vm
+			continue
+		}
 		if !found {
+			if vm.CreateOutcomeUncertain {
+				// A provider-owned create deadline has no authoritative absence
+				// result. Keep its durable capacity fence even when ordinary
+				// inventory no longer reports the name; replacing it could
+				// over-allocate a runtime that the daemon still owns.
+				vm.Phase = LifecycleQuarantined
+				reconciled[name] = vm
+				continue
+			}
 			if err := m.recordLifecycleRemoteAbsence(ctx, name); err != nil {
 				vm.Phase = LifecycleQuarantined
 				reconciled[name] = vm
@@ -1189,7 +1252,24 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 	if err != nil {
 		return known, err
 	}
+	var uncertainCreates []poolstate.Record
+	var recoveryInventoryUncertain []poolstate.Record
+	if m.LifecycleState != nil {
+		records, listErr := m.LifecycleState.List(ctx)
+		if listErr != nil {
+			return known, fmt.Errorf("read lifecycle state for uncertain create reconciliation: %w", listErr)
+		}
+		for _, record := range records {
+			if HasPrefix(record.Name, m.Config.Pool.NamePrefix) && isUncertainCreateRecord(record) {
+				uncertainCreates = append(uncertainCreates, record)
+			}
+			if HasPrefix(record.Name, m.Config.Pool.NamePrefix) && record.RecoveryInventoryUncertain {
+				recoveryInventoryUncertain = append(recoveryInventoryUncertain, record)
+			}
+		}
+	}
 	reconciled := make(map[string]ProvisionedInstance)
+	recoveryInventoryObserved := make(map[string]struct{})
 	for _, item := range locals {
 		local := item.Instance
 		if !HasPrefix(local.Name, m.Config.Pool.NamePrefix) {
@@ -1207,7 +1287,22 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			if recordErr != nil {
 				return known, fmt.Errorf("read lifecycle identity for %s: %w", local.Name, recordErr)
 			}
+			vm.RecoveryInventoryUncertain = record.RecoveryInventoryUncertain
 			vm.RunnerID = record.GitHub.RunnerID
+			if record.RecoveryInventoryUncertain {
+				if local.ProviderID != record.ProviderID {
+					vm.Phase = LifecycleQuarantined
+					vm.RecoveryInventoryUncertain = true
+					reconciled[local.Name] = vm
+					continue
+				}
+				if _, transitionErr := m.LifecycleState.Transition(ctx, local.Name, poolstate.Transition{Action: poolstate.ActionRecoveryInventoryObserved}); transitionErr != nil {
+					return known, fmt.Errorf("record positive post-recovery identity for %s: %w", local.Name, transitionErr)
+				}
+				vm.RecoveryInventoryUncertain = false
+				delete(recoveryInventoryObserved, local.Name)
+				recoveryInventoryObserved[local.Name] = struct{}{}
+			}
 		}
 		if !owned {
 			providerID := local.ProviderID
@@ -1234,7 +1329,51 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			m.warnf("[%s] stopped-instance cleanup pending: %v\n", local.Name, err)
 		}
 	}
+	for _, record := range recoveryInventoryUncertain {
+		if _, observed := recoveryInventoryObserved[record.Name]; observed {
+			continue
+		}
+		vm, found := reconciled[record.Name]
+		if !found {
+			vm = m.reconciledInstance(known, record.Name)
+		}
+		vm.ProviderID = record.ProviderID
+		vm.ProviderOwned = true
+		vm.Phase = LifecycleQuarantined
+		vm.RecoveryInventoryUncertain = true
+		reconciled[record.Name] = vm
+	}
+	for _, record := range uncertainCreates {
+		vm, found := reconciled[record.Name]
+		if !found {
+			vm = m.reconciledInstance(known, record.Name)
+			vm.ProviderOwned = true
+		}
+		vm.Phase = LifecycleQuarantined
+		vm.CreateOutcomeUncertain = true
+		reconciled[record.Name] = vm
+	}
 	return reconciled, nil
+}
+
+func isUncertainCreateRecord(record poolstate.Record) bool {
+	if record.ProviderID != "" {
+		return false
+	}
+	if record.CreateOutcomeUncertain {
+		return true
+	}
+	if record.Phase == poolstate.PhaseCreating {
+		// Creating is the first durable state after the provider side effect
+		// becomes possible. A controller crash or a failed quarantine write
+		// therefore leaves an ambiguous create, not evidence of absence.
+		return true
+	}
+	if record.Phase != poolstate.PhaseQuarantined || record.Quarantine == nil {
+		return false
+	}
+	reason := record.Quarantine.Reason
+	return strings.HasPrefix(reason, createOutcomeUncertainReason) || reason == interruptedCreateNoIdentityReason || reason == interruptedCreateGitHubIdentityReason
 }
 
 func (m *Manager) reconciledInstance(known map[string]ProvisionedInstance, name string) ProvisionedInstance {
@@ -1684,11 +1823,12 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		return vm, err
 	}
 	vm.Phase = LifecycleProvisioning
-	if err := m.acquireLifecycleLease(ctx, name, "provision", "controller", 2*time.Hour); err != nil {
-		return vm, fmt.Errorf("acquire provisioning lifecycle lease: %w", err)
-	}
 	configureAttempted := false
 	listenerMayBeRunning := false
+	createAttempted := false
+	createAdmissionRecoveryToken := uint64(0)
+	identityDurablyRecorded := m.LifecycleState == nil
+	var created provider.Instance
 	defer func() {
 		m.releaseLifecycleLease(context.Background(), name, "provision", "controller")
 		if err == nil {
@@ -1716,6 +1856,23 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if listenerMayBeRunning {
 			m.quarantineLifecycle(context.Background(), name, err)
 			vm.Phase = LifecycleQuarantined
+			return
+		}
+		if createAttempted && errors.Is(err, provider.ErrCreateOutcomeUncertain) && !identityDurablyRecorded {
+			// A provider admission timeout may have created a runtime after
+			// the client stopped waiting. Preserve the durable capacity fence
+			// instead of treating an ordinary empty inventory read as proof of
+			// absence. Exact cleanup remains possible if a later provider
+			// readback supplies the immutable identity and receipt.
+			vm.CreateOutcomeUncertain = true
+			vm.Phase = LifecycleQuarantined
+			if quarantineErr := m.quarantineLifecycle(context.Background(), name, errors.New(createOutcomeUncertainReason)); quarantineErr != nil {
+				// Do not silently continue when the durable fence could not be
+				// persisted. The in-memory slot remains quarantined, and the
+				// combined error makes the storage failure visible to the
+				// recovery supervisor and operator.
+				err = errors.Join(err, fmt.Errorf("persist uncertain create quarantine: %w", quarantineErr))
+			}
 			return
 		}
 		if m.LifecycleState == nil {
@@ -1747,7 +1904,13 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			vm.Phase = LifecycleQuarantined
 			return
 		}
-		cleanupErr := m.cleanupLifecycleRecordWithRemoteAbsence(context.Background(), record, inventoryByName(inventory)[name], remoteKnownAbsent)
+		sameNameInventory := inventoryByName(inventory)[name]
+		var cleanupErr error
+		if identityDurablyRecorded || !createAttempted || !errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+			cleanupErr = m.cleanupLifecycleRecordAfterKnownCreateFailure(context.Background(), record, sameNameInventory, remoteKnownAbsent)
+		} else {
+			cleanupErr = m.cleanupLifecycleRecordWithRemoteAbsence(context.Background(), record, sameNameInventory, remoteKnownAbsent)
+		}
 		if cleanupErr != nil {
 			vm.Phase = LifecycleCleanupPending
 			err = errors.Join(err, fmt.Errorf("rollback local instance %s: %w", name, cleanupErr))
@@ -1755,6 +1918,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		}
 		vm.Phase = ""
 	}()
+	if err := m.acquireLifecycleLease(ctx, name, "provision", "controller", 2*time.Hour); err != nil {
+		return vm, fmt.Errorf("acquire provisioning lifecycle lease: %w", err)
+	}
 	var trustSnapshot hosttrust.Snapshot
 	if m.hostTrustEnabled() {
 		var err error
@@ -1774,13 +1940,25 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		creationOperation = "create"
 	}
 	m.logger().Info(creationMessage, "provider", m.Config.Provider.Type, "instance", name, "operation", creationOperation, "sourceImage", m.Config.Provider.SourceImage, "logPath", logPath)
-	var created provider.Instance
 	createStage := "instance_container_create"
 	if m.Config.Provider.Type == "docker-sandboxes" {
 		createStage = "sandbox_create_and_initial_identity_verification"
 	}
 	createStageErr := m.timeFirstInstanceStage(name, createStage, func() error {
 		return m.runDockerSandboxesCreateProgress(name, func() error {
+			if m.dockerSandboxesExclusiveRecovery() {
+				var tokenErr error
+				createAdmissionRecoveryToken, tokenErr = m.captureProviderAdmissionRecoveryToken(ctx)
+				if tokenErr != nil {
+					return tokenErr
+				}
+			}
+			if err := m.recordLifecycleCreateIntent(ctx, name); err != nil {
+				return err
+			}
+			// The durable create intent is the point after which a provider
+			// side effect may be in flight, including across a controller crash.
+			createAttempted = true
 			var createErr error
 			created, createErr = m.createProviderInstance(ctx, name)
 			return createErr
@@ -1789,6 +1967,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 	if created.Name != "" || created.ProviderID != "" || created.ReceiptVersion != "" || len(created.Receipt) != 0 {
 		if created.Name != name || created.ProviderID == "" {
 			identityErr := fmt.Errorf("provider create returned an incomplete immutable identity for %q", name)
+			if createAttempted {
+				identityErr = provider.NewUncertainCreateFailure("create provider instance", identityErr)
+			}
 			if createStageErr != nil {
 				return vm, errors.Join(createStageErr, identityErr)
 			}
@@ -1796,6 +1977,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		}
 		if created.ReceiptVersion == "" || len(created.Receipt) == 0 {
 			receiptErr := fmt.Errorf("provider create returned an incomplete versioned receipt for %q", name)
+			if createAttempted {
+				receiptErr = provider.NewUncertainCreateFailure("create provider instance", receiptErr)
+			}
 			if createStageErr != nil {
 				return vm, errors.Join(createStageErr, receiptErr)
 			}
@@ -1804,6 +1988,9 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		var providerReceipt map[string]any
 		if json.Unmarshal(created.Receipt, &providerReceipt) != nil || providerReceipt == nil {
 			receiptErr := fmt.Errorf("provider create returned an invalid versioned receipt for %q", name)
+			if createAttempted {
+				receiptErr = provider.NewUncertainCreateFailure("create provider instance", receiptErr)
+			}
 			if createStageErr != nil {
 				return vm, errors.Join(createStageErr, receiptErr)
 			}
@@ -1816,15 +2003,18 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			}
 			return vm, recordErr
 		}
+		identityDurablyRecorded = true
 	}
 	if createStageErr != nil {
 		return vm, createStageErr
 	}
-	if created.Name == name && created.ProviderID != "" {
-		m.resetProviderAdmissionRecovery()
+	if created.Name == name && created.ProviderID != "" && m.dockerSandboxesExclusiveRecovery() {
+		if resetErr := m.resetProviderAdmissionRecoveryWithContext(context.WithoutCancel(ctx), createAdmissionRecoveryToken); resetErr != nil {
+			return vm, fmt.Errorf("persist successful Docker Sandboxes create recovery resolution: %w", resetErr)
+		}
 	}
 	if created.Name != name || created.ProviderID == "" {
-		return vm, fmt.Errorf("provider create returned no immutable identity for %q", name)
+		return vm, provider.NewUncertainCreateFailure("create provider instance", fmt.Errorf("provider create returned no immutable identity for %q", name))
 	}
 	if err := m.recordLifecycleValidationIntent(ctx, name); err != nil {
 		return vm, fmt.Errorf("record runtime validation intent: %w", err)
@@ -2202,6 +2392,10 @@ func recordRunnerLiveness(confirmedInactive map[string]int, name string, alive b
 	}
 	confirmedInactive[name]++
 	return confirmedInactive[name], confirmedInactive[name] >= runnerConfirmedInactiveCheckLimit
+}
+
+func shouldProbeRunnerLiveness(vm ProvisionedInstance) bool {
+	return vm.ProviderOwned && vm.ProviderID != "" && !vm.CreateOutcomeUncertain && !vm.RecoveryInventoryUncertain
 }
 
 func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	"github.com/solutionforest/ephemeral-action-runner/internal/terminalprogress"
 )
 
@@ -61,7 +62,11 @@ func (m *Manager) runDockerSandboxesCreateProgress(instance string, operation fu
 	elapsed := time.Since(startedAt).Round(time.Second)
 	progressRenderer.Finish()
 	if err != nil {
-		m.logger().Warn(label+" failed", append(attributes, "elapsed", elapsed)...)
+		// The default human console omits structured attributes. Keep the
+		// cause in the message so recovery warnings cannot hide the original
+		// failure, and redact before sending it to any configured sink.
+		cause := provider.RedactText(err.Error())
+		m.logger().Warn(label+" failed: "+cause, append(attributes, "elapsed", elapsed, "error", cause)...)
 		return err
 	}
 	m.logger().Info(label+" complete", append(attributes, "elapsed", elapsed)...)
@@ -80,7 +85,8 @@ func (m *Manager) runDockerSandboxesPostCreateStage(instance, stage, label strin
 	err = operation()
 	elapsed := time.Since(startedAt).Round(time.Millisecond)
 	if err != nil {
-		m.logger().Warn(label+" failed", append(attributes, "elapsed", elapsed)...)
+		cause := provider.RedactText(err.Error())
+		m.logger().Warn(label+" failed: "+cause, append(attributes, "elapsed", elapsed, "error", cause)...)
 		return err
 	}
 	m.logger().Info(label+" complete", append(attributes, "elapsed", elapsed)...)

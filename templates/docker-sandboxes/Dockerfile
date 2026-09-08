@@ -4,6 +4,7 @@ ARG TEMPLATE_PLATFORM=linux/amd64
 ARG SOURCE_IMAGE=ghcr.io/catthehacker/ubuntu@sha256:b40b8af93baee90b83f29c834440873300c8478809535786dbf79fa836c086ac
 ARG GO_BUILDER_IMAGE=docker.io/library/golang@sha256:9006890ecba0a168034d99516084099ae3114d9f2b7d6572c77f2dde57ebc980
 ARG BINFMT_IMAGE=docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:465d3fdd28d0f2b871ba4b4ec98bd183292e96167f00d9fd40bd249f8632d705
+ARG SBOM_GENERATOR_IMAGE=docker.io/docker/buildkit-syft-scanner@sha256:13864237fb990943433f89d698590aad1de38d4a7e13d38e7b12f2488c1952e7
 
 FROM --platform=${TEMPLATE_PLATFORM} ${BINFMT_IMAGE} AS qemu-source
 
@@ -133,5 +134,21 @@ USER root
 RUN install -d -m 0755 /out \
     && /opt/epar/collect-software-inventory.sh > /out/software-inventory.txt
 
-FROM scratch AS software-inventory-export
+FROM scratch AS software-inventory-root
 COPY --from=software-inventory /out/software-inventory.txt /software-inventory.txt
+
+# Use the locked scanner's native protocol, but export its statements as ordinary
+# files. BuildKit's native attestation reader caps even local exports at 40/80 MiB.
+# Keep both the original core (inventory root) and full runner-template extra.
+FROM --platform=${TEMPLATE_PLATFORM} ${SBOM_GENERATOR_IMAGE} AS sbom-scan
+ENV BUILDKIT_SCAN_DESTINATION=/run/out \
+    BUILDKIT_SCAN_SOURCE=/run/src/core/sbom \
+    BUILDKIT_SCAN_SOURCE_EXTRAS=/run/src/extras/
+WORKDIR /run/out
+RUN --mount=type=bind,from=software-inventory-root,source=/,target=/run/src/core/sbom \
+    --mount=type=bind,from=runner-template,source=/,target=/run/src/extras/sbom-runner-template \
+    ["/bin/syft-scanner"]
+
+FROM scratch AS software-inventory-export
+COPY --from=software-inventory-root /software-inventory.txt /software-inventory.txt
+COPY --from=sbom-scan /run/out/sbom-runner-template.spdx.json /sbom-runner-template.spdx.json

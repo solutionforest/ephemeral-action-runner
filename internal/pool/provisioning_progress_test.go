@@ -107,8 +107,36 @@ func TestDockerSandboxesCreateProgressDoesNotReportFailureAsComplete(t *testing.
 	if !strings.Contains(output, "Docker Sandboxes instance preparation failed") {
 		t.Fatalf("failed create omitted terminal progress state: %q", output)
 	}
+	if !strings.Contains(output, expected.Error()) {
+		t.Fatalf("default console omitted underlying create failure: %q", output)
+	}
 	if strings.Contains(output, "Docker Sandboxes instance preparation complete") {
 		t.Fatalf("failed create was reported complete: %q", output)
+	}
+}
+
+func TestDockerSandboxesProgressFailureReportsRedactedCause(t *testing.T) {
+	for _, stage := range []string{"create", "post-create"} {
+		t.Run(stage, func(t *testing.T) {
+			manager, console, closeRuntime := newProvisioningProgressTestManager(t)
+			defer closeRuntime()
+			setProvisioningProgressTestGlobals(t, false, console, 0)
+			cause := errors.New("backend rejected request GH_TOKEN=secret-test-value")
+			operation := func() error { return cause }
+			var err error
+			if stage == "create" {
+				err = manager.runDockerSandboxesCreateProgress("sandbox-one", operation)
+			} else {
+				err = manager.runDockerSandboxesPostCreateStage("sandbox-one", "admission", "Admission", operation)
+			}
+			if !errors.Is(err, cause) {
+				t.Fatalf("original error identity lost: %v", err)
+			}
+			output := console.String()
+			if !strings.Contains(output, "backend rejected request") || strings.Contains(output, "secret-test-value") {
+				t.Fatalf("failure cause was omitted or not redacted: %q", output)
+			}
+		})
 	}
 }
 

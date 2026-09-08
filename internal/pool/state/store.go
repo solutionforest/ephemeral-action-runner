@@ -386,7 +386,15 @@ func applyTransition(record *Record, transition Transition, now time.Time) error
 	}
 	switch transition.Action {
 	case ActionCreateIntent:
-		return move(record, PhaseReserved, PhaseCreating, transition.Action)
+		if err := move(record, PhaseReserved, PhaseCreating, transition.Action); err != nil {
+			return err
+		}
+		// Once create side effects become possible, a controller crash cannot
+		// prove that the provider has no resource. Keep this typed fence in the
+		// durable record until either exact creation is recorded or a known
+		// active-attempt rollback abandons the create.
+		record.CreateOutcomeUncertain = true
+		return nil
 	case ActionAbandonCreate:
 		identitylessQuarantine := record.Phase == PhaseQuarantined && record.ProviderID == "" && emptyReceipt(record.Receipt)
 		if record.Phase != PhaseReserved && record.Phase != PhaseCreating && !identitylessQuarantine {
@@ -400,12 +408,15 @@ func applyTransition(record *Record, transition Transition, now time.Time) error
 		record.Cleanup.LocalRemoveIntentAt = timePtr(now)
 		record.Cleanup.LocalAbsentAt = timePtr(now)
 		record.Phase = PhaseTombstoned
+		record.CreateOutcomeUncertain = false
 		record.TombstonedAt = timePtr(now)
 	case ActionCreated:
 		if record.Phase != PhaseCreating || validateName("provider id", transition.ProviderID) != nil || validateReceipt(transition.Receipt) != nil {
 			return invalid(record, transition.Action)
 		}
 		record.ProviderID, record.Receipt, record.Phase = transition.ProviderID, transition.Receipt, PhaseCreated
+		record.CreateOutcomeUncertain = false
+		record.RecoveryInventoryUncertain = false
 	case ActionValidateIntent:
 		return move(record, PhaseCreated, PhaseValidating, transition.Action)
 	case ActionValidated:
@@ -425,7 +436,23 @@ func applyTransition(record *Record, transition Transition, now time.Time) error
 		if transition.Reason == "" || !quarantineAllowed(record.Phase) {
 			return invalid(record, transition.Action)
 		}
+		wasCreating := record.Phase == PhaseCreating
 		record.Phase, record.Quarantine = PhaseQuarantined, &Quarantine{Reason: transition.Reason, ReportedAt: now}
+		// Preserve uncertainty across generic quarantine reasons. Older
+		// snapshots may not have the typed bit, so a quarantined creating
+		// record is upgraded conservatively when this transition is replayed.
+		record.CreateOutcomeUncertain = record.CreateOutcomeUncertain || wasCreating
+	case ActionRecoveryInventoryUncertain:
+		if transition.Reason == "" || record.ProviderID == "" || !recoveryInventoryUncertaintyAllowed(record.Phase) {
+			return invalid(record, transition.Action)
+		}
+		record.Phase, record.Quarantine = PhaseQuarantined, &Quarantine{Reason: transition.Reason, ReportedAt: now}
+		record.RecoveryInventoryUncertain = true
+	case ActionRecoveryInventoryObserved:
+		if record.Phase != PhaseQuarantined || !record.RecoveryInventoryUncertain {
+			return invalid(record, transition.Action)
+		}
+		record.RecoveryInventoryUncertain = false
 	case ActionFenceIntent:
 		if !fenceAllowed(record.Phase) {
 			return invalid(record, transition.Action)
@@ -475,7 +502,7 @@ func applyTransition(record *Record, transition Transition, now time.Time) error
 			record.Phase = PhaseFencing
 		}
 	case ActionTombstone:
-		if record.Phase != PhaseLocalAbsent || record.Cleanup.RemoteAbsentAt == nil || record.Cleanup.LocalAbsentAt == nil || len(activeLeases(record.Leases, now)) != 0 {
+		if record.Phase != PhaseLocalAbsent || record.Cleanup.RemoteAbsentAt == nil || record.Cleanup.LocalAbsentAt == nil || record.RecoveryInventoryUncertain || len(activeLeases(record.Leases, now)) != 0 {
 			return invalid(record, transition.Action)
 		}
 		record.Phase, record.TombstonedAt = PhaseTombstoned, timePtr(now)
@@ -506,6 +533,15 @@ func fenceAllowed(phase Phase) bool {
 func quarantineAllowed(phase Phase) bool {
 	switch phase {
 	case PhaseReserved, PhaseCreating, PhaseCreated, PhaseValidating, PhaseStandby, PhaseRegistering, PhaseReady, PhaseBusy, PhaseDraining:
+		return true
+	default:
+		return false
+	}
+}
+
+func recoveryInventoryUncertaintyAllowed(phase Phase) bool {
+	switch phase {
+	case PhaseCreated, PhaseValidating, PhaseStandby, PhaseRegistering, PhaseReady, PhaseBusy, PhaseDraining, PhaseQuarantined, PhaseCleanupPending, PhaseFencing, PhaseFenced, PhaseRemoteReconciling, PhaseRemoteAbsent, PhaseLocalRemoving:
 		return true
 	default:
 		return false
@@ -581,6 +617,9 @@ func validateRecord(record Record) error {
 	}
 	if record.Phase == PhaseTombstoned && (record.TombstonedAt == nil || record.Cleanup.RemoteAbsentAt == nil || record.Cleanup.LocalAbsentAt == nil) {
 		return fmt.Errorf("%w: tombstone needs exact absence", ErrInvalidRecord)
+	}
+	if record.RecoveryInventoryUncertain && (record.ProviderID == "" || record.Phase != PhaseQuarantined) {
+		return fmt.Errorf("%w: recovery inventory uncertainty needs an identified quarantined record", ErrInvalidRecord)
 	}
 	return nil
 }

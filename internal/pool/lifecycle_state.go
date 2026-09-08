@@ -114,8 +114,14 @@ func (m *Manager) reserveLifecycle(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("reserve provider-neutral lifecycle record: %w", err)
 	}
-	_, err = m.LifecycleState.Transition(ctx, name, poolstate.Transition{Action: poolstate.ActionCreateIntent})
-	if err != nil {
+	return nil
+}
+
+func (m *Manager) recordLifecycleCreateIntent(ctx context.Context, name string) error {
+	if m.LifecycleState == nil {
+		return nil
+	}
+	if _, err := m.LifecycleState.Transition(ctx, name, poolstate.Transition{Action: poolstate.ActionCreateIntent}); err != nil {
 		return fmt.Errorf("record provider create intent: %w", err)
 	}
 	return nil
@@ -291,13 +297,15 @@ func (m *Manager) recordLifecycleRegistered(ctx context.Context, name string, ru
 	return err
 }
 
-func (m *Manager) quarantineLifecycle(ctx context.Context, name string, cause error) {
+func (m *Manager) quarantineLifecycle(ctx context.Context, name string, cause error) error {
 	if m.LifecycleState == nil || cause == nil {
-		return
+		return nil
 	}
 	if _, err := m.LifecycleState.Transition(ctx, name, poolstate.Transition{Action: poolstate.ActionQuarantine, Reason: cause.Error()}); err != nil && !errors.Is(err, poolstate.ErrInvalidTransition) {
 		m.warnf("[%s] provider-neutral lifecycle quarantine failed: %v\n", name, err)
+		return err
 	}
+	return nil
 }
 
 func (m *Manager) lifecycleOwns(ctx context.Context, name, providerID string) (bool, error) {

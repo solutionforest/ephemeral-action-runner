@@ -7,10 +7,13 @@ import (
 	"os"
 )
 
-var errPlatformLocked = errors.New("file locks are unsupported on this platform")
+var (
+	errPlatformLocked      = errors.New("file lock is already held")
+	errPlatformUnsupported = ErrUnsupported
+)
 
 func lockFile(_ *os.File) error {
-	return errPlatformLocked
+	return errPlatformUnsupported
 }
 
 func unlockFile(_ *os.File) error {

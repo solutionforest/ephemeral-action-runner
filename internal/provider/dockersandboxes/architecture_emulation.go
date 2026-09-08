@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
@@ -82,18 +83,43 @@ type bestEffortArchitectureEnabler struct {
 }
 
 func (enabler bestEffortArchitectureEnabler) Enable(ctx context.Context, sandboxProvider *Provider, instance provider.Instance) (architectureEmulationResult, error) {
-	evidence, qemuErr := (qemuBinfmtEnabler{}).Enable(ctx, sandboxProvider, instance)
+	qemuCtx, cancelQEMU := architectureAttemptContext(ctx, 2)
+	evidence, qemuErr := (qemuBinfmtEnabler{}).Enable(qemuCtx, sandboxProvider, instance)
+	cancelQEMU()
 	if qemuErr == nil {
 		evidence.Mode = architectureEmulationBestEffort
 		return evidence, nil
 	}
-	evidence, nativeErr := (nativeArchitectureEnabler{platform: enabler.platform, allowHandlers: true}).Enable(ctx, sandboxProvider, instance)
+	nativeCtx, cancelNative := architectureAttemptContext(ctx, 1)
+	evidence, nativeErr := (nativeArchitectureEnabler{platform: enabler.platform, allowHandlers: true}).Enable(nativeCtx, sandboxProvider, instance)
+	cancelNative()
 	if nativeErr != nil {
-		return architectureEmulationResult{}, fmt.Errorf("Docker Sandboxes QEMU/binfmt activation failed (%v), and native architecture verification also failed: %w", qemuErr, nativeErr)
+		return architectureEmulationResult{}, fmt.Errorf("Docker Sandboxes QEMU/binfmt activation failed (%w), and native architecture verification also failed: %w", qemuErr, nativeErr)
 	}
 	evidence.Mode = architectureEmulationBestEffort
 	evidence.Warning = truncate(qemuErr.Error(), architectureWarningLimit)
 	return evidence, nil
+}
+
+// architectureAttemptContext gives each best-effort capability attempt its
+// own budget while respecting a caller-wide deadline. Without this split, a
+// slow QEMU activation consumes the complete liveness deadline and the native
+// fallback receives an already-expired context, producing a misleading
+// "QEMU and native both timed out" result.
+func architectureAttemptContext(parent context.Context, attemptsRemaining int) (context.Context, context.CancelFunc) {
+	timeout := providerReadbackTimeout
+	if attemptsRemaining > 0 {
+		if deadline, ok := parent.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining < timeout {
+				timeout = remaining / time.Duration(attemptsRemaining)
+			}
+		}
+	}
+	if timeout <= 0 {
+		timeout = time.Nanosecond
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 // parseExperimentalInstanceReceipt accepts only enough of the unreleased v2

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -106,13 +107,31 @@ func netJoinHostPort(host string, port int) string {
 	return host + ":" + strconv.Itoa(port)
 }
 
+const applyNetworkPolicyAdmissionOperation = "apply Docker Sandboxes network policy admission"
+
+// classifyApplyNetworkPolicyAdmissionTimeout follows the admission classifier's
+// caller-ownership boundary while recognizing command deadlines wrapped by the
+// inventory control-plane failure used by assertIdentity.
+func classifyApplyNetworkPolicyAdmissionTimeout(ctx context.Context, err error) error {
+	if !errors.Is(err, provider.ErrControlPlaneFailure) {
+		return classifyAdmissionTimeout(ctx, applyNetworkPolicyAdmissionOperation, err)
+	}
+	if ctx.Err() != nil || errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return provider.NewControlPlaneAdmissionFailure(applyNetworkPolicyAdmissionOperation, err)
+	}
+	return err
+}
+
 func (p *Provider) ApplyNetworkPolicy(ctx context.Context, instance provider.Instance, rules []provider.NetworkPolicyRule) error {
 	if len(rules) == 0 {
 		return nil
 	}
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil {
-		return err
+		return classifyApplyNetworkPolicyAdmissionTimeout(ctx, err)
 	}
 	if !present {
 		return fmt.Errorf("docker sandbox is missing")
@@ -124,12 +143,12 @@ func (p *Provider) ApplyNetworkPolicy(ctx context.Context, instance provider.Ins
 		args := []string{"policy", string(rule.Decision), "network", "--sandbox", instance.Name, strings.Join(rule.Resources, ",")}
 		result, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy", timeout: providerCleanupTimeout})
 		if runErr != nil && !strings.Contains(strings.ToLower(result.Stdout+"\n"+result.Stderr), "already covered") {
-			return runErr
+			return classifyApplyNetworkPolicyAdmissionTimeout(ctx, runErr)
 		}
 	}
 	actual, err := p.readNetworkPolicyVerified(ctx, instance)
 	if err != nil {
-		return err
+		return classifyApplyNetworkPolicyAdmissionTimeout(ctx, err)
 	}
 	for _, expected := range rules {
 		if !containsSandboxPolicyRule(actual, expected, instance.Name) {
