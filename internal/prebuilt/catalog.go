@@ -70,6 +70,7 @@ var (
 
 const (
 	compatibleRuntimeContract = "docker-sandboxes-v1"
+	upstreamSourceRepository  = "ghcr.io/catthehacker/ubuntu"
 	upstreamRepository        = "catthehacker/docker_images"
 	upstreamFullWorkflow      = ".github/workflows/copy-full-image.yml"
 	upstreamActWorkflow       = ".github/workflows/build-ubuntu.yml"
@@ -403,6 +404,56 @@ type CompatiblePromotion struct {
 	At                 time.Time                `json:"at"`
 }
 
+// RebuildSourceSelection is the immutable source authorization exported to a
+// workflow after the containing catalog has been signature verified.
+type RebuildSourceSelection struct {
+	Profile                  string                   `json:"profile"`
+	SourcePackageIndexDigest string                   `json:"sourcePackageIndexDigest"`
+	Source                   SourceDescriptor         `json:"source"`
+	Upstream                 UpstreamWorkflowEvidence `json:"upstream"`
+}
+
+// ValidateResolution verifies that registry readback resolved the exact index
+// and two platform descriptors authorized by this selection.
+func (s RebuildSourceSelection) ValidateResolution(reference, indexDigest, amd64Digest, arm64Digest string) error {
+	profile, err := NormalizeProfile(s.Profile)
+	if err != nil {
+		return err
+	}
+	if _, err := NormalizeDigest(s.SourcePackageIndexDigest); err != nil {
+		return fmt.Errorf("rebuild source package digest: %w", err)
+	}
+	if s.Source.Repository != upstreamSourceRepository || s.Source.SourceTag != profile+"-latest" || s.Source.Reference != upstreamSourceRepository+"@"+s.Source.IndexDigest {
+		return errors.New("rebuild source selection has a non-canonical source identity")
+	}
+	if reference != s.Source.Reference {
+		return fmt.Errorf("rebuild source reference expected %s got %s", s.Source.Reference, reference)
+	}
+	resolved := map[string]string{
+		"index":       indexDigest,
+		"linux/amd64": amd64Digest,
+		"linux/arm64": arm64Digest,
+	}
+	expected := map[string]string{
+		"index":       s.Source.IndexDigest,
+		"linux/amd64": s.Source.PlatformDigests["linux/amd64"],
+		"linux/arm64": s.Source.PlatformDigests["linux/arm64"],
+	}
+	if len(s.Source.PlatformDigests) != 2 {
+		return fmt.Errorf("rebuild source selection must contain exactly two platform digests, got %d", len(s.Source.PlatformDigests))
+	}
+	for name, want := range expected {
+		got, err := NormalizeDigest(resolved[name])
+		if err != nil {
+			return fmt.Errorf("resolved %s digest: %w", name, err)
+		}
+		if want != got {
+			return fmt.Errorf("resolved %s digest expected %s got %s", name, want, got)
+		}
+	}
+	return nil
+}
+
 // Catalog is an append-only publication ledger. Aliases are a projection of
 // the latest successful promotion and can be regenerated from Entries.
 type Catalog struct {
@@ -542,6 +593,62 @@ func validateUpstreamWorkflowEvidence(profile string, evidence UpstreamWorkflowE
 		return errors.New("upstream workflow evidence is stale or newer than the promotion")
 	}
 	return nil
+}
+
+// SelectRebuildSource returns the exact upstream source identity and historical
+// workflow evidence attached to a profile's current active package. Callers
+// must obtain the Catalog from a signature-verified catalog resolver before
+// trusting the returned values.
+func (c Catalog) SelectRebuildSource(profile, packageDigest string) (RebuildSourceSelection, error) {
+	profile, err := NormalizeProfile(profile)
+	if err != nil {
+		return RebuildSourceSelection{}, err
+	}
+	packageDigest, err = NormalizeDigest(packageDigest)
+	if err != nil {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package digest: %w", err)
+	}
+	entry, ok := c.EntryByDigest(packageDigest)
+	if !ok {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s is missing from the verified catalog", packageDigest)
+	}
+	if entry.Profile != profile {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s belongs to profile %s, not %s", packageDigest, entry.Profile, profile)
+	}
+	wantSourceTag := profile + "-latest"
+	if entry.Source.Repository != upstreamSourceRepository || entry.Source.SourceTag != wantSourceTag || entry.Source.Reference != upstreamSourceRepository+"@"+entry.Source.IndexDigest {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s does not use the canonical %s source identity", packageDigest, profile)
+	}
+	status, err := c.EffectiveStatus(packageDigest)
+	if err != nil {
+		return RebuildSourceSelection{}, err
+	}
+	if status != StatusActive {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s has effective status %s, not active", packageDigest, status)
+	}
+	alias, ok := c.Aliases[profile]
+	if !ok || alias.PackageIndexDigest != packageDigest {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s is not the current %s alias target", packageDigest, profile)
+	}
+	var upstream UpstreamWorkflowEvidence
+	found := false
+	for _, promotion := range c.CompatiblePromotions {
+		if promotion.PackageIndexDigest != packageDigest {
+			continue
+		}
+		if err := c.validateCompatiblePromotion(promotion); err != nil {
+			return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s has invalid historical upstream evidence: %w", packageDigest, err)
+		}
+		if found {
+			return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s has ambiguous historical upstream evidence", packageDigest)
+		}
+		upstream = promotion.Upstream
+		found = true
+	}
+	if !found {
+		return RebuildSourceSelection{}, fmt.Errorf("rebuild source package %s has no compatible-promotion upstream evidence", packageDigest)
+	}
+	return RebuildSourceSelection{Profile: profile, SourcePackageIndexDigest: packageDigest, Source: entry.Source, Upstream: upstream}, nil
 }
 
 func (c Catalog) validateCompatiblePromotion(promotion CompatiblePromotion) error {

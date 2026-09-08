@@ -50,3 +50,37 @@ func TestReadEntryOrPlanAcceptsBothJSONShapes(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyRebuildSourceCommandExecutesExactReferenceAndPlatformChecks(t *testing.T) {
+	packageDigest := "sha256:" + strings.Repeat("a", 64)
+	indexDigest := "sha256:" + strings.Repeat("d", 64)
+	amd64Digest := "sha256:" + strings.Repeat("e", 64)
+	arm64Digest := "sha256:" + strings.Repeat("f", 64)
+	selection := prebuilt.RebuildSourceSelection{
+		Profile:                  prebuilt.ProfileFull,
+		SourcePackageIndexDigest: packageDigest,
+		Source: prebuilt.SourceDescriptor{
+			Repository:      "ghcr.io/catthehacker/ubuntu",
+			SourceTag:       "full-latest",
+			Reference:       "ghcr.io/catthehacker/ubuntu@" + indexDigest,
+			IndexDigest:     indexDigest,
+			PlatformDigests: map[string]string{"linux/amd64": amd64Digest, "linux/arm64": arm64Digest},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "selection.json")
+	data, err := json.Marshal(selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--selection", path, "--reference", selection.Source.Reference, "--index-digest", indexDigest, "--amd64-digest", amd64Digest, "--arm64-digest", arm64Digest}
+	if err := verifyRebuildSourceCommand(args); err != nil {
+		t.Fatal(err)
+	}
+	args[3] = "ghcr.io/catthehacker/ubuntu:full-latest"
+	if err := verifyRebuildSourceCommand(args); err == nil || !strings.Contains(err.Error(), "reference expected") {
+		t.Fatalf("mutable source reference error = %v", err)
+	}
+}

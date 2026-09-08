@@ -22,12 +22,16 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: epar-prebuilt-publisher <upstream-gate|plan|accept|promote|catalog|reconcile-alias|verify-catalog|verify-package> [flags]"))
+		fatal(errors.New("usage: epar-prebuilt-publisher <upstream-gate|rebuild-source|verify-rebuild-source|plan|accept|promote|catalog|reconcile-alias|verify-catalog|verify-package> [flags]"))
 	}
 	var err error
 	switch os.Args[1] {
 	case "upstream-gate":
 		err = upstreamGateCommand(os.Args[2:])
+	case "rebuild-source":
+		err = rebuildSourceCommand(os.Args[2:])
+	case "verify-rebuild-source":
+		err = verifyRebuildSourceCommand(os.Args[2:])
 	case "plan":
 		err = planCommand(os.Args[2:])
 	case "accept":
@@ -48,6 +52,59 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+}
+
+func rebuildSourceCommand(args []string) error {
+	flags := flag.NewFlagSet("rebuild-source", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	catalogPath := flags.String("catalog", "", "signature-verified catalog JSON path")
+	profile := flags.String("profile", "", "profile whose active source will be reused")
+	packageDigest := flags.String("package-digest", "", "exact active package digest supplying the source identity")
+	outputPath := flags.String("output", "", "rebuild source selection JSON path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *catalogPath == "" || *profile == "" || *packageDigest == "" || *outputPath == "" {
+		return errors.New("rebuild-source requires --catalog, --profile, --package-digest, and --output")
+	}
+	catalog, err := readCatalog(*catalogPath)
+	if err != nil {
+		return err
+	}
+	selection, err := catalog.SelectRebuildSource(*profile, *packageDigest)
+	if err != nil {
+		return fmt.Errorf("select rebuild source: %w", err)
+	}
+	if err := writeJSON(*outputPath, selection); err != nil {
+		return fmt.Errorf("write rebuild source selection: %w", err)
+	}
+	fmt.Printf("sourcePackageIndexDigest=%s\nsourceIndexDigest=%s\n", selection.SourcePackageIndexDigest, selection.Source.IndexDigest)
+	return nil
+}
+
+func verifyRebuildSourceCommand(args []string) error {
+	flags := flag.NewFlagSet("verify-rebuild-source", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	selectionPath := flags.String("selection", "", "rebuild source selection JSON path")
+	reference := flags.String("reference", "", "resolved immutable source reference")
+	indexDigest := flags.String("index-digest", "", "resolved source index digest")
+	amd64Digest := flags.String("amd64-digest", "", "resolved linux/amd64 manifest digest")
+	arm64Digest := flags.String("arm64-digest", "", "resolved linux/arm64 manifest digest")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *selectionPath == "" || *reference == "" || *indexDigest == "" || *amd64Digest == "" || *arm64Digest == "" {
+		return errors.New("verify-rebuild-source requires --selection, --reference, --index-digest, --amd64-digest, and --arm64-digest")
+	}
+	var selection prebuilt.RebuildSourceSelection
+	if err := readJSON(*selectionPath, &selection); err != nil {
+		return fmt.Errorf("read rebuild source selection: %w", err)
+	}
+	if err := selection.ValidateResolution(*reference, *indexDigest, *amd64Digest, *arm64Digest); err != nil {
+		return fmt.Errorf("verify rebuild source resolution: %w", err)
+	}
+	fmt.Printf("verifiedSourceIndexDigest=%s\n", *indexDigest)
+	return nil
 }
 
 func upstreamGateCommand(args []string) error {
