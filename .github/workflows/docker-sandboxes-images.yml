@@ -40,6 +40,11 @@ on:
         required: true
         type: boolean
         default: false
+      rebuild_source_digest:
+        description: 'Optional exact active EPAR package digest whose signed upstream source/evidence will be reused. Evidence must still be <=10 days old for automatic alias advancement.'
+        required: false
+        type: string
+        default: ''
       promote_candidate:
         description: 'Promote one already-published candidate digest without rebuilding; requires protected environment approval and PROMOTE confirmation.'
         required: true
@@ -144,6 +149,7 @@ jobs:
         shell: bash
         env:
           DISPATCH_PROFILE: ${{ inputs.profile }}
+          REBUILD_SOURCE_DIGEST: ${{ inputs.rebuild_source_digest }}
           SCHEDULE_EXPRESSION: ${{ github.event.schedule }}
           UPSTREAM_ACTIONS_READ_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_READ_TOKEN || github.token }}
         run: |
@@ -161,7 +167,12 @@ jobs:
             *) echo "unsupported profile: $profile" >&2; exit 1 ;;
           esac
           result="$RUNNER_TEMP/upstream-gate.json"
-          if ! go run ./cmd/epar-prebuilt-publisher upstream-gate --profile "$profile" --output "$result"; then
+          rebuild_source_digest="${REBUILD_SOURCE_DIGEST:-}"
+          if [[ -n "$rebuild_source_digest" ]]; then
+            [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || { echo 'rebuild_source_digest is valid only for workflow_dispatch' >&2; exit 1; }
+            [[ "$rebuild_source_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'rebuild_source_digest must be sha256:<64 lowercase hex>' >&2; exit 1; }
+            jq -n --arg reason 'explicit rebuild requested; signed active catalog source verification is deferred to resolve' '{eligible:true,reason:$reason,evidence:{}}' > "$result"
+          elif ! go run ./cmd/epar-prebuilt-publisher upstream-gate --profile "$profile" --output "$result"; then
             jq -n --arg reason 'GitHub Actions metadata was unavailable or invalid; publication skipped without building or writing GHCR/catalog state' '{eligible:false,reason:$reason}' > "$result"
           fi
           eligible="$(jq -r 'if (.eligible | type) == "boolean" then (.eligible | tostring) else error("eligible must be boolean") end' "$result")"
@@ -180,8 +191,13 @@ jobs:
             echo "- Eligible: \`$eligible\`"
             echo "- Reason: $reason"
             if [[ "$eligible" == true ]]; then
-              echo "- Upstream run: \`$(jq -r '.evidence.repository + "/actions/runs/" + (.evidence.runId | tostring)' "$result")\`"
-              echo "- Completed: \`$(jq -r '.evidence.completedAt' "$result")\`"
+              if [[ -n "$rebuild_source_digest" ]]; then
+                echo "- Rebuild source package: \`$rebuild_source_digest\`"
+                echo '- Its signed active catalog entry, exact source descriptors, and historical upstream evidence will be verified before source access.'
+              else
+                echo "- Upstream run: \`$(jq -r '.evidence.repository + "/actions/runs/" + (.evidence.runId | tostring)' "$result")\`"
+                echo "- Completed: \`$(jq -r '.evidence.completedAt' "$result")\`"
+              fi
             else
               echo '- No source resolution, build, package push, catalog publication, or profile-tag movement was attempted.'
             fi
@@ -196,10 +212,11 @@ jobs:
     outputs:
       profile: ${{ steps.select.outputs.profile }}
       source_tag: ${{ steps.select.outputs.source_tag }}
-      source_reference: ${{ steps.select.outputs.source_reference }}
+      source_reference: ${{ steps.source.outputs.source_reference }}
       source_index_digest: ${{ steps.source.outputs.index_digest }}
       source_amd64_digest: ${{ steps.source.outputs.amd64_digest }}
       source_arm64_digest: ${{ steps.source.outputs.arm64_digest }}
+      rebuild_source_digest: ${{ steps.rebuild.outputs.source_package_digest }}
       recipe_digest: ${{ steps.recipe.outputs.recipe_digest }}
       source_lock_digest: ${{ steps.recipe.outputs.source_lock_digest }}
       tool_digest: ${{ steps.recipe.outputs.tool_digest }}
@@ -210,7 +227,7 @@ jobs:
       runner_arm64_digest: ${{ steps.runner.outputs.arm64_digest }}
       catalog_manifest_digest: ${{ steps.catalog.outputs.catalog_manifest_digest }}
       noop: ${{ steps.noop.outputs.noop }}
-      upstream_evidence: ${{ needs.upstream-gate.outputs.evidence }}
+      upstream_evidence: ${{ steps.rebuild.outputs.upstream_evidence }}
     steps:
       - name: Check out source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -265,16 +282,84 @@ jobs:
             echo "source_reference=$source_reference"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Verify explicit signed active rebuild source
+        id: rebuild
+        shell: bash
+        env:
+          PROFILE: ${{ steps.select.outputs.profile }}
+          REBUILD_SOURCE_DIGEST: ${{ inputs.rebuild_source_digest }}
+          FRESH_UPSTREAM_EVIDENCE: ${{ needs.upstream-gate.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          requested="${REBUILD_SOURCE_DIGEST:-}"
+          if [[ -z "$requested" ]]; then
+            {
+              echo 'enabled=false'
+              echo 'source_package_digest='
+              echo 'catalog_manifest_digest='
+              echo "upstream_evidence=$FRESH_UPSTREAM_EVIDENCE"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          rebuild_dir="$RUNNER_TEMP/epar-rebuild"
+          mkdir -p "$rebuild_dir"
+          verified_catalog="$rebuild_dir/catalog-state.json"
+          verification="$rebuild_dir/catalog-verification.json"
+          selection="$rebuild_dir/source-selection.json"
+          go run ./cmd/epar-prebuilt-publisher verify-catalog \
+            --repository "$PACKAGE_REPOSITORY" \
+            --profile "$PROFILE" \
+            --ref refs/heads/main \
+            --allowed-events schedule,workflow_dispatch,push \
+            --output "$verified_catalog" > "$verification"
+          go run ./cmd/epar-prebuilt-publisher rebuild-source \
+            --catalog "$verified_catalog" \
+            --profile "$PROFILE" \
+            --package-digest "$requested" \
+            --output "$selection"
+          source_repository="$(jq -er '.source.repository' "$selection")"
+          source_reference="$(jq -er '.source.reference' "$selection")"
+          source_index_digest="$(jq -er '.source.indexDigest' "$selection")"
+          source_amd64_digest="$(jq -er '.source.platformDigests["linux/amd64"]' "$selection")"
+          source_arm64_digest="$(jq -er '.source.platformDigests["linux/arm64"]' "$selection")"
+          upstream_evidence="$(jq -c '.upstream' "$selection")"
+          catalog_manifest_digest="$(jq -er '.catalogManifestDigest' "$verification")"
+          [[ "$source_repository" == "$SOURCE_REPOSITORY" ]]
+          [[ "$source_reference" == "${SOURCE_REPOSITORY}@${source_index_digest}" ]]
+          [[ "$source_index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$source_amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$source_arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$catalog_manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo 'enabled=true'
+            echo "source_package_digest=$requested"
+            echo "source_reference=$source_reference"
+            echo "source_index_digest=$source_index_digest"
+            echo "source_amd64_digest=$source_amd64_digest"
+            echo "source_arm64_digest=$source_arm64_digest"
+            echo "catalog_manifest_digest=$catalog_manifest_digest"
+            echo "upstream_evidence=$upstream_evidence"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Resolve OCI source index and platform descriptors
         id: source
         shell: bash
         env:
           SOURCE_REFERENCE: ${{ steps.select.outputs.source_reference }}
+          REBUILD_ENABLED: ${{ steps.rebuild.outputs.enabled }}
+          REBUILD_SOURCE_REFERENCE: ${{ steps.rebuild.outputs.source_reference }}
+          REBUILD_SOURCE_INDEX_DIGEST: ${{ steps.rebuild.outputs.source_index_digest }}
+          REBUILD_SOURCE_AMD64_DIGEST: ${{ steps.rebuild.outputs.source_amd64_digest }}
+          REBUILD_SOURCE_ARM64_DIGEST: ${{ steps.rebuild.outputs.source_arm64_digest }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/epar-source"
-          oras manifest fetch "$SOURCE_REFERENCE" --format json > "$RUNNER_TEMP/epar-source/source.json"
-          index_digest="$(oras resolve "$SOURCE_REFERENCE")"
+          source_reference="$SOURCE_REFERENCE"
+          if [[ "$REBUILD_ENABLED" == true ]]; then
+            source_reference="$REBUILD_SOURCE_REFERENCE"
+          fi
+          oras manifest fetch "$source_reference" --format json > "$RUNNER_TEMP/epar-source/source.json"
+          index_digest="$(oras resolve "$source_reference")"
           [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           platform_count="$(jq '[(.content.manifests // .manifests)[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/epar-source/source.json")"
           [[ "$platform_count" == 2 ]]
@@ -284,7 +369,19 @@ jobs:
           arm64_digest="$(jq -er '(.content.manifests // .manifests)[] | select(.platform.os == "linux" and .platform.architecture == "arm64") | .digest' "$RUNNER_TEMP/epar-source/source.json" | head -n 1)"
           [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$REBUILD_ENABLED" == true ]]; then
+            go run ./cmd/epar-prebuilt-publisher verify-rebuild-source \
+              --selection "$RUNNER_TEMP/epar-rebuild/source-selection.json" \
+              --reference "$source_reference" \
+              --index-digest "$index_digest" \
+              --amd64-digest "$amd64_digest" \
+              --arm64-digest "$arm64_digest"
+            [[ "$index_digest" == "$REBUILD_SOURCE_INDEX_DIGEST" ]]
+            [[ "$amd64_digest" == "$REBUILD_SOURCE_AMD64_DIGEST" ]]
+            [[ "$arm64_digest" == "$REBUILD_SOURCE_ARM64_DIGEST" ]]
+          fi
           {
+            echo "source_reference=$source_reference"
             echo "index_digest=$index_digest"
             echo "amd64_digest=$amd64_digest"
             echo "arm64_digest=$arm64_digest"
@@ -357,22 +454,29 @@ jobs:
           SOURCE_INDEX_DIGEST: ${{ steps.source.outputs.index_digest }}
           RECIPE_DIGEST: ${{ steps.recipe.outputs.recipe_digest }}
           RECIPE_REVISION: ${{ github.sha }}
+          REBUILD_ENABLED: ${{ steps.rebuild.outputs.enabled }}
+          REBUILD_CATALOG_MANIFEST: ${{ steps.rebuild.outputs.catalog_manifest_digest }}
         run: |
           set -euo pipefail
           catalog_dir="$RUNNER_TEMP/epar-catalog"
           mkdir -p "$catalog_dir"
-          catalog_reference="${PACKAGE_REPOSITORY}:catalog-v1"
-          catalog_error="$catalog_dir/catalog-fetch.error"
-          if catalog_digest="$(oras resolve "$catalog_reference" 2>"$catalog_error")"; then
-            [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${catalog_digest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog_dir/catalog-state.json"
-            echo "catalog_manifest_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
+          if [[ "$REBUILD_ENABLED" == true ]]; then
+            [[ "$REBUILD_CATALOG_MANIFEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            cp "$RUNNER_TEMP/epar-rebuild/catalog-state.json" "$catalog_dir/catalog-state.json"
+            echo "catalog_manifest_digest=$REBUILD_CATALOG_MANIFEST" >> "$GITHUB_OUTPUT"
           else
-            if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_error"; then
-              cat "$catalog_error" >&2
-              exit 1
-            fi
-            cat > "$catalog_dir/catalog-state.json" <<'JSON'
+            catalog_reference="${PACKAGE_REPOSITORY}:catalog-v1"
+            catalog_error="$catalog_dir/catalog-fetch.error"
+            if catalog_digest="$(oras resolve "$catalog_reference" 2>"$catalog_error")"; then
+              [[ "$catalog_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              go run ./cmd/epar-prebuilt-publisher verify-catalog --repository "$PACKAGE_REPOSITORY" --profile act --reference "${PACKAGE_REPOSITORY}@${catalog_digest}" --ref refs/heads/main --allowed-events schedule,workflow_dispatch,push --output "$catalog_dir/catalog-state.json"
+              echo "catalog_manifest_digest=$catalog_digest" >> "$GITHUB_OUTPUT"
+            else
+              if ! grep -Eqi 'manifest unknown|not found|404' "$catalog_error"; then
+                cat "$catalog_error" >&2
+                exit 1
+              fi
+              cat > "$catalog_dir/catalog-state.json" <<'JSON'
           {
             "schemaVersion": 1,
             "artifactKind": "docker-sandboxes-template",
@@ -386,7 +490,8 @@ jobs:
             "transitions": []
           }
           JSON
-            echo 'catalog_manifest_digest=' >> "$GITHUB_OUTPUT"
+              echo 'catalog_manifest_digest=' >> "$GITHUB_OUTPUT"
+            fi
           fi
           jq '.policies.act = {enabled:true,wizardDefault:false,autoAdvance:true} | .policies.full = {enabled:true,wizardDefault:true,autoAdvance:true}' "$catalog_dir/catalog-state.json" > "$catalog_dir/catalog-state.tmp"
           mv "$catalog_dir/catalog-state.tmp" "$catalog_dir/catalog-state.json"
@@ -1075,6 +1180,7 @@ jobs:
           PROVENANCE_DIGEST: ${{ steps.gates.outputs.provenance_digest }}
           SBOM_DIGEST: ${{ steps.gates.outputs.sbom_digest }}
           UPSTREAM_EVIDENCE: ${{ needs.resolve.outputs.upstream_evidence }}
+          REBUILD_SOURCE_DIGEST: ${{ needs.resolve.outputs.rebuild_source_digest }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/epar-publisher"
@@ -1088,8 +1194,9 @@ jobs:
             --arg runnerVersion "$RUNNER_VERSION" --arg runnerAmd64 "$RUNNER_AMD64_DIGEST" --arg runnerArm64 "$RUNNER_ARM64_DIGEST" \
             --arg provenanceDigest "$PROVENANCE_DIGEST" --arg sbomDigest "$SBOM_DIGEST" --arg attestationDigest "$PROVENANCE_DIGEST" \
             --arg candidateId "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PROFILE}-${PACKAGE_INDEX_DIGEST#sha256:}" --argjson platforms "$package_platforms" --argjson tools "$tools_json" --argjson upstream "$UPSTREAM_EVIDENCE" \
+            --arg rebuildSourceDigest "$REBUILD_SOURCE_DIGEST" \
             --arg sourceRechecked "$SOURCE_RECHECKED" --arg provenanceGenerated "$PROVENANCE_GENERATED" --arg sbomGenerated "$SBOM_GENERATED" --arg attestationVerified "$ATTESTATION_VERIFIED" --arg runtimeValidated "$RUNTIME_VALIDATED" --arg importReadback "$IMPORT_READBACK" \
-            '{profile:$profile,channel:"stable",sourceReference:$sourceReference,sourceTag:$sourceTag,packageRepository:$packageRepository,packageReference:$packageReference,packageIndexDigest:$packageDigest,packagePlatforms:$platforms,recipe:{digest:$recipeDigest,runtimeContract:$runtime,templateSchema:2,recipeRevision:$recipeRevision,sourceLockDigest:$sourceLockDigest,toolDigest:$toolDigest},runner:{selector:"latest",version:$runnerVersion,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64},overlayRequired:false},tools:$tools,evidence:{provenanceDigest:$provenanceDigest,sbomDigest:$sbomDigest,attestationDigest:$attestationDigest},gates:{sourceResolved:true,sourceRechecked:($sourceRechecked == "true"),buildSucceeded:true,platformsValidated:true,importReadback:($importReadback == "true"),runtimeValidated:($runtimeValidated == "true"),provenanceGenerated:($provenanceGenerated == "true"),sbomGenerated:($sbomGenerated == "true"),attestationVerified:($attestationVerified == "true")},upstream:$upstream,candidateId:$candidateId}' > "$input"
+            '{profile:$profile,channel:"stable",sourceReference:$sourceReference,sourceTag:$sourceTag,packageRepository:$packageRepository,packageReference:$packageReference,packageIndexDigest:$packageDigest,packagePlatforms:$platforms,recipe:{digest:$recipeDigest,runtimeContract:$runtime,templateSchema:2,recipeRevision:$recipeRevision,sourceLockDigest:$sourceLockDigest,toolDigest:$toolDigest},runner:{selector:"latest",version:$runnerVersion,assetDigests:{"linux/amd64":$runnerAmd64,"linux/arm64":$runnerArm64},overlayRequired:false},tools:$tools,evidence:{provenanceDigest:$provenanceDigest,sbomDigest:$sbomDigest,attestationDigest:$attestationDigest},gates:{sourceResolved:true,sourceRechecked:($sourceRechecked == "true"),buildSucceeded:true,platformsValidated:true,importReadback:($importReadback == "true"),runtimeValidated:($runtimeValidated == "true"),provenanceGenerated:($provenanceGenerated == "true"),sbomGenerated:($sbomGenerated == "true"),attestationVerified:($attestationVerified == "true")},upstream:$upstream,rebuildSourceDigest:(if $rebuildSourceDigest == "" then null else $rebuildSourceDigest end),candidateId:$candidateId}' > "$input"
           if [[ "$SOURCE_RECHECKED" != true ]]; then
             jq --arg immutable "${SOURCE_REPOSITORY}@${SOURCE_INDEX_DIGEST}" '.sourceReference = $immutable' "$input" > "$input.tmp"
             mv "$input.tmp" "$input"

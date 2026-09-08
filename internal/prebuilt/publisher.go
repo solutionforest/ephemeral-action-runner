@@ -19,22 +19,23 @@ const (
 // remain explicit workflow steps. This boundary verifies that the resulting
 // package and evidence can be represented safely in the catalog.
 type PublicationInput struct {
-	Profile            string                   `json:"profile"`
-	Channel            string                   `json:"channel"`
-	SourceReference    string                   `json:"sourceReference"`
-	SourceTag          string                   `json:"sourceTag"`
-	PackageRepository  string                   `json:"packageRepository"`
-	PackageReference   string                   `json:"packageReference"`
-	PackageIndexDigest string                   `json:"packageIndexDigest"`
-	PackagePlatforms   []PlatformPublication    `json:"packagePlatforms"`
-	Recipe             RecipeDescriptor         `json:"recipe"`
-	Runner             RunnerDescriptor         `json:"runner"`
-	Tools              []ToolDescriptor         `json:"tools"`
-	Evidence           EvidenceDescriptor       `json:"evidence"`
-	Gates              GateResults              `json:"gates"`
-	Upstream           UpstreamWorkflowEvidence `json:"upstream"`
-	CandidateID        string                   `json:"candidateId,omitempty"`
-	PublishedAt        time.Time                `json:"publishedAt"`
+	Profile             string                   `json:"profile"`
+	Channel             string                   `json:"channel"`
+	SourceReference     string                   `json:"sourceReference"`
+	SourceTag           string                   `json:"sourceTag"`
+	PackageRepository   string                   `json:"packageRepository"`
+	PackageReference    string                   `json:"packageReference"`
+	PackageIndexDigest  string                   `json:"packageIndexDigest"`
+	PackagePlatforms    []PlatformPublication    `json:"packagePlatforms"`
+	Recipe              RecipeDescriptor         `json:"recipe"`
+	Runner              RunnerDescriptor         `json:"runner"`
+	Tools               []ToolDescriptor         `json:"tools"`
+	Evidence            EvidenceDescriptor       `json:"evidence"`
+	Gates               GateResults              `json:"gates"`
+	Upstream            UpstreamWorkflowEvidence `json:"upstream"`
+	RebuildSourceDigest string                   `json:"rebuildSourceDigest,omitempty"`
+	CandidateID         string                   `json:"candidateId,omitempty"`
+	PublishedAt         time.Time                `json:"publishedAt"`
 }
 
 // PublicationPlan is a deterministic decision after observing the source
@@ -48,6 +49,7 @@ type PublicationPlan struct {
 	ExpectedAliasDigest  string                   `json:"expectedAliasDigest,omitempty"`
 	SourceReference      string                   `json:"sourceReference"`
 	Upstream             UpstreamWorkflowEvidence `json:"upstream"`
+	RebuildSourceDigest  string                   `json:"rebuildSourceDigest,omitempty"`
 	ProtectedPromotion   bool                     `json:"protectedPromotion,omitempty"`
 }
 
@@ -111,9 +113,28 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 	if err != nil {
 		return PublicationPlan{}, err
 	}
-	plan := PublicationPlan{Entry: entry, Action: PlanCandidate, Reason: "new immutable package candidate", ExpectedSourceDigest: source.Digest, SourceReference: input.SourceReference, Upstream: input.Upstream}
+	rebuildSourceDigest := strings.TrimSpace(input.RebuildSourceDigest)
+	if rebuildSourceDigest != "" {
+		selection, err := catalog.SelectRebuildSource(profile, rebuildSourceDigest)
+		if err != nil {
+			return PublicationPlan{}, err
+		}
+		baseline, _ := catalog.EntryByDigest(selection.SourcePackageIndexDigest)
+		if !SourceIdentityEqual(baseline, entry) || baseline.Source.Repository != entry.Source.Repository || baseline.Source.SourceTag != entry.Source.SourceTag || baseline.Source.Reference != entry.Source.Reference {
+			return PublicationPlan{}, fmt.Errorf("rebuild source package %s does not match the resolved source index and platform digests", selection.SourcePackageIndexDigest)
+		}
+		if selection.Upstream != input.Upstream {
+			return PublicationPlan{}, fmt.Errorf("rebuild source package %s upstream evidence does not match its historical compatible promotion", selection.SourcePackageIndexDigest)
+		}
+		rebuildSourceDigest = selection.SourcePackageIndexDigest
+	}
+	plan := PublicationPlan{Entry: entry, Action: PlanCandidate, Reason: "new immutable package candidate", ExpectedSourceDigest: source.Digest, SourceReference: input.SourceReference, Upstream: input.Upstream, RebuildSourceDigest: rebuildSourceDigest}
 	policy, policyOK := catalog.Policies[profile]
-	autoEligible := policyOK && policy.Enabled && policy.AutoAdvance && entry.Recipe.RuntimeContract == compatibleRuntimeContract && entry.Recipe.TemplateSchema == 2 && entry.Gates.HostedPass() && validateUpstreamWorkflowEvidence(profile, input.Upstream, now) == nil
+	upstreamErr := validateUpstreamWorkflowEvidence(profile, input.Upstream, now)
+	autoEligible := policyOK && policy.Enabled && policy.AutoAdvance && entry.Recipe.RuntimeContract == compatibleRuntimeContract && entry.Recipe.TemplateSchema == 2 && entry.Gates.HostedPass() && upstreamErr == nil
+	if rebuildSourceDigest != "" && upstreamErr != nil {
+		plan.Reason = "pinned-source rebuild historical upstream evidence is no longer fresh; candidate retained"
+	}
 	if existing, ok := catalog.EntryByDigest(entry.PackageIndexDigest); ok {
 		status, statusErr := catalog.EffectiveStatus(entry.PackageIndexDigest)
 		if statusErr != nil {
@@ -133,7 +154,11 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 			}
 			if autoEligible {
 				plan.Action = PlanAdvanceAlias
-				plan.Reason = "existing compatible package passed fresh upstream and hosted gates"
+				if rebuildSourceDigest != "" {
+					plan.Reason = "existing compatible package rebuilt from a signed active source with still-fresh historical upstream and hosted gates"
+				} else {
+					plan.Reason = "existing compatible package passed fresh upstream and hosted gates"
+				}
 			} else {
 				plan.Action = PlanNoop
 				plan.Reason = "immutable package candidate is already recorded"
@@ -175,7 +200,11 @@ func (p Publisher) Plan(ctx context.Context, catalog Catalog, input PublicationI
 	}
 	if autoEligible && previous.Recipe.RuntimeContract == entry.Recipe.RuntimeContract {
 		plan.Action = PlanAdvanceAlias
-		plan.Reason = "compatible package passed fresh upstream and hosted gates"
+		if rebuildSourceDigest != "" {
+			plan.Reason = "compatible package rebuilt from a signed active source with still-fresh historical upstream and hosted gates"
+		} else {
+			plan.Reason = "compatible package passed fresh upstream and hosted gates"
+		}
 	}
 	return plan, nil
 }
@@ -222,6 +251,16 @@ func (p Publisher) Promote(ctx context.Context, catalog *Catalog, plan Publicati
 	}
 	if plan.ExpectedSourceDigest != entry.Source.IndexDigest {
 		return fmt.Errorf("promotion plan source digest does not match package provenance")
+	}
+	if plan.RebuildSourceDigest != "" {
+		selection, err := catalog.SelectRebuildSource(entry.Profile, plan.RebuildSourceDigest)
+		if err != nil {
+			return fmt.Errorf("rebuild source authorization: %w", err)
+		}
+		baseline, _ := catalog.EntryByDigest(selection.SourcePackageIndexDigest)
+		if !SourceIdentityEqual(baseline, entry) || baseline.Source.Repository != entry.Source.Repository || baseline.Source.SourceTag != entry.Source.SourceTag || baseline.Source.Reference != entry.Source.Reference || selection.Upstream != plan.Upstream || plan.ExpectedAliasDigest != selection.SourcePackageIndexDigest {
+			return fmt.Errorf("rebuild source authorization changed after planning")
+		}
 	}
 	if err := validateUpstreamWorkflowEvidence(entry.Profile, plan.Upstream, p.now()); err != nil {
 		return fmt.Errorf("upstream promotion evidence: %w", err)

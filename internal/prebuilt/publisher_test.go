@@ -100,6 +100,120 @@ func TestPublisherAutoAdvancesRecipeChangeWithinV1(t *testing.T) {
 	}
 }
 
+func TestPublisherRebuildUsesPinnedActiveSourceAndHistoricalFreshness(t *testing.T) {
+	baselinePackageDigest := "sha256:" + strings.Repeat("a", 64)
+	sourceIndexDigest := "sha256:" + strings.Repeat("d", 64)
+	sourceAMD64Digest := "sha256:" + strings.Repeat("e", 64)
+	sourceARM64Digest := "sha256:" + strings.Repeat("f", 64)
+	rebuiltPackageDigest := "sha256:" + strings.Repeat("c", 64)
+	completedAt := time.Unix(1, 0).UTC()
+	now := completedAt.Add(9 * 24 * time.Hour)
+	catalog := catalogWithCompatibleActiveDistinctSource(t, ProfileAct, baselinePackageDigest, sourceIndexDigest, sourceAMD64Digest, sourceARM64Digest, completedAt, completedAt.Add(time.Hour))
+	input := publicationInput(rebuiltPackageDigest)
+	input.SourceReference = "ghcr.io/catthehacker/ubuntu@" + sourceIndexDigest
+	input.RebuildSourceDigest = baselinePackageDigest
+	input.Upstream = catalog.CompatiblePromotions[0].Upstream
+	input.Recipe.Digest = "sha256:" + strings.Repeat("b", 64)
+	for i := range input.PackagePlatforms {
+		if NormalizePlatform(input.PackagePlatforms[i].Platform) == "linux/amd64" {
+			input.PackagePlatforms[i].SourceManifestDigest = sourceAMD64Digest
+		} else {
+			input.PackagePlatforms[i].SourceManifestDigest = sourceARM64Digest
+		}
+	}
+	resolvedSource := sourceObservationWithPlatforms(sourceIndexDigest, sourceAMD64Digest, sourceARM64Digest)
+	resolver := &sequenceResolver{observations: []ResolvedReference{resolvedSource, resolvedSource}}
+	publisher := Publisher{Resolver: resolver, Now: func() time.Time { return now }}
+
+	plan, err := publisher.Plan(context.Background(), catalog, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Action != PlanAdvanceAlias || plan.RebuildSourceDigest != baselinePackageDigest || plan.ExpectedAliasDigest != baselinePackageDigest || plan.ExpectedSourceDigest != sourceIndexDigest || plan.SourceReference != "ghcr.io/catthehacker/ubuntu@"+sourceIndexDigest {
+		t.Fatalf("rebuild plan = %#v", plan)
+	}
+	if plan.Entry.Source.IndexDigest != sourceIndexDigest || plan.Entry.Source.PlatformDigests["linux/amd64"] != sourceAMD64Digest || plan.Entry.Source.PlatformDigests["linux/arm64"] != sourceARM64Digest {
+		t.Fatalf("rebuilt entry source binding = %#v", plan.Entry.Source)
+	}
+	if err := publisher.Promote(context.Background(), &catalog, plan); err != nil {
+		t.Fatal(err)
+	}
+	if catalog.SchemaVersion != CatalogSchemaVersion || catalog.Aliases[ProfileAct].PackageIndexDigest != rebuiltPackageDigest || len(catalog.CompatiblePromotions) != 2 {
+		t.Fatalf("rebuild promotion = %#v", catalog)
+	}
+	got := catalog.CompatiblePromotions[1]
+	if got.PreviousDigest != baselinePackageDigest || got.PackageIndexDigest != rebuiltPackageDigest || got.Upstream != input.Upstream || !got.At.Equal(now) || !got.Upstream.CompletedAt.Equal(completedAt) {
+		t.Fatalf("historical evidence or honest promotion time changed: %#v", got)
+	}
+}
+
+func TestPublisherRebuildWithStaleHistoricalEvidenceRemainsCandidate(t *testing.T) {
+	sourceDigest := "sha256:" + strings.Repeat("a", 64)
+	packageDigest := "sha256:" + strings.Repeat("c", 64)
+	completedAt := time.Unix(1, 0).UTC()
+	catalog := catalogWithCompatibleActiveSource(t, ProfileAct, sourceDigest, completedAt, completedAt.Add(time.Hour))
+	input := publicationInput(packageDigest)
+	input.SourceReference = "ghcr.io/catthehacker/ubuntu@" + sourceDigest
+	input.RebuildSourceDigest = sourceDigest
+	input.Upstream = catalog.CompatiblePromotions[0].Upstream
+	input.Recipe.Digest = "sha256:" + strings.Repeat("b", 64)
+	for i := range input.PackagePlatforms {
+		input.PackagePlatforms[i].SourceManifestDigest = sourceDigest
+	}
+	publisher := Publisher{Resolver: &sequenceResolver{observations: []ResolvedReference{sourceObservation(sourceDigest)}}, Now: func() time.Time { return completedAt.Add(10*24*time.Hour + time.Second) }}
+	plan, err := publisher.Plan(context.Background(), catalog, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Action != PlanCandidate {
+		t.Fatalf("stale rebuild action = %q, reason %s", plan.Action, plan.Reason)
+	}
+}
+
+func TestPublisherNormalModeStillRequiresFreshUpstreamEvidence(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	input := publicationInput(digest)
+	input.Upstream.CompletedAt = time.Unix(1, 0).UTC()
+	publisher := Publisher{Resolver: &sequenceResolver{observations: []ResolvedReference{sourceObservation(digest)}}, Now: func() time.Time { return input.Upstream.CompletedAt.Add(10*24*time.Hour + time.Second) }}
+	plan, err := publisher.Plan(context.Background(), Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{ProfileAct: {Enabled: true, AutoAdvance: true}}, Aliases: map[string]Alias{}}, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Action != PlanCandidate {
+		t.Fatalf("stale normal-mode action = %q, want candidate", plan.Action)
+	}
+}
+
+func TestPublisherRebuildPromotionRejectsRevokedSourceAfterPlanning(t *testing.T) {
+	sourceDigest := "sha256:" + strings.Repeat("a", 64)
+	packageDigest := "sha256:" + strings.Repeat("c", 64)
+	completedAt := time.Unix(1, 0).UTC()
+	catalog := catalogWithCompatibleActiveSource(t, ProfileAct, sourceDigest, completedAt, completedAt.Add(time.Hour))
+	input := publicationInput(packageDigest)
+	input.SourceReference = "ghcr.io/catthehacker/ubuntu@" + sourceDigest
+	input.RebuildSourceDigest = sourceDigest
+	input.Upstream = catalog.CompatiblePromotions[0].Upstream
+	input.Recipe.Digest = "sha256:" + strings.Repeat("b", 64)
+	for i := range input.PackagePlatforms {
+		input.PackagePlatforms[i].SourceManifestDigest = sourceDigest
+	}
+	resolver := &sequenceResolver{observations: []ResolvedReference{sourceObservation(sourceDigest), sourceObservation(sourceDigest)}}
+	publisher := Publisher{Resolver: resolver, Now: func() time.Time { return completedAt.Add(2 * time.Hour) }}
+	plan, err := publisher.Plan(context.Background(), catalog, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.Revoke(sourceDigest, "source compromised", true, completedAt.Add(90*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Promote(context.Background(), &catalog, plan); err == nil || !strings.Contains(err.Error(), "critical-revoked") {
+		t.Fatalf("revoked source race error = %v", err)
+	}
+	if _, exists := catalog.EntryByDigest(packageDigest); exists {
+		t.Fatal("revoked-source race appended the rebuilt package")
+	}
+}
+
 func TestPublisherRuntimeMajorChangeRemainsCandidate(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	previous := validEntry(ProfileAct, "a", StatusActive)
@@ -547,9 +661,13 @@ func (r *sequenceResolver) Resolve(context.Context, string) (ResolvedReference, 
 }
 
 func sourceObservation(digest string) ResolvedReference {
-	return ResolvedReference{Reference: "ghcr.io/catthehacker/ubuntu:act-latest", Repository: "ghcr.io/catthehacker/ubuntu", Digest: digest, Platforms: map[string]PlatformDescriptor{
-		"linux/amd64": {Platform: "linux/amd64", Digest: digest},
-		"linux/arm64": {Platform: "linux/arm64", Digest: digest},
+	return sourceObservationWithPlatforms(digest, digest, digest)
+}
+
+func sourceObservationWithPlatforms(indexDigest, amd64Digest, arm64Digest string) ResolvedReference {
+	return ResolvedReference{Reference: "ghcr.io/catthehacker/ubuntu:act-latest", Repository: "ghcr.io/catthehacker/ubuntu", Digest: indexDigest, Platforms: map[string]PlatformDescriptor{
+		"linux/amd64": {Platform: "linux/amd64", Digest: amd64Digest},
+		"linux/arm64": {Platform: "linux/arm64", Digest: arm64Digest},
 	}}
 }
 

@@ -23,6 +23,87 @@ func TestCanonicalPackageTagUsesFullIndexDigest(t *testing.T) {
 	}
 }
 
+func TestSelectRebuildSourceRequiresExactActiveProfileBinding(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	catalog := catalogWithCompatibleActiveSource(t, ProfileFull, digest, time.Unix(1, 0), time.Unix(2, 0))
+
+	selection, err := catalog.SelectRebuildSource(ProfileFull, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.SourcePackageIndexDigest != digest || selection.Source.IndexDigest != digest || selection.Upstream.CompletedAt != time.Unix(1, 0).UTC() {
+		t.Fatalf("rebuild selection = %#v", selection)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		profile string
+		digest  string
+		want    string
+	}{
+		{name: "invalid digest", profile: ProfileFull, digest: "latest", want: "invalid sha256"},
+		{name: "missing digest", profile: ProfileFull, digest: "sha256:" + strings.Repeat("b", 64), want: "missing"},
+		{name: "cross profile", profile: ProfileAct, digest: digest, want: "belongs to profile full"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := catalog.SelectRebuildSource(tc.profile, tc.digest); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("selection error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	revoked := catalog
+	if _, err := revoked.Revoke(digest, "source compromised", false, time.Unix(3, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := revoked.SelectRebuildSource(ProfileFull, digest); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("revoked selection error = %v", err)
+	}
+}
+
+func TestSelectRebuildSourceRequiresHistoricalCompatiblePromotion(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	entry := validEntry(ProfileAct, "a", StatusActive)
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Entries: []Entry{entry}, Aliases: map[string]Alias{ProfileAct: {Profile: ProfileAct, Tag: "act-latest", Reference: DefaultPackageRepository + ":act-latest", PackageIndexDigest: digest, Channel: ChannelStable, Status: StatusActive}}}
+	if _, err := catalog.SelectRebuildSource(ProfileAct, digest); err == nil || !strings.Contains(err.Error(), "no compatible-promotion") {
+		t.Fatalf("missing historical promotion error = %v", err)
+	}
+}
+
+func TestRebuildSourceSelectionValidatesExecutableRegistryReadback(t *testing.T) {
+	packageDigest := "sha256:" + strings.Repeat("a", 64)
+	indexDigest := "sha256:" + strings.Repeat("d", 64)
+	amd64Digest := "sha256:" + strings.Repeat("e", 64)
+	arm64Digest := "sha256:" + strings.Repeat("f", 64)
+	catalog := catalogWithCompatibleActiveDistinctSource(t, ProfileFull, packageDigest, indexDigest, amd64Digest, arm64Digest, time.Unix(1, 0), time.Unix(2, 0))
+	selection, err := catalog.SelectRebuildSource(ProfileFull, packageDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := selection.ValidateResolution(selection.Source.Reference, indexDigest, amd64Digest, arm64Digest); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		reference string
+		index     string
+		amd64     string
+		arm64     string
+		want      string
+	}{
+		{name: "mutable reference", reference: upstreamSourceRepository + ":full-latest", index: indexDigest, amd64: amd64Digest, arm64: arm64Digest, want: "reference expected"},
+		{name: "index mismatch", reference: selection.Source.Reference, index: "sha256:" + strings.Repeat("b", 64), amd64: amd64Digest, arm64: arm64Digest, want: "resolved index digest expected"},
+		{name: "amd64 mismatch", reference: selection.Source.Reference, index: indexDigest, amd64: "sha256:" + strings.Repeat("b", 64), arm64: arm64Digest, want: "resolved linux/amd64 digest expected"},
+		{name: "arm64 mismatch", reference: selection.Source.Reference, index: indexDigest, amd64: amd64Digest, arm64: "sha256:" + strings.Repeat("b", 64), want: "resolved linux/arm64 digest expected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := selection.ValidateResolution(tc.reference, tc.index, tc.amd64, tc.arm64); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("resolution error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestCatalogAppendAndAliasMoveAreIdempotentAndGuarded(t *testing.T) {
 	entry := validEntry(ProfileAct, "a", StatusActive)
 	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Aliases: map[string]Alias{}}
@@ -295,6 +376,54 @@ func validEntry(profile, hexChar, status string) Entry {
 		Gates: GateResults{SourceResolved: true, SourceRechecked: true, BuildSucceeded: true, PlatformsValidated: true, ImportReadback: true, RuntimeValidated: true, ProvenanceGenerated: true, SBOMGenerated: true, AttestationVerified: true},
 	}
 	return entry
+}
+
+func catalogWithCompatibleActiveSource(t *testing.T, profile, digest string, completedAt, promotedAt time.Time) Catalog {
+	t.Helper()
+	entry := validEntry(profile, strings.TrimPrefix(digest, "sha256:")[:1], StatusActive)
+	entry.PackageIndexDigest = digest
+	entry.PackageReference = DefaultPackageRepository + "@" + digest
+	entry.Source.IndexDigest = digest
+	entry.Source.Reference = entry.Source.Repository + "@" + digest
+	for platform := range entry.Source.PlatformDigests {
+		entry.Source.PlatformDigests[platform] = digest
+	}
+	for i := range entry.Platforms {
+		entry.Platforms[i].SourceManifestDigest = digest
+	}
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{profile: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{entry}, Aliases: map[string]Alias{}}
+	if _, err := catalog.AppendCompatiblePromotion(digest, "", "fresh upstream and hosted gates", validUpstreamEvidence(profile, completedAt), promotedAt); err != nil {
+		t.Fatal(err)
+	}
+	tag, _ := AliasTag(profile)
+	catalog.Aliases[profile] = Alias{Profile: profile, Tag: tag, Reference: DefaultPackageRepository + ":" + tag, PackageIndexDigest: digest, Channel: ChannelStable, Status: StatusActive, UpdatedAt: promotedAt.UTC()}
+	return catalog
+}
+
+func catalogWithCompatibleActiveDistinctSource(t *testing.T, profile, packageDigest, sourceIndexDigest, sourceAMD64Digest, sourceARM64Digest string, completedAt, promotedAt time.Time) Catalog {
+	t.Helper()
+	entry := validEntry(profile, strings.TrimPrefix(packageDigest, "sha256:")[:1], StatusActive)
+	entry.PackageIndexDigest = packageDigest
+	entry.PackageReference = DefaultPackageRepository + "@" + packageDigest
+	entry.Source.IndexDigest = sourceIndexDigest
+	entry.Source.Reference = entry.Source.Repository + "@" + sourceIndexDigest
+	entry.Source.PlatformDigests["linux/amd64"] = sourceAMD64Digest
+	entry.Source.PlatformDigests["linux/arm64"] = sourceARM64Digest
+	for i := range entry.Platforms {
+		switch NormalizePlatform(entry.Platforms[i].Platform) {
+		case "linux/amd64":
+			entry.Platforms[i].SourceManifestDigest = sourceAMD64Digest
+		case "linux/arm64":
+			entry.Platforms[i].SourceManifestDigest = sourceARM64Digest
+		}
+	}
+	catalog := Catalog{SchemaVersion: CatalogSchemaVersion, ArtifactKind: CatalogArtifactKind, PackageRepository: DefaultPackageRepository, Policies: map[string]ProfilePolicy{profile: {Enabled: true, AutoAdvance: true}}, Entries: []Entry{entry}, Aliases: map[string]Alias{}}
+	if _, err := catalog.AppendCompatiblePromotion(packageDigest, "", "fresh upstream and hosted gates", validUpstreamEvidence(profile, completedAt), promotedAt); err != nil {
+		t.Fatal(err)
+	}
+	tag, _ := AliasTag(profile)
+	catalog.Aliases[profile] = Alias{Profile: profile, Tag: tag, Reference: DefaultPackageRepository + ":" + tag, PackageIndexDigest: packageDigest, Channel: ChannelStable, Status: StatusActive, UpdatedAt: promotedAt.UTC()}
+	return catalog
 }
 
 func validAcceptance(digest, platform string, playwrightRun, dockerHubRun int64) PlatformAcceptance {

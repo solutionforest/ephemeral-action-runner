@@ -88,6 +88,52 @@ func TestWorkflowSkipsAllPublicationWorkWhenUpstreamGateIsNotGreen(t *testing.T)
 	}
 }
 
+func TestWorkflowPinnedRebuildVerifiesAndPropagatesExactActiveSource(t *testing.T) {
+	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
+	for _, required := range []string{
+		`rebuild_source_digest:`,
+		`[[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]`,
+		`verify-catalog \`,
+		`--profile "$PROFILE"`,
+		`--ref refs/heads/main`,
+		`go run ./cmd/epar-prebuilt-publisher rebuild-source`,
+		`--package-digest "$requested"`,
+		`source_reference="$(jq -er '.source.reference' "$selection")"`,
+		`[[ "$source_reference" == "${SOURCE_REPOSITORY}@${source_index_digest}" ]]`,
+		`go run ./cmd/epar-prebuilt-publisher verify-rebuild-source`,
+		`--selection "$RUNNER_TEMP/epar-rebuild/source-selection.json"`,
+		`[[ "$index_digest" == "$REBUILD_SOURCE_INDEX_DIGEST" ]]`,
+		`[[ "$amd64_digest" == "$REBUILD_SOURCE_AMD64_DIGEST" ]]`,
+		`[[ "$arm64_digest" == "$REBUILD_SOURCE_ARM64_DIGEST" ]]`,
+		`REBUILD_SOURCE_DIGEST: ${{ needs.resolve.outputs.rebuild_source_digest }}`,
+		`rebuildSourceDigest:(if $rebuildSourceDigest == "" then null else $rebuildSourceDigest end)`,
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("pinned rebuild workflow contract is missing %q", required)
+		}
+	}
+	verify := strings.Index(workflow, "      - name: Verify explicit signed active rebuild source\n")
+	resolveSource := strings.Index(workflow, "      - name: Resolve OCI source index and platform descriptors\n")
+	if verify < 0 || resolveSource <= verify {
+		t.Fatalf("signed catalog source verification must precede source access: verify=%d source=%d", verify, resolveSource)
+	}
+	rebuildStep := workflow[verify:resolveSource]
+	if strings.Contains(rebuildStep, `${SOURCE_REPOSITORY}:${PROFILE}-latest`) || strings.Contains(rebuildStep, `oras resolve "${SOURCE_REPOSITORY}:`) {
+		t.Fatal("pinned rebuild source verification follows a current upstream tag")
+	}
+	gateStart := strings.Index(workflow, "      - name: Evaluate upstream workflow, job, and step evidence\n")
+	resolveStart := strings.Index(workflow, "\n  resolve:\n")
+	if gateStart < 0 || resolveStart <= gateStart {
+		t.Fatal("cannot isolate upstream gate")
+	}
+	gate := workflow[gateStart:resolveStart]
+	rebuildBranch := strings.Index(gate, `if [[ -n "$rebuild_source_digest" ]]`)
+	normalGate := strings.Index(gate, `go run ./cmd/epar-prebuilt-publisher upstream-gate --profile "$profile"`)
+	if rebuildBranch < 0 || normalGate <= rebuildBranch {
+		t.Fatal("normal upstream lookup is not isolated behind the empty rebuild selector")
+	}
+}
+
 func TestWorkflowRecipeDigestIncludesOnlyArtifactInputs(t *testing.T) {
 	workflow := strings.ReplaceAll(readPublisherWorkflow(t), "\r\n", "\n")
 	start := strings.Index(workflow, "      - name: Compute immutable recipe and tool identities\n")
