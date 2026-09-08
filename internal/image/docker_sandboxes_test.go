@@ -244,7 +244,7 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			}
 		}
 		verify := readTemplateFile(t, filepath.Join("guest", "verify-template.sh"))
-		for _, required := range []string{`[[ -z "${SSH_AUTH_SOCK:-}" ]]`, `[[ -z "${SSH_AUTH_SOCK_GATEWAY:-}" ]]`, `[[ -z "${SSH_AGENT_PID:-}" ]]`, `[[ ! -e /run/ssh-agent.sock && ! -L /run/ssh-agent.sock ]]`} {
+		for _, required := range []string{`-n "${SSH_AUTH_SOCK:-}"`, `-n "${SSH_AUTH_SOCK_GATEWAY:-}"`, `-n "${SSH_AGENT_PID:-}"`, `-e /run/ssh-agent.sock || -L /run/ssh-agent.sock`, "host SSH-agent forwarding is not permitted", "exit 1"} {
 			if !strings.Contains(verify, required) {
 				t.Fatalf("Docker Sandboxes template verification omitted SSH-agent isolation contract %q", required)
 			}
@@ -932,7 +932,9 @@ func TestDockerSandboxesBuildUsesDirectArchiveAndInventoryTargets(t *testing.T) 
 		`"--target", "runner-template", "--output", "type=docker,dest=" + partialArchivePath`,
 		`"--provenance=false", "--sbom=false"`,
 		`"--target", "software-inventory-export", "--output", "type=local,dest=" + evidenceExportRoot`,
-		`"--provenance", "mode=max", "--sbom", "generator=" + platformLock.SBOMGeneratorReference`,
+		`"--provenance", "mode=max", "--sbom=false"`,
+		`"SBOM_GENERATOR_IMAGE=" + platformLock.SBOMGeneratorReference`,
+		`copyDockerSandboxesSBOMStatement(exportedSBOMPath, sbomPath, storage.GiB)`,
 		`m.stopBuildxBuilder(ctx, builder, "release archive-build memory before full-image SBOM generation")`,
 		`"-attestation.docker-build.log"`,
 	} {
@@ -955,7 +957,7 @@ func TestDockerSandboxesBuildUsesDirectArchiveAndInventoryTargets(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"AS runner-template", "ARG BUILDKIT_SBOM_SCAN_STAGE=true", "AS software-inventory-export"} {
+	for _, required := range []string{"AS runner-template", "ARG BUILDKIT_SBOM_SCAN_STAGE=true", "AS software-inventory-export", "${SBOM_GENERATOR_IMAGE} AS sbom-scan", "BUILDKIT_SCAN_SOURCE=/run/src/core/sbom", "BUILDKIT_SCAN_SOURCE_EXTRAS=/run/src/extras/", "from=runner-template,source=/,target=/run/src/extras/sbom-runner-template", `["/bin/syft-scanner"]`, "COPY --from=sbom-scan /run/out/sbom-runner-template.spdx.json /sbom-runner-template.spdx.json"} {
 		if !strings.Contains(string(dockerfile), required) {
 			t.Fatalf("Dockerfile omitted %q", required)
 		}

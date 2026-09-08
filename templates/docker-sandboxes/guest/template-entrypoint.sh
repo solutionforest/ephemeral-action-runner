@@ -5,8 +5,13 @@ if [[ "$(id -u)" != "1000" || "$(id -g)" != "1000" || "${HOME:-}" != "/home/agen
   echo "EPAR Docker Sandboxes template: agent identity contract is not satisfied" >&2
   exit 1
 fi
+# sbx v0.42 injects this default even when forwarding is disabled. Only an
+# absent default endpoint is inert; all other SSH-agent evidence still fails.
+if [[ "${SSH_AUTH_SOCK:-}" == /run/ssh-agent.sock && -x /run && ! -e /run/ssh-agent.sock && ! -L /run/ssh-agent.sock && -z "${SSH_AUTH_SOCK_GATEWAY:-}" && -z "${SSH_AGENT_PID:-}" ]]; then
+  unset SSH_AUTH_SOCK
+fi
 if [[ -n "${SSH_AUTH_SOCK:-}" || -n "${SSH_AUTH_SOCK_GATEWAY:-}" || -n "${SSH_AGENT_PID:-}" || -e /run/ssh-agent.sock || -L /run/ssh-agent.sock ]]; then
-  echo "EPAR Docker Sandboxes template: host SSH-agent forwarding is not permitted; restart the Sandboxes daemon without SSH-agent variables" >&2
+  echo "EPAR Docker Sandboxes template: host SSH-agent forwarding is not permitted; coordinate with other sbx users, disable ssh.agentForwardingEnabled, and restart the Sandboxes daemon without SSH-agent variables" >&2
   exit 1
 fi
 unset SSH_AUTH_SOCK SSH_AUTH_SOCK_GATEWAY SSH_AGENT_PID

@@ -44,25 +44,27 @@ const (
 type Action string
 
 const (
-	ActionCreateIntent       Action = "create-intent"
-	ActionAbandonCreate      Action = "abandon-create"
-	ActionCreated            Action = "created"
-	ActionValidateIntent     Action = "validate-intent"
-	ActionValidated          Action = "validated"
-	ActionRegisterIntent     Action = "register-intent"
-	ActionRegistered         Action = "registered"
-	ActionJobStarted         Action = "job-started"
-	ActionJobFinished        Action = "job-finished"
-	ActionQuarantine         Action = "quarantine"
-	ActionFenceIntent        Action = "fence-intent"
-	ActionFenced             Action = "fenced"
-	ActionVerifyRemoteIntent Action = "verify-remote-absent-intent"
-	ActionRemoteAbsent       Action = "remote-absent"
-	ActionRemoveLocalIntent  Action = "remove-local-intent"
-	ActionLocalAbsent        Action = "local-absent"
-	ActionCleanupPending     Action = "cleanup-pending"
-	ActionResumeCleanup      Action = "resume-cleanup"
-	ActionTombstone          Action = "tombstone"
+	ActionCreateIntent               Action = "create-intent"
+	ActionAbandonCreate              Action = "abandon-create"
+	ActionCreated                    Action = "created"
+	ActionValidateIntent             Action = "validate-intent"
+	ActionValidated                  Action = "validated"
+	ActionRegisterIntent             Action = "register-intent"
+	ActionRegistered                 Action = "registered"
+	ActionJobStarted                 Action = "job-started"
+	ActionJobFinished                Action = "job-finished"
+	ActionQuarantine                 Action = "quarantine"
+	ActionRecoveryInventoryUncertain Action = "recovery-inventory-uncertain"
+	ActionRecoveryInventoryObserved  Action = "recovery-inventory-observed"
+	ActionFenceIntent                Action = "fence-intent"
+	ActionFenced                     Action = "fenced"
+	ActionVerifyRemoteIntent         Action = "verify-remote-absent-intent"
+	ActionRemoteAbsent               Action = "remote-absent"
+	ActionRemoveLocalIntent          Action = "remove-local-intent"
+	ActionLocalAbsent                Action = "local-absent"
+	ActionCleanupPending             Action = "cleanup-pending"
+	ActionResumeCleanup              Action = "resume-cleanup"
+	ActionTombstone                  Action = "tombstone"
 )
 
 // Receipt is provider-owned, versioned state. It is intentionally opaque to
@@ -97,19 +99,21 @@ type Cleanup struct {
 }
 
 type Record struct {
-	Name         string         `json:"name"`
-	ProviderType string         `json:"providerType"`
-	ProviderID   string         `json:"providerId,omitempty"`
-	Receipt      Receipt        `json:"receipt"`
-	GitHub       GitHubIdentity `json:"github"`
-	Phase        Phase          `json:"phase"`
-	Leases       []Lease        `json:"leases"`
-	Quarantine   *Quarantine    `json:"quarantine,omitempty"`
-	Cleanup      Cleanup        `json:"cleanup"`
-	Generation   uint64         `json:"generation"`
-	CreatedAt    time.Time      `json:"createdAt"`
-	UpdatedAt    time.Time      `json:"updatedAt"`
-	TombstonedAt *time.Time     `json:"tombstonedAt,omitempty"`
+	Name                       string         `json:"name"`
+	ProviderType               string         `json:"providerType"`
+	ProviderID                 string         `json:"providerId,omitempty"`
+	Receipt                    Receipt        `json:"receipt"`
+	GitHub                     GitHubIdentity `json:"github"`
+	Phase                      Phase          `json:"phase"`
+	Leases                     []Lease        `json:"leases"`
+	Quarantine                 *Quarantine    `json:"quarantine,omitempty"`
+	Cleanup                    Cleanup        `json:"cleanup"`
+	CreateOutcomeUncertain     bool           `json:"createOutcomeUncertain,omitempty"`
+	RecoveryInventoryUncertain bool           `json:"recoveryInventoryUncertain,omitempty"`
+	Generation                 uint64         `json:"generation"`
+	CreatedAt                  time.Time      `json:"createdAt"`
+	UpdatedAt                  time.Time      `json:"updatedAt"`
+	TombstonedAt               *time.Time     `json:"tombstonedAt,omitempty"`
 }
 
 type CreateSpec struct {

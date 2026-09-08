@@ -10,10 +10,14 @@ sha256sum --check helpers.sha256 >/dev/null
 [[ "${HOME:-}" == "/home/agent" ]]
 [[ "${USER:-}" == "agent" ]]
 [[ "${LOGNAME:-}" == "agent" ]]
-[[ -z "${SSH_AUTH_SOCK:-}" ]]
-[[ -z "${SSH_AUTH_SOCK_GATEWAY:-}" ]]
-[[ -z "${SSH_AGENT_PID:-}" ]]
-[[ ! -e /run/ssh-agent.sock && ! -L /run/ssh-agent.sock ]]
+# sbx exec also injects the inert default; never accept an actual endpoint.
+if [[ "${SSH_AUTH_SOCK:-}" == /run/ssh-agent.sock && -x /run && ! -e /run/ssh-agent.sock && ! -L /run/ssh-agent.sock && -z "${SSH_AUTH_SOCK_GATEWAY:-}" && -z "${SSH_AGENT_PID:-}" ]]; then
+  unset SSH_AUTH_SOCK
+fi
+if [[ -n "${SSH_AUTH_SOCK:-}" || -n "${SSH_AUTH_SOCK_GATEWAY:-}" || -n "${SSH_AGENT_PID:-}" || -e /run/ssh-agent.sock || -L /run/ssh-agent.sock ]]; then
+  echo "EPAR Docker Sandboxes template: host SSH-agent forwarding is not permitted; coordinate with other sbx users, disable ssh.agentForwardingEnabled, and restart the Sandboxes daemon without SSH-agent variables" >&2
+  exit 1
+fi
 [[ "${XDG_CONFIG_HOME:-}" == "/home/agent/.config" ]]
 [[ "${XDG_CACHE_HOME:-}" == "/home/agent/.cache" ]]
 [[ "${XDG_DATA_HOME:-}" == "/home/agent/.local/share" ]]
