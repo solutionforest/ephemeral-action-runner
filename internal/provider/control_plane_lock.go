@@ -22,12 +22,29 @@ var ErrControlPlaneRecoveryBusy = errors.New("provider control-plane recovery is
 
 type controlPlaneLockContextKey struct{}
 
+type controlPlaneRecoveryCoordinatorContextKey struct{}
+
 func WithControlPlaneLock(ctx context.Context) context.Context {
 	return context.WithValue(ctx, controlPlaneLockContextKey{}, true)
 }
 
 func ControlPlaneLockHeld(ctx context.Context) bool {
 	held, _ := ctx.Value(controlPlaneLockContextKey{}).(bool)
+	return held
+}
+
+// WithControlPlaneRecoveryCoordinator marks the context passed through a
+// provider-owned host-wide recovery coordinator. Providers use the marker to
+// avoid reacquiring a lease they already hold while running the synchronous
+// recovery callback.
+func WithControlPlaneRecoveryCoordinator(ctx context.Context) context.Context {
+	return context.WithValue(ctx, controlPlaneRecoveryCoordinatorContextKey{}, true)
+}
+
+// ControlPlaneRecoveryCoordinatorHeld reports whether provider recovery is
+// already executing inside its host-wide coordinator callback.
+func ControlPlaneRecoveryCoordinatorHeld(ctx context.Context) bool {
+	held, _ := ctx.Value(controlPlaneRecoveryCoordinatorContextKey{}).(bool)
 	return held
 }
 

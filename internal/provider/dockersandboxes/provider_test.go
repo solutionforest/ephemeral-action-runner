@@ -139,6 +139,115 @@ func TestRecoverControlPlaneUsesExactColdStopAndDetachedStart(t *testing.T) {
 	done()
 }
 
+func TestControlPlaneRecoveryCoordinatorHoldsHostLeaseAcrossCallback(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	p := New("sbx-test-double")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		done <- p.CoordinateControlPlaneRecovery(context.Background(), func(ctx context.Context) error {
+			if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) || !provider.ControlPlaneLockHeld(ctx) || !controlPlaneGateHeld(ctx) {
+				return errors.New("coordinator callback context did not carry every held-lease marker")
+			}
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("provider coordinator did not enter its callback")
+	}
+	if secondRelease, err := provider.TryAcquireControlPlaneRecoveryLock(); !errors.Is(err, provider.ErrControlPlaneRecoveryBusy) {
+		if secondRelease != nil {
+			secondRelease()
+		}
+		t.Fatalf("second host recovery lease = %v, want busy while callback is active", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	secondRelease, err := provider.TryAcquireControlPlaneRecoveryLock()
+	if err != nil {
+		t.Fatalf("host recovery lease remained held after callback: %v", err)
+	}
+	secondRelease()
+}
+
+func TestControlPlaneRecoveryCoordinatorCancellationWhileCommandDrainsDoesNotInvokeCallback(t *testing.T) {
+	p := New("sbx-test-double")
+	commandStarted := make(chan struct{})
+	releaseCommand := make(chan struct{})
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		if !reflect.DeepEqual(request.args, []string{"ls", "--json"}) {
+			t.Fatalf("command args = %#v, want inventory", request.args)
+		}
+		close(commandStarted)
+		select {
+		case <-releaseCommand:
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case <-ctx.Done():
+			return provider.ExecResult{}, ctx.Err()
+		}
+	}
+	inventoryDone := make(chan error, 1)
+	go func() {
+		_, err := p.Inventory(context.Background())
+		inventoryDone <- err
+	}()
+	select {
+	case <-commandStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("inventory command did not enter the provider gate")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	callbackInvoked := false
+	err := p.CoordinateControlPlaneRecovery(ctx, func(context.Context) error {
+		callbackInvoked = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("coordinator drain cancellation error = %v, want context deadline", err)
+	}
+	if callbackInvoked {
+		t.Fatal("coordinator invoked callback after caller canceled while draining a command")
+	}
+	close(releaseCommand)
+	if err := <-inventoryDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverControlPlaneUsesExistingCoordinatorLease(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"daemon", "stop"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"stopped"}`}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"stopped"}`}},
+		commandStep{args: []string{"daemon", "start", "--detach"}},
+		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"running"}`}},
+	)
+	p.wait = func(context.Context, time.Duration) error { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := p.CoordinateControlPlaneRecovery(ctx, func(coordinatedCtx context.Context) error {
+		return p.RecoverControlPlane(coordinatedCtx, provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute})
+	}); err != nil {
+		t.Fatalf("nested coordinated recovery reacquired its lease: %v", err)
+	}
+	done()
+}
+
 func TestRecoverControlPlaneRejectsUnboundedQuiescenceBeforeCommands(t *testing.T) {
 	for _, duration := range []time.Duration{0, -time.Second, maximumRecoveryQuiescence + time.Nanosecond} {
 		p := New("sbx-test-double")
@@ -492,10 +601,14 @@ type fakeArchitectureEmulationEnabler struct {
 	calls  int
 	result architectureEmulationResult
 	err    error
+	enable func(context.Context, *Provider, provider.Instance) (architectureEmulationResult, error)
 }
 
-func (enabler *fakeArchitectureEmulationEnabler) Enable(context.Context, *Provider, provider.Instance) (architectureEmulationResult, error) {
+func (enabler *fakeArchitectureEmulationEnabler) Enable(ctx context.Context, sandboxProvider *Provider, instance provider.Instance) (architectureEmulationResult, error) {
 	enabler.calls++
+	if enabler.enable != nil {
+		return enabler.enable(ctx, sandboxProvider, instance)
+	}
 	return enabler.result, enabler.err
 }
 
@@ -621,6 +734,9 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 	if !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
 		t.Fatalf("Create error = %v, want typed control-plane admission failure", err)
 	}
+	if errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+		t.Fatalf("Create error = %v, immediate admission signature was incorrectly marked ambiguous", err)
+	}
 	for _, expected := range []string{
 		sandboxContainerFailureSignature,
 		"EPAR removes SSH-agent variables when its commands start a stopped daemon",
@@ -635,6 +751,150 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 		}
 	}
 	done()
+}
+
+func TestCreateProviderDeadlineBecomesAdmissionFailureAndPreservesExactIdentity(t *testing.T) {
+	p := New("sbx-test-double")
+	p.createTimeout = 10 * time.Millisecond
+	var inventoryCalls int
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		switch request.args[0] {
+		case "diagnose":
+			return provider.ExecResult{Stdout: healthyDiagnoseJSON}, nil
+		case "template":
+			return provider.ExecResult{Stdout: templateListJSON}, nil
+		case "ls":
+			inventoryCalls++
+			if inventoryCalls == 1 {
+				return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+			}
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case "create":
+			<-ctx.Done()
+			return provider.ExecResult{}, ctx.Err()
+		default:
+			t.Fatalf("unexpected command: %#v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create() error = %v, want typed admission failure", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Create() error = %v, want provider create deadline", err)
+	}
+	if !errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+		t.Fatalf("Create() error = %v, want ambiguous create outcome classification", err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("Create() partial instance = %#v, want exact receipted identity", instance)
+	}
+}
+
+func TestCreateCallerCancellationIsNotAdmissionFailure(t *testing.T) {
+	p := New("sbx-test-double")
+	p.createTimeout = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		switch request.args[0] {
+		case "diagnose":
+			return provider.ExecResult{Stdout: healthyDiagnoseJSON}, nil
+		case "template":
+			return provider.ExecResult{Stdout: templateListJSON}, nil
+		case "ls":
+			return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+		case "create":
+			cancel()
+			<-ctx.Done()
+			return provider.ExecResult{}, ctx.Err()
+		default:
+			t.Fatalf("unexpected command: %#v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+
+	instance, err := p.Create(ctx, validCreateRequest())
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error = %v, want caller cancellation", err)
+	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		t.Fatalf("Create() error = %v, caller cancellation was misclassified as admission failure", err)
+	}
+	if !errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+		t.Fatalf("Create() error = %v, caller cancellation lost the uncertainty fence", err)
+	}
+	if instance.Name != "" || instance.ProviderID != "" || len(instance.Receipt) != 0 {
+		t.Fatalf("Create() instance = %#v, want empty instance after caller cancellation", instance)
+	}
+}
+
+func TestCreateCallerCancellationDuringTimedOutReadbackIsNotAdmissionFailure(t *testing.T) {
+	p := New("sbx-test-double")
+	p.createTimeout = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readbackStarted := make(chan struct{})
+	allowReadback := make(chan struct{})
+	var inventoryCalls int
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		switch request.args[0] {
+		case "diagnose":
+			return provider.ExecResult{Stdout: healthyDiagnoseJSON}, nil
+		case "template":
+			return provider.ExecResult{Stdout: templateListJSON}, nil
+		case "ls":
+			inventoryCalls++
+			if inventoryCalls == 1 {
+				return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+			}
+			close(readbackStarted)
+			<-allowReadback
+			return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+		case "create":
+			<-ctx.Done()
+			return provider.ExecResult{}, ctx.Err()
+		default:
+			t.Fatalf("unexpected command: %#v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+
+	type outcome struct {
+		instance provider.Instance
+		err      error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		instance, err := p.Create(ctx, validCreateRequest())
+		result <- outcome{instance: instance, err: err}
+	}()
+	select {
+	case <-readbackStarted:
+		cancel()
+		close(allowReadback)
+	case <-time.After(time.Second):
+		t.Fatal("timed-out create did not reach identity readback")
+	}
+	select {
+	case result := <-result:
+		if result.err == nil || !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("Create() error = %v, want caller cancellation", result.err)
+		}
+		if errors.Is(result.err, provider.ErrControlPlaneAdmissionFailure) || errors.Is(result.err, provider.ErrControlPlaneFailure) {
+			t.Fatalf("Create() error = %v, caller cancellation was misclassified as recovery-authorizing", result.err)
+		}
+		if !errors.Is(result.err, provider.ErrCreateOutcomeUncertain) {
+			t.Fatalf("Create() error = %v, caller cancellation lost the uncertainty fence", result.err)
+		}
+		if result.instance.Name != "" || result.instance.ProviderID != "" || len(result.instance.Receipt) != 0 {
+			t.Fatalf("Create() instance = %#v, want empty instance after cancelled readback", result.instance)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Create() did not return after caller cancellation")
+	}
 }
 
 func TestCreateAdmissionClassificationUsesImmediateCreateStderrOnly(t *testing.T) {
@@ -666,7 +926,11 @@ func TestCreateRemovesEmptyStagingAfterImmediateCreateFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test helper uses a POSIX shell script")
 	}
-	root := filepath.Join(t.TempDir(), "staging")
+	tempRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(tempRoot, "staging")
 	if _, err := staging.Open(root); err != nil {
 		t.Fatal(err)
 	}
@@ -739,6 +1003,140 @@ func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T)
 	}
 	if !strings.Contains(logOutput.String(), "QEMU/binfmt unavailable; continuing with verified native") {
 		t.Fatalf("best-effort create log = %q, want native fallback warning", logOutput.String())
+	}
+	done()
+}
+
+func TestCreateArchitectureProviderDeadlineIsAdmissionFailureWithExactReceipt(t *testing.T) {
+	tests := []struct {
+		name              string
+		enabler           architectureEmulationEnabler
+		architectureSteps []commandStep
+	}{
+		{
+			name:    "required-qemu",
+			enabler: qemuBinfmtEnabler{},
+			architectureSteps: []commandStep{
+				{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: context.DeadlineExceeded},
+			},
+		},
+		{
+			name:    "native-only",
+			enabler: nativeArchitectureEnabler{platform: "linux/amd64"},
+			architectureSteps: []commandStep{
+				{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, err: context.DeadlineExceeded},
+			},
+		},
+		{
+			name:    "best-effort-qemu-deadline",
+			enabler: bestEffortArchitectureEnabler{platform: "linux/amd64"},
+			architectureSteps: []commandStep{
+				{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: context.DeadlineExceeded},
+				{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, result: provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/arm64"}`}},
+			},
+		},
+		{
+			name:    "best-effort-native-deadline",
+			enabler: bestEffortArchitectureEnabler{platform: "linux/amd64"},
+			architectureSteps: []commandStep{
+				{args: []string{"exec", testName, "--", "sudo", "-n", architectureEmulationHelper}, err: errors.New("binfmt_misc is unavailable")},
+				{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, err: context.DeadlineExceeded},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			steps := []commandStep{
+				{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+				{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+				{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+				{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+				{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+				{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+				{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+				{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+			}
+			steps = append(steps, test.architectureSteps...)
+			p, done := scriptedProvider(t, steps...)
+			p.architectureEmulation = test.enabler
+
+			instance, err := p.Create(context.Background(), validCreateRequest())
+			if err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Create() error = %v, want provider-owned architecture deadline admission failure", err)
+			}
+			if errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+				t.Fatalf("Create() error = %v, exact identity was incorrectly marked uncertain", err)
+			}
+			if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+				t.Fatalf("Create() instance = %#v, want exact receipted identity", instance)
+			}
+			done()
+		})
+	}
+}
+
+func TestCreateCallerCancellationDuringArchitectureAdmissionIsNotRecoveryAuthorizing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+	)
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{
+		enable: func(ctx context.Context, _ *Provider, _ provider.Instance) (architectureEmulationResult, error) {
+			cancel()
+			<-ctx.Done()
+			return architectureEmulationResult{}, ctx.Err()
+		},
+	}
+
+	instance, err := p.Create(ctx, validCreateRequest())
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error = %v, want caller cancellation", err)
+	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("Create() error = %v, caller cancellation was misclassified as recovery-authorizing", err)
+	}
+	var uncertain *provider.UncertainCreateFailure
+	if !errors.As(err, &uncertain) || !uncertain.CallerOwned() || !errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+		t.Fatalf("Create() error = %v, want caller-owned uncertainty marker", err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("Create() instance = %#v, want exact receipted identity", instance)
+	}
+	done()
+}
+
+func TestCreateArchitectureNonDeadlinePreservesOrdinaryFailure(t *testing.T) {
+	cause := errors.New("native architecture helper rejected the request")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+		commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}},
+		commandStep{args: []string{"exec", "-i", testName, "--", "bash", "-lc", directWorkspaceVerificationScript}},
+		commandStep{args: []string{"exec", testName, "--", "sudo", "-n", nativeArchitectureHelper, "linux/amd64"}, err: cause},
+	)
+	p.architectureEmulation = nativeArchitectureEnabler{platform: "linux/amd64"}
+
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if err == nil || !errors.Is(err, cause) {
+		t.Fatalf("Create() error = %v, want original non-deadline architecture failure", err)
+	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || errors.Is(err, provider.ErrCreateOutcomeUncertain) {
+		t.Fatalf("Create() error = %v, ordinary architecture failure was misclassified", err)
+	}
+	if instance.Name != testName || instance.ProviderID != testID || instance.ReceiptVersion != "v1" || len(instance.Receipt) == 0 {
+		t.Fatalf("Create() instance = %#v, want exact receipted identity", instance)
 	}
 	done()
 }
@@ -887,6 +1285,33 @@ func TestBestEffortArchitectureFallsBackToVerifiedNative(t *testing.T) {
 			}
 			done()
 		})
+	}
+}
+
+func TestBestEffortArchitectureGivesNativeFallbackItsRemainingDeadline(t *testing.T) {
+	p := New("sbx-test-double")
+	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
+		switch request.args[0] {
+		case "exec":
+			if request.args[len(request.args)-1] == architectureEmulationHelper {
+				<-ctx.Done()
+				return provider.ExecResult{}, ctx.Err()
+			}
+			return provider.ExecResult{Stdout: `{"backend":"native","handlerCount":0,"platform":"linux/amd64"}`}, nil
+		default:
+			t.Fatalf("unexpected command: %#v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	result, err := (bestEffortArchitectureEnabler{platform: "linux/amd64"}).Enable(ctx, p, testInstance)
+	if err != nil {
+		t.Fatalf("best-effort architecture verification = %v, want native fallback success", err)
+	}
+	if result.Backend != "native" || result.Platform != "linux/amd64" {
+		t.Fatalf("best-effort architecture result = %#v, want native evidence", result)
 	}
 }
 
@@ -1207,6 +1632,23 @@ func TestInstanceAdmissionRechecksConfiguredArchitectureCapability(t *testing.T)
 	done()
 }
 
+func TestAdmissionTimeoutIsRecoveryAuthorizingForLiveCaller(t *testing.T) {
+	p, done := scriptedProvider(t, commandStep{args: []string{"diagnose", "--output", "json"}, err: context.DeadlineExceeded})
+	err := p.VerifyAdmission(context.Background())
+	if err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("VerifyAdmission() error = %v, want live provider timeout admission failure", err)
+	}
+	done()
+
+	p, done = identityAdmissionScript(t, commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: inspectionJSON}})
+	p.architectureEmulation = &fakeArchitectureEmulationEnabler{err: context.DeadlineExceeded}
+	err = p.VerifyInstanceAdmission(context.Background(), testInstance)
+	if err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("VerifyInstanceAdmission() error = %v, want live provider timeout admission failure", err)
+	}
+	done()
+}
+
 func TestInstanceAdmissionRejectsPublishedPortInventory(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -1405,6 +1847,22 @@ func TestInventoryParsesWrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
 		if _, err := parseInventory([]byte(fixture)); err == nil {
 			t.Fatalf("schema drift was accepted: %s", fixture)
 		}
+	}
+}
+
+func TestInventoryRejectsDuplicateJSONKeysRecursively(t *testing.T) {
+	validRecord := `"id":"` + testID + `","name":"` + testName + `","status":"running","workspaces":[` + strconv.Quote(testWorkspace) + `]`
+	fixtures := map[string]string{
+		"top-level inventory key": `{"sandboxes":[],"sandboxes":[]}`,
+		"sandbox identity key":    `{"sandboxes":[{` + validRecord + `,"id":"` + testID + `"}]}`,
+		"nested additive key":     `{"sandboxes":[{` + validRecord + `,"metadata":{"generation":1,"generation":2}}]}`,
+	}
+	for name, fixture := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseInventory([]byte(fixture)); err == nil || !strings.Contains(err.Error(), "unsupported json schema") {
+				t.Fatalf("duplicate-key inventory error = %v, want fail-closed schema rejection for %s", err, fixture)
+			}
+		})
 	}
 }
 
@@ -1766,6 +2224,80 @@ func TestStopAndDeleteAreIdempotentWhenInventorySaysMissing(t *testing.T) {
 			p, done := scriptedProvider(t, commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}})
 			if err := test.call(p); err != nil {
 				t.Fatal(err)
+			}
+			done()
+		})
+	}
+}
+
+func TestIsMissingSandboxPreservesLegacyAndMatchesOnlyTheRequestedSbx042Name(t *testing.T) {
+	tests := []struct {
+		name       string
+		targetName string
+		message    string
+		want       bool
+	}{
+		{name: "legacy sandbox not found", targetName: testName, message: "sandbox not found", want: true},
+		{name: "legacy no such sandbox", targetName: testName, message: "no such sandbox", want: true},
+		{name: "legacy status 404", targetName: testName, message: "status 404", want: true},
+		{name: "sbx 0.42 exact name", targetName: testName, message: "sandbox 'epar-sandbox-1' not found", want: true},
+		{name: "sbx 0.42 Error wrapper", targetName: testName, message: "Error: sandbox 'epar-sandbox-1' not found", want: true},
+		{name: "sbx 0.42 error wrapper", targetName: testName, message: "error: sandbox 'epar-sandbox-1' not found", want: true},
+		{name: "uppercase target remains exact", targetName: "EPAR-SANDBOX-1", message: "sandbox 'EPAR-SANDBOX-1' not found", want: true},
+		{name: "uppercase mismatch", targetName: testName, message: "sandbox 'EPAR-SANDBOX-1' not found", want: false},
+		{name: "different sandbox", targetName: testName, message: "sandbox 'other-sandbox' not found", want: false},
+		{name: "name prefix", targetName: testName, message: "sandbox 'epar-sandbox-10' not found", want: false},
+		{name: "unrelated resource", targetName: testName, message: "resource 'epar-sandbox-1' not found", want: false},
+		{name: "unrelated prefix", targetName: testName, message: "volume for sandbox 'epar-sandbox-1' not found", want: false},
+		{name: "unrelated suffix", targetName: testName, message: "sandbox 'epar-sandbox-1' not found in local cache; permission denied", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isMissingSandbox(test.message, test.targetName); got != test.want {
+				t.Fatalf("isMissingSandbox(%q, %q) = %t, want %t", test.message, test.targetName, got, test.want)
+			}
+		})
+	}
+}
+
+func TestStopAndDeleteTreatExactSbx042MissingSandboxErrorsAsIdempotent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(*Provider) error
+		args []string
+	}{
+		{name: "stop", call: func(p *Provider) error { return p.Stop(context.Background(), testInstance) }, args: []string{"stop", testName}},
+		{name: "delete", call: func(p *Provider) error { return p.Delete(context.Background(), testInstance) }, args: []string{"rm", "--force", testName}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+				commandStep{args: test.args, result: provider.ExecResult{Stderr: "sandbox '" + testName + "' not found"}, err: errors.New("exit status 1")},
+			)
+			if err := test.call(p); err != nil {
+				t.Fatal(err)
+			}
+			done()
+		})
+	}
+}
+
+func TestStopAndDeleteDoNotSwallowUnrelatedResourceNotFoundErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(*Provider) error
+		args []string
+	}{
+		{name: "stop", call: func(p *Provider) error { return p.Stop(context.Background(), testInstance) }, args: []string{"stop", testName}},
+		{name: "delete", call: func(p *Provider) error { return p.Delete(context.Background(), testInstance) }, args: []string{"rm", "--force", testName}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+				commandStep{args: test.args, result: provider.ExecResult{Stderr: "resource '" + testName + "' not found"}, err: errors.New("exit status 1")},
+			)
+			if err := test.call(p); err == nil || !strings.Contains(err.Error(), "resource '") {
+				t.Fatalf("error = %v, want unrelated resource error", err)
 			}
 			done()
 		})

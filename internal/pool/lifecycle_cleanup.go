@@ -83,6 +83,19 @@ func (m *Manager) cleanupLifecycleRecord(ctx context.Context, initial poolstate.
 }
 
 func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, initial poolstate.Record, sameName []provider.InventoryItem, remoteKnownAbsent bool) error {
+	return m.cleanupLifecycleRecordWithPolicy(ctx, initial, sameName, remoteKnownAbsent, false)
+}
+
+// cleanupLifecycleRecordAfterKnownCreateFailure is used only by the active
+// provisioning attempt after the provider has returned an ordinary,
+// non-ambiguous create failure. A restarted controller cannot make that same
+// inference from a durable creating record, so the normal cleanup path keeps
+// its conservative uncertainty fence.
+func (m *Manager) cleanupLifecycleRecordAfterKnownCreateFailure(ctx context.Context, initial poolstate.Record, sameName []provider.InventoryItem, remoteKnownAbsent bool) error {
+	return m.cleanupLifecycleRecordWithPolicy(ctx, initial, sameName, remoteKnownAbsent, true)
+}
+
+func (m *Manager) cleanupLifecycleRecordWithPolicy(ctx context.Context, initial poolstate.Record, sameName []provider.InventoryItem, remoteKnownAbsent, allowKnownCreateAbsence bool) error {
 	for {
 		record, err := m.LifecycleState.Read(ctx, initial.Name)
 		if err != nil {
@@ -115,14 +128,17 @@ func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, i
 						return reportErr
 					}
 				}
-				m.quarantineLifecycle(ctx, record.Name, fmt.Errorf("create was interrupted before an immutable provider identity was recorded"))
+				m.quarantineLifecycle(ctx, record.Name, errors.New(interruptedCreateNoIdentityReason))
 				return fmt.Errorf("unidentified same-name instance is quarantined and was not deleted")
+			}
+			if isUncertainCreateRecord(record) && !(allowKnownCreateAbsence && record.Phase == poolstate.PhaseCreating) {
+				return fmt.Errorf("provider create outcome remains uncertain; refusing absence-only tombstone")
 			}
 			if m.GitHub != nil {
 				if _, found, err := m.GitHub.RunnerByName(ctx, record.GitHub.ExactName); err != nil {
 					return err
 				} else if found {
-					m.quarantineLifecycle(ctx, record.Name, fmt.Errorf("create was interrupted and a same-name GitHub runner exists without a recorded immutable id"))
+					m.quarantineLifecycle(ctx, record.Name, errors.New(interruptedCreateGitHubIdentityReason))
 					return fmt.Errorf("unidentified same-name GitHub runner is quarantined and was not deleted")
 				}
 			}
@@ -142,6 +158,9 @@ func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, i
 					}
 					return fmt.Errorf("unidentified same-name instance is quarantined and was not deleted")
 				}
+				if isUncertainCreateRecord(record) {
+					return fmt.Errorf("provider create outcome remains uncertain; refusing absence-only tombstone")
+				}
 				if m.GitHub == nil {
 					return fmt.Errorf("record has no immutable provider identity and GitHub absence cannot be verified")
 				}
@@ -152,6 +171,25 @@ func (m *Manager) cleanupLifecycleRecordWithRemoteAbsence(ctx context.Context, i
 				}
 				_, err = m.LifecycleState.Transition(ctx, record.Name, poolstate.Transition{Action: poolstate.ActionAbandonCreate})
 				return err
+			}
+			if record.RecoveryInventoryUncertain {
+				exactFound := false
+				for _, item := range sameName {
+					if item.Instance.Name != record.Name {
+						continue
+					}
+					if item.Instance.ProviderID != record.ProviderID {
+						return fmt.Errorf("same-name provider instance id=%s does not match recorded id=%s; refusing deletion", item.Instance.ProviderID, record.ProviderID)
+					}
+					exactFound = true
+				}
+				if !exactFound {
+					return fmt.Errorf("post-recovery provider inventory remains uncertain; refusing absence-only cleanup")
+				}
+				if _, err := m.LifecycleState.Transition(ctx, record.Name, poolstate.Transition{Action: poolstate.ActionRecoveryInventoryObserved}); err != nil {
+					return err
+				}
+				continue
 			}
 			if _, err := m.LifecycleState.Transition(ctx, record.Name, poolstate.Transition{Action: poolstate.ActionFenceIntent}); err != nil {
 				return err

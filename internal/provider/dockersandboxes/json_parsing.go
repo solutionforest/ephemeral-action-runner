@@ -72,6 +72,13 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 }
 
 func parseInventory(data []byte) ([]provider.InventoryItem, error) {
+	// sbx does not expose a host-wide generation or count alongside this API.
+	// Recovery therefore treats one validated `sbx ls --json` response as the
+	// complete authoritative snapshot and rejects duplicate keys at every depth
+	// before map decoding could collapse contradictory evidence.
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	var wrapper map[string]json.RawMessage
@@ -122,6 +129,71 @@ func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 		items = append(items, provider.InventoryItem{Instance: instance, State: status, Source: agent, Workspaces: workspaces})
 	}
 	return items, nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := consumeUniqueJSONValue(decoder); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func consumeUniqueJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("json object key must be a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate json object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return fmt.Errorf("json object did not end with a closing delimiter")
+		}
+		return nil
+	case '[':
+		for decoder.More() {
+			if err := consumeUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return fmt.Errorf("json array did not end with a closing delimiter")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unexpected json delimiter %q", delimiter)
+	}
 }
 
 func requiredStringArray(record map[string]json.RawMessage, key string) ([]string, error) {

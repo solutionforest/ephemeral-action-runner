@@ -12,6 +12,10 @@ import (
 // ErrLocked means another process or file descriptor currently owns the lock.
 var ErrLocked = errors.New("file lock is already held")
 
+// ErrUnsupported means this build has no safe cross-process lock primitive.
+// Callers must fail closed rather than treating it as ordinary contention.
+var ErrUnsupported = errors.New("file locks are unsupported on this platform")
+
 // Lock is an exclusive advisory lock. Close releases it and is idempotent.
 type Lock struct {
 	file *os.File
@@ -33,6 +37,9 @@ func Acquire(path string) (*Lock, error) {
 		_ = file.Close()
 		if errors.Is(err, errPlatformLocked) {
 			return nil, fmt.Errorf("%w: %s", ErrLocked, path)
+		}
+		if errors.Is(err, ErrUnsupported) {
+			return nil, fmt.Errorf("%w: %s", ErrUnsupported, path)
 		}
 		return nil, fmt.Errorf("lock file %s: %w", path, err)
 	}

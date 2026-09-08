@@ -80,6 +80,7 @@ type Provider struct {
 	architectureEmulation  architectureEmulationEnabler
 	architectureLogged     sync.Map
 	logger                 *slog.Logger
+	createTimeout          time.Duration
 	instanceOperationGates [64]sync.Mutex
 	relayMu                sync.Mutex
 	relay                  *egressRelay
@@ -245,16 +246,44 @@ func (p *Provider) RecoverControlPlane(ctx context.Context, request provider.Con
 	if p.dryRun {
 		return fmt.Errorf("Docker Sandboxes control-plane recovery is unavailable in dry-run mode")
 	}
+	if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) {
+		return p.CoordinateControlPlaneRecovery(ctx, func(coordinatedCtx context.Context) error {
+			return p.recoverControlPlaneUnderCoordinator(coordinatedCtx, request)
+		})
+	}
+	return p.recoverControlPlaneUnderCoordinator(ctx, request)
+}
+
+// CoordinateControlPlaneRecovery holds the Docker Sandboxes process-local
+// command gate and host-wide recovery lease continuously across the supplied
+// callback. Commands issued with the callback context are already admitted by
+// both gates and must not reacquire them.
+func (p *Provider) CoordinateControlPlaneRecovery(ctx context.Context, operation func(context.Context) error) error {
+	if operation == nil {
+		return errors.New("Docker Sandboxes control-plane recovery coordinator operation is nil")
+	}
+	if provider.ControlPlaneRecoveryCoordinatorHeld(ctx) {
+		return errors.New("Docker Sandboxes control-plane recovery coordinator is already held")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	releaseRecoverySlot, err := p.acquireRecoverySlot(ctx)
 	if err != nil {
 		return err
 	}
 	defer releaseRecoverySlot()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	releaseControlPlaneGate, err := p.controlPlaneGate.beginRecovery(ctx)
 	if err != nil {
 		return err
 	}
 	defer releaseControlPlaneGate()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var releaseHostLock func()
 	if p.runCommand == nil {
 		releaseHostLock, err = provider.TryAcquireControlPlaneRecoveryLock()
@@ -263,15 +292,22 @@ func (p *Provider) RecoverControlPlane(ctx context.Context, request provider.Con
 		}
 		defer releaseHostLock()
 	}
-	recoveryCtx := provider.WithControlPlaneLock(withControlPlaneGate(ctx))
+	coordinatedCtx := provider.WithControlPlaneRecoveryCoordinator(provider.WithControlPlaneLock(withControlPlaneGate(ctx)))
+	return operation(coordinatedCtx)
+}
 
-	_, stopErr := p.run(recoveryCtx, commandRequest{
+func (p *Provider) recoverControlPlaneUnderCoordinator(ctx context.Context, request provider.ControlPlaneRecoveryRequest) error {
+	if !provider.ControlPlaneRecoveryCoordinatorHeld(ctx) || !provider.ControlPlaneLockHeld(ctx) || !controlPlaneGateHeld(ctx) {
+		return errors.New("Docker Sandboxes control-plane recovery requires its provider coordinator lease")
+	}
+
+	_, stopErr := p.run(ctx, commandRequest{
 		args:        []string{"daemon", "stop"},
 		operation:   "stop docker sandboxes daemon for control-plane recovery",
 		outputLimit: diagnosticOutputLimit,
 		timeout:     providerCleanupTimeout,
 	})
-	if stateErr := p.waitForDaemonState(recoveryCtx, daemonControlStateStopped, providerCleanupTimeout); stateErr != nil {
+	if stateErr := p.waitForDaemonState(ctx, daemonControlStateStopped, providerCleanupTimeout); stateErr != nil {
 		if stopErr != nil {
 			return errors.Join(stopErr, fmt.Errorf("confirm Docker Sandboxes daemon stopped: %w", stateErr))
 		}
@@ -281,10 +317,10 @@ func (p *Provider) RecoverControlPlane(ctx context.Context, request provider.Con
 		p.logger.Warn("Docker Sandboxes daemon stop returned an error but authoritative status confirmed stopped; continuing exclusive recovery", "provider", "docker-sandboxes")
 	}
 
-	if err := p.wait(recoveryCtx, request.Quiescence); err != nil {
+	if err := p.wait(ctx, request.Quiescence); err != nil {
 		return fmt.Errorf("wait for Docker Sandboxes daemon quiescence: %w", err)
 	}
-	state, err := p.readDaemonControlState(recoveryCtx)
+	state, err := p.readDaemonControlState(ctx)
 	if err != nil {
 		return fmt.Errorf("refusing Docker Sandboxes daemon start because stopped state is unknown after quiescence: %w", err)
 	}
@@ -292,8 +328,8 @@ func (p *Provider) RecoverControlPlane(ctx context.Context, request provider.Con
 		return fmt.Errorf("refusing Docker Sandboxes daemon start after quiescence: state is %q, want %q", state, daemonControlStateStopped)
 	}
 
-	startErr := p.StartDaemon(recoveryCtx)
-	stateErr := p.waitForDaemonState(recoveryCtx, daemonControlStateRunning, providerReadbackTimeout)
+	startErr := p.StartDaemon(ctx)
+	stateErr := p.waitForDaemonState(ctx, daemonControlStateRunning, providerReadbackTimeout)
 	if stateErr != nil {
 		if startErr != nil {
 			return errors.Join(startErr, fmt.Errorf("confirm Docker Sandboxes daemon running: %w", stateErr))
@@ -459,65 +495,162 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 	if request.DockerDisk != "" {
 		environment["DOCKER_SANDBOXES_DOCKER_SIZE"] = request.DockerDisk
 	}
-	result, createErr := p.run(ctx, commandRequest{args: args, environment: environment, operation: "create docker sandbox", timeout: providerCreateTimeout})
+	createCtx, cancelCreate := context.WithTimeout(ctx, p.createOperationTimeout())
+	result, createErr := p.run(createCtx, commandRequest{args: args, environment: environment, operation: "create docker sandbox"})
+	createTimedOut := errors.Is(createCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	cancelCreate()
 	if createErr != nil {
-		if stagingRoot != nil {
+		if ctx.Err() != nil || errors.Is(createErr, context.Canceled) {
+			// Once the provider command has started, caller cancellation cannot
+			// prove that the sandbox side effect did not complete. Preserve the
+			// uncertainty fence and avoid both staging deletion and recovery
+			// authorization; the pool will retain the capacity for exact review.
+			return provider.Instance{}, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", withSandboxContainerFailureRemediation(createErr))
+		}
+		if stagingRoot != nil && !createTimedOut {
 			if cleanupErr := stagingRoot.RemoveEmptyOwned(request.Name, ownedStaging.Identity); cleanupErr != nil {
 				createErr = errors.Join(createErr, fmt.Errorf("remove failed Docker Sandboxes staging workspace: %w", cleanupErr))
 			}
 		}
 		failure := withSandboxContainerFailureRemediation(createErr)
+		if createTimedOut {
+			// A provider-owned deadline is an ambiguous outcome: sbx may have
+			// materialized the runtime after the client stopped waiting. Make one
+			// bounded, read-only inventory attempt so an exact identity and
+			// receipt can still be preserved for lifecycle cleanup. An absent or
+			// failed readback remains uncertain and is never treated as proof of
+			// absence.
+			outcome, outcomeErr := p.reconcileTimedOutCreate(ctx, request, ownedStaging)
+			if ctx.Err() != nil {
+				// A caller cancellation or attempt deadline wins over the
+				// provider-owned timeout, including when it arrives during the
+				// bounded readback. Do not authorize a daemon restart for a
+				// cancelled caller; preserve an exact identity if readback had
+				// already recovered one so normal cleanup can remain exact.
+				if outcomeErr != nil {
+					// Do not wrap outcomeErr here: inventoryVerified classifies
+					// its provider command failure as ErrControlPlaneFailure,
+					// which would incorrectly authorize daemon recovery through
+					// errors.Is after caller cancellation.
+					failure = errors.Join(failure, fmt.Errorf("timed-out create readback interrupted by caller: %w", ctx.Err()), fmt.Errorf("post-timeout Docker Sandboxes identity readback failed: %v", outcomeErr))
+				} else {
+					failure = errors.Join(failure, fmt.Errorf("timed-out create readback interrupted by caller: %w", ctx.Err()))
+				}
+				return outcome, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", failure)
+			}
+			if outcomeErr != nil {
+				failure = errors.Join(failure, fmt.Errorf("post-timeout Docker Sandboxes identity readback: %w", outcomeErr))
+			} else {
+				return outcome, provider.NewUncertainCreateAdmissionFailure("create Docker Sandboxes instance", failure)
+			}
+		}
 		if hasSandboxCreateAdmissionSignature(result.Stderr) {
 			return provider.Instance{}, provider.NewControlPlaneAdmissionFailure("create Docker Sandboxes instance", failure)
 		}
+		if createTimedOut {
+			return provider.Instance{}, provider.NewUncertainCreateAdmissionFailure("create Docker Sandboxes instance", failure)
+		}
 		return provider.Instance{}, failure
 	}
-	items, err = p.inventoryVerified(ctx)
+	// The create command has returned success, so its side effect is no
+	// longer cancellable by the caller. Keep the identity readback bounded but
+	// independent of caller cancellation; otherwise a shutdown can turn a
+	// successfully created, unidentifiable sandbox into an absence inference.
+	readbackCtx, cancelReadback := context.WithTimeout(context.WithoutCancel(ctx), providerReadbackTimeout)
+	items, err = p.inventoryVerified(readbackCtx)
+	cancelReadback()
 	if err != nil {
-		return provider.Instance{}, fmt.Errorf("docker sandbox was created but identity readback failed: %w", err)
+		readbackFailure := fmt.Errorf("docker sandbox was created but identity readback failed: %w", err)
+		if ctx.Err() != nil {
+			readbackFailure = errors.Join(readbackFailure, ctx.Err())
+			return provider.Instance{}, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", readbackFailure)
+		}
+		return provider.Instance{}, provider.NewUncertainCreateFailure("create Docker Sandboxes instance", readbackFailure)
 	}
 	for _, item := range items {
 		if item.Instance.Name == request.Name {
-			if item.Instance.ProviderID == "" {
-				return provider.Instance{}, fmt.Errorf("docker sandbox inventory omitted the stable provider id")
+			instance, receiptErr := p.receiptedInstance(item, request, ownedStaging)
+			if receiptErr != nil {
+				readbackFailure := fmt.Errorf("docker sandbox identity readback failed: %w", receiptErr)
+				if ctx.Err() != nil {
+					readbackFailure = errors.Join(readbackFailure, ctx.Err())
+					return provider.Instance{}, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", readbackFailure)
+				}
+				return provider.Instance{}, provider.NewUncertainCreateFailure("create Docker Sandboxes instance", readbackFailure)
 			}
-			if item.Source != "shell" || !containsExactWorkspace(item.Workspaces, request.StagingPath) {
-				return provider.Instance{}, fmt.Errorf("docker sandbox inventory did not bind the exact shell workspace")
+			if ctx.Err() != nil {
+				return instance, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", ctx.Err())
 			}
-			receipt, encodeErr := json.Marshal(instanceReceipt{
-				SchemaVersion:   1,
-				StagingPath:     ownedStaging.Path,
-				StagingIdentity: ownedStaging.Identity,
-				Template:        request.Template,
-				TemplateDigest:  request.TemplateDigest,
-			})
-			if encodeErr != nil {
-				return provider.Instance{}, encodeErr
-			}
-			instance := item.Instance
-			instance.ReceiptVersion = "v1"
-			instance.Receipt = receipt
 			if err := p.verifyNoPublishedPorts(ctx, item.Instance); err != nil {
-				return instance, err
+				return instance, classifyCreateAdmissionFailure(ctx, err)
 			}
 			if err := p.verifyInspection(ctx, item.Instance, &request, cacheID); err != nil {
-				return instance, err
+				return instance, classifyCreateAdmissionFailure(ctx, err)
 			}
 			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
-				return instance, err
+				return instance, classifyCreateAdmissionFailure(ctx, err)
 			}
 			if p.architectureEmulation == nil {
 				return instance, fmt.Errorf("Docker Sandboxes architecture emulation enabler is unavailable")
 			}
 			emulation, err := p.architectureEmulation.Enable(ctx, p, item.Instance)
 			if err != nil {
-				return instance, err
+				return instance, classifyCreateAdmissionFailure(ctx, err)
 			}
 			p.logArchitectureCapability(item.Instance.Name, emulation)
 			return instance, nil
 		}
 	}
-	return provider.Instance{}, fmt.Errorf("docker sandbox was not present in inventory after create")
+	if ctx.Err() != nil {
+		return provider.Instance{}, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", fmt.Errorf("docker sandbox was not present in inventory after create: %w", ctx.Err()))
+	}
+	return provider.Instance{}, provider.NewUncertainCreateFailure("create Docker Sandboxes instance", fmt.Errorf("docker sandbox was not present in inventory after create"))
+}
+
+func (p *Provider) createOperationTimeout() time.Duration {
+	if p.createTimeout > 0 {
+		return p.createTimeout
+	}
+	return providerCreateTimeout
+}
+
+func (p *Provider) reconcileTimedOutCreate(ctx context.Context, request provider.CreateRequest, ownedStaging staging.OwnedDirectory) (provider.Instance, error) {
+	outcomeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), providerReadbackTimeout)
+	defer cancel()
+	items, err := p.inventoryVerified(outcomeCtx)
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	for _, item := range items {
+		if item.Instance.Name != request.Name {
+			continue
+		}
+		return p.receiptedInstance(item, request, ownedStaging)
+	}
+	return provider.Instance{}, fmt.Errorf("exact inventory did not contain the requested sandbox")
+}
+
+func (p *Provider) receiptedInstance(item provider.InventoryItem, request provider.CreateRequest, ownedStaging staging.OwnedDirectory) (provider.Instance, error) {
+	if item.Instance.ProviderID == "" {
+		return provider.Instance{}, fmt.Errorf("docker sandbox inventory omitted the stable provider id")
+	}
+	if item.Source != "shell" || !containsExactWorkspace(item.Workspaces, request.StagingPath) {
+		return provider.Instance{}, fmt.Errorf("docker sandbox inventory did not bind the exact shell workspace")
+	}
+	receipt, err := json.Marshal(instanceReceipt{
+		SchemaVersion:   1,
+		StagingPath:     ownedStaging.Path,
+		StagingIdentity: ownedStaging.Identity,
+		Template:        request.Template,
+		TemplateDigest:  request.TemplateDigest,
+	})
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	instance := item.Instance
+	instance.ReceiptVersion = "v1"
+	instance.Receipt = receipt
+	return instance, nil
 }
 
 func withSandboxContainerFailureRemediation(err error) error {
@@ -767,32 +900,63 @@ func (p *Provider) ResolveTemplateCacheID(ctx context.Context, reference string)
 // VerifyInstanceAdmission after that exact sandbox has been created.
 func (p *Provider) VerifyAdmission(ctx context.Context) error {
 	_, err := p.VerifyHostReadiness(ctx)
-	return err
+	return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes host admission", err)
 }
 
 func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provider.Instance) error {
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil {
-		return err
+		return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes instance admission", err)
 	}
 	if !present {
 		return fmt.Errorf("docker sandbox is missing")
 	}
 	if err := p.verifyNoPublishedPorts(ctx, instance); err != nil {
-		return err
+		return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes instance admission", err)
 	}
 	if err := p.verifyInspection(ctx, instance, nil, ""); err != nil {
-		return err
+		return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes instance admission", err)
 	}
 	if p.architectureEmulation == nil {
 		return fmt.Errorf("Docker Sandboxes architecture emulation enabler is unavailable")
 	}
 	emulation, err := p.architectureEmulation.Enable(ctx, p, instance)
 	if err != nil {
-		return err
+		return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes instance admission", err)
 	}
 	p.logArchitectureCapability(instance.Name, emulation)
 	return nil
+}
+
+// classifyAdmissionTimeout marks only a provider-owned command deadline as a
+// recovery-authorizing admission incident. A live caller deadline is handled
+// by the caller's cancellation path and must never restart the shared daemon.
+func classifyAdmissionTimeout(ctx context.Context, operation string, err error) error {
+	if err == nil || ctx.Err() != nil || errors.Is(err, provider.ErrControlPlaneFailure) || errors.Is(err, provider.ErrControlPlaneAdmissionFailure) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return provider.NewControlPlaneAdmissionFailure(operation, err)
+	}
+	return err
+}
+
+// classifyCreateAdmissionFailure preserves the exact receipted instance that
+// Create returns alongside this error. Only a provider-owned child deadline
+// authorizes control-plane recovery. If the caller ended the create attempt,
+// retain the caller-owned uncertainty marker so a nested provider failure can
+// never be mistaken for daemon-restart authorization.
+func classifyCreateAdmissionFailure(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if callerErr := ctx.Err(); callerErr != nil {
+		if !errors.Is(err, callerErr) {
+			err = errors.Join(err, callerErr)
+		}
+		return provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", err)
+	}
+	return classifyAdmissionTimeout(ctx, "verify newly created Docker Sandboxes instance admission", err)
 }
 
 func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest, expectedCacheID string) error {
@@ -941,16 +1105,20 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 	if err := validateCommandRequest(request); err != nil {
 		return nil, err
 	}
-	releaseGate, err := p.controlPlaneGate.acquire(ctx)
-	if err != nil {
-		return nil, err
+	if !controlPlaneGateHeld(ctx) {
+		releaseGate, err := p.controlPlaneGate.acquire(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseGate()
 	}
-	defer releaseGate()
-	releaseHostLock, err := provider.AcquireControlPlaneCommandLock(ctx)
-	if err != nil {
-		return nil, err
+	if !provider.ControlPlaneLockHeld(ctx) {
+		releaseHostLock, err := provider.AcquireControlPlaneCommandLock(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseHostLock()
 	}
-	defer releaseHostLock()
 	// The caller's context bounds startup only. The returned keepalive owns the
 	// sandbox lifetime and must survive the provisioning-attempt context that the
 	// pool cancels as soon as Start returns.
@@ -1163,7 +1331,7 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 		return err
 	}
 	result, err := p.run(ctx, commandRequest{args: []string{"stop", instance.Name}, operation: "stop docker sandbox", timeout: providerCleanupTimeout})
-	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error()) {
+	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error(), instance.Name) {
 		return nil
 	}
 	return err
@@ -1198,7 +1366,7 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 		}
 	}
 	result, err := p.run(ctx, commandRequest{args: []string{"rm", "--force", instance.Name}, operation: "delete docker sandbox", timeout: providerCleanupTimeout})
-	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error()) {
+	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error(), instance.Name) {
 		err = nil
 	}
 	if err != nil {
@@ -1228,6 +1396,12 @@ func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryI
 	for attempt := 1; attempt <= 2; attempt++ {
 		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes", timeout: providerReadbackTimeout})
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				// A caller-owned deadline/cancellation is not evidence that the
+				// provider control plane is wedged. Preserve the original error so
+				// the recovery supervisor cannot mistake it for an incident.
+				return nil, err
+			}
 			return nil, provider.NewControlPlaneFailure("inventory Docker Sandboxes", err)
 		}
 		items, parseErr := parseInventory([]byte(result.Stdout))
@@ -1674,9 +1848,23 @@ func truncate(value string, limit int) string {
 	return value[:limit]
 }
 
-func isMissingSandbox(text string) bool {
-	text = strings.ToLower(text)
-	return strings.Contains(text, "sandbox not found") || strings.Contains(text, "no such sandbox") || strings.Contains(text, "status 404")
+func isMissingSandbox(text, name string) bool {
+	lowerText := strings.ToLower(text)
+	legacy := strings.Contains(lowerText, "sandbox not found") || strings.Contains(lowerText, "no such sandbox") || strings.Contains(lowerText, "status 404")
+	if legacy {
+		return true
+	}
+	// sbx v0.42 standardizes this as a complete quoted diagnostic line. Keep
+	// the target name case-sensitive and reject arbitrary prefixes/suffixes so
+	// an unrelated resource error cannot make Stop/Delete appear successful.
+	diagnostic := "sandbox '" + name + "' not found"
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == diagnostic || line == "Error: "+diagnostic || line == "error: "+diagnostic {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeStrictJSON(data []byte, destination any) error {
@@ -1699,6 +1887,7 @@ func decodeStrictJSON(data []byte, destination any) error {
 
 var _ provider.Lifecycle = (*Provider)(nil)
 var _ provider.ControlPlaneRecoverer = (*Provider)(nil)
+var _ provider.ControlPlaneRecoveryCoordinator = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)

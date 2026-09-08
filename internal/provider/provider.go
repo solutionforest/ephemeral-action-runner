@@ -17,6 +17,7 @@ var (
 	ErrTemplateNotFound             = errors.New("imported provider template not found")
 	ErrControlPlaneFailure          = errors.New("provider control plane failure")
 	ErrControlPlaneAdmissionFailure = errors.New("provider control plane admission failure")
+	ErrCreateOutcomeUncertain       = errors.New("provider create outcome is uncertain")
 	ErrControlPlaneRecoveryFailure  = errors.New("provider control plane recovery failed")
 )
 
@@ -55,6 +56,7 @@ func NewControlPlaneFailure(operation string, cause error) error {
 type ControlPlaneAdmissionFailure struct {
 	Operation string
 	cause     error
+	uncertain bool
 }
 
 func (failure *ControlPlaneAdmissionFailure) Error() string {
@@ -70,13 +72,68 @@ func (failure *ControlPlaneAdmissionFailure) Error() string {
 func (failure *ControlPlaneAdmissionFailure) Unwrap() error { return failure.cause }
 
 func (failure *ControlPlaneAdmissionFailure) Is(target error) bool {
-	return target == ErrControlPlaneAdmissionFailure
+	return target == ErrControlPlaneAdmissionFailure || (target == ErrCreateOutcomeUncertain && failure.uncertain)
 }
 
 // NewControlPlaneAdmissionFailure constructs a typed provider admission
 // failure without changing the existing user-facing diagnostic.
 func NewControlPlaneAdmissionFailure(operation string, cause error) error {
 	return &ControlPlaneAdmissionFailure{Operation: operation, cause: cause}
+}
+
+// NewUncertainCreateAdmissionFailure marks an admission failure whose side
+// effect may have completed after the provider stopped waiting. Callers must
+// retain capacity and must not infer absence from an empty inventory.
+func NewUncertainCreateAdmissionFailure(operation string, cause error) error {
+	return &ControlPlaneAdmissionFailure{Operation: operation, cause: cause, uncertain: true}
+}
+
+// UncertainCreateFailure marks a provider create whose side effect may have
+// completed, but whose failure must not authorize a control-plane recovery.
+// This is used when the caller cancels while the provider is performing its
+// bounded post-timeout identity readback.
+type UncertainCreateFailure struct {
+	Operation   string
+	cause       error
+	callerOwned bool
+}
+
+func (failure *UncertainCreateFailure) Error() string {
+	if failure.cause != nil {
+		return failure.cause.Error()
+	}
+	if operation := strings.TrimSpace(failure.Operation); operation != "" {
+		return operation + ": " + ErrCreateOutcomeUncertain.Error()
+	}
+	return ErrCreateOutcomeUncertain.Error()
+}
+
+func (failure *UncertainCreateFailure) Unwrap() error { return failure.cause }
+
+func (failure *UncertainCreateFailure) Is(target error) bool {
+	return target == ErrCreateOutcomeUncertain
+}
+
+// CallerOwned reports that the uncertainty was caused by the caller ending
+// its operation context. Such an error must never authorize recovery of a
+// shared provider control plane, even when its bounded readback also observed
+// a provider command deadline.
+func (failure *UncertainCreateFailure) CallerOwned() bool {
+	return failure != nil && failure.callerOwned
+}
+
+// NewUncertainCreateFailure constructs an uncertainty fence without marking
+// the error as a recoverable provider control-plane failure.
+func NewUncertainCreateFailure(operation string, cause error) error {
+	return &UncertainCreateFailure{Operation: operation, cause: cause}
+}
+
+// NewCallerOwnedUncertainCreateFailure constructs an uncertainty fence for a
+// create that may have completed after the caller canceled. It deliberately
+// carries a marker so a later supervisor cannot confuse a nested provider
+// timeout with authorization to restart the shared control plane.
+func NewCallerOwnedUncertainCreateFailure(operation string, cause error) error {
+	return &UncertainCreateFailure{Operation: operation, cause: cause, callerOwned: true}
 }
 
 // ControlPlaneRecoveryFailure marks a failed provider recovery command without
@@ -216,6 +273,16 @@ type ControlPlaneRecoveryRequest struct {
 // fail closed when the stopped state cannot be established authoritatively.
 type ControlPlaneRecoverer interface {
 	RecoverControlPlane(ctx context.Context, request ControlPlaneRecoveryRequest) error
+}
+
+// ControlPlaneRecoveryCoordinator is an optional provider capability that
+// holds one provider-specific host-wide exclusion lease while shared recovery
+// orchestration captures authoritative inventory, publishes its durable
+// reservation, performs intervention, and verifies stable inventory. The
+// callback must run synchronously and must use the supplied context for every
+// provider operation covered by the lease.
+type ControlPlaneRecoveryCoordinator interface {
+	CoordinateControlPlaneRecovery(ctx context.Context, operation func(context.Context) error) error
 }
 
 // ArtifactManager is an optional provider capability for runtimes whose
