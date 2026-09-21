@@ -68,7 +68,7 @@ dockerSandboxes:
     - telemetry.example.invalid
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
-  memory: 8GiB
+  memory: 4GiB
   # EPAR derives this sparse logical maximum from the selected image and stores the effective size in the active artifact receipt.
   rootDisk: auto
   # Independent sparse workload capacity for Docker inside the sandbox.

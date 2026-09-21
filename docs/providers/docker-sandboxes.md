@@ -78,7 +78,7 @@ dockerSandboxes:
   recoveryQuiescenceSeconds: 60
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
-  memory: 8GiB
+  memory: 4GiB
   rootDisk: auto
   dockerDisk: 50GiB
   maxConcurrentCreates: 2

@@ -185,7 +185,7 @@ If the complete subsection is absent, EPAR warns and uses the strict recommended
 | `additionalDeny` | unique hostname or `*.domain`, optional port; empty | Docker Sandboxes. | Adds sandbox-scoped deny resources. A resource cannot be in both allow and deny lists. |
 | `stagingRoot` | canonical project-relative `.local/...` path; `.local/cache/docker-sandboxes/staging` | Docker Sandboxes. | Per-create disposable staging root; cannot be absolute, escape `.local`, or overlap `.local/bin` or `.local/state`. |
 | `cpus` | positive integer; `4` | Docker Sandboxes. | CPU allocation for each sandbox. |
-| `memory` | positive byte size; `8GiB` | Docker Sandboxes. | Per-sandbox memory allocation written by the wizard. |
+| `memory` | positive byte size; `4GiB` | Docker Sandboxes. | Per-sandbox memory allocation written by the wizard. |
 | `rootDisk` | `auto` or byte size at least `20GiB`; `auto` | Docker Sandboxes. | Sparse guest-root logical maximum. `auto` is recalculated for each artifact as the expanded image estimate plus 5 GiB build allowance and 20 GiB writable headroom, rounded up to 10 GiB. An explicit undersized value is rejected before creation. |
 | `dockerDisk` | byte size at least `1GiB`; `50GiB` | Docker Sandboxes. | Independent sparse logical maximum for the Docker daemon inside the sandbox; it is workload capacity and is not derived from the base image. |
 | `maxConcurrentCreates` | positive integer; `2` | Docker Sandboxes. | Limits concurrent sandbox creation to control capacity pressure. |

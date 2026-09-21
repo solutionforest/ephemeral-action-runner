@@ -320,7 +320,7 @@ func Default() Config {
 			RecoveryQuiescenceSeconds: DockerSandboxesDefaultRecoveryQuiescenceSeconds,
 			StagingRoot:               ".local/cache/docker-sandboxes/staging",
 			CPUs:                      4,
-			Memory:                    "8GiB",
+			Memory:                    "4GiB",
 			RootDisk:                  DockerSandboxesAutomaticRootDisk,
 			DockerDisk:                DockerSandboxesDefaultDockerDisk,
 			MaxConcurrentCreates:      2,

@@ -56,7 +56,7 @@ func TestLiveRunnerTemplateIsolation(t *testing.T) {
 		TemplateDigest: digest,
 		StagingPath:    path,
 		CPUs:           4,
-		Memory:         "8GiB",
+		Memory:         "4GiB",
 		RootDisk:       rootDisk,
 		DockerDisk:     dockerDisk,
 	})
