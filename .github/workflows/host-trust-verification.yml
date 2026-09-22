@@ -87,7 +87,8 @@ jobs:
           if [[ "${RUNNER_OS}" == "macOS" ]]; then
             export TMPDIR="$(cd "${RUNNER_TEMP}" && pwd -P)"
           fi
-          go test -count=25 -json ./internal/pool -run '^Test(Health|LeaseKeeper|LeaseMaintenance|ExpiredLease|ReplacementProvisioning)' | tee "${RUNNER_TEMP}/go-timing.jsonl"
+          timing_tests='^Test(Health|LeaseKeeper|LeaseMaintenance|ExpiredLease|Replacement(Provisioning|Cooldown)|RunPool(DoesNotReplace|ReplacesCompleted|FailsClosedWhenReplacement|AddsCurrentTrustCapacity|VerifiesHostTrustTransport|UsesConfiguredInstances)|CleanupFailureRemains|ShutdownCancellationPreserves|LegacyOverCapacity)'
+          go test -count=25 -json ./internal/pool -run "${timing_tests}" | tee "${RUNNER_TEMP}/go-timing.jsonl"
 
       - name: Preserve native test evidence
         if: always()
