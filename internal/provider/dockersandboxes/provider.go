@@ -1602,7 +1602,7 @@ func (p *Provider) run(ctx context.Context, request commandRequest) (provider.Ex
 		result.Stdout = truncate(result.Stdout, request.outputLimit)
 		result.Stderr = truncate(result.Stderr, request.outputLimit)
 	}
-	if ctxErr := operationCtx.Err(); ctxErr != nil {
+	if ctxErr := operationCtx.Err(); ctxErr != nil && !errors.Is(runErr, ctxErr) {
 		runErr = errors.Join(ctxErr, runErr)
 	}
 	result, finishErr := provider.FinishSensitiveExecution(result, runErr, flush(), request.sensitiveValues)

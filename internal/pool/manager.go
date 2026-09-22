@@ -535,6 +535,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	var currentHostTrust hosttrust.Snapshot
 	hostTrustBusyHandoff := make(map[string]bool)
 	confirmedInactiveChecks := make(map[string]int)
+	health := healthScheduler{}
 	imageMaintenanceIdleChecks := make(map[string]int)
 	retry := replacementRetryState{}
 	imageMaintenancePending := false
@@ -705,22 +706,30 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					// provider instance cannot starve every runner's lease cadence.
 					livenessCtx, cancelLiveness = context.WithTimeout(ctx, hostTrustRefreshInterval/2)
 				}
-				for name, vm := range active {
-					if !shouldProbeRunnerLiveness(vm) {
-						// Report-only provider resources are retained in active so
-						// they continue to fence capacity, but they have no
-						// lifecycle identity that runner health probing can safely
-						// use. Reconciliation remains responsible for reporting
-						// them; never turn them into liveness failures.
-						delete(confirmedInactiveChecks, name)
-						continue
+				health.sync(active, m.providerRecoveryStateGeneration(), m.currentTime(), confirmedInactiveChecks, currentHostTrust.Generation)
+				failedHealth := make(map[string]bool)
+				// Each visit advances one phase. A bounded number of visits also
+				// prevents fast failures from spinning within a supervisor tick.
+				for visits := 0; visits < 1+3*len(active) && livenessCtx.Err() == nil; visits++ {
+					previousCursor := health.cursor
+					name, progress := health.next(failedHealth)
+					if progress == nil {
+						break
 					}
-					alive, reason, err := m.runnerAlive(livenessCtx, vm)
+					vm := active[name]
+					if !health.fits(livenessCtx, progress, m.currentTime()) {
+						health.cursor = previousCursor
+						m.logger().Debug(fmt.Sprintf("runner health phase deferred to next tick: instance=%s providerID=%s runnerID=%d stage=%s", name, vm.ProviderID, vm.RunnerID, health.phase(progress)))
+						break
+					}
+					done, alive, reason, stage, err := m.visitRunnerHealth(livenessCtx, &health, progress, vm)
 					if err != nil {
 						if ctx.Err() != nil {
 							cancelLiveness()
 							return cleanup()
 						}
+						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
+						m.reportUnknownHealth(ctx, livenessCtx, &health, vm, stage, err)
 						handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
 						if handled {
 							if recoveryErr != nil {
@@ -733,13 +742,26 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							// A recovery attempt changes the provider-wide control
 							// plane. Stop this sweep so another unhealthy runner
 							// cannot trigger a second restart in the same tick.
+							health.globalAt = time.Time{}
+							clear(health.progress)
+							clear(confirmedInactiveChecks)
 							break
 						}
-						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
-						m.warnf("[%s] runner health is temporarily unknown; keeping the runner and retrying: %v\n", name, err)
+						// A shared admission failure blocks this sweep. An individual
+						// failure must not prevent healthy peers from making progress.
+						if stage == "global-admission" {
+							break
+						}
+						failedHealth[name] = true
 						continue
 					}
+					if !done {
+						continue
+					}
+					progress.done = true
+					m.reportRecoveredHealth(&health, vm)
 					if alive {
+						health.lastSuccess[runnerHealthIdentity(vm)] = m.currentTime()
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, nil)
 						continue
 					}
@@ -748,16 +770,59 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						m.warnf("[%s] runner process is confirmed inactive (%d/%d); EPAR will verify once more before cleanup\n", name, confirmedCount, runnerConfirmedInactiveCheckLimit)
 						continue
 					}
+					if livenessCtx.Err() != nil {
+						break
+					}
+					// A current verdict may authorize synchronous exact cleanup,
+					// but cleanup must not inherit an almost exhausted probe budget.
 					if reason == runnerProcessInactiveReason {
-						m.captureRunnerReadinessDiagnostics(livenessCtx, name, vm.GuestLogPath)
+						if deadline, ok := livenessCtx.Deadline(); !ok || time.Until(deadline) > 3*time.Second {
+							diagnosticCtx, cancelDiagnostic := context.WithTimeout(livenessCtx, 2*time.Second)
+							m.captureRunnerReadinessDiagnostics(diagnosticCtx, name, vm.GuestLogPath)
+							cancelDiagnostic()
+							if livenessCtx.Err() != nil {
+								break
+							}
+							if m.GitHub != nil {
+								runner, found, lookupErr := m.GitHub.RunnerByName(livenessCtx, name)
+								if lookupErr == nil && found && vm.RunnerID != 0 && runner.ID != vm.RunnerID {
+									lookupErr = fmt.Errorf("GitHub runner identity changed for %s", name)
+								}
+								if lookupErr != nil || livenessCtx.Err() != nil {
+									if lookupErr == nil {
+										lookupErr = livenessCtx.Err()
+									}
+									delete(confirmedInactiveChecks, name)
+									m.reportUnknownHealth(ctx, livenessCtx, &health, vm, "pre-retirement-github", lookupErr)
+									break
+								}
+								if found && runner.Busy {
+									delete(confirmedInactiveChecks, name)
+									continue
+								}
+							}
+						}
 					}
+					if !health.evidenceFresh(progress, m.currentTime()) || livenessCtx.Err() != nil {
+						m.logger().Debug(fmt.Sprintf("runner retirement deferred: instance=%s providerID=%s runnerID=%d admission evidence expired or sweep ended", name, vm.ProviderID, vm.RunnerID))
+						break
+					}
+					cancelLiveness()
+					retireCtx, cancelRetire := m.steadyStateMaintenanceContext(ctx)
 					m.infof("[%s] runner is finished or unhealthy: %s\n", name, reason)
-					if err := m.retireInstance(livenessCtx, vm, reason); err != nil {
-						m.warnf("[%s] retirement warning: %v\n", name, err)
-						continue
+					if err := retireCtx.Err(); err != nil {
+						cancelRetire()
+						break
 					}
+					if err := m.retireInstance(retireCtx, vm, reason); err != nil {
+						cancelRetire()
+						m.warnf("[%s] retirement warning: %v\n", name, err)
+						break
+					}
+					cancelRetire()
 					delete(active, name)
 					delete(confirmedInactiveChecks, name)
+					break
 				}
 				cancelLiveness()
 			}
@@ -2490,12 +2555,19 @@ func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
 func (m *Manager) probeRunnerProcess(ctx context.Context, name string) (bool, error) {
 	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	script := fmt.Sprintf("if test -x /opt/epar/check-runner.sh; then if sudo bash /opt/epar/check-runner.sh; then printf '%%s\\n' %s; else printf '%%s\\n' %s; fi; elif systemctl is-active --quiet actions-runner.service; then printf '%%s\\n' %s; else printf '%%s\\n' %s; fi", shellQuote(runnerProcessRunningSentinel), shellQuote(runnerProcessStoppedSentinel), shellQuote(runnerProcessRunningSentinel), shellQuote(runnerProcessStoppedSentinel))
-	result, err := m.execGuest(checkCtx, name, provider.ShellCommand(script), provider.ExecOptions{SuppressTranscript: true})
+	result, err := m.execGuest(checkCtx, name, provider.ShellCommand(runnerProcessHealthScript()), provider.ExecOptions{SuppressTranscript: true})
 	if err != nil {
 		return false, fmt.Errorf("execute runner process health probe: %w", err)
 	}
-	switch strings.TrimSpace(result.Stdout) {
+	return parseRunnerProcessHealth(result.Stdout)
+}
+
+func runnerProcessHealthScript() string {
+	return fmt.Sprintf("if test -x /opt/epar/check-runner.sh; then if sudo bash /opt/epar/check-runner.sh; then printf '%%s\\n' %s; else printf '%%s\\n' %s; fi; elif systemctl is-active --quiet actions-runner.service; then printf '%%s\\n' %s; else printf '%%s\\n' %s; fi", shellQuote(runnerProcessRunningSentinel), shellQuote(runnerProcessStoppedSentinel), shellQuote(runnerProcessRunningSentinel), shellQuote(runnerProcessStoppedSentinel))
+}
+
+func parseRunnerProcessHealth(stdout string) (bool, error) {
+	switch strings.TrimSpace(stdout) {
 	case runnerProcessRunningSentinel:
 		return true, nil
 	case runnerProcessStoppedSentinel:

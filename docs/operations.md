@@ -41,6 +41,8 @@ At startup and before a replacement, EPAR compares provider inventory with exact
 
 For transient GitHub or network failures during replacement, including `429` and `5xx` responses, EPAR pauses allocation and retries with configured exponential backoff while monitoring and cleanup continue. Authentication failures and invalid configuration remain fail-fast. See [Configuration](configuration.md) to adjust the retry settings.
 
+Runner health monitoring preserves uncertain capacity and uses bounded, fair progress so one slow check cannot consume every runner's monitoring opportunity or indefinitely postpone host-trust maintenance. Repeated unknown-health warnings are summarized, with a recovery message when health is verified again. This limits console and manager-log noise without changing exact cleanup, inactive-process confirmation, or provider recovery authorization. See [Health warnings](troubleshooting.md#an-idle-runner-reports-github-or-sandbox-health-warnings).
+
 ## Inspect status and logs
 
 ```bash

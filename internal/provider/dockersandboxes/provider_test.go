@@ -2040,6 +2040,65 @@ func TestRunHonorsOperationTimeout(t *testing.T) {
 	}
 }
 
+func TestRunContextErrorPreservesDistinctErrorsWithoutDuplicates(t *testing.T) {
+	for _, contextKind := range []string{"deadline", "canceled"} {
+		for _, errorKind := range []string{"direct", "wrapped", "joined", "distinct", "nil"} {
+			t.Run(contextKind+"/"+errorKind, func(t *testing.T) {
+				const secret = "sentinel-context-secret"
+				distinctErr := errors.New("command failed: " + secret)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				wantContextErr := context.Canceled
+				var timeout time.Duration
+				if contextKind == "deadline" {
+					wantContextErr = context.DeadlineExceeded
+					timeout = 10 * time.Millisecond
+				}
+				p := New("sbx-test-double")
+				p.runCommand = func(operationCtx context.Context, _ commandRequest) (provider.ExecResult, error) {
+					if contextKind == "canceled" {
+						cancel()
+					}
+					<-operationCtx.Done()
+					var runErr error
+					switch errorKind {
+					case "direct":
+						runErr = operationCtx.Err()
+					case "wrapped":
+						runErr = fmt.Errorf("command %s: %w", secret, operationCtx.Err())
+					case "joined":
+						runErr = errors.Join(operationCtx.Err(), distinctErr)
+					case "distinct":
+						runErr = distinctErr
+					}
+					return provider.ExecResult{Stdout: secret}, runErr
+				}
+				result, err := p.run(ctx, commandRequest{
+					args:            []string{"ls", "--json"},
+					operation:       "context test command",
+					timeout:         timeout,
+					sensitiveValues: []string{secret},
+				})
+				if !errors.Is(err, wantContextErr) {
+					t.Fatalf("run() error = %v, want %v", err, wantContextErr)
+				}
+				if count := strings.Count(err.Error(), wantContextErr.Error()); count != 1 {
+					t.Fatalf("context error appears %d times in %q, want once", count, err)
+				}
+				if errorKind == "distinct" || errorKind == "joined" {
+					if !errors.Is(err, distinctErr) || !strings.Contains(err.Error(), "command failed:") {
+						t.Fatalf("distinct command error lost: %v", err)
+					}
+				}
+				combined := result.Stdout + err.Error()
+				if strings.Contains(combined, secret) || !strings.Contains(combined, "[REDACTED]") {
+					t.Fatalf("sensitive output was not redacted: %q", combined)
+				}
+			})
+		}
+	}
+}
+
 func TestLifecycleCommandsUseExactIdentityAndArgv(t *testing.T) {
 	t.Run("start", func(t *testing.T) {
 		p, done := identityScript(t, commandStep{args: []string{"exec", "-i", testName, "--", "/bin/sleep", "infinity"}})

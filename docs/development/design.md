@@ -36,6 +36,8 @@ For every provider, the common controller:
 
 Unknown ownership, unavailable dependencies, failed cleanup, and uncertain remote state consume capacity and block new allocation. EPAR does not silently fall back to another provider or broaden cleanup to a wildcard, prune, or reset. A provider may opt into restart recovery for prefix-matching orphan inventory only when it can reconstruct immutable exact cleanup evidence from provider identity, configured workspace, and provider-specific ownership checks; a prefix alone never authorizes deletion.
 
+Steady-state health monitoring must make fair, bounded progress without starving host-trust maintenance. Successful partial health evidence is bounded in lifetime and tied to immutable instance identity; it is not an authorization to skip admission during provisioning or registration. An exhausted controller monitoring budget defers work rather than proving provider failure or authorizing daemon recovery. Repeated unknown-health reports are bounded and include recovery reporting; uncertainty continues to preserve physical capacity and resets consecutive inactive-process evidence.
+
 ## Storage Lifecycle
 
 Each provider reports the storage surfaces and temporary expansion required by bootstrap, artifact builds, instance creation, and replacement. The common preflight requires enough space for the operation plus the configured free-space reserve.
