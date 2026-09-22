@@ -34,7 +34,7 @@ For every provider, the common controller:
 5. Tracks the exact provider and GitHub identities in durable state.
 6. Removes the completed instance, verifies absence, and creates a replacement without exceeding `pool.instances`.
 
-Unknown ownership, unavailable dependencies, failed cleanup, and uncertain remote state consume capacity and block new allocation. EPAR does not silently fall back to another provider or broaden cleanup from an exact identity to a prefix, wildcard, prune, or reset.
+Unknown ownership, unavailable dependencies, failed cleanup, and uncertain remote state consume capacity and block new allocation. EPAR does not silently fall back to another provider or broaden cleanup to a wildcard, prune, or reset. A provider may opt into restart recovery for prefix-matching orphan inventory only when it can reconstruct immutable exact cleanup evidence from provider identity, configured workspace, and provider-specific ownership checks; a prefix alone never authorizes deletion.
 
 ## Storage Lifecycle
 
@@ -48,4 +48,4 @@ See [Adding a Provider](adding-provider.md) for the extension checklist.
 
 New runtime-generated paths must follow the classification in [Generated files and recovery](../generated-files.md). Large reproducible downloads, archives, contexts, and compiler caches belong under `.local/cache`; compact receipts, update policy, supervision, and pool lifecycle records belong under `.local/state`; compact builder, bootstrap, trust, and exact ownership metadata belongs under `.local/storage`; operational output belongs under `work/logs`; provider-specific resumable work belongs under an explicitly documented `work/` subdirectory. Do not add large binary content to state or place logs directly under `.local`.
 
-Every generated resource outside the checkout must have a provider readback identity and, when EPAR owns or introduced it, an exact per-user catalog record. A human-readable `epar-` prefix is useful for diagnostics but never sufficient cleanup authority. Recovery from missing cache/state must reacquire or rebuild without silently changing the configured source/provider; reset and cleanup must remain exact, previewed, lease-aware, and shared-reference-aware.
+Every generated resource outside the checkout must have a provider readback identity and, when EPAR owns or introduced it, an exact per-user catalog record. A human-readable `epar-` prefix is an ownership boundary for a configured pool, but never sufficient cleanup authority by itself; restart recovery must also prove the exact provider identity, workspace, and provider receipt before deletion. Recovery from missing cache/state must reacquire or rebuild without silently changing the configured source/provider; reset and cleanup must remain exact, previewed, lease-aware, and shared-reference-aware.

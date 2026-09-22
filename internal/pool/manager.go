@@ -164,6 +164,42 @@ const (
 	runnerReadinessProbeFailureLimit  = 3
 )
 
+// resumePendingLifecycleCleanup retries only records that had already crossed
+// the cleanup boundary before a previous controller stopped. Active and
+// quarantined records remain protected for normal pool reconciliation; a
+// cleanup-pending record is safe to resume because its durable cleanup intent
+// and exact provider receipt already fence the instance.
+func (m *Manager) resumePendingLifecycleCleanup(ctx context.Context) error {
+	if m.LifecycleState == nil {
+		return nil
+	}
+	records, err := m.LifecycleState.List(ctx)
+	if err != nil {
+		return fmt.Errorf("read pending lifecycle cleanup records: %w", err)
+	}
+	pending := make([]poolstate.Record, 0)
+	for _, record := range records {
+		if record.ProviderType == m.Config.Provider.Type && HasPrefix(record.Name, m.Config.Pool.NamePrefix) && record.Phase == poolstate.PhaseCleanupPending {
+			pending = append(pending, record)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	inventory, err := m.inventoryProvider(ctx)
+	if err != nil {
+		return fmt.Errorf("read provider inventory for pending lifecycle cleanup: %w", err)
+	}
+	byName := inventoryByName(inventory)
+	var firstErr error
+	for _, record := range pending {
+		if err := m.cleanupLifecycleRecord(ctx, record, byName[record.Name]); err != nil {
+			firstErr = errors.Join(firstErr, fmt.Errorf("resume cleanup %s: %w", record.Name, err))
+		}
+	}
+	return firstErr
+}
+
 func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 	if opts.RegisterOnly {
 		if err := m.PreflightRunnerGroup(ctx); err != nil {
@@ -283,6 +319,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
 		return err
+	}
+	if err := m.resumePendingLifecycleCleanup(ctx); err != nil {
+		m.warnf("startup cleanup of pending lifecycle records is incomplete; preserving the exact capacity fence: %v\n", err)
 	}
 	if !opts.HostTrustLockHeld {
 		controllerLock, err := m.AcquireHostTrustControllerLock()
@@ -1305,6 +1344,34 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			}
 		}
 		if !owned {
+			if m.LifecycleState != nil {
+				cleaned, cleanupErr := m.cleanupPrefixOrphanInventory(ctx, item)
+				if cleanupErr != nil {
+					discoveries, discoveryErr := m.LifecycleState.Discoveries(ctx)
+					if discoveryErr != nil {
+						return known, fmt.Errorf("read prefix-owned cleanup discovery %s: %w", local.Name, errors.Join(cleanupErr, discoveryErr))
+					}
+					retained := false
+					for _, discovery := range discoveries {
+						if discovery.ProviderType == m.Config.Provider.Type && discovery.ProviderID == local.ProviderID {
+							retained = true
+							break
+						}
+					}
+					if !retained {
+						if reportErr := m.reportUnknownLifecycle(ctx, local.Name, local.ProviderID, item.Source, item.State); reportErr != nil {
+							return known, fmt.Errorf("quarantine failed prefix-owned cleanup candidate %s: %w", local.Name, errors.Join(cleanupErr, reportErr))
+						}
+					}
+					vm.Phase = LifecycleQuarantined
+					reconciled[local.Name] = vm
+					m.warnf("[%s] prefix-owned orphan cleanup pending: %v\n", local.Name, cleanupErr)
+					continue
+				}
+				if cleaned {
+					continue
+				}
+			}
 			providerID := local.ProviderID
 			if providerID == "" {
 				providerID = "unidentified:" + local.Name

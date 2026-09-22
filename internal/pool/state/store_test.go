@@ -183,6 +183,31 @@ func TestProviderReceiptAndUnknownDiscoveryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestForgetUnknownRemovesOnlyExactProviderDiscovery(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, discovery := range []Discovery{
+		{ProviderType: "docker-sandboxes", ProviderID: "sandbox:gone", ExactName: "epar-test-gone", Receipt: receipt(t)},
+		{ProviderType: "docker-sandboxes", ProviderID: "sandbox:keep", ExactName: "epar-test-keep", Receipt: receipt(t)},
+	} {
+		if _, err := store.ReportUnknown(context.Background(), discovery); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.ForgetUnknown(context.Background(), "docker-sandboxes", "sandbox:gone"); err != nil {
+		t.Fatal(err)
+	}
+	discoveries, err := store.Discoveries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discoveries) != 1 || discoveries[0].ProviderID != "sandbox:keep" {
+		t.Fatalf("discoveries = %#v, want only the unrelated exact discovery", discoveries)
+	}
+}
+
 func jsonEqual(left, right json.RawMessage) bool {
 	var leftValue any
 	var rightValue any

@@ -47,6 +47,67 @@ func providerTestWorkspace() string {
 	return filepath.Join(string(filepath.Separator), "var", "lib", "epar", "staging", "job-1")
 }
 
+func TestPrepareOrphanCleanupReconstructsReceiptFromExactStagingEvidence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "staging")
+	stagingRoot, err := staging.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := stagingRoot.CreateOwned(testName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(owned.Path, "runtime-state"), []byte("sandbox"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := New("sbx")
+	item := provider.InventoryItem{
+		Instance: provider.Instance{Name: testName, ProviderID: testID, State: "running", Source: "shell"},
+		State:    "running",
+		Source:   "shell",
+		Workspaces: []string{
+			owned.Path,
+		},
+	}
+
+	instance, err := p.PrepareOrphanCleanup(context.Background(), item, owned.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Name != item.Instance.Name || instance.ProviderID != item.Instance.ProviderID || instance.ReceiptVersion != "v1" {
+		t.Fatalf("prepared instance = %#v, want exact identity and v1 receipt", instance)
+	}
+	var receipt instanceReceipt
+	if err := json.Unmarshal(instance.Receipt, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.StagingPath != owned.Path || receipt.StagingIdentity != owned.Identity {
+		t.Fatalf("receipt = %#v, want exact observed staging evidence", receipt)
+	}
+}
+
+func TestPrepareOrphanCleanupRejectsWorkspaceMismatch(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "staging")
+	stagingRoot, err := staging.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := stagingRoot.CreateOwned(testName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New("sbx")
+	item := provider.InventoryItem{
+		Instance:   provider.Instance{Name: testName, ProviderID: testID, State: "running", Source: "shell"},
+		State:      "running",
+		Source:     "shell",
+		Workspaces: []string{owned.Path},
+	}
+	if _, err := p.PrepareOrphanCleanup(context.Background(), item, filepath.Join(root, "other")); err == nil {
+		t.Fatal("workspace mismatch was accepted for orphan cleanup")
+	}
+}
+
 func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
 	p := NewWithDryRun("sbx", true)
 	called := false

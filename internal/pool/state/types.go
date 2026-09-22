@@ -130,7 +130,9 @@ type Transition struct {
 	Reason     string
 }
 
-// Discovery stores an unowned provider resource. It is never a cleanup target.
+// Discovery stores provider inventory that was not matched to a live
+// lifecycle record. It remains a safety fence until a provider-specific
+// prefix-ownership proof permits exact cleanup and absence readback.
 type Discovery struct {
 	ProviderType string    `json:"providerType"`
 	ProviderID   string    `json:"providerId"`

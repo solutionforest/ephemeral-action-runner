@@ -207,7 +207,7 @@ Docker Sandboxes templates always bundle the pinned `tonistiigi/binfmt` installe
 - Docker Sandboxes requires `runner.ephemeral: true`, `security.runnerGroup.enforcement: enforce`, the exact Catthehacker `full-latest` or `act-latest` profile, policy generation, resource values, and a lowercase-compatible pool prefix.
 - `image.sourcePlatform` requires `image.sourceType: docker-image`; all byte-size fields require a positive `B`, `KiB`, `MiB`, `GiB`, or `TiB` value.
 - Host-trust overlay requires a non-empty, duplicate-free scope list and `runner.ephemeral: true`; `user` is not supported on Linux.
-- `pool.namePrefix` is a host-wide controller and ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses its durable ledger of exact owned identities. EPAR rejects concurrent reuse across configs, projects, and providers; do not assume broad prefix cleanup is safe.
+- `pool.namePrefix` is a host-wide controller and ownership boundary. Tart, WSL, and Docker Container use the configured prefix to select legacy owned resources; Docker Sandboxes uses the prefix together with exact inventory, staging-workspace, and receipt evidence to recover orphaned sandboxes, while durable lifecycle records remain authoritative for active or interrupted work. EPAR rejects concurrent reuse across configs, projects, and providers; do not assume broad prefix cleanup is safe.
 - `runner.labels` must never be empty, even when `runner.noDefaultLabels` is false.
 
 ## Provider defaults

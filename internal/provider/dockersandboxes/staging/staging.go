@@ -24,6 +24,17 @@ type OwnedDirectory struct {
 }
 
 func Open(root string) (*Staging, error) {
+	return open(root, true)
+}
+
+// OpenExisting opens an already-created staging root without creating or
+// changing it. Cleanup and recovery use this form so an inventory item cannot
+// cause EPAR to materialize a new host path merely while proving ownership.
+func OpenExisting(root string) (*Staging, error) {
+	return open(root, false)
+}
+
+func open(root string, create bool) (*Staging, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.New("Docker Sandboxes staging root is required")
 	}
@@ -40,8 +51,13 @@ func Open(root string) (*Staging, error) {
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return nil, fmt.Errorf("inspect Docker Sandboxes staging root: %w", statErr)
 	}
-	if err := createPathWithoutRedirect(absRoot); err != nil {
-		return nil, fmt.Errorf("create Docker Sandboxes staging root: %w", err)
+	if statErr != nil && !create {
+		return nil, fmt.Errorf("Docker Sandboxes staging root does not exist: %w", statErr)
+	}
+	if create {
+		if err := createPathWithoutRedirect(absRoot); err != nil {
+			return nil, fmt.Errorf("create Docker Sandboxes staging root: %w", err)
+		}
 	}
 	if !rootExisted {
 		if err := restrictPlatformPermissions(absRoot); err != nil {
@@ -114,6 +130,27 @@ func (s *Staging) VerifyOwnedEmpty(name, identity string) (string, error) {
 
 func (s *Staging) VerifyOwned(name, identity string) (string, error) {
 	return s.verifyOwned(name, identity, false)
+}
+
+// ObserveOwned returns the exact direct-child path and current filesystem
+// identity for an existing staging directory. It does not require the
+// directory to be empty because a stale sandbox may have populated it.
+func (s *Staging) ObserveOwned(name string) (OwnedDirectory, error) {
+	if err := validateName(name); err != nil {
+		return OwnedDirectory{}, err
+	}
+	path, err := s.exactPath(name)
+	if err != nil {
+		return OwnedDirectory{}, err
+	}
+	if err := validateDirectory(path, false); err != nil {
+		return OwnedDirectory{}, err
+	}
+	identity, err := platformDirectoryIdentity(path)
+	if err != nil {
+		return OwnedDirectory{}, fmt.Errorf("read Docker Sandboxes staging directory identity %q: %w", path, err)
+	}
+	return OwnedDirectory{Path: path, Identity: identity}, nil
 }
 
 func (s *Staging) verifyOwned(name, identity string, requireEmpty bool) (string, error) {

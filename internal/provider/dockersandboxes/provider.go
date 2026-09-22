@@ -1395,6 +1395,54 @@ func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, err
 	return p.inventoryVerified(ctx)
 }
 
+// PrepareOrphanCleanup reconstructs the minimum immutable receipt needed to
+// remove a sandbox that is visible in provider inventory but has no durable
+// EPAR lifecycle record. The shared pool supplies the workspace path derived
+// from the active configuration; this provider additionally requires the
+// shell agent and the exact direct staging directory identity before allowing
+// the caller to proceed.
+func (p *Provider) PrepareOrphanCleanup(ctx context.Context, item provider.InventoryItem, expectedWorkspace string) (provider.Instance, error) {
+	if err := ctx.Err(); err != nil {
+		return provider.Instance{}, err
+	}
+	if item.Instance.Name == "" || item.Instance.ProviderID == "" {
+		return provider.Instance{}, fmt.Errorf("Docker Sandbox orphan cleanup requires an exact name and stable provider id")
+	}
+	source := item.Source
+	if source == "" {
+		source = item.Instance.Source
+	}
+	if source != "shell" {
+		return provider.Instance{}, fmt.Errorf("Docker Sandbox orphan cleanup requires the shell agent")
+	}
+	if strings.TrimSpace(expectedWorkspace) == "" || !containsExactWorkspace(item.Workspaces, expectedWorkspace) {
+		return provider.Instance{}, fmt.Errorf("Docker Sandbox inventory did not bind the configured staging workspace")
+	}
+	stagingRoot, err := staging.OpenExisting(filepath.Dir(expectedWorkspace))
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	if filepath.Clean(expectedWorkspace) != filepath.Join(stagingRoot.Root(), item.Instance.Name) {
+		return provider.Instance{}, fmt.Errorf("refusing Docker Sandbox orphan cleanup outside the exact configured staging path")
+	}
+	ownedStaging, err := stagingRoot.ObserveOwned(item.Instance.Name)
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	receipt, err := json.Marshal(instanceReceipt{
+		SchemaVersion:   1,
+		StagingPath:     ownedStaging.Path,
+		StagingIdentity: ownedStaging.Identity,
+	})
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	instance := item.Instance
+	instance.ReceiptVersion = "v1"
+	instance.Receipt = receipt
+	return instance, nil
+}
+
 func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryItem, error) {
 	for attempt := 1; attempt <= 2; attempt++ {
 		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes", timeout: providerReadbackTimeout})
@@ -1948,6 +1996,7 @@ var _ provider.Lifecycle = (*Provider)(nil)
 var _ provider.ControlPlaneRecoverer = (*Provider)(nil)
 var _ provider.ControlPlaneRecoveryCoordinator = (*Provider)(nil)
 var _ provider.ControlPlaneIdentityAbsenceVerifier = (*Provider)(nil)
+var _ provider.OrphanCleanupPreparer = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)

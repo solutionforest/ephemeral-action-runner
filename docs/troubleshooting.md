@@ -220,7 +220,7 @@ env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start 
 
 EPAR strips these variables from Docker Sandboxes commands it launches, so a stopped daemon auto-started through those commands is sanitized, but an already-running daemon retains the environment with which another shell or tool started it. Do not disable this admission check, use `sbx reset` or `sbx logout`, or forward an agent into a reusable runner template. The installed `sbx` CLI does not expose a durable create-operation identity, so an identityless timed-out create cannot be adopted after a controller restart from name, workspace, or template metadata alone; it remains report-only and capacity-fenced until an operator performs an exact, evidence-backed resolution. If the failed creation predates the immutable-receipt fix, preserve its reported sandbox UUID and use exact provider cleanup; never delete a same-name resource by prefix alone.
 
-Report-only resources discovered by prefix are retained as capacity fences but are excluded from runner liveness probes because no exact lifecycle identity exists for a safe health check. The normal reconciliation pass continues to report them; this does not authorize deletion, adoption, or capacity reuse.
+Report-only resources discovered by prefix are retained as capacity fences but are excluded from runner liveness probes until provider-specific exact ownership evidence is available. Docker Sandboxes may recover a matching orphan when its stable sandbox ID, configured staging workspace, and staging receipt can be reconstructed; otherwise normal reconciliation continues to report it without authorizing deletion, adoption, or capacity reuse.
 
 ## Docker Hub login succeeds but a private pull is denied in Docker Sandboxes
 
@@ -481,4 +481,4 @@ For a confirmed stale EPAR resource, run the configured cleanup command:
 ./start cleanup
 ```
 
-Cleanup is bounded by the configured pool and durable exact lifecycle identities; it does not authorize a broad prefix deletion, wildcard, Docker prune, or removal of unknown/shared resources. Keep `pool.namePrefix` unique per controller and organization.
+Cleanup is bounded by the configured pool and exact lifecycle/provider evidence; a configured prefix can authorize only a provider-specific orphan recovery after exact identity, workspace, receipt, and absence checks, never a broad prefix deletion, wildcard, Docker prune, or removal of unknown/shared resources. Keep `pool.namePrefix` unique per controller and organization.
