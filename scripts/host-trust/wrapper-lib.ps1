@@ -64,19 +64,49 @@ function ConvertTo-EparPowerShellLiteral {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
-function Test-EparHostTrustCurrentFeed {
+function Read-EparHostTrustFeedDocument {
     param([Parameter(Mandatory = $true)][string] $Path)
 
+    # Hold one complete snapshot without blocking the publisher's atomic replace.
+    # ReadAllText uses FileShare.Read, which denies replacement on Windows.
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
     try {
-        $document = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop
-        if ($document.schemaVersion -ne 1 -or $document.hostOS -ne 'windows') { return $false }
-        if (@($document.scopes).Count -eq 0 -or @($document.certificates).Count -eq 0) { return $false }
+        $reader = [System.IO.StreamReader]::new($stream)
+        try { return ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop) }
+        finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
+function Test-EparHostTrustCurrentFeed {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [ref] $FailureReason
+    )
+
+    if ($FailureReason) { $FailureReason.Value = 'unknown validation failure' }
+    try {
+        $document = Read-EparHostTrustFeedDocument -Path $Path
+        if ($document.schemaVersion -ne 1 -or $document.hostOS -ne 'windows') {
+            if ($FailureReason) { $FailureReason.Value = 'unsupported schema or host OS' }
+            return $false
+        }
+        if (-not $document.scopes -or -not $document.certificates) {
+            if ($FailureReason) { $FailureReason.Value = 'empty scopes or certificates' }
+            return $false
+        }
         $generatedAt = if ($document.generatedAt -is [DateTime]) { [DateTimeOffset]::new($document.generatedAt.ToUniversalTime()) } else { [DateTimeOffset]::Parse([string]$document.generatedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
         $expiresAt = if ($document.expiresAt -is [DateTime]) { [DateTimeOffset]::new($document.expiresAt.ToUniversalTime()) } else { [DateTimeOffset]::Parse([string]$document.expiresAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
         $now = [DateTimeOffset]::UtcNow
-        if ($expiresAt -le $generatedAt -or $generatedAt -gt $now.AddSeconds(5) -or ($now - $generatedAt).TotalSeconds -gt 30 -or $now -gt $expiresAt) { return $false }
+        if ($expiresAt -le $generatedAt -or $generatedAt -gt $now.AddSeconds(5) -or ($now - $generatedAt).TotalSeconds -gt 30 -or $now -gt $expiresAt) {
+            if ($FailureReason) { $FailureReason.Value = "timestamps outside freshness bounds (generated=$($generatedAt.ToString('o')), expires=$($expiresAt.ToString('o')), now=$($now.ToString('o')))" }
+            return $false
+        }
+        if ($FailureReason) { $FailureReason.Value = '' }
         return $true
     } catch {
+        # Do not include JSON/certificate contents in diagnostics.
+        $cause = $_.Exception.GetBaseException()
+        if ($FailureReason) { $FailureReason.Value = "read or parse failed ($($cause.GetType().Name), HRESULT=$($cause.HResult))" }
         return $false
     }
 }
@@ -122,11 +152,13 @@ function Wait-EparHostTrustWatcherReady {
         }
         $owner = Get-EparHostTrustLockOwner -FeedDir $FeedDir
         $readyOwner = Get-EparHostTrustReadyOwner -FeedDir $FeedDir
-        if ($owner -eq $Process.Id -and $readyOwner -eq $Process.Id -and (Test-EparHostTrustCurrentFeed -Path $currentPath)) { return }
+        $feedFailure = ''
+        $feedValid = Test-EparHostTrustCurrentFeed -Path $currentPath -FailureReason ([ref]$feedFailure)
+        if ($owner -eq $Process.Id -and $readyOwner -eq $Process.Id -and $feedValid) { return }
         if ([DateTime]::UtcNow -ge $deadline) {
             $ownerDescription = if ($owner -gt 0) { [string]$owner } else { 'missing or invalid' }
             $readyDescription = if ($readyOwner -gt 0) { [string]$readyOwner } else { 'missing or invalid' }
-            $feedDescription = if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) { 'missing' } elseif (Test-EparHostTrustCurrentFeed -Path $currentPath) { 'valid' } else { 'invalid or stale' }
+            $feedDescription = if ($feedValid) { 'valid' } else { "invalid or stale: $feedFailure" }
             throw "$Purpose trust watcher did not become ready within $TimeoutMilliseconds ms: expected PID $($Process.Id), observed lock owner $ownerDescription and ready marker $readyDescription; current.json is $feedDescription. Diagnostics: $Diagnostics"
         }
         Start-Sleep -Milliseconds 25

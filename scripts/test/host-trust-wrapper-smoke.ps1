@@ -25,7 +25,7 @@ function Read-EparHostTrustFeed {
     $delay = 10
     for ($attempt = 0; $attempt -lt 8; $attempt++) {
         try {
-            return ([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop)
+            return (Read-EparHostTrustFeedDocument -Path $Path)
         } catch {
             if (-not (Test-EparTransientFeedReadError -Exception $_.Exception) -or $attempt -eq 7) { throw }
             Start-Sleep -Milliseconds $delay
@@ -154,12 +154,9 @@ image:
         if ($owner -ne $entry.Process.Id) { throw "Windows host-trust watcher lock owner $owner did not match process $($entry.Process.Id)" }
         $readyOwner = Get-EparHostTrustReadyOwner -FeedDir $entry.FeedDir
         if ($readyOwner -ne $entry.Process.Id) { throw "Windows host-trust watcher ready marker $readyOwner did not match process $($entry.Process.Id)" }
-        $currentPath = Join-Path $entry.FeedDir 'current.json'
-        $currentDeadline = [DateTime]::UtcNow.AddSeconds(1)
-        while (-not (Test-EparHostTrustCurrentFeed -Path $currentPath) -and [DateTime]::UtcNow -lt $currentDeadline) {
-            Start-Sleep -Milliseconds 10
-        }
-        if (-not (Test-EparHostTrustCurrentFeed -Path $currentPath)) { throw 'Windows host-trust bridge returned before current.json was valid and fresh' }
+        # Recheck readiness with one observation per poll. A second read after a
+        # successful poll can race the watcher's immediate atomic publication.
+        Wait-EparHostTrustWatcherReady -Process $entry.Process -FeedDir $entry.FeedDir -Purpose 'post-start smoke' -Diagnostics 'watcher errors are emitted to the controller console' -TimeoutMilliseconds 1000
     }
     $runnerEntry = @($watchEntries | Where-Object { $_.FeedDir -eq $bridge.RunnerFeedDir })[0]
     if ($bridge.WatchProcess.Id -ne $runnerEntry.Process.Id) { throw 'Windows bridge WatchProcess did not retain runner/final watcher compatibility' }
