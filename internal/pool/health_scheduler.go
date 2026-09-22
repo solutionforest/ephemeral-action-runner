@@ -251,8 +251,9 @@ func (s *healthScheduler) fits(ctx context.Context, p *healthProgress, clock ...
 }
 
 // visit performs only one resumable phase. Negative verdicts are returned now,
-// never stored for retirement in a later tick. Every dependency receives a live
-// context; a success arriving after the deadline remains an unknown result.
+// never stored for retirement in a later tick. Observed cancellation prevents
+// dispatch; cancellation may still race with dependency entry. A success arriving
+// after the deadline remains an unknown result.
 func (m *Manager) visitRunnerHealth(ctx context.Context, s *healthScheduler, p *healthProgress, vm ProvisionedInstance) (done, alive bool, reason, stage string, err error) {
 	stage = s.phase(p)
 	if err = ctx.Err(); err != nil {
