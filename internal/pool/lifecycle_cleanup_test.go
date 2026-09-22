@@ -3,6 +3,7 @@ package pool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -632,6 +633,268 @@ func TestReconciliationPreservesStoppedBusyRunnerProtectedByJobLease(t *testing.
 	if got := atomic.LoadInt32(&github.deleteCalls); got != 0 {
 		t.Fatalf("GitHub delete calls = %d, want 0 while exact lifecycle cleanup is pending", got)
 	}
+}
+
+func TestLifecycleCleanupRemovesPrefixOwnedOrphanAfterProviderProof(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "epar-test-orphan"
+	item := provider.InventoryItem{
+		Instance: provider.Instance{Name: name, ProviderID: "sandbox:orphan", State: "running", Source: "shell"},
+		State:    "running",
+		Source:   "shell",
+		Workspaces: []string{
+			"/tmp/epar-test-orphan",
+		},
+	}
+	if _, err := store.ReportUnknown(context.Background(), poolstate.Discovery{
+		ProviderType: "docker-sandboxes",
+		ProviderID:   item.Instance.ProviderID,
+		ExactName:    item.Instance.Name,
+		Receipt:      poolstate.Receipt{Version: "v1", Payload: []byte(`{"state":"running"}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := &prefixOrphanLifecycle{items: []provider.InventoryItem{item}}
+	var runnerDeleted atomic.Bool
+	github := &fakeGitHub{
+		runnerByNameFunc: func(context.Context, string) (gh.Runner, bool, error) {
+			if runnerDeleted.Load() {
+				return gh.Runner{}, false, nil
+			}
+			return gh.Runner{Name: name, ID: 73, Status: "offline"}, true, nil
+		},
+		deleteFunc: func(context.Context, int64) error {
+			runnerDeleted.Store(true)
+			return nil
+		},
+	}
+	manager := Manager{
+		Config: config.Config{
+			Provider:        config.ProviderConfig{Type: "docker-sandboxes"},
+			Pool:            config.PoolConfig{NamePrefix: "epar-test"},
+			Logging:         config.LoggingConfig{Directory: t.TempDir()},
+			DockerSandboxes: config.DockerSandboxesConfig{StagingRoot: ".local/cache/docker-sandboxes/staging"},
+		},
+		Lifecycle:      lifecycle,
+		LifecycleState: store,
+		GitHub:         github,
+		ProjectRoot:    t.TempDir(),
+	}
+
+	if err := manager.cleanupOwnedLifecycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(lifecycle.items) != 0 {
+		t.Fatalf("remaining inventory = %#v, want no orphan", lifecycle.items)
+	}
+	if lifecycle.deleteCalls != 1 || lifecycle.stopCalls != 1 {
+		t.Fatalf("provider cleanup calls = stop %d delete %d, want one each", lifecycle.stopCalls, lifecycle.deleteCalls)
+	}
+	if got := atomic.LoadInt32(&github.deleteCalls); got != 1 {
+		t.Fatalf("GitHub delete calls = %d, want 1", got)
+	}
+	discoveries, err := store.Discoveries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discoveries) != 0 {
+		t.Fatalf("discoveries = %#v, want exact orphan discovery removed after readback", discoveries)
+	}
+	if lifecycle.preparedWorkspace == "" {
+		t.Fatal("orphan cleanup did not request the configuration-derived workspace")
+	}
+}
+
+func TestReconcileLocalInventoryCleansPrefixOwnedOrphanOnRestart(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := provider.InventoryItem{
+		Instance: provider.Instance{Name: "epar-test-restart-orphan", ProviderID: "sandbox:restart", State: "running", Source: "shell"},
+		State:    "running",
+		Source:   "shell",
+	}
+	lifecycle := &prefixOrphanLifecycle{items: []provider.InventoryItem{item}}
+	manager := Manager{
+		Config: config.Config{
+			Provider:        config.ProviderConfig{Type: "docker-sandboxes"},
+			Pool:            config.PoolConfig{NamePrefix: "epar-test"},
+			Logging:         config.LoggingConfig{Directory: t.TempDir()},
+			DockerSandboxes: config.DockerSandboxesConfig{StagingRoot: ".local/cache/docker-sandboxes/staging"},
+		},
+		Lifecycle:      lifecycle,
+		LifecycleState: store,
+		ProjectRoot:    t.TempDir(),
+	}
+
+	active, err := manager.reconcileLocalInventoryWithContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("reconciled active instances = %#v, want orphan removed", active)
+	}
+	if len(lifecycle.items) != 0 || lifecycle.deleteCalls != 1 {
+		t.Fatalf("restart orphan cleanup = remaining %#v, delete calls %d; want exact deletion", lifecycle.items, lifecycle.deleteCalls)
+	}
+}
+
+func TestReconcileLocalInventoryDoesNotTreatIdentityMismatchAsPrefixOrphan(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "epar-test-rebound"
+	if _, err := store.Reserve(context.Background(), poolstate.CreateSpec{
+		Name:         name,
+		ProviderType: "docker-sandboxes",
+		GitHub:       poolstate.GitHubIdentity{ExactName: name},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	item := provider.InventoryItem{
+		Instance: provider.Instance{Name: name, ProviderID: "sandbox:new", State: "running", Source: "shell"},
+		State:    "running",
+		Source:   "shell",
+	}
+	lifecycle := &prefixOrphanLifecycle{items: []provider.InventoryItem{item}}
+	manager := Manager{
+		Config: config.Config{
+			Provider:        config.ProviderConfig{Type: "docker-sandboxes"},
+			Pool:            config.PoolConfig{NamePrefix: "epar-test"},
+			Logging:         config.LoggingConfig{Directory: t.TempDir()},
+			DockerSandboxes: config.DockerSandboxesConfig{StagingRoot: ".local/cache/docker-sandboxes/staging"},
+		},
+		Lifecycle:      lifecycle,
+		LifecycleState: store,
+		ProjectRoot:    t.TempDir(),
+	}
+
+	active, err := manager.reconcileLocalInventoryWithContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lifecycle.deleteCalls != 0 {
+		t.Fatalf("provider delete calls = %d, want 0 for same-name identity mismatch", lifecycle.deleteCalls)
+	}
+	if active[name].Phase != LifecycleQuarantined {
+		t.Fatalf("phase = %s, want %s", active[name].Phase, LifecycleQuarantined)
+	}
+}
+
+func TestLifecycleCleanupKeepsPrefixOrphanReportOnlyWithoutProviderProof(t *testing.T) {
+	store, err := poolstate.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := provider.InventoryItem{
+		Instance: provider.Instance{Name: "epar-test-unproven", ProviderID: "sandbox:unproven", State: "running", Source: "shell"},
+		State:    "running",
+		Source:   "shell",
+	}
+	lifecycle := &prefixOrphanLifecycle{items: []provider.InventoryItem{item}, prepareErr: errors.New("workspace proof unavailable")}
+	manager := Manager{
+		Config: config.Config{
+			Provider:        config.ProviderConfig{Type: "docker-sandboxes"},
+			Pool:            config.PoolConfig{NamePrefix: "epar-test"},
+			Logging:         config.LoggingConfig{Directory: t.TempDir()},
+			DockerSandboxes: config.DockerSandboxesConfig{StagingRoot: ".local/cache/docker-sandboxes/staging"},
+		},
+		Lifecycle:      lifecycle,
+		LifecycleState: store,
+		ProjectRoot:    t.TempDir(),
+	}
+
+	if err := manager.cleanupOwnedLifecycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lifecycle.deleteCalls != 0 || len(lifecycle.items) != 1 {
+		t.Fatalf("unproven orphan mutation = delete calls %d, remaining %d; want report-only", lifecycle.deleteCalls, len(lifecycle.items))
+	}
+	discoveries, err := store.Discoveries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discoveries) != 1 || discoveries[0].ExactName != item.Instance.Name {
+		t.Fatalf("discoveries = %#v, want one retained discovery", discoveries)
+	}
+}
+
+func TestResumePendingLifecycleCleanupTombstonesExactAbsentRecordOnRestart(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	for _, transition := range []poolstate.Transition{
+		{Action: poolstate.ActionFenceIntent},
+		{Action: poolstate.ActionFenced},
+		{Action: poolstate.ActionVerifyRemoteIntent},
+		{Action: poolstate.ActionRemoteAbsent},
+		{Action: poolstate.ActionRemoveLocalIntent},
+		{Action: poolstate.ActionCleanupPending},
+	} {
+		if _, err := store.Transition(context.Background(), name, transition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lifecycle := &prefixOrphanLifecycle{}
+	manager.Lifecycle = lifecycle
+
+	if err := manager.resumePendingLifecycleCleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("phase = %s, want %s after restart cleanup resumes exact absent record", record.Phase, poolstate.PhaseTombstoned)
+	}
+	if lifecycle.deleteCalls != 0 {
+		t.Fatalf("provider delete calls = %d, want no provider mutation after exact inventory absence", lifecycle.deleteCalls)
+	}
+}
+
+type prefixOrphanLifecycle struct {
+	provider.Lifecycle
+	items             []provider.InventoryItem
+	prepareErr        error
+	preparedWorkspace string
+	stopCalls         int
+	deleteCalls       int
+}
+
+func (lifecycle *prefixOrphanLifecycle) Inventory(context.Context) ([]provider.InventoryItem, error) {
+	return append([]provider.InventoryItem(nil), lifecycle.items...), nil
+}
+
+func (lifecycle *prefixOrphanLifecycle) PrepareOrphanCleanup(_ context.Context, item provider.InventoryItem, expectedWorkspace string) (provider.Instance, error) {
+	if lifecycle.prepareErr != nil {
+		return provider.Instance{}, lifecycle.prepareErr
+	}
+	lifecycle.preparedWorkspace = expectedWorkspace
+	instance := item.Instance
+	instance.ReceiptVersion = "v1"
+	instance.Receipt = []byte(`{"stagingPath":"/tmp/exact","stagingIdentity":"unix:1:2"}`)
+	return instance, nil
+}
+
+func (lifecycle *prefixOrphanLifecycle) Stop(context.Context, provider.Instance) error {
+	lifecycle.stopCalls++
+	return nil
+}
+
+func (lifecycle *prefixOrphanLifecycle) Delete(_ context.Context, instance provider.Instance) error {
+	lifecycle.deleteCalls++
+	remaining := lifecycle.items[:0]
+	for _, item := range lifecycle.items {
+		if item.Instance.ProviderID != instance.ProviderID {
+			remaining = append(remaining, item)
+		}
+	}
+	lifecycle.items = remaining
+	return nil
 }
 
 func readyLifecycleManager(t *testing.T) (*Manager, *poolstate.Store, string) {

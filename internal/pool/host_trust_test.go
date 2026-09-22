@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
@@ -228,28 +229,27 @@ func TestResolveHostTrustRejectsContainerWithoutFeed(t *testing.T) {
 }
 
 func TestInitialLeaseKeeperRevokesRunnerWhenGenerationChanges(t *testing.T) {
-	oldInterval := hostTrustRefreshInterval
-	hostTrustRefreshInterval = 5 * time.Millisecond
-	t.Cleanup(func() { hostTrustRefreshInterval = oldInterval })
-
-	provider := &fakeProvider{}
-	github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: false}, found: true}
-	manager := Manager{
-		Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
-		Provider: provider,
-		GitHub:   github,
-	}
-	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
-		return hosttrust.Snapshot{
-			Generation: "g2", HostOS: "linux", Scopes: []string{"system"},
-			Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
-			CollectedAt:  time.Now().UTC(),
-		}, nil
-	}
-	add, stop := manager.startHostTrustLeaseKeeper(context.Background())
-	add(ProvisionedInstance{Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1"})
-	deadline := time.Now().Add(time.Second)
-	for {
+	synctest.Test(t, func(t *testing.T) {
+		provider := &fakeProvider{}
+		github := &fakeGitHub{runner: gh.Runner{Name: "runner-1", ID: 42, Status: "online", Busy: false}, found: true}
+		manager := Manager{
+			Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
+			Provider: provider,
+			GitHub:   github,
+		}
+		manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
+			return hosttrust.Snapshot{
+				Generation: "g2", HostOS: "linux", Scopes: []string{"system"},
+				Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+				CollectedAt:  time.Now().UTC(),
+			}, nil
+		}
+		add, stop := manager.startHostTrustLeaseKeeper(context.Background())
+		defer stop()
+		add(ProvisionedInstance{Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady})
+		// Drain the immediate refresh triggered by the addition before inspection.
+		synctest.Wait()
+		stop()
 		provider.mu.Lock()
 		found := false
 		for _, options := range provider.execOptions {
@@ -259,16 +259,10 @@ func TestInitialLeaseKeeperRevokesRunnerWhenGenerationChanges(t *testing.T) {
 			}
 		}
 		provider.mu.Unlock()
-		if found {
-			break
-		}
-		if time.Now().After(deadline) {
-			stop()
+		if !found {
 			t.Fatal("initial lease keeper did not revoke G1 after observing G2")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	stop()
+	})
 }
 
 func TestHostTrustReconciliationRevokesAndRetiresIdleOldGeneration(t *testing.T) {
@@ -886,32 +880,34 @@ func TestHostTrustLeaseWriteFailureAttemptsExactFence(t *testing.T) {
 }
 
 func TestHostTrustLeaseWriteTimeoutIsReportedWithoutBlocking(t *testing.T) {
-	oldTimeout := hostTrustWriteTimeout
-	hostTrustWriteTimeout = 5 * time.Millisecond
-	t.Cleanup(func() { hostTrustWriteTimeout = oldTimeout })
-	fake := &fakeProvider{execFunc: func(ctx context.Context, _ string, _ []string, _ provider.ExecOptions) (provider.ExecResult, error) {
-		<-ctx.Done()
-		return provider.ExecResult{}, ctx.Err()
-	}}
-	manager := Manager{
-		Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
-		Provider: fake,
-	}
-	snapshot := hosttrust.Snapshot{
-		Generation:   "g1",
-		HostOS:       "linux",
-		Scopes:       []string{"system"},
-		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
-		CollectedAt:  time.Now().UTC(),
-	}
-	started := time.Now()
-	err := manager.issueHostTrustLease(context.Background(), "runner-1", snapshot)
-	if err == nil || !strings.Contains(err.Error(), "host trust lease write exceeded") {
-		t.Fatalf("issueHostTrustLease() error = %v, want bounded-timeout detail", err)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("lease timeout took %s, want less than one second", elapsed)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeProvider{execFunc: func(ctx context.Context, _ string, _ []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			<-ctx.Done()
+			return provider.ExecResult{}, ctx.Err()
+		}}
+		manager := Manager{
+			Config:   config.Config{Image: config.ImageConfig{HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"}}},
+			Provider: fake,
+		}
+		snapshot := hosttrust.Snapshot{
+			Generation:   "g1",
+			HostOS:       "linux",
+			Scopes:       []string{"system"},
+			Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+			CollectedAt:  time.Now().UTC(),
+		}
+		started := time.Now()
+		err := manager.issueHostTrustLease(context.Background(), "runner-1", snapshot)
+		if err == nil || !strings.Contains(err.Error(), "host trust lease write exceeded") {
+			t.Fatalf("issueHostTrustLease() error = %v, want bounded-timeout detail", err)
+		}
+		if elapsed := time.Since(started); elapsed != 2*hostTrustWriteTimeout {
+			t.Fatalf("lease timeout took %s, want one write timeout plus one revocation timeout (%s)", elapsed, 2*hostTrustWriteTimeout)
+		}
+		if got := atomic.LoadInt32(&fake.execCalls); got != 2 {
+			t.Fatalf("guest calls = %d, want timed-out write plus revocation", got)
+		}
+	})
 }
 
 func hostTrustLeaseInputs(provider *fakeProvider) []string {

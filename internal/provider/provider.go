@@ -295,6 +295,16 @@ type ControlPlaneIdentityAbsenceVerifier interface {
 	VerifyControlPlaneIdentityAbsent(ctx context.Context, instance Instance) (bool, error)
 }
 
+// OrphanCleanupPreparer is an optional provider capability for reconstructing
+// the immutable receipt needed to remove an inventory item that belongs to the
+// configured pool prefix but has no live lifecycle record. Providers must
+// validate the exact expected workspace (when supplied) and return the same
+// provider identity that was observed in Inventory; callers must still enforce
+// the configured prefix boundary before invoking cleanup.
+type OrphanCleanupPreparer interface {
+	PrepareOrphanCleanup(ctx context.Context, item InventoryItem, expectedWorkspace string) (Instance, error)
+}
+
 // ArtifactManager is an optional provider capability for runtimes whose
 // reusable artifact is not prepared by the shared OCI image pipeline.
 type ArtifactManager interface {

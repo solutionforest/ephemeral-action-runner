@@ -41,6 +41,8 @@ At startup and before a replacement, EPAR compares provider inventory with exact
 
 For transient GitHub or network failures during replacement, including `429` and `5xx` responses, EPAR pauses allocation and retries with configured exponential backoff while monitoring and cleanup continue. Authentication failures and invalid configuration remain fail-fast. See [Configuration](configuration.md) to adjust the retry settings.
 
+Runner health monitoring preserves uncertain capacity and uses bounded, fair progress so one slow check cannot consume every runner's monitoring opportunity or indefinitely postpone host-trust maintenance. Repeated unknown-health warnings are summarized, with a recovery message when health is verified again. This limits console and manager-log noise without changing exact cleanup, inactive-process confirmation, or provider recovery authorization. See [Health warnings](troubleshooting.md#an-idle-runner-reports-github-or-sandbox-health-warnings).
+
 ## Inspect status and logs
 
 ```bash
@@ -62,7 +64,7 @@ When multiple configs run concurrently, give each one a distinct `logging.direct
 ./start pool down
 ```
 
-`pool down` is an alias for `cleanup`. Cleanup is intentionally bounded: Docker Sandboxes uses the durable ledger of exact owned identities, while legacy providers use the configured `pool.namePrefix` boundary. Unknown, shared, or identity-drifted resources are report-only rather than broad deletion targets. Do not reuse a prefix across machines or independent supervisors in the same GitHub organization.
+`pool down` is an alias for `cleanup`. Cleanup is intentionally bounded: Docker Sandboxes uses durable exact identities for recorded work and can recover an unrecorded sandbox only when its configured-prefix, exact workspace, stable provider ID, and staging-receipt evidence all match; legacy providers use the configured `pool.namePrefix` boundary. Unknown, shared, or identity-drifted resources are report-only rather than broad deletion targets. Do not reuse a prefix across machines or independent supervisors in the same GitHub organization.
 
 Before an exact cleanup honors a recorded job lease, EPAR rechecks the recorded runner name and immutable GitHub runner ID. A runner that is still busy remains protected; an exact runner that is idle or absent has its completed-job lease reconciled so cleanup can continue without waiting for lease expiry. API failures and identity drift preserve the lease and stop cleanup.
 

@@ -35,7 +35,19 @@ jobs:
           cache: true
 
       - name: Run race tests
-        run: go test -race ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -json ./... | tee "${RUNNER_TEMP}/go-race.jsonl"
+
+      - name: Preserve race test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: go-race-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/go-race.jsonl
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Run vet
         run: go vet ./...
@@ -66,7 +78,28 @@ jobs:
           if [[ "${RUNNER_OS}" == "macOS" ]]; then
             export TMPDIR="$(cd "${RUNNER_TEMP}" && pwd -P)"
           fi
-          go test ./...
+          go test -count=1 -json ./... | tee "${RUNNER_TEMP}/go-native.jsonl"
+
+      - name: Repeat scheduler and lease regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            export TMPDIR="$(cd "${RUNNER_TEMP}" && pwd -P)"
+          fi
+          timing_tests='^Test(Health|LeaseKeeper|LeaseMaintenance|ExpiredLease|Replacement(Provisioning|Cooldown)|RunPool(DoesNotReplace|ReplacesCompleted|FailsClosedWhenReplacement|AddsCurrentTrustCapacity|VerifiesHostTrustTransport|UsesConfiguredInstances)|CleanupFailureRemains|ShutdownCancellationPreserves|LegacyOverCapacity)'
+          go test -count=25 -json ./internal/pool -run "${timing_tests}" | tee "${RUNNER_TEMP}/go-timing.jsonl"
+
+      - name: Preserve native test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: go-native-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/go-native.jsonl
+            ${{ runner.temp }}/go-timing.jsonl
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Smoke-test native host root collection without trust-store mutations
         shell: bash

@@ -3,9 +3,9 @@
 // records to progress through the lifecycle. Provider-specific details belong
 // in Receipt, an explicitly versioned opaque JSON object.
 //
-// Unknown provider inventory is stored as a Discovery. Discoveries are
-// quarantine/report-only: they cannot be converted into an owned Record or
-// deleted through this package.
+// Unknown provider inventory is stored as a Discovery. Discoveries remain
+// quarantine/report-only until a provider-specific ownership proof authorizes
+// exact cleanup; they cannot be converted into an owned Record by name alone.
 //
 // The primary transition table is:
 //

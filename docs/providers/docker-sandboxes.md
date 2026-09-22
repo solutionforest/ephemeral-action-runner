@@ -78,7 +78,7 @@ dockerSandboxes:
   recoveryQuiescenceSeconds: 60
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
-  memory: 8GiB
+  memory: 4GiB
   rootDisk: auto
   dockerDisk: 50GiB
   maxConcurrentCreates: 2
@@ -178,7 +178,7 @@ Use the prewarm command above for an unregistered lifecycle check. To include Gi
 ./start pool verify --config .local/docker-sandboxes.yml --instances 1 --register-only --cleanup
 ```
 
-The shared pool treats provisioning, ready, draining, quarantined, and cleanup-pending instances as capacity-consuming states. Prefix-only or otherwise unowned resources remain report-only capacity fences and are excluded from runner liveness probes; reconciliation continues to report them without adopting or deleting them. Cleanup uses durable exact sandbox, GitHub runner, and staging-directory identities; it never uses an `sbx` reset or broad prefix deletion.
+The shared pool treats provisioning, ready, draining, quarantined, and cleanup-pending instances as capacity-consuming states. A Docker Sandbox that matches the configured `pool.namePrefix` but has no non-tombstoned lifecycle record can be recovered on restart only when inventory proves its stable sandbox ID and exact configured staging workspace and EPAR can reconstruct the staging-directory receipt; the manager then removes that exact GitHub runner and sandbox after busy-state and absence readbacks. Prefix-only, shared, identity-drifted, or otherwise unproven resources remain report-only capacity fences and are excluded from runner liveness probes. Cleanup never uses an `sbx` reset or broad prefix deletion.
 
 ## Troubleshooting
 

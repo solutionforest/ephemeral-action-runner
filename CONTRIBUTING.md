@@ -18,6 +18,10 @@ Thanks for taking the time to contribute.
 
 Fork pull requests run the safe hosted verification workflow. The live EPAR canary is reserved for branches in this repository because it uses a protected environment and disposable privileged containers.
 
+Timing-sensitive unit tests should use Go's `testing/synctest` clock or explicit synchronization instead of assuming that a hosted runner will schedule work within a few milliseconds. Keep cancellation, late-result rejection, and retry assertions separate from successful-cache assertions; a correctly canceled attempt is not a successful admission. Tests that exercise external processes or network I/O need real synchronization and bounded deadlines rather than a synthetic clock.
+
+Host trust verification runs uncached Go tests on Linux, macOS, and Windows, repeats scheduler and lease regression tests 25 times on each platform, and runs the race detector on Linux. Each attempt retains structured Go test output for 14 days as workflow artifacts. For a flakiness fix, rerun the complete workflow after its first success and check for two consecutive successful attempts on the same commit; do not use failed-job-only reruns as evidence of a clean full-suite attempt.
+
 ## Pull Request Expectations
 
 - Explain the problem, the approach, and how you tested it.
