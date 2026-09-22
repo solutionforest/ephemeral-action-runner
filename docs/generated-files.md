@@ -41,6 +41,8 @@ EPAR-created external resources use recognizable names such as `epar-...`, but a
 
 The catalog is intentionally outside the checkout so it survives source refreshes and coordinates multiple EPAR directories. Its default location is `%LOCALAPPDATA%\ephemeral-action-runner\state` on Windows, `$XDG_STATE_HOME/ephemeral-action-runner` or `~/.local/state/ephemeral-action-runner` on Linux, and the platform user state directory under `ephemeral-action-runner/state` on macOS. Do not delete this catalog before exact external cleanup; doing so discards the strongest evidence EPAR has for safe removal.
 
+The same per-user state root contains `provider-control-plane-recovery/docker-sandboxes.lock` and its `.admission` companion. These compact coordination files allow ordinary commands to share access while daemon recovery reserves admission and drains active commands. Their presence does not mean a controller is still running; operating-system locks are released when the owning process exits. Never unlink these files while any cooperating controller is active, because doing so can split coordination across different file identities.
+
 Docker Sandboxes templates live in the Sandbox cache, Docker images and BuildKit data live in the active Docker backend, WSL distributions live in the WSL backing store, and Tart images live in the Tart store. Removing `.local` or `work` alone does not reclaim those bytes. Conversely, broad Docker prune, `sbx` reset, Docker Desktop factory reset, WSL unregister-all, or prefix-based deletion can remove unrelated or intentionally shared data and is never EPAR's reset strategy.
 
 ## Exact configuration reset

@@ -289,9 +289,11 @@ func (p *Provider) CoordinateControlPlaneRecovery(ctx context.Context, operation
 	}
 	var releaseHostLock func()
 	if p.runCommand == nil {
-		releaseHostLock, err = provider.TryAcquireControlPlaneRecoveryLock()
+		admissionCtx, cancelAdmission := context.WithTimeout(ctx, providerReadbackTimeout)
+		releaseHostLock, err = provider.AcquireControlPlaneRecoveryLock(admissionCtx)
+		cancelAdmission()
 		if err != nil {
-			return err
+			return fmt.Errorf("wait for Docker Sandboxes exclusive recovery admission: %w", err)
 		}
 		defer releaseHostLock()
 	}
@@ -1474,16 +1476,7 @@ func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryI
 // template cache inventory. It does not create, load, or otherwise mutate a
 // template.
 func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error) {
-	result, err := p.run(ctx, commandRequest{
-		args:        []string{"template", "ls", "--json"},
-		operation:   "read docker sandbox template cache",
-		outputLimit: diagnosticOutputLimit,
-		timeout:     providerReadbackTimeout,
-	})
-	if err != nil {
-		return nil, err
-	}
-	images, err := parseTemplateInventory([]byte(result.Stdout))
+	images, err := p.templateInventoryVerified(ctx, "read docker sandbox template cache")
 	if err != nil {
 		return nil, err
 	}
@@ -1500,11 +1493,7 @@ func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error
 }
 
 func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, cacheID string) error {
-	result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: "verify cached docker sandbox template", timeout: providerReadbackTimeout})
-	if err != nil {
-		return err
-	}
-	images, err := parseTemplateInventory([]byte(result.Stdout))
+	images, err := p.templateInventoryVerified(ctx, "verify cached docker sandbox template")
 	if err != nil {
 		return err
 	}
@@ -1521,6 +1510,31 @@ func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, cacheI
 		}
 	}
 	return fmt.Errorf("%w: configured Docker Sandbox template was not present in the authoritative Sandbox cache", provider.ErrTemplateNotFound)
+}
+
+// templateInventoryVerified retries malformed readback once; uncertain inventory
+// must never be interpreted as an empty cache or trigger template mutations.
+func (p *Provider) templateInventoryVerified(ctx context.Context, operation string) ([]cachedTemplate, error) {
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: operation, outputLimit: diagnosticOutputLimit, timeout: providerReadbackTimeout})
+		if err != nil {
+			return nil, err
+		}
+		images, parseErr := parseTemplateInventory([]byte(result.Stdout))
+		if parseErr == nil {
+			return images, nil
+		}
+		if attempt == 2 {
+			return nil, parseErr
+		}
+		if p.logger != nil {
+			p.logger.Debug("Docker Sandboxes template inventory returned invalid machine-readable output; retrying once", "provider", "docker-sandboxes", "error", parseErr)
+		}
+	}
+	return nil, fmt.Errorf("read docker sandbox template inventory did not complete")
 }
 
 func validTemplateCacheID(value string) bool {
@@ -1744,12 +1758,17 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 	var releaseHostLock func()
 	if !provider.ControlPlaneLockHeld(ctx) {
 		var err error
+		lockStarted := time.Now()
 		releaseHostLock, err = provider.AcquireControlPlaneCommandLock(ctx)
 		if err != nil {
-			return provider.ExecResult{}, err
+			return provider.ExecResult{}, fmt.Errorf("wait for Docker Sandboxes command admission (command not started, waited %s): %w", time.Since(lockStarted).Round(time.Millisecond), err)
 		}
 		defer releaseHostLock()
+		if p.logger != nil {
+			p.logger.Debug("Docker Sandboxes command admitted", "operation", request.operation, "lockWait", time.Since(lockStarted))
+		}
 	}
+	commandStarted := time.Now()
 	cmd := exec.CommandContext(ctx, p.Binary, request.args...)
 	isolateManagedProcess(cmd)
 	cmd.WaitDelay = commandWaitDelay
@@ -1796,6 +1815,9 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 	result := provider.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if stdout.exceeded || stderr.exceeded {
 		err = errors.Join(err, fmt.Errorf("output limit exceeded"))
+	}
+	if p.logger != nil {
+		p.logger.Debug("Docker Sandboxes command completed", "operation", request.operation, "executionDuration", time.Since(commandStarted), "contextError", ctx.Err())
 	}
 	return result, err
 }

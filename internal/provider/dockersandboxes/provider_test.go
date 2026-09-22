@@ -636,8 +636,9 @@ func TestResolveTemplateCacheIDUsesAuthoritativeReferenceReadback(t *testing.T) 
 func TestResolveTemplateCacheIDRejectsAmbiguousReference(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024},{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:01:00Z","size":1024}]}`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024},{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:01:00Z","size":1024}]}`}},
 	)
-	if _, _, err := p.ResolveTemplateCacheID(context.Background(), "docker.io/library/epar-template:opaque"); err == nil || !strings.Contains(err.Error(), "duplicate image reference") {
+	if _, _, err := p.ResolveTemplateCacheID(context.Background(), "docker.io/library/epar-template:opaque"); err == nil || !strings.Contains(err.Error(), "category=duplicate_image_reference") {
 		t.Fatalf("ResolveTemplateCacheID() error = %v", err)
 	}
 	done()
@@ -1820,6 +1821,7 @@ func TestCachedTemplatesUsesMachineReadableInventoryWithoutVersionGate(t *testin
 
 func TestCachedTemplatesFailsClosedOnMalformedInventory(t *testing.T) {
 	p, done := scriptedProvider(t,
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"not-a-cache-id"}]}`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"not-a-cache-id"}]}`}},
 	)
 	if _, err := p.CachedTemplates(context.Background()); err == nil {

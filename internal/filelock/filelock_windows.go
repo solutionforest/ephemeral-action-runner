@@ -22,12 +22,16 @@ var (
 	procUnlockFileEx  = kernel32.NewProc("UnlockFileEx")
 )
 
-func lockFile(file *os.File) error {
+func lockFile(file *os.File, shared bool) error {
 	// Keep the lock range outside the metadata payload. Windows enforces byte
 	// range locks for ordinary reads, so locking byte zero would prevent another
 	// process from reading owner diagnostics while the lock is held.
 	overlapped := syscall.Overlapped{OffsetHigh: lockfileOffsetHigh}
-	result, _, callErr := procLockFileEx.Call(file.Fd(), lockfileExclusiveLock|lockfileFailImmediately, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
+	flags := uintptr(lockfileFailImmediately)
+	if !shared {
+		flags |= lockfileExclusiveLock
+	}
+	result, _, callErr := procLockFileEx.Call(file.Fd(), flags, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
 	if result != 0 {
 		return nil
 	}

@@ -247,7 +247,7 @@ func TestInitialLeaseKeeperRevokesRunnerWhenGenerationChanges(t *testing.T) {
 		}, nil
 	}
 	add, stop := manager.startHostTrustLeaseKeeper(context.Background())
-	add(ProvisionedInstance{Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1"})
+	add(ProvisionedInstance{Name: "runner-1", RunnerID: 42, HostTrustGeneration: "g1", ProviderOwned: true, Phase: LifecycleReady})
 	deadline := time.Now().Add(time.Second)
 	for {
 		provider.mu.Lock()

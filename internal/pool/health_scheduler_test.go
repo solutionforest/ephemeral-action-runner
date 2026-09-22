@@ -245,8 +245,9 @@ func TestHealthWarningEpisodesAndFlapping(t *testing.T) {
 }
 
 func TestHealthBudgetDeferralAndOversizedEstimate(t *testing.T) {
-	s := healthScheduler{globalAt: time.Now(), phaseDurations: map[string]time.Duration{"instance-admission": time.Minute}}
+	s := healthScheduler{globalAt: time.Now()}
 	p := &healthProgress{}
+	s.observeDuration(p.identity, "instance-admission", time.Minute, true)
 	short, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if s.fits(short, p) {
@@ -256,6 +257,120 @@ func TestHealthBudgetDeferralAndOversizedEstimate(t *testing.T) {
 	defer cancelFresh()
 	if !s.fits(fresh, p) {
 		t.Fatal("slow estimate can never retry with a fresh budget")
+	}
+}
+
+func TestHealthDurationIsolationAndGlobalTiming(t *testing.T) {
+	active, lifecycle := healthTestPool()
+	now := time.Now()
+	s := healthScheduler{}
+	s.sync(active, 0, now, map[string]int{})
+	s.globalAt = now
+	cost := 10 * time.Second
+	lifecycle.onCall = func(context.Context) error { now = now.Add(cost); return nil }
+	m := &Manager{Lifecycle: lifecycle, now: func() time.Time { return now }}
+	for _, name := range []string{"a", "b"} {
+		p := s.progress[name]
+		if _, _, _, _, err := m.visitRunnerHealth(context.Background(), &s, p, active[name]); err != nil {
+			t.Fatal(err)
+		}
+		p.stage = 0
+		cost = time.Second
+	}
+	if got := s.estimatedDuration(s.progress["a"]); got != 10*time.Second {
+		t.Fatalf("fast peer replaced slow estimate: %s", got)
+	}
+	if got := s.estimatedDuration(s.progress["b"]); got != time.Second {
+		t.Fatalf("peer did not retain own estimate: %s", got)
+	}
+	ctx := healthClockContext{Context: context.Background(), now: &now, end: now.Add(5 * time.Second)}
+	if s.fits(ctx, s.progress["a"], now) || !s.fits(ctx, s.progress["b"], now) {
+		t.Fatal("budget admission ignored individual duration/headroom")
+	}
+	s.globalAt = time.Time{}
+	s.observeDuration(s.progress["a"].identity, "global-admission", 8*time.Second, true)
+	s.observeDuration(s.progress["b"].identity, "global-admission", time.Second, true)
+	for _, p := range s.progress {
+		if got := s.estimatedDuration(p); got != 8*time.Second-7*time.Second/8 {
+			t.Fatalf("global timing was not shared and conservative: %s", got)
+		}
+	}
+}
+
+func TestHealthDurationConservativeUpdate(t *testing.T) {
+	s := healthScheduler{globalAt: time.Now()}
+	p := &healthProgress{identity: healthIdentity{name: "a", providerID: "exact"}}
+	for _, phase := range []string{"instance-admission", "github", "process", "global-admission"} {
+		t.Run(phase, func(t *testing.T) {
+			read := func() time.Duration {
+				if phase == "global-admission" {
+					return s.globalDuration
+				}
+				return s.instanceDurations[p.identity][phase]
+			}
+			s.observeDuration(p.identity, phase, 10*time.Second, true)
+			s.observeDuration(p.identity, phase, 2*time.Second, true)
+			if got := read(); got != 9*time.Second {
+				t.Fatalf("fast success did not decay conservatively: %s", got)
+			}
+			s.observeDuration(p.identity, phase, time.Second, false)
+			s.observeDuration(p.identity, phase, 0, true)
+			if got := read(); got != 9*time.Second {
+				t.Fatalf("partial/zero sample reduced estimate: %s", got)
+			}
+			s.observeDuration(p.identity, phase, 12*time.Second, false)
+			if got := read(); got != 12*time.Second {
+				t.Fatalf("slow failure did not raise estimate: %s", got)
+			}
+			for i := 0; i < 100; i++ {
+				s.observeDuration(p.identity, phase, 2*time.Second, true)
+			}
+			if got := read(); got < 2*time.Second || got > 2100*time.Millisecond {
+				t.Fatalf("estimate failed to converge toward sustained faster success: %s", got)
+			}
+		})
+	}
+}
+
+func TestHealthDurationIdentityReset(t *testing.T) {
+	for _, change := range []string{"provider", "runner", "trust", "removed", "uncertain"} {
+		t.Run(change, func(t *testing.T) {
+			active, _ := healthTestPool()
+			now := time.Now()
+			s := healthScheduler{}
+			inactive := map[string]int{}
+			s.sync(active, 0, now, inactive)
+			old := s.progress["a"].identity
+			s.observeDuration(old, "instance-admission", 12*time.Second, true)
+			s.observeDuration(s.progress["b"].identity, "instance-admission", time.Second, true)
+			s.observeDuration(old, "global-admission", 2*time.Second, true)
+			vm := active["a"]
+			switch change {
+			case "provider":
+				vm.ProviderID = "replacement"
+			case "runner":
+				vm.RunnerID++
+			case "trust":
+				vm.HostTrustGeneration = "replacement"
+			case "uncertain":
+				vm.RecoveryInventoryUncertain = true
+			}
+			active["a"] = vm
+			if change == "removed" {
+				delete(active, "a")
+			}
+			s.sync(active, 0, now, inactive)
+			s.globalAt = now
+			if _, ok := s.instanceDurations[old]; ok {
+				t.Fatal("obsolete identity retained duration history")
+			}
+			if p := s.progress["a"]; p != nil && s.estimatedDuration(p) != 9*time.Second {
+				t.Fatal("replacement inherited old timing")
+			}
+			if s.estimatedDuration(s.progress["b"]) != time.Second || s.globalDuration != 2*time.Second {
+				t.Fatal("identity change discarded peer or global timing")
+			}
+		})
 	}
 }
 

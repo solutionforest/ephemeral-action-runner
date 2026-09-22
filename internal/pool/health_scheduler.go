@@ -37,16 +37,17 @@ type healthEpisode struct {
 
 // Owned exclusively by RunPool. No probes or lifecycle mutations outlive a tick.
 type healthScheduler struct {
-	progress        map[string]*healthProgress
-	episodes        map[healthIdentity]*healthEpisode
-	lastWarnings    map[healthIdentity]time.Time
-	lastSuccess     map[healthIdentity]time.Time
-	globalAt        time.Time
-	generation      uint64
-	cursor          string
-	phaseDurations  map[string]time.Duration
-	trustGeneration string
-	resume          string
+	progress          map[string]*healthProgress
+	episodes          map[healthIdentity]*healthEpisode
+	lastWarnings      map[healthIdentity]time.Time
+	lastSuccess       map[healthIdentity]time.Time
+	globalAt          time.Time
+	generation        uint64
+	cursor            string
+	globalDuration    time.Duration
+	instanceDurations map[healthIdentity]map[string]time.Duration
+	trustGeneration   string
+	resume            string
 }
 
 func (s *healthScheduler) sync(active map[string]ProvisionedInstance, generation uint64, now time.Time, inactive map[string]int, trust ...string) {
@@ -123,6 +124,11 @@ func (s *healthScheduler) sync(active map[string]ProvisionedInstance, generation
 			delete(s.lastSuccess, id)
 		}
 	}
+	for id := range s.instanceDurations {
+		if !identities[id] {
+			delete(s.instanceDurations, id)
+		}
+	}
 	for _, p := range s.progress {
 		if p.done || (p.stage > 0 && (p.admittedAt.IsZero() || now.Sub(p.admittedAt) >= healthEvidenceLifetime)) {
 			p.stage = 0
@@ -175,11 +181,45 @@ func (s *healthScheduler) phase(p *healthProgress) string {
 // Estimates affect scheduling only; they neither declare failure nor extend a
 // deadline. Retain the cursor on deferral so the next tick starts with this work.
 func (s *healthScheduler) estimatedDuration(p *healthProgress) time.Duration {
-	estimate := map[string]time.Duration{"global-admission": 4 * time.Second, "instance-admission": 9 * time.Second, "github": 3 * time.Second, "process": 6 * time.Second}[s.phase(p)]
-	if observed := s.phaseDurations[s.phase(p)]; observed > 0 {
+	phase := s.phase(p)
+	estimate := map[string]time.Duration{"global-admission": 4 * time.Second, "instance-admission": 9 * time.Second, "github": 3 * time.Second, "process": 6 * time.Second}[phase]
+	observed := s.instanceDurations[p.identity][phase]
+	if phase == "global-admission" {
+		observed = s.globalDuration
+	}
+	if observed > 0 {
 		estimate = observed
 	}
 	return estimate
+}
+
+// A slow sample raises the estimate immediately. Successful faster samples
+// release only one eighth of the excess each time; failed/partial probes cannot
+// lower it. fits adds headroom and caps budget admission so slow work can retry.
+func (s *healthScheduler) observeDuration(id healthIdentity, phase string, elapsed time.Duration, succeeded bool) {
+	if elapsed <= 0 {
+		return
+	}
+	update := func(previous time.Duration) time.Duration {
+		if elapsed >= previous {
+			return elapsed
+		}
+		if succeeded {
+			return previous - (previous-elapsed)/8
+		}
+		return previous
+	}
+	if phase == "global-admission" {
+		s.globalDuration = update(s.globalDuration)
+		return
+	}
+	if s.instanceDurations == nil {
+		s.instanceDurations = make(map[healthIdentity]map[string]time.Duration)
+	}
+	if s.instanceDurations[id] == nil {
+		s.instanceDurations[id] = make(map[string]time.Duration)
+	}
+	s.instanceDurations[id][phase] = update(s.instanceDurations[id][phase])
 }
 
 func (s *healthScheduler) fits(ctx context.Context, p *healthProgress, clock ...time.Time) bool {
@@ -243,13 +283,8 @@ func (m *Manager) visitRunnerHealth(ctx context.Context, s *healthScheduler, p *
 		} else if stage != "global-admission" {
 			s.resume = vm.Name
 		}
-		if s.phaseDurations == nil {
-			s.phaseDurations = make(map[string]time.Duration)
-		}
 		elapsed := m.currentTime().Sub(started)
-		if err == nil || elapsed > s.phaseDurations[stage] {
-			s.phaseDurations[stage] = elapsed
-		}
+		s.observeDuration(runnerHealthIdentity(vm), stage, elapsed, err == nil)
 		m.logger().Debug(fmt.Sprintf("runner health phase completed: instance=%s providerID=%s runnerID=%d stage=%s duration=%s finished=%t alive=%t error=%v", vm.Name, vm.ProviderID, vm.RunnerID, stage, elapsed, done, alive, err))
 	}()
 	if s.globalAt.IsZero() {

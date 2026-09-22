@@ -38,6 +38,8 @@ Unknown ownership, unavailable dependencies, failed cleanup, and uncertain remot
 
 Steady-state health monitoring must make fair, bounded progress without starving host-trust maintenance. Successful partial health evidence is bounded in lifetime and tied to immutable instance identity; it is not an authorization to skip admission during provisioning or registration. An exhausted controller monitoring budget defers work rather than proving provider failure or authorizing daemon recovery. Repeated unknown-health reports are bounded and include recovery reporting; uncertainty continues to preserve physical capacity and resets consecutive inactive-process evidence.
 
+During initial and replacement provisioning, a bounded lease keeper maintains already-ready runners while the synchronous controller waits for the candidate. It uses the same transport verification, generation, and one-time busy-handoff rules as steady-state monitoring, leaves physical retirement to the controller, and transfers quarantine and handoff state by exact identity after joining. Normal handoff waits for an in-flight renewal instead of canceling it; shutdown still cancels work. Docker Sandboxes ordinary commands share a cross-process admission lease, while recovery reserves admission and exclusively drains commands before its census and daemon intervention. A long registration on one sandbox must not serialize lease maintenance on another.
+
 ## Storage Lifecycle
 
 Each provider reports the storage surfaces and temporary expansion required by bootstrap, artifact builds, instance creation, and replacement. The common preflight requires enough space for the operation plus the configured free-space reserve.

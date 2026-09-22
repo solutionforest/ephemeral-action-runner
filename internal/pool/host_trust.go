@@ -42,6 +42,8 @@ var hostTrustWriteTimeout = 10 * time.Second
 var hostTrustControllerInContainer = linuxControllerInContainer
 var hostTrustControllerOS = runtime.GOOS
 
+var errHostTrustLeaseSnapshot = errors.New("host trust lease snapshot unavailable")
+
 type hostTrustImageMetadata = artifactimage.HostTrustMetadata
 
 type hostTrustMarker struct {
@@ -446,7 +448,7 @@ func (m *Manager) issueHostTrustLeaseWithLifetime(ctx context.Context, instanceN
 	}
 	content, err := hostTrustLeaseJSONWithLifetime(snapshot, time.Now().UTC(), lifetime)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errHostTrustLeaseSnapshot, err)
 	}
 	writeCtx, cancel := context.WithTimeout(ctx, hostTrustWriteTimeout)
 	defer cancel()
@@ -456,6 +458,9 @@ func (m *Manager) issueHostTrustLeaseWithLifetime(ctx context.Context, instanceN
 		revokeCtx, revokeCancel := context.WithTimeout(context.WithoutCancel(ctx), hostTrustWriteTimeout)
 		revokeErr := m.revokeHostTrustLease(revokeCtx, instanceName)
 		revokeCancel()
+		if revokeErr != nil {
+			revokeErr = fmt.Errorf("host trust lease revocation failed: %w", revokeErr)
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return errors.Join(fmt.Errorf("host trust lease write exceeded %s: %w", hostTrustWriteTimeout, err), revokeErr)
 		}
@@ -497,6 +502,12 @@ func (m *Manager) fenceHostTrustRunnerRegistration(ctx context.Context, instance
 }
 
 func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot, busyHandoff map[string]bool) int {
+	return m.reconcileHostTrustRunnersMode(ctx, active, current, busyHandoff, true)
+}
+
+// Lease keepers use the same admission and handoff rules as monitoring, but
+// leave physical retirement to the controller that owns the capacity map.
+func (m *Manager) reconcileHostTrustRunnersMode(ctx context.Context, active map[string]ProvisionedInstance, current hosttrust.Snapshot, busyHandoff map[string]bool, retireStale bool) int {
 	if m.GitHub == nil {
 		return 0
 	}
@@ -507,6 +518,9 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 	}
 	retired := 0
 	for name, instance := range active {
+		if ctx.Err() != nil {
+			break
+		}
 		if !instance.ProviderOwned || (instance.Phase != LifecycleReady && instance.Phase != LifecycleDraining) {
 			continue
 		}
@@ -515,6 +529,13 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			// safe for an already-running job (its hook already ran) and closes
 			// the assignment window even when GitHub status is unavailable.
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return retired
+				}
+				if errors.Is(err, errHostTrustLeaseSnapshot) {
+					m.warnf("[%s] host trust snapshot unavailable; lease will expire closed until fresh collection: %v\n", name, err)
+					continue
+				}
 				m.warnf("[%s] old-generation revocation warning: %v\n", name, err)
 				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
 					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
@@ -538,6 +559,14 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 				delete(busyHandoff, name)
 				continue
 			}
+			if instance.RunnerID == 0 || runner.ID != instance.RunnerID {
+				identityErr := fmt.Errorf("GitHub runner identity changed during host trust refresh: got id=%d, expected id=%d", runner.ID, instance.RunnerID)
+				m.quarantineLifecycle(ctx, name, identityErr)
+				m.warnf("[%s] host trust lease not refreshed: %v\n", name, identityErr)
+				instance.Phase = LifecycleQuarantined
+				active[name] = instance
+				continue
+			}
 			// Relay activation is a destructive guest transaction: it removes the
 			// job-start marker before reconfiguring the private daemon. Verify the
 			// current transport read-only first; if it is unhealthy, fence this
@@ -549,6 +578,9 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			if requiresTransportActivation || hasTransportVerifier {
 				providerInstance, providerErr := m.providerInstance(ctx, name)
 				if providerErr != nil {
+					if errors.Is(ctx.Err(), context.Canceled) {
+						return retired
+					}
 					m.warnf("[%s] host trust transport identity warning; lease not refreshed: %v\n", name, providerErr)
 					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, providerErr); fenceErr != nil {
 						m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
@@ -558,6 +590,9 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 					continue
 				}
 				if verifyErr := m.verifyProviderHostTrustRuntime(ctx, providerInstance); verifyErr != nil {
+					if errors.Is(ctx.Err(), context.Canceled) {
+						return retired
+					}
 					transportErr := fmt.Errorf("host trust transport verification failed: %w", verifyErr)
 					m.warnf("[%s] host trust transport verification warning; lease not refreshed: %v\n", name, transportErr)
 					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, transportErr); fenceErr != nil {
@@ -576,6 +611,13 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 				// Issue one bounded handoff lease for that transition, but never
 				// renew it while the job remains busy.
 				if err := m.issueHostTrustLeaseWithLifetime(ctx, name, current, hostTrustHandoffLease); err != nil {
+					if errors.Is(ctx.Err(), context.Canceled) {
+						return retired
+					}
+					if errors.Is(err, errHostTrustLeaseSnapshot) {
+						m.warnf("[%s] host trust snapshot unavailable; lease will expire closed until fresh collection: %v\n", name, err)
+						continue
+					}
 					m.warnf("[%s] host trust job handoff lease warning: %v\n", name, err)
 					if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
 						m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
@@ -589,6 +631,13 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			}
 			delete(busyHandoff, name)
 			if err := m.issueHostTrustLease(ctx, name, current); err != nil {
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return retired
+				}
+				if errors.Is(err, errHostTrustLeaseSnapshot) {
+					m.warnf("[%s] host trust snapshot unavailable; lease will expire closed until fresh collection: %v\n", name, err)
+					continue
+				}
 				m.warnf("[%s] host trust lease refresh warning: %v\n", name, err)
 				if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
 					m.warnf("[%s] host trust registration fencing warning: %v\n", name, fenceErr)
@@ -598,9 +647,11 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 			}
 			continue
 		}
-		if found && runner.Busy {
+		if !retireStale || (found && runner.Busy) {
 			delete(busyHandoff, name)
-			m.infof("[%s] draining busy runner on old host trust generation %s\n", name, instance.HostTrustGeneration)
+			if instance.Phase != LifecycleDraining {
+				m.infof("[%s] draining runner on old host trust generation %s\n", name, instance.HostTrustGeneration)
+			}
 			instance.Phase = LifecycleDraining
 			active[name] = instance
 			continue
@@ -617,80 +668,128 @@ func (m *Manager) reconcileHostTrustRunners(ctx context.Context, active map[stri
 	return retired
 }
 
-// startHostTrustLeaseKeeper preserves already-ready idle capacity while a
-// controller is still provisioning the rest of the initial pool (or waiting
-// for parallel verification instances). It never refreshes a busy runner and
-// never renews an old generation after host trust changes.
+// provisionWithHostTrustMaintenance brackets only candidate provisioning. The
+// keeper has joined before the caller reconciles, retires, or recovers survivors.
+func (m *Manager) provisionWithHostTrustMaintenance(ctx context.Context, name string, register, allowBusy bool, active map[string]ProvisionedInstance, handoffs map[string]bool) (ProvisionedInstance, error) {
+	_, stop := m.startHostTrustLeaseKeeperForRunners(ctx, active, handoffs)
+	defer stop(active)
+	return m.provisionOne(ctx, name, register, allowBusy)
+}
+
+// startHostTrustLeaseKeeper is the verification entry point. Pool startup and
+// replacement also transfer exact runner state and busy-handoff history.
 func (m *Manager) startHostTrustLeaseKeeper(parent context.Context) (func(ProvisionedInstance), func()) {
+	add, stop := m.startHostTrustLeaseKeeperForRunners(parent, nil, nil)
+	return add, func() { stop(nil) }
+}
+
+// startHostTrustLeaseKeeperForRunners takes exclusive responsibility for lease
+// maintenance during a provisioning phase. The caller must not reconcile trust
+// or retire these runners until stop returns. Only this goroutine accesses its
+// snapshot; state is merged back by exact identity after it has joined.
+func (m *Manager) startHostTrustLeaseKeeperForRunners(parent context.Context, initial map[string]ProvisionedInstance, handoffs map[string]bool) (func(ProvisionedInstance), func(map[string]ProvisionedInstance)) {
 	if !m.hostTrustEnabled() || m.GitHub == nil {
-		return func(ProvisionedInstance) {}, func() {}
+		return func(ProvisionedInstance) {}, func(map[string]ProvisionedInstance) {}
 	}
-	ctx, cancel := context.WithCancel(parent)
+	active := make(map[string]ProvisionedInstance, len(initial))
+	for name, instance := range initial {
+		active[name] = instance
+	}
+	busyHandoff := make(map[string]bool, len(handoffs))
+	for name, handedOff := range handoffs {
+		busyHandoff[name] = handedOff
+	}
 	additions := make(chan ProvisionedInstance, 64)
+	stopping := make(chan struct{})
 	done := make(chan struct{})
 	var once sync.Once
 	go func() {
 		defer close(done)
-		active := make(map[string]ProvisionedInstance)
-		ticker := time.NewTicker(hostTrustRefreshInterval)
-		defer ticker.Stop()
+		// Sweep immediately at handoff: repeatedly short provisioning phases
+		// must not reset the first renewal beyond the lease's lifetime.
+		refresh := time.NewTimer(0)
+		defer refresh.Stop()
 		var current hosttrust.Snapshot
 		nextCollection := time.Time{}
 		for {
 			select {
-			case <-ctx.Done():
+			case <-parent.Done():
+				return
+			case <-stopping:
 				return
 			case instance := <-additions:
 				active[instance.Name] = instance
-			case now := <-ticker.C:
-				if current.Generation == "" || !now.Before(nextCollection) {
-					snapshot, err := m.resolveHostTrust(ctx)
-					nextCollection = now.Add(m.hostTrustCollectionInterval())
-					if err != nil {
-						current = hosttrust.Snapshot{}
-						m.warnf("host trust initial lease refresh warning: %v\n", err)
-						continue
-					}
-					current = snapshot
-				}
+				refresh.Reset(0)
+			case <-refresh.C:
 				for name, instance := range active {
-					if instance.HostTrustGeneration != current.Generation {
-						if err := m.issueHostTrustLease(ctx, name, current); err != nil {
-							m.warnf("[%s] host trust initial stale-generation revocation warning: %v\n", name, err)
-							if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
-								m.warnf("[%s] host trust initial registration fencing warning: %v\n", name, fenceErr)
+					select {
+					case <-stopping:
+						return
+					case <-parent.Done():
+						return
+					default:
+					}
+					if !instance.ProviderOwned || (instance.Phase != LifecycleReady && instance.Phase != LifecycleDraining) {
+						continue
+					}
+					// Use wall time per runner, not the ticker timestamp: earlier
+					// slow checks may have consumed the snapshot's freshness.
+					now := time.Now()
+					_, snapshotErr := validateHostTrustSnapshot(current, now)
+					if snapshotErr != nil || !now.Before(nextCollection) {
+						ctx, cancel := context.WithTimeout(parent, hostTrustWriteTimeout)
+						snapshot, err := m.resolveHostTrust(ctx)
+						cancel()
+						nextCollection = now.Add(m.hostTrustCollectionInterval())
+						if err != nil {
+							current = hosttrust.Snapshot{}
+							if parent.Err() == nil {
+								m.warnf("host trust provisioning lease refresh warning: %v\n", err)
 							}
-							instance.Phase = LifecycleQuarantined
-							active[name] = instance
+							break
 						}
-						continue
+						current = snapshot
 					}
-					runner, found, err := m.GitHub.RunnerByName(ctx, name)
-					if err != nil || !found || runner.Busy {
-						continue
-					}
-					if err := m.issueHostTrustLease(ctx, name, current); err != nil {
-						m.warnf("[%s] host trust initial lease refresh warning: %v\n", name, err)
-						if fenceErr := m.fenceHostTrustRunnerRegistration(ctx, instance, err); fenceErr != nil {
-							m.warnf("[%s] host trust initial registration fencing warning: %v\n", name, fenceErr)
-						}
-						instance.Phase = LifecycleQuarantined
-						active[name] = instance
-					}
+					// Bound each runner independently so one slow read cannot consume
+					// every other runner's allowance. Retirement remains synchronous.
+					ctx, cancel := context.WithTimeout(parent, 3*hostTrustWriteTimeout)
+					one := map[string]ProvisionedInstance{name: instance}
+					handoff := map[string]bool{name: busyHandoff[name]}
+					m.reconcileHostTrustRunnersMode(ctx, one, current, handoff, false)
+					cancel()
+					active[name] = one[name]
+					busyHandoff[name] = handoff[name]
 				}
+				refresh.Reset(hostTrustRefreshInterval)
 			}
 		}
 	}()
 	add := func(instance ProvisionedInstance) {
 		select {
 		case additions <- instance:
-		case <-ctx.Done():
+		case <-parent.Done():
+		case <-done:
 		}
 	}
-	stop := func() {
+	stop := func(destination map[string]ProvisionedInstance) {
 		once.Do(func() {
-			cancel()
+			// Do not cancel a healthy in-flight renewal to hand control back.
+			// Each operation is bounded and parent shutdown still cancels it.
+			close(stopping)
 			<-done
+			for name, previous := range active {
+				instance, found := destination[name]
+				if !found || instance.ProviderID != previous.ProviderID || instance.RunnerID != previous.RunnerID || instance.HostTrustGeneration != previous.HostTrustGeneration {
+					continue
+				}
+				if (instance.Phase == LifecycleReady || instance.Phase == LifecycleDraining) && (previous.Phase == LifecycleQuarantined || previous.Phase == LifecycleDraining) {
+					instance.Phase = previous.Phase
+					destination[name] = instance
+				}
+				if handoffs != nil {
+					handoffs[name] = busyHandoff[name]
+				}
+			}
 		})
 	}
 	return add, stop

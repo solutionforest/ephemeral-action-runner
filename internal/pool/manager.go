@@ -444,10 +444,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		}
 		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
-	leaseAdd, stopLeaseKeeper := m.startHostTrustLeaseKeeper(ctx)
+	hostTrustBusyHandoff := make(map[string]bool)
 	for len(active) < opts.Instances {
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
-			stopLeaseKeeper()
 			if ctx.Err() != nil {
 				return cleanup()
 			}
@@ -464,7 +463,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 			sequence++
 			var provisionErr error
-			vm, provisionErr = m.provisionOne(attemptCtx, name, opts.Register, opts.Register && opts.ReplaceCompleted)
+			vm, provisionErr = m.provisionWithHostTrustMaintenance(attemptCtx, name, opts.Register, opts.Register && opts.ReplaceCompleted, active, hostTrustBusyHandoff)
 			if isPhysicalPhase(vm.Phase) {
 				active[vm.Name] = vm
 			}
@@ -475,14 +474,12 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if handled {
 				if recoveryErr != nil {
 					if ctx.Err() != nil {
-						stopLeaseKeeper()
 						return cleanup()
 					}
 					m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
 				}
 				continue
 			}
-			stopLeaseKeeper()
 			if ctx.Err() != nil {
 				return cleanup()
 			}
@@ -491,13 +488,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		if len(active) >= opts.Instances && vm.Name == "" {
 			break
 		}
-		leaseAdd(vm)
 		if vm.HostTrustGeneration != "" {
 			poolTrustGeneration = vm.HostTrustGeneration
 		}
 		m.infof("%s online at %s providerLog=%s guestLog=%s\n", vm.Name, vm.IP, vm.LogPath, vm.GuestLogPath)
 	}
-	stopLeaseKeeper()
 	if readyPoolCapacity(active) >= opts.Instances {
 		if err := m.markExternalOutageRecovered(); err != nil {
 			return errors.Join(err, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
@@ -533,7 +528,6 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	nextHostTrustCollection := time.Time{}
 	nextHostTrustReconciliation := time.Time{}
 	var currentHostTrust hosttrust.Snapshot
-	hostTrustBusyHandoff := make(map[string]bool)
 	confirmedInactiveChecks := make(map[string]int)
 	health := healthScheduler{}
 	imageMaintenanceIdleChecks := make(map[string]int)
@@ -979,7 +973,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				if attemptErr != nil {
 					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
-				vm, err := m.provisionOne(attemptCtx, name, opts.Register, true)
+				vm, err := m.provisionWithHostTrustMaintenance(attemptCtx, name, opts.Register, true, active, hostTrustBusyHandoff)
 				cancelAttempt()
 				if isPhysicalPhase(vm.Phase) {
 					active[vm.Name] = vm
