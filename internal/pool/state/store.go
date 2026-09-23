@@ -178,7 +178,8 @@ func (s *Store) ReleaseLease(ctx context.Context, name, purpose, holder string) 
 }
 
 // ReportUnknown records inventory that was not created by this state store.
-// It is intentionally not exposed to Transition or cleanup operations.
+// A prefix-owned provider may later prove exact cleanup authority; until then
+// the discovery remains a durable safety fence.
 func (s *Store) ReportUnknown(ctx context.Context, discovery Discovery) (Discovery, error) {
 	if err := validateName("provider type", discovery.ProviderType); err != nil {
 		return Discovery{}, err
@@ -206,6 +207,28 @@ func (s *Store) ReportUnknown(ctx context.Context, discovery Discovery) (Discove
 		return nil
 	})
 	return discovery, err
+}
+
+// ForgetUnknown removes one discovery after its exact provider identity has
+// been deleted and independently verified absent.
+func (s *Store) ForgetUnknown(ctx context.Context, providerType, providerID string) error {
+	if err := validateName("provider type", providerType); err != nil {
+		return err
+	}
+	if err := validateName("provider id", providerID); err != nil {
+		return err
+	}
+	return s.mutate(ctx, func(state *diskState, _ time.Time) error {
+		for index, discovery := range state.Discoveries {
+			if discovery.ProviderType != providerType || discovery.ProviderID != providerID {
+				continue
+			}
+			state.Generation++
+			state.Discoveries = append(state.Discoveries[:index], state.Discoveries[index+1:]...)
+			return nil
+		}
+		return nil
+	})
 }
 
 func (s *Store) Read(ctx context.Context, name string) (Record, error) {

@@ -1675,6 +1675,9 @@ func TestLoadDockerSandboxesArchitectureEmulation(t *testing.T) {
 
 func TestDockerSandboxesRecoveryDefaults(t *testing.T) {
 	cfg := Default()
+	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
+		t.Fatalf("dockerSandboxes.memory = %q, want default %q", got, want)
+	}
 	if got, want := cfg.DockerSandboxes.RecoveryMode, DockerSandboxesRecoveryModeExclusiveAuto; got != want {
 		t.Fatalf("dockerSandboxes.recoveryMode = %q, want default %q", got, want)
 	}

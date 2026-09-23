@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
 	poolstate "github.com/solutionforest/ephemeral-action-runner/internal/pool/state"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
@@ -21,25 +23,32 @@ func (m *Manager) cleanupOwnedLifecycle(ctx context.Context) error {
 		return fmt.Errorf("read provider inventory for exact cleanup: %w", err)
 	}
 	byName := inventoryByName(inventory)
-	ownedNames := make(map[string]struct{}, len(records))
+	protectedNames := make(map[string]struct{}, len(records))
 	for _, record := range records {
-		if record.ProviderType == m.Config.Provider.Type && record.Phase != poolstate.PhaseTombstoned {
-			ownedNames[record.Name] = struct{}{}
+		if record.Phase != poolstate.PhaseTombstoned {
+			protectedNames[record.Name] = struct{}{}
 		}
 	}
+	var firstErr error
 	for _, item := range inventory {
 		if !HasPrefix(item.Instance.Name, m.Config.Pool.NamePrefix) {
 			continue
 		}
-		if _, found := ownedNames[item.Instance.Name]; found {
+		if _, found := protectedNames[item.Instance.Name]; found {
 			continue
 		}
-		if err := m.reportUnknownInventory(ctx, item); err != nil {
-			return err
+		cleaned, cleanupErr := m.cleanupPrefixOrphanInventory(ctx, item)
+		if cleanupErr != nil {
+			firstErr = errors.Join(firstErr, fmt.Errorf("cleanup prefix-owned orphan %s: %w", item.Instance.Name, cleanupErr))
+			continue
+		}
+		if !cleaned {
+			if err := m.reportUnknownInventory(ctx, item); err != nil {
+				return err
+			}
 		}
 	}
 
-	var firstErr error
 	for _, record := range records {
 		if record.ProviderType != m.Config.Provider.Type || record.Phase == poolstate.PhaseTombstoned {
 			continue
@@ -49,6 +58,114 @@ func (m *Manager) cleanupOwnedLifecycle(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// cleanupPrefixOrphanInventory removes an inventory item that matches this
+// configuration's exact prefix but has no non-tombstoned lifecycle record. A
+// provider must opt in by reconstructing an immutable cleanup receipt from
+// the inventory evidence; a bare name or prefix never authorizes deletion.
+func (m *Manager) cleanupPrefixOrphanInventory(ctx context.Context, item provider.InventoryItem) (bool, error) {
+	if !HasPrefix(item.Instance.Name, m.Config.Pool.NamePrefix) {
+		return false, nil
+	}
+	if m.LifecycleState != nil {
+		record, err := m.LifecycleState.Read(ctx, item.Instance.Name)
+		if err == nil {
+			if record.Phase != poolstate.PhaseTombstoned {
+				return false, nil
+			}
+		} else if !errors.Is(err, poolstate.ErrNotFound) {
+			return false, err
+		}
+	}
+	preparer, ok := m.providerLifecycle().(provider.OrphanCleanupPreparer)
+	if !ok {
+		return false, nil
+	}
+	instance, err := preparer.PrepareOrphanCleanup(ctx, item, m.expectedOrphanWorkspace(item.Instance.Name))
+	if err != nil {
+		return false, nil
+	}
+	if instance.Name != item.Instance.Name || instance.ProviderID == "" || instance.ProviderID != item.Instance.ProviderID || instance.ReceiptVersion == "" || len(instance.Receipt) == 0 {
+		return false, nil
+	}
+
+	retain := func(cause error) error {
+		retained := item
+		retained.Instance = instance
+		if retainErr := m.reportUnknownInventory(ctx, retained); retainErr != nil {
+			return errors.Join(cause, retainErr)
+		}
+		return cause
+	}
+	if m.GitHub != nil {
+		runner, found, lookupErr := m.GitHub.RunnerByName(ctx, item.Instance.Name)
+		if lookupErr != nil {
+			return false, retain(lookupErr)
+		}
+		if found {
+			if runner.Busy {
+				return false, retain(fmt.Errorf("same-name GitHub runner id=%d is busy; refusing orphan cleanup", runner.ID))
+			}
+			deleteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			deleteErr := m.GitHub.DeleteRunnerIfExists(deleteCtx, runner.ID)
+			cancel()
+			if deleteErr != nil {
+				return false, retain(fmt.Errorf("delete exact prefix-owned GitHub runner %s id=%d: %w", runner.Name, runner.ID, deleteErr))
+			}
+			after, remains, verifyErr := m.GitHub.RunnerByName(ctx, item.Instance.Name)
+			if verifyErr != nil {
+				return false, retain(fmt.Errorf("verify exact prefix-owned GitHub runner absence: %w", verifyErr))
+			}
+			if remains {
+				return false, retain(fmt.Errorf("GitHub runner remains after exact deletion: name=%s id=%d", after.Name, after.ID))
+			}
+			m.infof("cleanup: deleted exact prefix-owned GitHub runner %s id=%d\n", runner.Name, runner.ID)
+		}
+	}
+	stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
+	_ = m.stopProviderInstance(stopCtx, instance)
+	stopCancel()
+	deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
+	deleteErr := m.deleteProviderInstance(deleteCtx, instance)
+	deleteCancel()
+	if deleteErr != nil {
+		return false, retain(fmt.Errorf("delete exact prefix-owned provider instance %s id=%s: %w", instance.Name, instance.ProviderID, deleteErr))
+	}
+	remaining, inventoryErr := m.inventoryProvider(ctx)
+	if inventoryErr != nil {
+		return false, retain(fmt.Errorf("verify exact prefix-owned provider instance absence: %w", inventoryErr))
+	}
+	for _, remainingItem := range remaining {
+		if remainingItem.Instance.ProviderID == instance.ProviderID {
+			return false, retain(fmt.Errorf("provider instance remains after exact deletion: name=%s id=%s", remainingItem.Instance.Name, remainingItem.Instance.ProviderID))
+		}
+		if remainingItem.Instance.Name == instance.Name {
+			return false, retain(fmt.Errorf("same-name provider instance id=%s appeared after exact deletion; refusing to treat it as the deleted resource", remainingItem.Instance.ProviderID))
+		}
+	}
+	if m.LifecycleState != nil {
+		if err := m.LifecycleState.ForgetUnknown(ctx, m.Config.Provider.Type, instance.ProviderID); err != nil {
+			return false, retain(err)
+		}
+	}
+	paths := ProvisionedInstance{Name: instance.Name, LogPath: m.instanceLogPath(instance.Name, "."+m.Config.Provider.Type+".log"), GuestLogPath: m.instanceLogPath(instance.Name, ".guest.log")}
+	if releaseErr := m.releaseInstanceTranscripts(paths); releaseErr != nil {
+		m.logger().Warn("instance transcript close failed after prefix-owned orphan cleanup", "provider", m.Config.Provider.Type, "instance", instance.Name, "operation", "cleanup", "error", releaseErr)
+	}
+	m.infof("cleanup: deleted exact prefix-owned instance %s id=%s\n", instance.Name, instance.ProviderID)
+	return true, nil
+}
+
+func (m *Manager) expectedOrphanWorkspace(name string) string {
+	if m.Config.Provider.Type != "docker-sandboxes" || name == "" {
+		return ""
+	}
+	root, err := filepath.Abs(config.ProjectPath(m.ProjectRoot, m.Config.DockerSandboxes.StagingRoot))
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Clean(root), name)
 }
 
 func inventoryByName(items []provider.InventoryItem) map[string][]provider.InventoryItem {
@@ -65,11 +182,15 @@ func (m *Manager) reportUnknownInventory(ctx context.Context, item provider.Inve
 		providerID = "unidentified:" + item.Instance.Name
 	}
 	payload, _ := json.Marshal(map[string]string{"state": item.State, "source": item.Source})
+	receipt := poolstate.Receipt{Version: "v1", Payload: payload}
+	if item.Instance.ReceiptVersion != "" && len(item.Instance.Receipt) != 0 && json.Valid(item.Instance.Receipt) {
+		receipt = poolstate.Receipt{Version: item.Instance.ReceiptVersion, Payload: append([]byte(nil), item.Instance.Receipt...)}
+	}
 	_, err := m.LifecycleState.ReportUnknown(ctx, poolstate.Discovery{
 		ProviderType: m.Config.Provider.Type,
 		ProviderID:   providerID,
 		ExactName:    item.Instance.Name,
-		Receipt:      poolstate.Receipt{Version: "v1", Payload: payload},
+		Receipt:      receipt,
 	})
 	if err != nil {
 		return fmt.Errorf("quarantine unowned provider instance %q: %w", item.Instance.Name, err)

@@ -12,7 +12,7 @@ var (
 	errPlatformUnsupported = ErrUnsupported
 )
 
-func lockFile(_ *os.File) error {
+func lockFile(_ *os.File, _ bool) error {
 	return errPlatformUnsupported
 }
 

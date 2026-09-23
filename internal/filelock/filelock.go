@@ -16,16 +16,27 @@ var ErrLocked = errors.New("file lock is already held")
 // Callers must fail closed rather than treating it as ordinary contention.
 var ErrUnsupported = errors.New("file locks are unsupported on this platform")
 
-// Lock is an exclusive advisory lock. Close releases it and is idempotent.
+// Lock is a shared or exclusive advisory lock. Close releases it and is idempotent.
 type Lock struct {
-	file *os.File
-	once sync.Once
-	err  error
+	file   *os.File
+	shared bool
+	once   sync.Once
+	err    error
 }
 
 // Acquire opens path, creating it when necessary, and attempts to acquire an
 // exclusive lock without waiting.
 func Acquire(path string) (*Lock, error) {
+	return acquire(path, false)
+}
+
+// AcquireShared attempts a non-blocking shared lock. Shared owners may coexist,
+// but exclude Acquire owners across both processes and file descriptors.
+func AcquireShared(path string) (*Lock, error) {
+	return acquire(path, true)
+}
+
+func acquire(path string, shared bool) (*Lock, error) {
 	if path == "" {
 		return nil, errors.New("lock path is empty")
 	}
@@ -33,7 +44,7 @@ func Acquire(path string) (*Lock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
-	if err := lockFile(file); err != nil {
+	if err := lockFile(file, shared); err != nil {
 		_ = file.Close()
 		if errors.Is(err, errPlatformLocked) {
 			return nil, fmt.Errorf("%w: %s", ErrLocked, path)
@@ -43,7 +54,7 @@ func Acquire(path string) (*Lock, error) {
 		}
 		return nil, fmt.Errorf("lock file %s: %w", path, err)
 	}
-	return &Lock{file: file}, nil
+	return &Lock{file: file, shared: shared}, nil
 }
 
 // ReplaceContent atomically with respect to this lock replaces the lock-file
@@ -53,6 +64,9 @@ func Acquire(path string) (*Lock, error) {
 func (lock *Lock) ReplaceContent(content []byte) error {
 	if lock == nil || lock.file == nil {
 		return errors.New("file lock is not open")
+	}
+	if lock.shared {
+		return errors.New("cannot replace content under a shared file lock")
 	}
 	if err := lock.file.Truncate(0); err != nil {
 		return fmt.Errorf("truncate lock file: %w", err)

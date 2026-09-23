@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/config"
@@ -397,333 +398,349 @@ func TestRetireInstanceDefersLocalDeleteWhenGitHubDeleteFails(t *testing.T) {
 	}
 }
 
+// RunPool timer tests keep contexts and controller timers in the same synctest
+// bubble so filesystem latency cannot consume the budget before monitoring starts.
 func TestRunPoolDoesNotReplaceWhenRetirementIsDeferred(t *testing.T) {
-	provider := &fakeProvider{ip: "127.0.0.1"}
-	github := &fakeGitHub{
-		runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "offline"},
-		found:      true,
-		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
-		deleteErr:  errors.New("github runner is currently running a job"),
-	}
-	manager := Manager{
-		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image"},
-			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
-			Logging:  config.LoggingConfig{Directory: t.TempDir()},
-			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}},
-		},
-		Provider:    provider,
-		GitHub:      github,
-		ProjectRoot: t.TempDir(),
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		provider := &fakeProvider{ip: "127.0.0.1"}
+		github := &fakeGitHub{
+			runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "offline"},
+			found:      true,
+			waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+			deleteErr:  errors.New("github runner is currently running a job"),
+		}
+		manager := Manager{
+			Config: config.Config{
+				Provider: config.ProviderConfig{SourceImage: "image"},
+				Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
+				Logging:  config.LoggingConfig{Directory: t.TempDir()},
+				Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}},
+			},
+			Provider:    provider,
+			GitHub:      github,
+			ProjectRoot: t.TempDir(),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
 
-	if err := manager.RunPool(ctx, RunOptions{
-		Instances:        1,
-		Register:         true,
-		KeepOnExit:       true,
-		ReplaceCompleted: true,
-		MonitorInterval:  5 * time.Millisecond,
-		PoolLockHeld:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&provider.cloneCalls); got != 1 {
-		t.Fatalf("Clone called %d time(s), want 1; deferred retirement should not create replacements", got)
-	}
+		if err := manager.RunPool(ctx, RunOptions{
+			Instances:        1,
+			Register:         true,
+			KeepOnExit:       true,
+			ReplaceCompleted: true,
+			MonitorInterval:  5 * time.Millisecond,
+			PoolLockHeld:     true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&provider.cloneCalls); got != 1 {
+			t.Fatalf("Clone called %d time(s), want 1; deferred retirement should not create replacements", got)
+		}
+		if got := atomic.LoadInt32(&github.deleteCalls); got == 0 {
+			t.Fatal("retirement was never attempted; deferral was not exercised")
+		}
+	})
 }
 
 func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
-	provider := &fakeProvider{ip: "127.0.0.1"}
-	github := &fakeGitHub{
-		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
-	}
-	manager := Manager{
-		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image"},
-			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
-			Logging:  config.LoggingConfig{Directory: t.TempDir()},
-			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
-			Security: config.Default().Security,
-		},
-		Provider:    provider,
-		GitHub:      github,
-		ProjectRoot: t.TempDir(),
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		provider := &fakeProvider{ip: "127.0.0.1"}
+		github := &fakeGitHub{
+			waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+		}
+		manager := Manager{
+			Config: config.Config{
+				Provider: config.ProviderConfig{SourceImage: "image"},
+				Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
+				Logging:  config.LoggingConfig{Directory: t.TempDir()},
+				Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+				Security: config.Default().Security,
+			},
+			Provider:    provider,
+			GitHub:      github,
+			ProjectRoot: t.TempDir(),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
 
-	if err := manager.RunPool(ctx, RunOptions{
-		Instances:        1,
-		Register:         true,
-		KeepOnExit:       true,
-		ReplaceCompleted: true,
-		MonitorInterval:  5 * time.Millisecond,
-		PoolLockHeld:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&provider.cloneCalls); got < 2 {
-		t.Fatalf("Clone called %d time(s), want a replacement after the initially busy ephemeral runner disappeared", got)
-	}
-	if got := atomic.LoadInt32(&provider.deleteCalls); got < 1 {
-		t.Fatalf("Delete called %d time(s), want completed runner instance retired", got)
-	}
-	if got := atomic.LoadInt32(&github.waitOnlineCalls); got < 2 {
-		t.Fatalf("WaitRunnerOnline called %d time(s), want initial busy runner and replacement", got)
-	}
-	if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 0 {
-		t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want supervised pool to accept busy runners", got)
-	}
+		if err := manager.RunPool(ctx, RunOptions{
+			Instances:        1,
+			Register:         true,
+			KeepOnExit:       true,
+			ReplaceCompleted: true,
+			MonitorInterval:  5 * time.Millisecond,
+			PoolLockHeld:     true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&provider.cloneCalls); got < 2 {
+			t.Fatalf("Clone called %d time(s), want a replacement after the initially busy ephemeral runner disappeared", got)
+		}
+		if got := atomic.LoadInt32(&provider.deleteCalls); got < 1 {
+			t.Fatalf("Delete called %d time(s), want completed runner instance retired", got)
+		}
+		if got := atomic.LoadInt32(&github.waitOnlineCalls); got < 2 {
+			t.Fatalf("WaitRunnerOnline called %d time(s), want initial busy runner and replacement", got)
+		}
+		if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 0 {
+			t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want supervised pool to accept busy runners", got)
+		}
+	})
 }
 
 func TestRunPoolFailsClosedWhenReplacementHostTrustActivationFails(t *testing.T) {
-	const activationFailure = "activate provider host-trust runtime: execute in docker sandbox failed: exit status 1: EPAR host-trust relay: activation failed at private-dockerd-contract (exit=1)"
-	snapshot := hosttrust.Snapshot{
-		Generation:   "g1",
-		HostOS:       "windows",
-		Scopes:       []string{"system"},
-		Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
-		CollectedAt:  time.Now().UTC(),
-	}
-	fake := &fakeProvider{ip: "127.0.0.1"}
-	marker, err := hostTrustMarkerJSON(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
-		commandText := strings.Join(command, " ")
-		if commandText == "cat "+hostTrustMarkerGuest {
-			return provider.ExecResult{Stdout: string(marker)}, nil
-		}
-		if strings.Contains(commandText, runnerProcessRunningSentinel) {
-			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
-		}
-		return provider.ExecResult{}, nil
-	}
-	github := &fakeGitHub{
-		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
-	}
-	activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
-	activator.onActivate = func(provider.Instance) {
-		if activator.calls == 2 {
-			activator.err = errors.New(activationFailure)
-		}
-	}
-	manager := newRegisteredTestManager(t, fake, github)
-	manager.Config.Provider.Type = "docker-sandboxes"
-	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
-	manager.Config.Image.HostTrustScopes = []string{"system"}
-	manager.AllowInsufficientStorage = true
-	manager.Lifecycle = activator
-	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
-	manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
-	state, err := poolstate.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manager.LifecycleState = state
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err = manager.RunPool(ctx, RunOptions{
-		Instances:         1,
-		Register:          true,
-		ReplaceCompleted:  true,
-		MonitorInterval:   5 * time.Millisecond,
-		PoolLockHeld:      true,
-		HostTrustLockHeld: true,
-	})
-	if err == nil || !strings.Contains(err.Error(), "private-dockerd-contract") {
-		t.Fatalf("RunPool() error = %v, want terminal host-trust stage failure", err)
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("RunPool() timed out instead of returning the replacement failure: %v", err)
-	}
-	if isTransientDependencyError(err) {
-		t.Fatalf("replacement failure was classified transient: %v", err)
-	}
-	if activator.calls != 2 {
-		t.Fatalf("host-trust activation calls = %d, want initial activation and one failed replacement", activator.calls)
-	}
-	if got := atomic.LoadInt32(&fake.cloneCalls); got != 2 {
-		t.Fatalf("Clone calls = %d, want exactly two candidates and no retry storm", got)
-	}
-	if got := atomic.LoadInt32(&github.registrationCalls); got != 1 {
-		t.Fatalf("registration token calls = %d, want only the initial runner registered", got)
-	}
-	if got := atomic.LoadInt32(&fake.deleteCalls); got != 2 {
-		t.Fatalf("provider delete calls = %d, want retired runner and failed replacement", got)
-	}
-	fake.mu.Lock()
-	deletedNames := append([]string(nil), fake.deletedNames...)
-	remaining := append([]provider.Instance(nil), fake.instances...)
-	fake.mu.Unlock()
-	if len(remaining) != 0 {
-		t.Fatalf("provider inventory after terminal cleanup = %#v, want empty", remaining)
-	}
-	if len(activator.instances) < 2 {
-		t.Fatalf("activated instances = %#v, want the failed replacement candidate", activator.instances)
-	}
-	replacementName := activator.instances[1].Name
-	deletedReplacement := false
-	for _, deletedName := range deletedNames {
-		if deletedName == replacementName {
-			deletedReplacement = true
-			break
-		}
-	}
-	if !deletedReplacement {
-		t.Fatalf("deleted provider names = %v, want exact failed replacement %q", deletedNames, replacementName)
-	}
-	records, err := state.List(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(records) != 2 {
-		t.Fatalf("lifecycle records = %#v, want initial and replacement tombstones", records)
-	}
-	for _, record := range records {
-		if record.Phase != poolstate.PhaseTombstoned || !strings.HasPrefix(record.ProviderID, "fake:") {
-			t.Fatalf("lifecycle record = %#v, want exact tombstoned provider identity", record)
-		}
-	}
-}
-
-func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
-	fake := &fakeProvider{ip: "127.0.0.1"}
-	github := &fakeGitHub{
-		runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
-		found:      true,
-		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
-	}
-	manager := Manager{
-		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
-			Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
-			Logging:  config.LoggingConfig{Directory: t.TempDir()},
-			Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
-			Image: config.ImageConfig{
-				HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"},
-			},
-		},
-		Provider:    fake,
-		GitHub:      github,
-		ProjectRoot: t.TempDir(),
-	}
-	snapshot := func(generation string) hosttrust.Snapshot {
-		return hosttrust.Snapshot{
-			Generation: generation, HostOS: "linux", Scopes: []string{"system"},
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	synctest.Test(t, func(t *testing.T) {
+		const activationFailure = "activate provider host-trust runtime: execute in docker sandbox failed: exit status 1: EPAR host-trust relay: activation failed at private-dockerd-contract (exit=1)"
+		snapshot := hosttrust.Snapshot{
+			Generation:   "g1",
+			HostOS:       "windows",
+			Scopes:       []string{"system"},
 			Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
 			CollectedAt:  time.Now().UTC(),
 		}
-	}
-	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
-		if atomic.LoadInt32(&github.waitOnlineCalls)+atomic.LoadInt32(&github.waitOnlineIdleCalls) == 0 {
-			return snapshot("g1"), nil
+		fake := &fakeProvider{ip: "127.0.0.1"}
+		marker, err := hostTrustMarkerJSON(snapshot)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return snapshot("g2"), nil
-	}
-	var imageEnsures int32
-	manager.hostTrustImageEnsurer = func(context.Context) error {
-		atomic.AddInt32(&imageEnsures, 1)
-		return nil
-	}
-	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
-		if strings.Contains(strings.Join(command, " "), hostTrustMarkerGuest) {
-			generation := "g1"
-			if atomic.LoadInt32(&fake.cloneCalls) >= 2 {
-				generation = "g2"
+		fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			commandText := strings.Join(command, " ")
+			if commandText == "cat "+hostTrustMarkerGuest {
+				return provider.ExecResult{Stdout: string(marker)}, nil
 			}
-			marker := fmt.Sprintf(`{"schemaVersion":1,"generation":%q,"hostOS":"linux","mode":"overlay","scopes":["system"],"certificateCount":1}`, generation)
-			return provider.ExecResult{Stdout: marker}, nil
+			if strings.Contains(commandText, runnerProcessRunningSentinel) {
+				return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+			}
+			return provider.ExecResult{}, nil
 		}
-		return provider.ExecResult{}, nil
-	}
+		github := &fakeGitHub{
+			waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+		}
+		activator := &activatingLifecycle{Lifecycle: provider.AdaptLegacy(fake, false)}
+		activator.onActivate = func(provider.Instance) {
+			if activator.calls == 2 {
+				activator.err = errors.New(activationFailure)
+			}
+		}
+		manager := newRegisteredTestManager(t, fake, github)
+		manager.Config.Provider.Type = "docker-sandboxes"
+		manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+		manager.Config.Image.HostTrustScopes = []string{"system"}
+		manager.AllowInsufficientStorage = true
+		manager.Lifecycle = activator
+		manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+		manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
+		state, err := poolstate.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager.LifecycleState = state
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
-	defer cancel()
-	if err := manager.RunPool(ctx, RunOptions{
-		Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: false, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&fake.cloneCalls); got != 1 {
-		t.Fatalf("Clone called %d time(s), want strict physical cap while busy G1 drains", got)
-	}
-	if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
-		t.Fatalf("busy G1 was deleted %d time(s), want it left draining", got)
-	}
-	if got := atomic.LoadInt32(&imageEnsures); got == 0 {
-		t.Fatal("G2 replacement image was not ensured")
-	}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		err = manager.RunPool(ctx, RunOptions{
+			Instances:         1,
+			Register:          true,
+			ReplaceCompleted:  true,
+			MonitorInterval:   5 * time.Millisecond,
+			PoolLockHeld:      true,
+			HostTrustLockHeld: true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "private-dockerd-contract") {
+			t.Fatalf("RunPool() error = %v, want terminal host-trust stage failure", err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			t.Fatalf("RunPool() timed out instead of returning the replacement failure: err=%v context=%v", err, ctx.Err())
+		}
+		if isTransientDependencyError(err) {
+			t.Fatalf("replacement failure was classified transient: %v", err)
+		}
+		if activator.calls != 2 {
+			t.Fatalf("host-trust activation calls = %d, want initial activation and one failed replacement", activator.calls)
+		}
+		if got := atomic.LoadInt32(&fake.cloneCalls); got != 2 {
+			t.Fatalf("Clone calls = %d, want exactly two candidates and no retry storm", got)
+		}
+		if got := atomic.LoadInt32(&github.registrationCalls); got != 1 {
+			t.Fatalf("registration token calls = %d, want only the initial runner registered", got)
+		}
+		if got := atomic.LoadInt32(&fake.deleteCalls); got != 2 {
+			t.Fatalf("provider delete calls = %d, want retired runner and failed replacement", got)
+		}
+		fake.mu.Lock()
+		deletedNames := append([]string(nil), fake.deletedNames...)
+		remaining := append([]provider.Instance(nil), fake.instances...)
+		fake.mu.Unlock()
+		if len(remaining) != 0 {
+			t.Fatalf("provider inventory after terminal cleanup = %#v, want empty", remaining)
+		}
+		if len(activator.instances) < 2 {
+			t.Fatalf("activated instances = %#v, want the failed replacement candidate", activator.instances)
+		}
+		replacementName := activator.instances[1].Name
+		deletedReplacement := false
+		for _, deletedName := range deletedNames {
+			if deletedName == replacementName {
+				deletedReplacement = true
+				break
+			}
+		}
+		if !deletedReplacement {
+			t.Fatalf("deleted provider names = %v, want exact failed replacement %q", deletedNames, replacementName)
+		}
+		records, err := state.List(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) != 2 {
+			t.Fatalf("lifecycle records = %#v, want initial and replacement tombstones", records)
+		}
+		for _, record := range records {
+			if record.Phase != poolstate.PhaseTombstoned || !strings.HasPrefix(record.ProviderID, "fake:") {
+				t.Fatalf("lifecycle record = %#v, want exact tombstoned provider identity", record)
+			}
+		}
+	})
+}
+
+func TestRunPoolAddsCurrentTrustCapacityWhileOldGenerationDrains(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeProvider{ip: "127.0.0.1"}
+		github := &fakeGitHub{
+			runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+			found:      true,
+			waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online", Busy: true},
+		}
+		manager := Manager{
+			Config: config.Config{
+				Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
+				Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
+				Logging:  config.LoggingConfig{Directory: t.TempDir()},
+				Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
+				Image: config.ImageConfig{
+					HostTrustMode: config.HostTrustModeOverlay, HostTrustScopes: []string{"system"},
+				},
+			},
+			Provider:    fake,
+			GitHub:      github,
+			ProjectRoot: t.TempDir(),
+		}
+		snapshot := func(generation string) hosttrust.Snapshot {
+			return hosttrust.Snapshot{
+				Generation: generation, HostOS: "linux", Scopes: []string{"system"},
+				Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}},
+				CollectedAt:  time.Now().UTC(),
+			}
+		}
+		manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) {
+			if atomic.LoadInt32(&github.waitOnlineCalls)+atomic.LoadInt32(&github.waitOnlineIdleCalls) == 0 {
+				return snapshot("g1"), nil
+			}
+			return snapshot("g2"), nil
+		}
+		var imageEnsures int32
+		manager.hostTrustImageEnsurer = func(context.Context) error {
+			atomic.AddInt32(&imageEnsures, 1)
+			return nil
+		}
+		fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			if strings.Contains(strings.Join(command, " "), hostTrustMarkerGuest) {
+				generation := "g1"
+				if atomic.LoadInt32(&fake.cloneCalls) >= 2 {
+					generation = "g2"
+				}
+				marker := fmt.Sprintf(`{"schemaVersion":1,"generation":%q,"hostOS":"linux","mode":"overlay","scopes":["system"],"certificateCount":1}`, generation)
+				return provider.ExecResult{Stdout: marker}, nil
+			}
+			return provider.ExecResult{}, nil
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{
+			Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: false, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&fake.cloneCalls); got != 1 {
+			t.Fatalf("Clone called %d time(s), want strict physical cap while busy G1 drains", got)
+		}
+		if got := atomic.LoadInt32(&fake.deleteCalls); got != 0 {
+			t.Fatalf("busy G1 was deleted %d time(s), want it left draining", got)
+		}
+		if got := atomic.LoadInt32(&imageEnsures); got == 0 {
+			t.Fatal("G2 replacement image was not ensured")
+		}
+	})
 }
 
 func TestRunPoolVerifiesHostTrustTransportWithoutReactivationOnLeaseCadence(t *testing.T) {
-	snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
-	marker, err := hostTrustMarkerJSON(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := &fakeProvider{ip: "127.0.0.1"}
-	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
-		if strings.Join(command, " ") == "cat "+hostTrustMarkerGuest {
-			return provider.ExecResult{Stdout: string(marker)}, nil
+	synctest.Test(t, func(t *testing.T) {
+		snapshot := hosttrust.Snapshot{Generation: "g1", HostOS: "windows", Scopes: []string{"system"}, Certificates: []hosttrust.Certificate{{Name: "root.crt", PEM: []byte("pem")}}, CollectedAt: time.Now().UTC()}
+		marker, err := hostTrustMarkerJSON(snapshot)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if strings.Contains(strings.Join(command, " "), runnerProcessRunningSentinel) {
-			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+		fake := &fakeProvider{ip: "127.0.0.1"}
+		fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			if strings.Join(command, " ") == "cat "+hostTrustMarkerGuest {
+				return provider.ExecResult{Stdout: string(marker)}, nil
+			}
+			if strings.Contains(strings.Join(command, " "), runnerProcessRunningSentinel) {
+				return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+			}
+			return provider.ExecResult{}, nil
 		}
-		return provider.ExecResult{}, nil
-	}
-	github := &fakeGitHub{
-		runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
-		found:      true,
-		waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
-	}
-	activation := make(chan struct{}, 4)
-	verification := make(chan struct{}, 4)
-	activator := &hostTrustVerifyingLifecycle{
-		activatingLifecycle: &activatingLifecycle{
-			Lifecycle:  provider.AdaptLegacy(fake, false),
-			onActivate: func(provider.Instance) { activation <- struct{}{} },
-		},
-		onVerifyHostTrust: func(provider.Instance) { verification <- struct{}{} },
-	}
-	manager := newRegisteredTestManager(t, fake, github)
-	manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
-	manager.Config.Image.HostTrustScopes = []string{"system"}
-	manager.Lifecycle = activator
-	manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
-	manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
+		github := &fakeGitHub{
+			runner:     gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+			found:      true,
+			waitRunner: gh.Runner{Name: "epar-test-1", ID: 123, Status: "online"},
+		}
+		activation := make(chan struct{}, 4)
+		verification := make(chan struct{}, 4)
+		activator := &hostTrustVerifyingLifecycle{
+			activatingLifecycle: &activatingLifecycle{
+				Lifecycle:  provider.AdaptLegacy(fake, false),
+				onActivate: func(provider.Instance) { activation <- struct{}{} },
+			},
+			onVerifyHostTrust: func(provider.Instance) { verification <- struct{}{} },
+		}
+		manager := newRegisteredTestManager(t, fake, github)
+		manager.Config.Image.HostTrustMode = config.HostTrustModeOverlay
+		manager.Config.Image.HostTrustScopes = []string{"system"}
+		manager.Lifecycle = activator
+		manager.hostTrustResolver = func(context.Context) (hosttrust.Snapshot, error) { return snapshot, nil }
+		manager.hostTrustImageEnsurer = func(context.Context) error { return nil }
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true})
-	}()
-	select {
-	case <-activation:
-	case <-time.After(2 * time.Second):
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, HostTrustLockHeld: true, PoolLockHeld: true})
+		}()
+		select {
+		case <-activation:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatal("initial host trust activation did not occur")
+		}
+		select {
+		case <-verification:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatal("steady-state host trust verification did not occur")
+		}
+		select {
+		case <-activation:
+			cancel()
+			t.Fatal("host trust transport was reactivated during steady-state lease reconciliation")
+		case <-time.After(25 * time.Millisecond):
+		}
 		cancel()
-		t.Fatal("initial host trust activation did not occur")
-	}
-	select {
-	case <-verification:
-	case <-time.After(2 * time.Second):
-		cancel()
-		t.Fatal("steady-state host trust verification did not occur")
-	}
-	select {
-	case <-activation:
-		cancel()
-		t.Fatal("host trust transport was reactivated during steady-state lease reconciliation")
-	case <-time.After(25 * time.Millisecond):
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestRunPoolCancellationDuringLivenessSkipsTransientWarningAndCleansUp(t *testing.T) {
@@ -796,31 +813,33 @@ func TestVerifyUsesIdleReadiness(t *testing.T) {
 }
 
 func TestRunPoolUsesConfiguredInstancesWhenNoOverride(t *testing.T) {
-	provider := &fakeProvider{ip: "127.0.0.1"}
-	manager := Manager{
-		Config: config.Config{
-			Provider: config.ProviderConfig{SourceImage: "image"},
-			Pool:     config.PoolConfig{Instances: 2, NamePrefix: "epar-test"},
-			Logging:  config.LoggingConfig{Directory: t.TempDir()},
-		},
-		Provider:    provider,
-		ProjectRoot: t.TempDir(),
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		provider := &fakeProvider{ip: "127.0.0.1"}
+		manager := Manager{
+			Config: config.Config{
+				Provider: config.ProviderConfig{SourceImage: "image"},
+				Pool:     config.PoolConfig{Instances: 2, NamePrefix: "epar-test"},
+				Logging:  config.LoggingConfig{Directory: t.TempDir()},
+			},
+			Provider:    provider,
+			ProjectRoot: t.TempDir(),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
 
-	if err := manager.RunPool(ctx, RunOptions{
-		Instances:        0,
-		Register:         false,
-		KeepOnExit:       true,
-		ReplaceCompleted: false,
-		PoolLockHeld:     true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&provider.cloneCalls); got != 2 {
-		t.Fatalf("Clone called %d time(s), want configured instances 2", got)
-	}
+		if err := manager.RunPool(ctx, RunOptions{
+			Instances:        0,
+			Register:         false,
+			KeepOnExit:       true,
+			ReplaceCompleted: false,
+			PoolLockHeld:     true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&provider.cloneCalls); got != 2 {
+			t.Fatalf("Clone called %d time(s), want configured instances 2", got)
+		}
+	})
 }
 
 func TestProvisionOneRetriesTransientRuntimeValidationFailure(t *testing.T) {
@@ -1619,17 +1638,19 @@ func TestOneHundredRegistrationOutagesNeverExceedPhysicalCap(t *testing.T) {
 }
 
 func TestCleanupFailureRemainsCountedAndBlocksClone(t *testing.T) {
-	p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing", State: "running"}}, deleteErr: errors.New("delete failed")}
-	g := &fakeGitHub{}
-	manager := newRegisteredTestManager(t, p, g)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: time.Millisecond, PoolLockHeld: true}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&p.cloneCalls); got != 0 {
-		t.Fatalf("clone calls = %d, want 0 while cleanup-pending resource occupies capacity", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing", State: "running"}}, deleteErr: errors.New("delete failed")}
+		g := &fakeGitHub{}
+		manager := newRegisteredTestManager(t, p, g)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&p.cloneCalls); got != 0 {
+			t.Fatalf("clone calls = %d, want 0 while cleanup-pending resource occupies capacity", got)
+		}
+	})
 }
 
 func TestInitialTerminalFailureCleansReadyInstancesButPreservesQuarantine(t *testing.T) {
@@ -1668,27 +1689,29 @@ func TestInitialTerminalFailureCleansReadyInstancesButPreservesQuarantine(t *tes
 }
 
 func TestShutdownCancellationPreservesPostListenerCandidateWhenKeepOnExit(t *testing.T) {
-	p := &fakeProvider{ip: "127.0.0.1"}
-	g := &fakeGitHub{waitFunc: func(ctx context.Context, _ string, _ time.Duration) (gh.Runner, error) {
-		<-ctx.Done()
-		return gh.Runner{}, ctx.Err()
-	}}
-	manager := newRegisteredTestManager(t, p, g)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, PoolLockHeld: true}); err != nil {
-		t.Fatalf("RunPool() cancellation error = %v, want clean shutdown", err)
-	}
-	if got := atomic.LoadInt32(&p.deleteCalls); got != 0 {
-		t.Fatalf("local delete calls = %d, want post-listener candidate preserved by keep-on-exit", got)
-	}
-	instances, err := p.List(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(instances) != 1 {
-		t.Fatalf("surviving local instances = %d, want 1 quarantined candidate", len(instances))
-	}
+	synctest.Test(t, func(t *testing.T) {
+		p := &fakeProvider{ip: "127.0.0.1"}
+		g := &fakeGitHub{waitFunc: func(ctx context.Context, _ string, _ time.Duration) (gh.Runner, error) {
+			<-ctx.Done()
+			return gh.Runner{}, ctx.Err()
+		}}
+		manager := newRegisteredTestManager(t, p, g)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, PoolLockHeld: true}); err != nil {
+			t.Fatalf("RunPool() cancellation error = %v, want clean shutdown", err)
+		}
+		if got := atomic.LoadInt32(&p.deleteCalls); got != 0 {
+			t.Fatalf("local delete calls = %d, want post-listener candidate preserved by keep-on-exit", got)
+		}
+		instances, err := p.List(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(instances) != 1 {
+			t.Fatalf("surviving local instances = %d, want 1 quarantined candidate", len(instances))
+		}
+	})
 }
 
 func TestStoppedLocalIsCleanedEvenWhenGitHubIsUnavailable(t *testing.T) {
@@ -1729,16 +1752,18 @@ func TestRestartUnknownResourcesCountAndBlockAllocation(t *testing.T) {
 }
 
 func TestLegacyOverCapacityInventoryBlocksAllocation(t *testing.T) {
-	p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing-1", State: "running"}, {Name: "epar-test-existing-2", State: "running"}, {Name: "epar-test-existing-3", State: "running"}}}
-	manager := newRegisteredTestManager(t, p, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	if err := manager.RunPool(ctx, RunOptions{Instances: 2, KeepOnExit: true, PoolLockHeld: true}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&p.cloneCalls); got != 0 {
-		t.Fatalf("clone calls = %d, want 0 while legacy physical inventory exceeds target", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing-1", State: "running"}, {Name: "epar-test-existing-2", State: "running"}, {Name: "epar-test-existing-3", State: "running"}}}
+		manager := newRegisteredTestManager(t, p, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 2, KeepOnExit: true, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&p.cloneCalls); got != 0 {
+			t.Fatalf("clone calls = %d, want 0 while legacy physical inventory exceeds target", got)
+		}
+	})
 }
 
 func TestReconciliationCleanupUsesMaintenanceContext(t *testing.T) {
@@ -1984,41 +2009,43 @@ func TestTransientDependencyClassification(t *testing.T) {
 }
 
 func TestReplacementCooldownSkipsGitHubButContinuesLocalHousekeeping(t *testing.T) {
-	p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing", State: "running"}}}
-	g := &fakeGitHub{runner: gh.Runner{Name: "epar-test-existing", ID: 1, Status: "online"}, found: true}
-	g.listFunc = func(context.Context) ([]gh.Runner, error) {
-		if atomic.LoadInt32(&g.listCalls) == 1 {
-			return []gh.Runner{{Name: "epar-test-existing", ID: 1, Status: "online"}}, nil
+	synctest.Test(t, func(t *testing.T) {
+		p := &fakeProvider{instances: []provider.Instance{{Name: "epar-test-existing", State: "running"}}}
+		g := &fakeGitHub{runner: gh.Runner{Name: "epar-test-existing", ID: 1, Status: "online"}, found: true}
+		g.listFunc = func(context.Context) ([]gh.Runner, error) {
+			if atomic.LoadInt32(&g.listCalls) == 1 {
+				return []gh.Runner{{Name: "epar-test-existing", ID: 1, Status: "online"}}, nil
+			}
+			p.mu.Lock()
+			if len(p.instances) > 0 {
+				p.instances[0].State = "stopped"
+			}
+			p.mu.Unlock()
+			return nil, &gh.HTTPError{StatusCode: 503}
 		}
-		p.mu.Lock()
-		if len(p.instances) > 0 {
-			p.instances[0].State = "stopped"
+		manager := newRegisteredTestManager(t, p, g)
+		manager.Config.Pool.ReplacementRetryInitialSeconds = 15
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
 		}
-		p.mu.Unlock()
-		return nil, &gh.HTTPError{StatusCode: 503}
-	}
-	manager := newRegisteredTestManager(t, p, g)
-	manager.Config.Pool.ReplacementRetryInitialSeconds = 15
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: time.Millisecond, PoolLockHeld: true}); err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&g.listCalls); got != 2 {
-		t.Fatalf("GitHub ListRunners calls = %d, want initial success plus one failed retry trigger", got)
-	}
-	if got := atomic.LoadInt32(&g.runnerByNameCalls); got > 1 {
-		t.Fatalf("GitHub RunnerByName calls = %d, want no calls during cooldown", got)
-	}
-	if got := atomic.LoadInt32(&p.listCalls); got <= 2 {
-		t.Fatalf("local List calls = %d, want repeated housekeeping during cooldown", got)
-	}
-	if got := atomic.LoadInt32(&p.deleteCalls); got != 1 {
-		t.Fatalf("local delete calls = %d, want stopped resource cleanup during cooldown", got)
-	}
-	if got := atomic.LoadInt32(&p.cloneCalls); got != 0 {
-		t.Fatalf("clone calls = %d, want allocation paused during cooldown", got)
-	}
+		if got := atomic.LoadInt32(&g.listCalls); got != 2 {
+			t.Fatalf("GitHub ListRunners calls = %d, want initial success plus one failed retry trigger", got)
+		}
+		if got := atomic.LoadInt32(&g.runnerByNameCalls); got > 1 {
+			t.Fatalf("GitHub RunnerByName calls = %d, want no calls during cooldown", got)
+		}
+		if got := atomic.LoadInt32(&p.listCalls); got <= 2 {
+			t.Fatalf("local List calls = %d, want repeated housekeeping during cooldown", got)
+		}
+		if got := atomic.LoadInt32(&p.deleteCalls); got != 1 {
+			t.Fatalf("local delete calls = %d, want stopped resource cleanup during cooldown", got)
+		}
+		if got := atomic.LoadInt32(&p.cloneCalls); got != 0 {
+			t.Fatalf("clone calls = %d, want allocation paused during cooldown", got)
+		}
+	})
 }
 
 func newRegisteredTestManager(t *testing.T, provider provider.Provider, github GitHubClient) Manager {

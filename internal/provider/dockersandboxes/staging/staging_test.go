@@ -73,6 +73,41 @@ func TestRejectsPreexistingOrNonemptyDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenExistingObservesNonemptyOwnedDirectoryWithoutCreatingRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "staging")
+	staging, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := staging.CreateOwned("stale-sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(owned.Path, "runtime-state"), []byte("sandbox"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenExisting(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := reopened.ObserveOwned("stale-sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Path != owned.Path || observed.Identity != owned.Identity {
+		t.Fatalf("observed ownership = %#v, want %#v", observed, owned)
+	}
+
+	missingRoot := filepath.Join(t.TempDir(), "must-not-be-created")
+	if _, err := OpenExisting(missingRoot); err == nil {
+		t.Fatal("OpenExisting created a missing staging root")
+	}
+	if _, err := os.Lstat(missingRoot); !os.IsNotExist(err) {
+		t.Fatalf("missing staging root was created: %v", err)
+	}
+}
+
 func TestRejectsSymlinkOrJunctionRedirection(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")

@@ -2113,7 +2113,7 @@ func TestInitPromotedDockerSandboxesDefaultsOnlyAfterPassingPreflight(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: native-only", "recoveryMode: exclusive-auto", "recoveryQuiescenceSeconds: 60"} {
+	for _, required := range []string{"type: docker-sandboxes", "dockerSandboxes:", "epar-docker-sandboxes", "policyGeneration: " + record.PolicyFingerprint, "architectureEmulation: native-only", "recoveryMode: exclusive-auto", "recoveryQuiescenceSeconds: 60", "memory: 4GiB"} {
 		if !strings.Contains(string(configText), required) {
 			t.Fatalf("generated Docker Sandboxes config omitted %q:\n%s", required, configText)
 		}

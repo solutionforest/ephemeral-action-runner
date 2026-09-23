@@ -346,7 +346,7 @@ func runPool(args []string) error {
 		common := addCommonFlags(fs)
 		instances := fs.Int("instances", 0, "number of concurrent instances to verify; overrides pool.instances")
 		registerOnly := fs.Bool("register-only", false, "register runners and verify online/idle without dispatching a job")
-		cleanup := fs.Bool("cleanup", false, "clean up verification resources; legacy providers use the configured pool prefix, while Docker Sandboxes uses exact owned records")
+		cleanup := fs.Bool("cleanup", false, "clean up verification resources; legacy providers use the configured pool prefix, while Docker Sandboxes uses exact records or provider-proven matching-prefix orphans")
 		allowInsufficientStorage := fs.Bool("allow-insufficient-storage", false, "continue this invocation despite confirmed insufficient storage")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err

@@ -47,6 +47,67 @@ func providerTestWorkspace() string {
 	return filepath.Join(string(filepath.Separator), "var", "lib", "epar", "staging", "job-1")
 }
 
+func TestPrepareOrphanCleanupReconstructsReceiptFromExactStagingEvidence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "staging")
+	stagingRoot, err := staging.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := stagingRoot.CreateOwned(testName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(owned.Path, "runtime-state"), []byte("sandbox"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := New("sbx")
+	item := provider.InventoryItem{
+		Instance: provider.Instance{Name: testName, ProviderID: testID, State: "running", Source: "shell"},
+		State:    "running",
+		Source:   "shell",
+		Workspaces: []string{
+			owned.Path,
+		},
+	}
+
+	instance, err := p.PrepareOrphanCleanup(context.Background(), item, owned.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Name != item.Instance.Name || instance.ProviderID != item.Instance.ProviderID || instance.ReceiptVersion != "v1" {
+		t.Fatalf("prepared instance = %#v, want exact identity and v1 receipt", instance)
+	}
+	var receipt instanceReceipt
+	if err := json.Unmarshal(instance.Receipt, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.StagingPath != owned.Path || receipt.StagingIdentity != owned.Identity {
+		t.Fatalf("receipt = %#v, want exact observed staging evidence", receipt)
+	}
+}
+
+func TestPrepareOrphanCleanupRejectsWorkspaceMismatch(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "staging")
+	stagingRoot, err := staging.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := stagingRoot.CreateOwned(testName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New("sbx")
+	item := provider.InventoryItem{
+		Instance:   provider.Instance{Name: testName, ProviderID: testID, State: "running", Source: "shell"},
+		State:      "running",
+		Source:     "shell",
+		Workspaces: []string{owned.Path},
+	}
+	if _, err := p.PrepareOrphanCleanup(context.Background(), item, filepath.Join(root, "other")); err == nil {
+		t.Fatal("workspace mismatch was accepted for orphan cleanup")
+	}
+}
+
 func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
 	p := NewWithDryRun("sbx", true)
 	called := false
@@ -575,8 +636,9 @@ func TestResolveTemplateCacheIDUsesAuthoritativeReferenceReadback(t *testing.T) 
 func TestResolveTemplateCacheIDRejectsAmbiguousReference(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024},{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:01:00Z","size":1024}]}`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"ec2006fea720","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:00:00Z","size":1024},{"id":"aaaaaaaaaaaa","repository":"docker.io/library/epar-template","tag":"opaque","created_at":"2026-08-10T00:01:00Z","size":1024}]}`}},
 	)
-	if _, _, err := p.ResolveTemplateCacheID(context.Background(), "docker.io/library/epar-template:opaque"); err == nil || !strings.Contains(err.Error(), "duplicate image reference") {
+	if _, _, err := p.ResolveTemplateCacheID(context.Background(), "docker.io/library/epar-template:opaque"); err == nil || !strings.Contains(err.Error(), "category=duplicate_image_reference") {
 		t.Fatalf("ResolveTemplateCacheID() error = %v", err)
 	}
 	done()
@@ -1760,6 +1822,7 @@ func TestCachedTemplatesUsesMachineReadableInventoryWithoutVersionGate(t *testin
 func TestCachedTemplatesFailsClosedOnMalformedInventory(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"not-a-cache-id"}]}`}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[{"id":"not-a-cache-id"}]}`}},
 	)
 	if _, err := p.CachedTemplates(context.Background()); err == nil {
 		t.Fatal("malformed template inventory was accepted")
@@ -1976,6 +2039,65 @@ func TestRunHonorsOperationTimeout(t *testing.T) {
 	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("bounded command error = %v, want context deadline exceeded", err)
+	}
+}
+
+func TestRunContextErrorPreservesDistinctErrorsWithoutDuplicates(t *testing.T) {
+	for _, contextKind := range []string{"deadline", "canceled"} {
+		for _, errorKind := range []string{"direct", "wrapped", "joined", "distinct", "nil"} {
+			t.Run(contextKind+"/"+errorKind, func(t *testing.T) {
+				const secret = "sentinel-context-secret"
+				distinctErr := errors.New("command failed: " + secret)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				wantContextErr := context.Canceled
+				var timeout time.Duration
+				if contextKind == "deadline" {
+					wantContextErr = context.DeadlineExceeded
+					timeout = 10 * time.Millisecond
+				}
+				p := New("sbx-test-double")
+				p.runCommand = func(operationCtx context.Context, _ commandRequest) (provider.ExecResult, error) {
+					if contextKind == "canceled" {
+						cancel()
+					}
+					<-operationCtx.Done()
+					var runErr error
+					switch errorKind {
+					case "direct":
+						runErr = operationCtx.Err()
+					case "wrapped":
+						runErr = fmt.Errorf("command %s: %w", secret, operationCtx.Err())
+					case "joined":
+						runErr = errors.Join(operationCtx.Err(), distinctErr)
+					case "distinct":
+						runErr = distinctErr
+					}
+					return provider.ExecResult{Stdout: secret}, runErr
+				}
+				result, err := p.run(ctx, commandRequest{
+					args:            []string{"ls", "--json"},
+					operation:       "context test command",
+					timeout:         timeout,
+					sensitiveValues: []string{secret},
+				})
+				if !errors.Is(err, wantContextErr) {
+					t.Fatalf("run() error = %v, want %v", err, wantContextErr)
+				}
+				if count := strings.Count(err.Error(), wantContextErr.Error()); count != 1 {
+					t.Fatalf("context error appears %d times in %q, want once", count, err)
+				}
+				if errorKind == "distinct" || errorKind == "joined" {
+					if !errors.Is(err, distinctErr) || !strings.Contains(err.Error(), "command failed:") {
+						t.Fatalf("distinct command error lost: %v", err)
+					}
+				}
+				combined := result.Stdout + err.Error()
+				if strings.Contains(combined, secret) || !strings.Contains(combined, "[REDACTED]") {
+					t.Fatalf("sensitive output was not redacted: %q", combined)
+				}
+			})
+		}
 	}
 }
 

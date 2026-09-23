@@ -25,17 +25,31 @@ type cachedTemplate struct {
 }
 
 func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
+	// Diagnostics contain only fixed categories and a size, never provider data
+	// or decoder errors (which can include credentials from malformed output).
+	invalid := func(category string) error {
+		return fmt.Errorf("docker sandbox template inventory parse failure: category=%s stdoutBytes=%d", category, len(data))
+	}
+	if !json.Valid(data) {
+		return nil, invalid("invalid_json")
+	}
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return nil, invalid("duplicate_json_key")
+	}
 	var wrapper map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &wrapper); err != nil {
-		return nil, fmt.Errorf("docker sandbox template inventory returned an unsupported json schema")
+	if err := decodeStrictJSON(data, &wrapper); err != nil || wrapper == nil {
+		return nil, invalid("invalid_root_type")
 	}
 	rawImages, ok := wrapper["images"]
-	if !ok || bytes.Equal(bytes.TrimSpace(rawImages), []byte("null")) {
-		return nil, fmt.Errorf("docker sandbox template inventory returned an unsupported json schema")
+	if !ok {
+		return nil, invalid("missing_images")
+	}
+	if bytes.Equal(bytes.TrimSpace(rawImages), []byte("null")) || bytes.TrimSpace(rawImages)[0] != '[' {
+		return nil, invalid("invalid_images_type")
 	}
 	var records []map[string]json.RawMessage
 	if err := json.Unmarshal(rawImages, &records); err != nil {
-		return nil, fmt.Errorf("docker sandbox template inventory returned an unsupported json schema")
+		return nil, invalid("invalid_image_schema")
 	}
 	images := make([]cachedTemplate, 0, len(records))
 	seenIDs := make(map[string]struct{}, len(records))
@@ -52,17 +66,17 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 		sizeErr := json.Unmarshal(rawSize, &size)
 		sizeValue, integerErr := strconv.ParseInt(size.String(), 10, 64)
 		if idErr != nil || !cachedTemplateIDPattern.MatchString(id) || repositoryErr != nil || tagErr != nil || flavorErr != nil || createdAtErr != nil || timestampErr != nil || !sizePresent || len(rawSize) == 0 || rawSize[0] < '0' || rawSize[0] > '9' || sizeErr != nil || integerErr != nil || sizeValue <= 0 {
-			return nil, fmt.Errorf("docker sandbox template inventory returned an unsupported image schema")
+			return nil, invalid("invalid_image_schema")
 		}
 		if !templatePattern.MatchString(repository) || !profilePattern.MatchString(tag) || flavor != "" && !profilePattern.MatchString(flavor) {
-			return nil, fmt.Errorf("docker sandbox template inventory returned an invalid image identity")
+			return nil, invalid("invalid_image_identity")
 		}
 		reference := repository + ":" + tag
 		if _, duplicate := seenIDs[id]; duplicate {
-			return nil, fmt.Errorf("docker sandbox template inventory returned a duplicate image id")
+			return nil, invalid("duplicate_image_id")
 		}
 		if _, duplicate := seenReferences[reference]; duplicate {
-			return nil, fmt.Errorf("docker sandbox template inventory returned a duplicate image reference")
+			return nil, invalid("duplicate_image_reference")
 		}
 		seenIDs[id] = struct{}{}
 		seenReferences[reference] = struct{}{}

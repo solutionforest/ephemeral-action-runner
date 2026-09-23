@@ -289,9 +289,11 @@ func (p *Provider) CoordinateControlPlaneRecovery(ctx context.Context, operation
 	}
 	var releaseHostLock func()
 	if p.runCommand == nil {
-		releaseHostLock, err = provider.TryAcquireControlPlaneRecoveryLock()
+		admissionCtx, cancelAdmission := context.WithTimeout(ctx, providerReadbackTimeout)
+		releaseHostLock, err = provider.AcquireControlPlaneRecoveryLock(admissionCtx)
+		cancelAdmission()
 		if err != nil {
-			return err
+			return fmt.Errorf("wait for Docker Sandboxes exclusive recovery admission: %w", err)
 		}
 		defer releaseHostLock()
 	}
@@ -1395,6 +1397,54 @@ func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, err
 	return p.inventoryVerified(ctx)
 }
 
+// PrepareOrphanCleanup reconstructs the minimum immutable receipt needed to
+// remove a sandbox that is visible in provider inventory but has no durable
+// EPAR lifecycle record. The shared pool supplies the workspace path derived
+// from the active configuration; this provider additionally requires the
+// shell agent and the exact direct staging directory identity before allowing
+// the caller to proceed.
+func (p *Provider) PrepareOrphanCleanup(ctx context.Context, item provider.InventoryItem, expectedWorkspace string) (provider.Instance, error) {
+	if err := ctx.Err(); err != nil {
+		return provider.Instance{}, err
+	}
+	if item.Instance.Name == "" || item.Instance.ProviderID == "" {
+		return provider.Instance{}, fmt.Errorf("Docker Sandbox orphan cleanup requires an exact name and stable provider id")
+	}
+	source := item.Source
+	if source == "" {
+		source = item.Instance.Source
+	}
+	if source != "shell" {
+		return provider.Instance{}, fmt.Errorf("Docker Sandbox orphan cleanup requires the shell agent")
+	}
+	if strings.TrimSpace(expectedWorkspace) == "" || !containsExactWorkspace(item.Workspaces, expectedWorkspace) {
+		return provider.Instance{}, fmt.Errorf("Docker Sandbox inventory did not bind the configured staging workspace")
+	}
+	stagingRoot, err := staging.OpenExisting(filepath.Dir(expectedWorkspace))
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	if filepath.Clean(expectedWorkspace) != filepath.Join(stagingRoot.Root(), item.Instance.Name) {
+		return provider.Instance{}, fmt.Errorf("refusing Docker Sandbox orphan cleanup outside the exact configured staging path")
+	}
+	ownedStaging, err := stagingRoot.ObserveOwned(item.Instance.Name)
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	receipt, err := json.Marshal(instanceReceipt{
+		SchemaVersion:   1,
+		StagingPath:     ownedStaging.Path,
+		StagingIdentity: ownedStaging.Identity,
+	})
+	if err != nil {
+		return provider.Instance{}, err
+	}
+	instance := item.Instance
+	instance.ReceiptVersion = "v1"
+	instance.Receipt = receipt
+	return instance, nil
+}
+
 func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryItem, error) {
 	for attempt := 1; attempt <= 2; attempt++ {
 		result, err := p.run(ctx, commandRequest{args: []string{"ls", "--json"}, operation: "inventory docker sandboxes", timeout: providerReadbackTimeout})
@@ -1426,16 +1476,7 @@ func (p *Provider) inventoryVerified(ctx context.Context) ([]provider.InventoryI
 // template cache inventory. It does not create, load, or otherwise mutate a
 // template.
 func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error) {
-	result, err := p.run(ctx, commandRequest{
-		args:        []string{"template", "ls", "--json"},
-		operation:   "read docker sandbox template cache",
-		outputLimit: diagnosticOutputLimit,
-		timeout:     providerReadbackTimeout,
-	})
-	if err != nil {
-		return nil, err
-	}
-	images, err := parseTemplateInventory([]byte(result.Stdout))
+	images, err := p.templateInventoryVerified(ctx, "read docker sandbox template cache")
 	if err != nil {
 		return nil, err
 	}
@@ -1452,11 +1493,7 @@ func (p *Provider) CachedTemplates(ctx context.Context) ([]CachedTemplate, error
 }
 
 func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, cacheID string) error {
-	result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: "verify cached docker sandbox template", timeout: providerReadbackTimeout})
-	if err != nil {
-		return err
-	}
-	images, err := parseTemplateInventory([]byte(result.Stdout))
+	images, err := p.templateInventoryVerified(ctx, "verify cached docker sandbox template")
 	if err != nil {
 		return err
 	}
@@ -1473,6 +1510,31 @@ func (p *Provider) verifyImportedTemplate(ctx context.Context, reference, cacheI
 		}
 	}
 	return fmt.Errorf("%w: configured Docker Sandbox template was not present in the authoritative Sandbox cache", provider.ErrTemplateNotFound)
+}
+
+// templateInventoryVerified retries malformed readback once; uncertain inventory
+// must never be interpreted as an empty cache or trigger template mutations.
+func (p *Provider) templateInventoryVerified(ctx context.Context, operation string) ([]cachedTemplate, error) {
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, err := p.run(ctx, commandRequest{args: []string{"template", "ls", "--json"}, operation: operation, outputLimit: diagnosticOutputLimit, timeout: providerReadbackTimeout})
+		if err != nil {
+			return nil, err
+		}
+		images, parseErr := parseTemplateInventory([]byte(result.Stdout))
+		if parseErr == nil {
+			return images, nil
+		}
+		if attempt == 2 {
+			return nil, parseErr
+		}
+		if p.logger != nil {
+			p.logger.Debug("Docker Sandboxes template inventory returned invalid machine-readable output; retrying once", "provider", "docker-sandboxes", "error", parseErr)
+		}
+	}
+	return nil, fmt.Errorf("read docker sandbox template inventory did not complete")
 }
 
 func validTemplateCacheID(value string) bool {
@@ -1554,7 +1616,7 @@ func (p *Provider) run(ctx context.Context, request commandRequest) (provider.Ex
 		result.Stdout = truncate(result.Stdout, request.outputLimit)
 		result.Stderr = truncate(result.Stderr, request.outputLimit)
 	}
-	if ctxErr := operationCtx.Err(); ctxErr != nil {
+	if ctxErr := operationCtx.Err(); ctxErr != nil && !errors.Is(runErr, ctxErr) {
 		runErr = errors.Join(ctxErr, runErr)
 	}
 	result, finishErr := provider.FinishSensitiveExecution(result, runErr, flush(), request.sensitiveValues)
@@ -1696,12 +1758,17 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 	var releaseHostLock func()
 	if !provider.ControlPlaneLockHeld(ctx) {
 		var err error
+		lockStarted := time.Now()
 		releaseHostLock, err = provider.AcquireControlPlaneCommandLock(ctx)
 		if err != nil {
-			return provider.ExecResult{}, err
+			return provider.ExecResult{}, fmt.Errorf("wait for Docker Sandboxes command admission (command not started, waited %s): %w", time.Since(lockStarted).Round(time.Millisecond), err)
 		}
 		defer releaseHostLock()
+		if p.logger != nil {
+			p.logger.Debug("Docker Sandboxes command admitted", "operation", request.operation, "lockWait", time.Since(lockStarted))
+		}
 	}
+	commandStarted := time.Now()
 	cmd := exec.CommandContext(ctx, p.Binary, request.args...)
 	isolateManagedProcess(cmd)
 	cmd.WaitDelay = commandWaitDelay
@@ -1748,6 +1815,9 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 	result := provider.ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if stdout.exceeded || stderr.exceeded {
 		err = errors.Join(err, fmt.Errorf("output limit exceeded"))
+	}
+	if p.logger != nil {
+		p.logger.Debug("Docker Sandboxes command completed", "operation", request.operation, "executionDuration", time.Since(commandStarted), "contextError", ctx.Err())
 	}
 	return result, err
 }
@@ -1948,6 +2018,7 @@ var _ provider.Lifecycle = (*Provider)(nil)
 var _ provider.ControlPlaneRecoverer = (*Provider)(nil)
 var _ provider.ControlPlaneRecoveryCoordinator = (*Provider)(nil)
 var _ provider.ControlPlaneIdentityAbsenceVerifier = (*Provider)(nil)
+var _ provider.OrphanCleanupPreparer = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
 var _ provider.InstanceAdmissionVerifier = (*Provider)(nil)
 var _ provider.PolicyManager = (*Provider)(nil)
