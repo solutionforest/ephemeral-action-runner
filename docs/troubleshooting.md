@@ -414,6 +414,8 @@ Use the normal host entry point so EPAR can inspect the real Windows certificate
 
 Use `./start image build --replace` on every supported shell, including native Windows PowerShell. The wrapper uses a native-host trust feed while compiling the native controller; the resulting native controller reads host trust directly for `start`, `image build`, `pool up`, and `pool verify`, even when runner overlay is disabled. Direct `scripts/run-with-docker.*` calls are wrapper-development diagnostics. A bare Linux toolchain container is not a replacement for the project-local native-controller path.
 
+If Windows wrapper startup reports that a trust watcher did not become ready, inspect the expected PID, observed lock owner, ready marker, and feed rejection reason in that message. Timestamp diagnostics distinguish an expired or future-dated snapshot from a read/parse failure; filesystem failures include the exception type and HRESULT without certificate contents. Readiness polls read one snapshot at a time and tolerate transient publication overlap within the existing startup deadline. A persistent invalid feed still blocks startup: do not extend the 30-second freshness window or reuse an older snapshot to bypass it.
+
 ## Windows Docker Desktop WSL2 disk is smaller than expected
 
 ### Symptom

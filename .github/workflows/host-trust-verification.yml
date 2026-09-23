@@ -257,10 +257,23 @@ jobs:
             Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Repeat Windows feed readback regressions
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          1..25 | ForEach-Object {
+            & scripts/test/host-trust-feed-readback.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+          }
+
       - name: Exercise official wrapper feed lifecycle and singleton lock
         shell: pwsh
         if: runner.os == 'Windows'
-        run: scripts/test/host-trust-wrapper-smoke.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+        run: |
+          $ErrorActionPreference = 'Stop'
+          1..3 | ForEach-Object {
+            & scripts/test/host-trust-wrapper-smoke.ps1 -ProjectRoot $env:GITHUB_WORKSPACE
+          }
 
       - name: Verify no-Go native-controller contract
         shell: pwsh
@@ -333,6 +346,7 @@ jobs:
             'scripts/host-trust/wrapper-lib.ps1',
             'scripts/test/docker-sandboxes-plan-smoke.ps1',
             'scripts/test/host-trust-wrapper-smoke.ps1',
+            'scripts/test/host-trust-feed-readback.ps1',
             'scripts/test/start-command-forwarding.ps1',
             'scripts/test/windows-native-controller-contract.ps1'
           )
