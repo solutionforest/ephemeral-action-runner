@@ -182,6 +182,26 @@ func TestRunExternalOutageStageRequiresTypedTransientFailure(t *testing.T) {
 	}
 }
 
+func TestRunExternalOutageStageDoesNotConsumeCandidateReadinessRecovery(t *testing.T) {
+	manager := outageTestManager(t)
+	policy, err := ParseExternalOutageRetryPolicy("continuous")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureExternalOutageRetry(policy); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	candidate := &candidateReadinessError{outcome: candidateReadinessHealthUnknown, cause: dependency.NewTransient("runner process probe", errors.New("offline"))}
+	err = manager.RunExternalOutageStage(context.Background(), "initial-capacity-provisioning", func(context.Context) error {
+		calls.Add(1)
+		return candidate
+	})
+	if err != candidate || calls.Load() != 1 {
+		t.Fatalf("error=%v calls=%d, want direct candidate failure after one attempt", err, calls.Load())
+	}
+}
+
 func TestRunPoolSupervisesTransientRunnerGroupPreflightFailure(t *testing.T) {
 	github := &fakeGitHub{policyErr: &gh.HTTPError{Method: http.MethodGet, Path: "/orgs/example/actions/runner-groups", StatusCode: http.StatusServiceUnavailable, Cause: errors.New("unavailable")}}
 	manager := newRegisteredTestManager(t, &fakeProvider{}, github)

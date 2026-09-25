@@ -14,7 +14,10 @@ Start with the symptom that most closely matches the failure. Regardless of prov
 - [Docker Sandboxes creation fails after a runtime-helper prompt](#docker-sandboxes-creation-fails-after-a-runtime-helper-prompt)
 - [Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present](#docker-sandboxes-rejects-a-staging-workspace-because-ssh-agent-forwarding-is-present)
 - [Docker Hub login succeeds but a private pull is denied in Docker Sandboxes](#docker-hub-login-succeeds-but-a-private-pull-is-denied-in-docker-sandboxes)
+- [Docker Sandboxes reports package-manager contention](#docker-sandboxes-reports-package-manager-contention)
+- [A candidate listener ends before readiness is observed](#a-candidate-listener-ends-before-readiness-is-observed)
 - [An idle runner reports GitHub or Sandbox health warnings](#an-idle-runner-reports-github-or-sandbox-health-warnings)
+- [EPAR exits during a GitHub or registry incident](#epar-exits-during-a-github-or-registry-incident)
 - [GitHub Actions runner release resolution reports HTTP 403 or 429](#github-actions-runner-release-resolution-reports-http-403-or-429)
 - [A scheduled image check or update fails](#a-scheduled-image-check-or-update-fails)
 - [A runner is held for diagnostics or an acknowledgement](#a-runner-is-held-for-diagnostics-or-an-acknowledgement)
@@ -246,6 +249,24 @@ Keep the host `sbx login` identity intentionally different from the workflow ide
 
 EPAR does not query or mutate host-global `sbx` secrets. After creating its exact sandbox, provider admission rejects any nonempty authentication capability actually attached to that sandbox without exposing credential metadata, then passes the Docker Sandboxes gateway proxy only to registration and the Actions listener. The hook's `GITHUB_ENV` validation and local relay substitution are scoped to the current runner's `_runner_file_commands` directory; they do not mutate unrelated sandboxes or `sbx login`. A root-capable workflow can still deliberately reconnect a client to Docker Sandboxes' gateway proxy, and v0.37.1 has no documented per-sandbox switch that disables the interceptor. Arbitrary nested images also need their own CA installation because the host bundle path does not exist inside them. Use a least-privilege host `sbx` account and choose Docker Container if that residual capability is outside the trust boundary. See [Docker Hub Credentials and Transparent Egress](providers/docker-sandboxes.md#docker-hub-credentials-and-transparent-egress).
 
+## Docker Sandboxes reports package-manager contention
+
+Docker Sandboxes starts a best-effort apt metadata refresh during guest boot. EPAR's bundled helper recognizes the complete legacy and v0.43.0 command identities, verifies the exact shell and `apt-get` executables and argument vectors, and terminates only that bootstrap refresh before runner registration. It never kills an arbitrary apt or dpkg process by name alone.
+
+If another package-manager process remains after the bounded wait, the guest log reports `EPAR_CANDIDATE_RECOVERY=package-manager-contention` before the process diagnostic. The normal registered, replacement-enabled supervisor keeps healthy peers running, quarantines this candidate, preserves the strict physical-capacity fence until exact cleanup succeeds, and retries allocation using the candidate-recovery backoff. This path works with `--external-outage-retry=off` and `continuous`; the external-outage option does not control it. One-shot verification and replacement-disabled runs still return the candidate failure.
+
+If the human timeout diagnostic appears without the recovery marker, treat it as an older or modified guest helper and rebuild or refresh the configured Docker Sandboxes template from this checkout. EPAR intentionally does not infer recoverability from diagnostic prose. Preserve the bounded process listing in the guest transcript when a marked candidate repeats; raw workflow logs and credentials are not collected automatically.
+
+## A candidate listener ends before readiness is observed
+
+A short-lived ephemeral runner can register, accept work, and end between EPAR readiness observations. The controller may report that the listener ended before readiness was observed or that readiness remained uncertain through its deadline. This message describes the observed lifecycle only; it does not prove that a job ran or completed. Check the GitHub Actions run for the authoritative job result.
+
+For the normal registered, replacement-enabled supervisor, this is a recoverable candidate event during initial provisioning and steady-state replacement. EPAR keeps running, preserves healthy peers, retains the candidate in quarantine and inside the strict `pool.instances` cap, and uses exact provider and GitHub reconciliation to decide whether the candidate can be adopted or safely removed. It does not create another candidate while uncertain or cleanup-pending capacity still occupies the slot.
+
+Allocation backs off using `pool.replacementRetryInitialSeconds`, `pool.replacementRetryMultiplier`, `pool.replacementRetryMaxSeconds`, and `pool.replacementRetryJitterPercent`. Reconciliation, safe cleanup, peer health monitoring, and host-trust lease maintenance continue while allocation waits. Repeated failures can therefore leave the pool visibly below desired ready capacity while the controller remains available and retries at the capped delay. A successful provision or verified healthy adoption resets the candidate-recovery backoff.
+
+This recovery does not require `--external-outage-retry` and does not turn authentication, trust, admission, configuration, durable-state, or unrelated local failures into retryable events. One-shot verification and operation with replacement explicitly disabled keep their existing behavior. If recovery does not progress, preserve the candidate's instance log and controller output, then inspect its exact local and GitHub identity; do not manually remove it by prefix or clear lifecycle state.
+
 ## An idle runner reports GitHub or Sandbox health warnings
 
 A GitHub 429/5xx response or an `sbx` command timeout makes runner health temporarily unknown; it does not prove that the Actions listener stopped. EPAR preserves uncertain local capacity, but a runner whose host-trust transport or lease cannot be maintained is quarantined and its exact GitHub registration is fenced after immutable name-and-ID verification so it cannot accept new work with an expired lease. Cleanup for an inactive listener requires two consecutive guest probes that successfully execute and explicitly report the process stopped. Review the instance guest transcript when warnings repeat; do not delete the runner merely because one API or Sandbox inspection failed.
@@ -262,7 +283,7 @@ The first unknown-health warning is immediate; repeated warnings for the same ex
 
 ## EPAR exits during a GitHub or registry incident
 
-Plain `./start` intentionally keeps fail-fast startup behavior for a human-attended invocation. For an unattended host, start the configured controller with `--external-outage-retry=continuous` or a bounded duration such as `--external-outage-retry=4h`. Use `./start status --no-github` to inspect the local incident stage, attempt, next retry, and deadline even while GitHub is unavailable.
+Plain `./start` intentionally keeps fail-fast startup behavior for typed external dependency incidents during a human-attended invocation. Candidate listener exit and readiness uncertainty use the separate default recovery described above. For an unattended host, start the configured controller with `--external-outage-retry=continuous` or a bounded duration such as `--external-outage-retry=4h`. Use `./start status --no-github` to inspect the local incident stage, attempt, next retry, and deadline even while GitHub is unavailable.
 
 Only typed transient failures such as HTTP 408, 429, 5xx, rate-limited 403 responses, DNS failures, connection resets/refusals, and timeouts are retried. Correct authentication, ordinary authorization, certificate trust, missing image manifests, storage, local Docker or Sandbox readiness, ownership, configuration, platform, and custom-script failures instead of expecting outage supervision to mask them. EPAR never queries GitHub Status and never silently changes a provider, source image, registry, credential, or trust policy.
 

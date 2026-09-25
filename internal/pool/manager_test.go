@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -486,6 +487,555 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 			t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want supervised pool to accept busy runners", got)
 		}
 	})
+}
+
+func TestRunPoolRecoversInitialCandidateReadinessFailure(t *testing.T) {
+	for _, outagePolicy := range []string{"off", "continuous"} {
+		t.Run(outagePolicy, func(t *testing.T) {
+			oldReadinessInterval := runnerReadinessHealthCheckInterval
+			runnerReadinessHealthCheckInterval = time.Millisecond
+			t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldReadinessInterval })
+			synctest.Test(t, func(t *testing.T) {
+				fake := &fakeProvider{ip: "127.0.0.1"}
+				var waitCalls atomic.Int32
+				var readyMu sync.Mutex
+				ready := make(map[string]gh.Runner)
+				var failedName string
+				var sawBusy, sawEphemeralRemoval bool
+				fake.execFunc = func(_ context.Context, name string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+					if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
+						readyMu.Lock()
+						failed := name == failedName
+						readyMu.Unlock()
+						if failed {
+							return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+						}
+						return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+					}
+					return provider.ExecResult{}, nil
+				}
+				github := &fakeGitHub{}
+				github.waitFunc = func(ctx context.Context, name string, _ time.Duration) (gh.Runner, error) {
+					if waitCalls.Add(1) == 1 {
+						readyMu.Lock()
+						failedName = name
+						ready[name] = gh.Runner{Name: name, ID: 101, Status: "online", Busy: true}
+						sawBusy = true
+						delete(ready, name)
+						sawEphemeralRemoval = true
+						readyMu.Unlock()
+						<-ctx.Done()
+						return gh.Runner{}, ctx.Err()
+					}
+					runner := gh.Runner{Name: name, ID: 102, Status: "online"}
+					readyMu.Lock()
+					ready[name] = runner
+					readyMu.Unlock()
+					return runner, nil
+				}
+				github.listFunc = func(context.Context) ([]gh.Runner, error) {
+					readyMu.Lock()
+					defer readyMu.Unlock()
+					result := make([]gh.Runner, 0, len(ready))
+					for _, runner := range ready {
+						result = append(result, runner)
+					}
+					return result, nil
+				}
+				github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+					readyMu.Lock()
+					defer readyMu.Unlock()
+					runner, found := ready[name]
+					return runner, found, nil
+				}
+				manager := newRegisteredTestManager(t, fake, github)
+				manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+				manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+				manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+				manager.Config.Pool.ReplacementRetryJitterPercent = 0
+				manager.randomFloat64 = func() float64 { return 0.5 }
+				manager.ConfigPath = filepath.Join(manager.ProjectRoot, "config.yml")
+				if err := os.WriteFile(manager.ConfigPath, []byte("test: config\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				policy, err := ParseExternalOutageRetryPolicy(outagePolicy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+				defer cancel()
+				if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true, ExternalOutageRetry: policy}); err != nil {
+					t.Fatal(err)
+				}
+				if got := waitCalls.Load(); got != 2 {
+					t.Fatalf("readiness attempts = %d, want failed candidate and successful replacement", got)
+				}
+				if got := atomic.LoadInt32(&fake.cloneCalls); got != 2 {
+					t.Fatalf("clone calls = %d, want one failed candidate and one replacement", got)
+				}
+				if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+					t.Fatalf("delete calls = %d, want exact failed-candidate cleanup", got)
+				}
+				if got := atomic.LoadInt32(&fake.maxInventory); got > 1 {
+					t.Fatalf("maximum physical inventory = %d, want strict capacity 1", got)
+				}
+				if !sawBusy || !sawEphemeralRemoval {
+					t.Fatalf("ephemeral lifecycle evidence = busy %t removed %t, want job assignment and unregister between readiness observations", sawBusy, sawEphemeralRemoval)
+				}
+			})
+		})
+	}
+}
+
+func TestRunPoolRecoversInitialPackageManagerContention(t *testing.T) {
+	for _, outagePolicy := range []string{"off", "continuous"} {
+		t.Run(outagePolicy, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fake := &fakeProvider{ip: "127.0.0.1"}
+				var configureCalls atomic.Int32
+				var readyMu sync.Mutex
+				ready := make(map[string]gh.Runner)
+				fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+					commandText := strings.Join(command, " ")
+					if strings.Contains(commandText, "configure-runner.sh") && configureCalls.Add(1) == 1 {
+						return provider.ExecResult{Stderr: candidatePackageManagerContentionMarker + "\nEPAR Docker Sandboxes template: timed out waiting for unexpected package-manager processes\n"}, errors.New("exit status 1")
+					}
+					if strings.Contains(commandText, "check-runner.sh") {
+						return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+					}
+					return provider.ExecResult{}, nil
+				}
+				github := &fakeGitHub{}
+				github.waitFunc = func(_ context.Context, name string, _ time.Duration) (gh.Runner, error) {
+					runner := gh.Runner{Name: name, ID: 401, Status: "online"}
+					readyMu.Lock()
+					ready[name] = runner
+					readyMu.Unlock()
+					return runner, nil
+				}
+				github.listFunc = func(context.Context) ([]gh.Runner, error) {
+					readyMu.Lock()
+					defer readyMu.Unlock()
+					result := make([]gh.Runner, 0, len(ready))
+					for _, runner := range ready {
+						result = append(result, runner)
+					}
+					return result, nil
+				}
+				github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+					readyMu.Lock()
+					defer readyMu.Unlock()
+					runner, found := ready[name]
+					return runner, found, nil
+				}
+				manager := newRegisteredTestManager(t, fake, github)
+				manager.Config.Provider.Type = "docker-sandboxes"
+				manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+				manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+				manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+				manager.Config.Pool.ReplacementRetryJitterPercent = 0
+				manager.randomFloat64 = func() float64 { return 0.5 }
+				manager.ConfigPath = filepath.Join(manager.ProjectRoot, "config.yml")
+				if err := os.WriteFile(manager.ConfigPath, []byte("test: config\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				policy, err := ParseExternalOutageRetryPolicy(outagePolicy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+				defer cancel()
+				if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true, ExternalOutageRetry: policy}); err != nil {
+					t.Fatal(err)
+				}
+				if got := configureCalls.Load(); got != 2 {
+					t.Fatalf("configure attempts = %d, want failed candidate and successful recovery", got)
+				}
+				if got := atomic.LoadInt32(&fake.cloneCalls); got != 2 {
+					t.Fatalf("clone calls = %d, want failed candidate and successful recovery", got)
+				}
+				if got := atomic.LoadInt32(&fake.deleteCalls); got != 1 {
+					t.Fatalf("delete calls = %d, want exact failed-candidate cleanup", got)
+				}
+				if got := atomic.LoadInt32(&fake.maxInventory); got > 1 {
+					t.Fatalf("maximum physical inventory = %d, want strict capacity 1", got)
+				}
+			})
+		})
+	}
+}
+
+func TestRunPoolReplacementReadinessRecoveryMaintainsBusyPeer(t *testing.T) {
+	oldReadinessInterval := runnerReadinessHealthCheckInterval
+	runnerReadinessHealthCheckInterval = time.Millisecond
+	t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldReadinessInterval })
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeProvider{ip: "127.0.0.1"}
+		var waitCalls atomic.Int32
+		var stateMu sync.Mutex
+		ready := make(map[string]gh.Runner)
+		var firstName, survivorName, failedCandidate string
+		fake.execFunc = func(_ context.Context, name string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
+				stateMu.Lock()
+				failed := name == failedCandidate
+				stateMu.Unlock()
+				if failed {
+					return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+				}
+				return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+			}
+			return provider.ExecResult{}, nil
+		}
+		github := &fakeGitHub{}
+		github.waitFunc = func(ctx context.Context, name string, _ time.Duration) (gh.Runner, error) {
+			call := waitCalls.Add(1)
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			switch call {
+			case 1:
+				firstName = name
+				runner := gh.Runner{Name: name, ID: 201, Status: "online"}
+				ready[name] = runner
+				return runner, nil
+			case 2:
+				survivorName = name
+				runner := gh.Runner{Name: name, ID: 202, Status: "online", Busy: true}
+				ready[name] = runner
+				delete(ready, firstName)
+				return runner, nil
+			case 3:
+				failedCandidate = name
+				ready[name] = gh.Runner{Name: name, ID: 203, Status: "online", Busy: true}
+				delete(ready, name)
+				stateMu.Unlock()
+				<-ctx.Done()
+				stateMu.Lock()
+				return gh.Runner{}, ctx.Err()
+			default:
+				runner := gh.Runner{Name: name, ID: 204, Status: "online"}
+				ready[name] = runner
+				return runner, nil
+			}
+		}
+		github.listFunc = func(context.Context) ([]gh.Runner, error) {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			result := make([]gh.Runner, 0, len(ready))
+			for _, runner := range ready {
+				result = append(result, runner)
+			}
+			return result, nil
+		}
+		github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			runner, found := ready[name]
+			return runner, found, nil
+		}
+		manager := newRegisteredTestManager(t, fake, github)
+		lifecycle, err := poolstate.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager.LifecycleState = lifecycle
+		manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+		manager.Config.Pool.Instances = 2
+		manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+		manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+		manager.Config.Pool.ReplacementRetryJitterPercent = 0
+		manager.randomFloat64 = func() float64 { return 0.5 }
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 2, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := waitCalls.Load(); got != 4 {
+			t.Fatalf("readiness attempts = %d, want two initial runners, failed candidate, and recovery", got)
+		}
+		survivor, err := lifecycle.Read(context.Background(), survivorName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if survivor.Phase != poolstate.PhaseBusy {
+			t.Fatalf("survivor lifecycle phase = %q, want busy", survivor.Phase)
+		}
+		jobLease := false
+		for _, lease := range survivor.Leases {
+			if lease.Purpose == "job" && lease.Holder == "github-202" {
+				jobLease = true
+				break
+			}
+		}
+		if !jobLease || atomic.LoadInt32(&github.listCalls) < 10 {
+			t.Fatalf("busy survivor maintenance = jobLease %t listCalls %d, want renewed job protection during recovery", jobLease, atomic.LoadInt32(&github.listCalls))
+		}
+		if got := atomic.LoadInt32(&fake.maxInventory); got > 2 {
+			t.Fatalf("maximum physical inventory = %d, want strict capacity 2", got)
+		}
+		fake.mu.Lock()
+		deleted := append([]string(nil), fake.deletedNames...)
+		fake.mu.Unlock()
+		if !slices.Contains(deleted, firstName) || !slices.Contains(deleted, failedCandidate) {
+			t.Fatalf("deleted instances = %v, want completed %q and failed candidate %q", deleted, firstName, failedCandidate)
+		}
+	})
+}
+
+func TestRunPoolRecoversReplacementPackageManagerContention(t *testing.T) {
+	for _, outagePolicy := range []string{"off", "continuous"} {
+		t.Run(outagePolicy, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fake := &fakeProvider{ip: "127.0.0.1"}
+				var configureCalls, waitCalls atomic.Int32
+				var stateMu sync.Mutex
+				ready := make(map[string]gh.Runner)
+				var firstName, survivorName, failedCandidate, recoveredName string
+				fake.execFunc = func(_ context.Context, name string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+					commandText := strings.Join(command, " ")
+					if strings.Contains(commandText, "configure-runner.sh") {
+						if configureCalls.Add(1) == 3 {
+							stateMu.Lock()
+							failedCandidate = name
+							stateMu.Unlock()
+							return provider.ExecResult{Stderr: candidatePackageManagerContentionMarker + "\nEPAR Docker Sandboxes template: timed out waiting for unexpected package-manager processes\n"}, errors.New("exit status 1")
+						}
+					}
+					if strings.Contains(commandText, "check-runner.sh") {
+						return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+					}
+					return provider.ExecResult{}, nil
+				}
+				github := &fakeGitHub{}
+				github.waitFunc = func(_ context.Context, name string, _ time.Duration) (gh.Runner, error) {
+					call := waitCalls.Add(1)
+					stateMu.Lock()
+					defer stateMu.Unlock()
+					runner := gh.Runner{Name: name, ID: int64(300 + call), Status: "online"}
+					switch call {
+					case 1:
+						firstName = name
+					case 2:
+						survivorName = name
+						runner.Busy = true
+						delete(ready, firstName)
+					case 3:
+						recoveredName = name
+					default:
+						t.Fatalf("unexpected readiness attempt %d for %s", call, name)
+					}
+					ready[name] = runner
+					return runner, nil
+				}
+				github.listFunc = func(context.Context) ([]gh.Runner, error) {
+					stateMu.Lock()
+					defer stateMu.Unlock()
+					result := make([]gh.Runner, 0, len(ready))
+					for _, runner := range ready {
+						result = append(result, runner)
+					}
+					return result, nil
+				}
+				github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+					stateMu.Lock()
+					defer stateMu.Unlock()
+					runner, found := ready[name]
+					return runner, found, nil
+				}
+				manager := newRegisteredTestManager(t, fake, github)
+				manager.Config.Provider.Type = "docker-sandboxes"
+				manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+				manager.Config.Pool.Instances = 2
+				manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+				manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+				manager.Config.Pool.ReplacementRetryJitterPercent = 0
+				manager.randomFloat64 = func() float64 { return 0.5 }
+				policy, err := ParseExternalOutageRetryPolicy(outagePolicy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+				defer cancel()
+				if err := manager.RunPool(ctx, RunOptions{Instances: 2, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true, ExternalOutageRetry: policy}); err != nil {
+					t.Fatal(err)
+				}
+				if got := configureCalls.Load(); got != 4 {
+					t.Fatalf("configure attempts = %d, want two initial candidates, one package-manager failure, and one recovery", got)
+				}
+				if got := waitCalls.Load(); got != 3 {
+					t.Fatalf("readiness attempts = %d, want two initial runners and one recovered replacement", got)
+				}
+				if got := atomic.LoadInt32(&fake.cloneCalls); got != 4 {
+					t.Fatalf("clone calls = %d, want four exact candidates", got)
+				}
+				if got := atomic.LoadInt32(&fake.maxInventory); got > 2 {
+					t.Fatalf("maximum physical inventory = %d, want strict capacity 2", got)
+				}
+				fake.mu.Lock()
+				deleted := append([]string(nil), fake.deletedNames...)
+				fake.mu.Unlock()
+				if !slices.Contains(deleted, firstName) || !slices.Contains(deleted, failedCandidate) {
+					t.Fatalf("deleted instances = %v, want completed %q and failed candidate %q", deleted, firstName, failedCandidate)
+				}
+				if slices.Contains(deleted, survivorName) || survivorName == "" || recoveredName == "" {
+					t.Fatalf("survivor/recovery state = survivor %q recovered %q deleted %v", survivorName, recoveredName, deleted)
+				}
+				if atomic.LoadInt32(&github.listCalls) < 5 {
+					t.Fatalf("GitHub list calls = %d, want continued peer monitoring during candidate cooldown", atomic.LoadInt32(&github.listCalls))
+				}
+			})
+		})
+	}
+}
+
+func TestRunPoolReadinessCleanupFailureBlocksReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeProvider{ip: "127.0.0.1", deleteErr: errors.New("provider cleanup unavailable")}
+		github := &fakeGitHub{waitFunc: func(_ context.Context, name string, timeout time.Duration) (gh.Runner, error) {
+			return gh.Runner{}, &gh.RunnerReadinessTimeoutError{Name: name, Timeout: timeout}
+		}}
+		manager := newRegisteredTestManager(t, fake, github)
+		manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+		manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+		manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&fake.cloneCalls); got != 1 {
+			t.Fatalf("clone calls = %d, want cleanup-pending candidate to retain the only capacity slot", got)
+		}
+	})
+}
+
+func TestRunPoolPackageManagerCleanupFailureBlocksReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeProvider{ip: "127.0.0.1", deleteErr: errors.New("provider cleanup unavailable")}
+		fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			if strings.Contains(strings.Join(command, " "), "configure-runner.sh") {
+				return provider.ExecResult{Stderr: candidatePackageManagerContentionMarker}, errors.New("exit status 1")
+			}
+			return provider.ExecResult{}, nil
+		}
+		manager := newRegisteredTestManager(t, fake, &fakeGitHub{})
+		manager.Config.Provider.Type = "docker-sandboxes"
+		manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+		manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+		manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := atomic.LoadInt32(&fake.cloneCalls); got != 1 {
+			t.Fatalf("clone calls = %d, want cleanup-pending package-manager candidate to retain the only capacity slot", got)
+		}
+		if got := atomic.LoadInt32(&fake.deleteCalls); got < 2 {
+			t.Fatalf("delete calls = %d, want repeated exact cleanup attempts while the slot remained fenced", got)
+		}
+	})
+}
+
+func TestRunPoolPackageManagerCleanupRetriesBeforeReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeProvider{ip: "127.0.0.1"}
+		var configureCalls, cleanupAttempts, waitCalls atomic.Int32
+		var readyMu sync.Mutex
+		ready := make(map[string]gh.Runner)
+		fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+			commandText := strings.Join(command, " ")
+			if strings.Contains(commandText, "configure-runner.sh") && configureCalls.Add(1) == 1 {
+				return provider.ExecResult{Stderr: candidatePackageManagerContentionMarker}, errors.New("exit status 1")
+			}
+			if strings.Contains(commandText, "check-runner.sh") {
+				return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
+			}
+			return provider.ExecResult{}, nil
+		}
+		fake.deleteFunc = func(_ context.Context, name string) error {
+			if cleanupAttempts.Add(1) == 1 {
+				return errors.New("temporary exact cleanup failure")
+			}
+			fake.mu.Lock()
+			remaining := fake.instances[:0]
+			for _, instance := range fake.instances {
+				if instance.Name != name {
+					remaining = append(remaining, instance)
+				}
+			}
+			fake.instances = remaining
+			fake.mu.Unlock()
+			return nil
+		}
+		github := &fakeGitHub{}
+		github.waitFunc = func(_ context.Context, name string, _ time.Duration) (gh.Runner, error) {
+			waitCalls.Add(1)
+			runner := gh.Runner{Name: name, ID: 451, Status: "online"}
+			readyMu.Lock()
+			ready[name] = runner
+			readyMu.Unlock()
+			return runner, nil
+		}
+		github.listFunc = func(context.Context) ([]gh.Runner, error) {
+			readyMu.Lock()
+			defer readyMu.Unlock()
+			result := make([]gh.Runner, 0, len(ready))
+			for _, runner := range ready {
+				result = append(result, runner)
+			}
+			return result, nil
+		}
+		github.runnerByNameFunc = func(_ context.Context, name string) (gh.Runner, bool, error) {
+			readyMu.Lock()
+			defer readyMu.Unlock()
+			runner, found := ready[name]
+			return runner, found, nil
+		}
+		manager := newRegisteredTestManager(t, fake, github)
+		manager.Config.Provider.Type = "docker-sandboxes"
+		manager.Config.Image.UpdateFrequency = config.ImageUpdateFrequencyManual
+		manager.Config.Pool.ReplacementRetryInitialSeconds = 1
+		manager.Config.Pool.ReplacementRetryMaxSeconds = 1
+		manager.Config.Pool.ReplacementRetryJitterPercent = 0
+		manager.randomFloat64 = func() float64 { return 0.5 }
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: true, MonitorInterval: 10 * time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := configureCalls.Load(); got != 2 {
+			t.Fatalf("configure attempts = %d, want failed candidate and successful recovery", got)
+		}
+		if got := cleanupAttempts.Load(); got != 2 {
+			t.Fatalf("exact cleanup attempts = %d, want one failure and one successful retry", got)
+		}
+		if got := waitCalls.Load(); got != 1 {
+			t.Fatalf("readiness attempts = %d, want only the recovered candidate", got)
+		}
+		if got := atomic.LoadInt32(&fake.cloneCalls); got != 2 {
+			t.Fatalf("clone calls = %d, want allocation only after exact cleanup and cooldown", got)
+		}
+		if got := atomic.LoadInt32(&fake.maxInventory); got > 1 {
+			t.Fatalf("maximum physical inventory = %d, want strict capacity 1", got)
+		}
+	})
+}
+
+func TestRunPoolReadinessFailureRemainsTerminalWhenReplacementDisabled(t *testing.T) {
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	github := &fakeGitHub{waitFunc: func(_ context.Context, name string, timeout time.Duration) (gh.Runner, error) {
+		return gh.Runner{}, &gh.RunnerReadinessTimeoutError{Name: name, Timeout: timeout, RequireIdle: true}
+	}}
+	manager := newRegisteredTestManager(t, fake, github)
+	err := manager.RunPool(context.Background(), RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: false, PoolLockHeld: true})
+	var readinessErr *candidateReadinessError
+	if !errors.As(err, &readinessErr) || readinessErr.outcome != candidateReadinessTimedOut {
+		t.Fatalf("RunPool() error = %v, want terminal readiness timeout when replacement is disabled", err)
+	}
+	if got := atomic.LoadInt32(&fake.cloneCalls); got != 1 {
+		t.Fatalf("clone calls = %d, want no recovery allocation", got)
+	}
 }
 
 func TestRunPoolFailsClosedWhenReplacementHostTrustActivationFails(t *testing.T) {
@@ -1011,15 +1561,16 @@ func TestProvisionOnePassesRunnerRegistrationControlsWithoutPrivateKey(t *testin
 	}
 }
 
-func TestProvisionOneFailsPromptlyAfterConsecutiveRunnerProbeFailures(t *testing.T) {
+func TestProvisionOneClassifiesConsecutiveUnknownRunnerHealth(t *testing.T) {
 	oldInterval := runnerReadinessHealthCheckInterval
 	runnerReadinessHealthCheckInterval = time.Millisecond
 	t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldInterval })
 
+	probeErr := &net.DNSError{Err: "temporary failure", Name: "sandbox-control.local", IsTemporary: true}
 	fake := &fakeProvider{ip: "127.0.0.1"}
 	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
 		if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
-			return provider.ExecResult{}, errors.New("listener process is gone")
+			return provider.ExecResult{}, probeErr
 		}
 		return provider.ExecResult{}, nil
 	}
@@ -1032,8 +1583,9 @@ func TestProvisionOneFailsPromptlyAfterConsecutiveRunnerProbeFailures(t *testing
 	manager := newRegisteredTestManager(t, fake, github)
 
 	_, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
-	if err == nil || !strings.Contains(err.Error(), "actions runner process failed 3 consecutive checks while waiting for GitHub online/idle") {
-		t.Fatalf("provisionOne() error = %v, want prompt listener process failure", err)
+	var readinessErr *candidateReadinessError
+	if !errors.As(err, &readinessErr) || readinessErr.outcome != candidateReadinessHealthUnknown || !errors.Is(err, probeErr) {
+		t.Fatalf("provisionOne() error = %v, want typed unknown-health failure preserving the probe cause", err)
 	}
 	if got := fake.commandCount("check-runner.sh"); got != runnerReadinessProbeFailureLimit {
 		t.Fatalf("runner process checks = %d, want %d consecutive failures", got, runnerReadinessProbeFailureLimit)
@@ -1043,7 +1595,35 @@ func TestProvisionOneFailsPromptlyAfterConsecutiveRunnerProbeFailures(t *testing
 	}
 }
 
-func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
+func TestProvisionOneClassifiesConfirmedListenerExit(t *testing.T) {
+	oldInterval := runnerReadinessHealthCheckInterval
+	runnerReadinessHealthCheckInterval = time.Millisecond
+	t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldInterval })
+
+	fake := &fakeProvider{ip: "127.0.0.1"}
+	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
+			return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+		}
+		return provider.ExecResult{}, nil
+	}
+	github := &fakeGitHub{waitFunc: func(ctx context.Context, _ string, _ time.Duration) (gh.Runner, error) {
+		<-ctx.Done()
+		return gh.Runner{}, ctx.Err()
+	}}
+	manager := newRegisteredTestManager(t, fake, github)
+
+	_, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
+	var readinessErr *candidateReadinessError
+	if !errors.As(err, &readinessErr) || readinessErr.outcome != candidateReadinessListenerEnded {
+		t.Fatalf("provisionOne() error = %v, want typed listener-ended failure", err)
+	}
+	if got := fake.commandCount("check-runner.sh"); got != runnerReadinessProbeFailureLimit {
+		t.Fatalf("runner process checks = %d, want %d confirmed inactive checks", got, runnerReadinessProbeFailureLimit)
+	}
+}
+
+func TestProvisionOneRunnerProbeEvidenceStreaksReset(t *testing.T) {
 	oldInterval := runnerReadinessHealthCheckInterval
 	runnerReadinessHealthCheckInterval = time.Millisecond
 	t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldInterval })
@@ -1055,8 +1635,14 @@ func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
 		if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
 			switch atomic.AddInt32(&healthChecks, 1) {
 			case 1:
-				return provider.ExecResult{}, errors.New("transient provider exec timeout")
+				return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
 			case 2:
+				return provider.ExecResult{}, &net.DNSError{Err: "temporary failure", Name: "sandbox-control.local", IsTemporary: true}
+			case 3:
+				return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+			case 4:
+				return provider.ExecResult{Stdout: runnerProcessStoppedSentinel + "\n"}, nil
+			case 5:
 				close(ready)
 			}
 			return provider.ExecResult{Stdout: runnerProcessRunningSentinel + "\n"}, nil
@@ -1082,16 +1668,46 @@ func TestProvisionOneRecoversFromTransientRunnerProbeFailure(t *testing.T) {
 	if vm.RunnerID != 123 {
 		t.Fatalf("RunnerID = %d, want 123", vm.RunnerID)
 	}
-	if got := atomic.LoadInt32(&healthChecks); got < 2 {
-		t.Fatalf("runner health checks = %d, want transient failure followed by recovery", got)
+	if got := atomic.LoadInt32(&healthChecks); got < 5 {
+		t.Fatalf("runner health checks = %d, want inactive and unknown streaks reset before recovery", got)
 	}
 	if got := fake.commandCount("collect-runner-diagnostics.sh"); got != 0 {
 		t.Fatalf("diagnostic collection calls = %d, want 0 after recovery", got)
 	}
 }
 
+func TestProvisionOneLeavesPermanentRunnerProbeFailureTerminal(t *testing.T) {
+	oldInterval := runnerReadinessHealthCheckInterval
+	runnerReadinessHealthCheckInterval = time.Millisecond
+	t.Cleanup(func() { runnerReadinessHealthCheckInterval = oldInterval })
+
+	permanentErr := errors.New("permission denied executing runner health probe")
+	fake := &fakeProvider{ip: "127.0.0.1", execFunc: func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), "check-runner.sh") {
+			return provider.ExecResult{}, permanentErr
+		}
+		return provider.ExecResult{}, nil
+	}}
+	github := &fakeGitHub{waitFunc: func(ctx context.Context, _ string, _ time.Duration) (gh.Runner, error) {
+		<-ctx.Done()
+		return gh.Runner{}, ctx.Err()
+	}}
+	manager := newRegisteredTestManager(t, fake, github)
+
+	_, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
+	if !errors.Is(err, permanentErr) {
+		t.Fatalf("provisionOne() error = %v, want permanent probe cause", err)
+	}
+	if _, recoverable := recoverableCandidateFailure(err); recoverable {
+		t.Fatalf("permanent runner probe failure was classified for candidate recovery: %v", err)
+	}
+	if got := fake.commandCount("check-runner.sh"); got != 1 {
+		t.Fatalf("runner process checks = %d, want immediate terminal classification", got)
+	}
+}
+
 func TestProvisionOneCapturesReadinessTimeoutAndPreservesCause(t *testing.T) {
-	timeoutErr := errors.New("GitHub runner online timeout")
+	timeoutErr := &gh.RunnerReadinessTimeoutError{Name: "epar-test-1", Timeout: 5 * time.Second, RequireIdle: true}
 	fake := &fakeProvider{ip: "127.0.0.1"}
 	fake.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
 		if strings.Contains(strings.Join(command, " "), "collect-runner-diagnostics.sh") {
@@ -1106,11 +1722,42 @@ func TestProvisionOneCapturesReadinessTimeoutAndPreservesCause(t *testing.T) {
 	if !errors.Is(err, timeoutErr) {
 		t.Fatalf("provisionOne() error = %v, want original timeout error", err)
 	}
+	var readinessErr *candidateReadinessError
+	if !errors.As(err, &readinessErr) || readinessErr.outcome != candidateReadinessTimedOut {
+		t.Fatalf("provisionOne() error = %v, want typed readiness-timeout failure", err)
+	}
 	if got := fake.commandCount("collect-runner-diagnostics.sh"); got != 1 {
 		t.Fatalf("diagnostic collection calls = %d, want 1", got)
 	}
 	if got := fake.logPathFor("collect-runner-diagnostics.sh"); !strings.HasSuffix(got, "epar-test-1.guest.log") {
 		t.Fatalf("diagnostic LogPath = %q, want existing guest log", got)
+	}
+}
+
+func TestProvisionOneClassifiesPostReadinessGitHubEvidenceFailure(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		lookupErr   error
+		recoverable bool
+	}{
+		{name: "transient unavailable", lookupErr: &gh.HTTPError{StatusCode: http.StatusServiceUnavailable}, recoverable: true},
+		{name: "authentication", lookupErr: &gh.HTTPError{StatusCode: http.StatusUnauthorized}, recoverable: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeProvider{ip: "127.0.0.1"}
+			timeoutErr := &gh.RunnerReadinessTimeoutError{Name: "epar-test-1", Timeout: time.Second}
+			github := &fakeGitHub{waitErr: timeoutErr, runnerErr: test.lookupErr}
+			manager := newRegisteredTestManager(t, fake, github)
+
+			vm, err := manager.provisionOne(context.Background(), "epar-test-1", true, false)
+			if vm.Phase != LifecycleQuarantined || !errors.Is(err, test.lookupErr) || !errors.Is(err, timeoutErr) {
+				t.Fatalf("provisionOne() = phase %q error %v, want quarantine preserving readiness and lookup causes", vm.Phase, err)
+			}
+			_, recoverable := recoverableCandidateFailure(err)
+			if recoverable != test.recoverable {
+				t.Fatalf("recoverable = %t, want %t for %v", recoverable, test.recoverable, err)
+			}
+		})
 	}
 }
 
@@ -1577,6 +2224,87 @@ func TestConfigureFailureDeletesExactLocalAndRemoteCandidate(t *testing.T) {
 	}
 }
 
+func TestConfigurePackageManagerContentionUsesNarrowCandidateRecoveryMarker(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerType string
+		stderr       string
+		wantRecovery bool
+		wantPhase    LifecyclePhase
+		wantDeletes  int32
+	}{
+		{
+			name:         "docker sandboxes marker",
+			providerType: "docker-sandboxes",
+			stderr:       candidatePackageManagerContentionMarker + "\nEPAR Docker Sandboxes template: timed out waiting for unexpected package-manager processes",
+			wantRecovery: true,
+			wantPhase:    LifecycleQuarantined,
+			wantDeletes:  0,
+		},
+		{
+			name:         "human diagnostic without marker",
+			providerType: "docker-sandboxes",
+			stderr:       "EPAR Docker Sandboxes template: timed out waiting for unexpected package-manager processes",
+			wantRecovery: false,
+			wantDeletes:  1,
+		},
+		{
+			name:         "marker from another provider",
+			providerType: "docker-container",
+			stderr:       candidatePackageManagerContentionMarker,
+			wantRecovery: false,
+			wantDeletes:  1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p := &fakeProvider{ip: "127.0.0.1"}
+			p.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+				if strings.Contains(strings.Join(command, " "), "configure-runner.sh") {
+					return provider.ExecResult{Stderr: test.stderr}, errors.New("exit status 1")
+				}
+				return provider.ExecResult{}, nil
+			}
+			manager := newRegisteredTestManager(t, p, &fakeGitHub{})
+			manager.Config.Provider.Type = test.providerType
+			vm, err := manager.provisionOne(context.Background(), "epar-test-package-manager", true, false)
+			candidateErr, recoverable := recoverableCandidateFailure(err)
+			if recoverable != test.wantRecovery {
+				t.Fatalf("recoverable candidate failure = %t for %v, want %t", recoverable, err, test.wantRecovery)
+			}
+			if test.wantRecovery && candidateErr.outcome != candidatePackageManagerContention {
+				t.Fatalf("candidate outcome = %q, want %q", candidateErr.outcome, candidatePackageManagerContention)
+			}
+			if vm.Phase != test.wantPhase {
+				t.Fatalf("phase = %q, want %q", vm.Phase, test.wantPhase)
+			}
+			if got := atomic.LoadInt32(&p.deleteCalls); got != test.wantDeletes {
+				t.Fatalf("local delete calls = %d, want %d", got, test.wantDeletes)
+			}
+		})
+	}
+}
+
+func TestRunPoolPackageManagerContentionRemainsTerminalWhenReplacementDisabled(t *testing.T) {
+	p := &fakeProvider{ip: "127.0.0.1"}
+	p.execFunc = func(_ context.Context, _ string, command []string, _ provider.ExecOptions) (provider.ExecResult, error) {
+		if strings.Contains(strings.Join(command, " "), "configure-runner.sh") {
+			return provider.ExecResult{Stderr: candidatePackageManagerContentionMarker}, errors.New("exit status 1")
+		}
+		return provider.ExecResult{}, nil
+	}
+	manager := newRegisteredTestManager(t, p, &fakeGitHub{})
+	manager.Config.Provider.Type = "docker-sandboxes"
+	err := manager.RunPool(context.Background(), RunOptions{Instances: 1, Register: true, KeepOnExit: true, ReplaceCompleted: false, PoolLockHeld: true})
+	var candidateErr *candidateRecoveryError
+	if !errors.As(err, &candidateErr) || candidateErr.outcome != candidatePackageManagerContention {
+		t.Fatalf("RunPool() error = %v, want terminal package-manager contention when replacement is disabled", err)
+	}
+	if got := atomic.LoadInt32(&p.cloneCalls); got != 1 {
+		t.Fatalf("clone calls = %d, want no recovery allocation", got)
+	}
+}
+
 func TestConfigureFailureRedactsRegistrationTokenFromErrorAndTiming(t *testing.T) {
 	const sentinel = "SENTINEL-RUNNER-REGISTRATION-TOKEN"
 	p := &fakeProvider{ip: "127.0.0.1"}
@@ -1978,6 +2706,47 @@ func TestReplacementBackoffSequenceJitterCapRetryAfterAndReset(t *testing.T) {
 	minimumState.schedule(&minimum, now, errors.New("ServiceUnavailable"))
 	if got := minimumState.next.Sub(now); got != time.Second {
 		t.Fatalf("minimum jittered delay = %s, want 1s", got)
+	}
+}
+
+func TestRecoverableCandidateFailureRequiresDirectOutcome(t *testing.T) {
+	candidate := &candidateReadinessError{outcome: candidateReadinessListenerEnded, cause: &runnerProcessInactiveError{}}
+	if got, ok := recoverableCandidateFailure(candidate); !ok || got != candidate {
+		t.Fatalf("direct candidate readiness failure = (%v, %t), want recoverable", got, ok)
+	}
+	durableErr := errors.New("persist lifecycle quarantine")
+	if got, ok := recoverableCandidateFailure(errors.Join(candidate, durableErr)); ok || got != nil {
+		t.Fatalf("joined durable failure = (%v, %t), want terminal", got, ok)
+	}
+}
+
+func TestCandidateReadinessRecoveryBackoffCapsAndResets(t *testing.T) {
+	manager := Manager{Config: config.Config{Pool: config.PoolConfig{
+		ReplacementRetryInitialSeconds: 15,
+		ReplacementRetryMaxSeconds:     30,
+		ReplacementRetryMultiplier:     2,
+		ReplacementRetryJitterPercent:  0,
+	}}}
+	state := candidateRecoveryState{}
+	failure := &candidateReadinessError{outcome: candidateReadinessListenerEnded, cause: &runnerProcessInactiveError{}}
+	now := time.Date(2026, time.September, 24, 12, 0, 0, 0, time.UTC)
+	for attempt, want := range []time.Duration{15 * time.Second, 30 * time.Second, 30 * time.Second} {
+		manager.scheduleCandidateRecovery(&state, now, "candidate", failure, nil, 1)
+		if got := state.next.Sub(now); got != want {
+			t.Fatalf("attempt %d delay = %s, want %s", attempt+1, got, want)
+		}
+		if state.attempt != attempt+1 || state.consecutiveSameOutcome != attempt+1 {
+			t.Fatalf("attempt %d state = attempt %d consecutive %d", attempt+1, state.attempt, state.consecutiveSameOutcome)
+		}
+		now = state.next
+	}
+	manager.scheduleCandidateRecovery(&state, now, "candidate", &candidateReadinessError{outcome: candidateReadinessTimedOut, cause: &gh.RunnerReadinessTimeoutError{Name: "candidate", Timeout: time.Minute}}, nil, 1)
+	if state.consecutiveSameOutcome != 1 {
+		t.Fatalf("changed outcome consecutive count = %d, want 1", state.consecutiveSameOutcome)
+	}
+	manager.resetCandidateRecovery(&state, "candidate became ready", map[string]ProvisionedInstance{"candidate": {Phase: LifecycleReady}}, 1)
+	if state.attempt != 0 || !state.next.IsZero() || state.lastOutcome != "" || state.consecutiveSameOutcome != 0 {
+		t.Fatalf("reset state = %#v, want zero value", state)
 	}
 }
 

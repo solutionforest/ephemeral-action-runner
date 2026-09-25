@@ -46,6 +46,23 @@ type RunnerLabel struct {
 	Type string `json:"type"`
 }
 
+// RunnerReadinessTimeoutError reports that GitHub never exposed the requested
+// runner readiness state within the configured observation window. Callers can
+// distinguish this inconclusive observation from authentication, transport,
+// and API failures without matching error text.
+type RunnerReadinessTimeoutError struct {
+	Name        string
+	Timeout     time.Duration
+	RequireIdle bool
+}
+
+func (e *RunnerReadinessTimeoutError) Error() string {
+	if e.RequireIdle {
+		return fmt.Sprintf("runner %q did not become online and idle within %s", e.Name, e.Timeout)
+	}
+	return fmt.Sprintf("runner %q did not become online within %s", e.Name, e.Timeout)
+}
+
 func New(cfg config.GitHubConfig) *Client {
 	if cfg.APIBaseURL == "" {
 		cfg.APIBaseURL = "https://api.github.com"
@@ -157,10 +174,7 @@ func (c *Client) waitRunnerOnline(ctx context.Context, name string, timeout time
 			}
 		}
 		if time.Now().After(deadline) {
-			if requireIdle {
-				return Runner{}, fmt.Errorf("runner %q did not become online and idle within %s", name, timeout)
-			}
-			return Runner{}, fmt.Errorf("runner %q did not become online within %s", name, timeout)
+			return Runner{}, &RunnerReadinessTimeoutError{Name: name, Timeout: timeout, RequireIdle: requireIdle}
 		}
 		select {
 		case <-ctx.Done():
