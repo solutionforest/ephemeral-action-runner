@@ -6,7 +6,9 @@ helper="$project_root/scripts/host-trust/host-trust-feed.sh"
 temporary="$(mktemp -d)"
 watch_pid=""
 cleanup() {
-  if [[ -n "$watch_pid" ]]; then
+  if declare -F epar_host_trust_cleanup >/dev/null 2>&1; then
+    epar_host_trust_cleanup || true
+  elif [[ -n "$watch_pid" ]]; then
     kill "$watch_pid" 2>/dev/null || true
     wait "$watch_pid" 2>/dev/null || true
   fi
@@ -190,6 +192,68 @@ SH
     echo "macOS optional-domain export failure was treated as absence" >&2
     exit 1
   fi
+fi
+
+if [[ "$host_os" == Darwin ]]; then
+  # Real Keychain collection is covered above. Keep the concurrent watcher
+  # lifecycle independent of hosted-runner root count and process speed so it
+  # tests the 30-second freshness contract and synchronization deterministically.
+  lifecycle_security="$temporary/macos-lifecycle-security"
+  lifecycle_root="$temporary/macos-lifecycle-root.pem"
+  lifecycle_key="$temporary/macos-lifecycle-root.key"
+  lifecycle_openssl_config="$temporary/macos-lifecycle-openssl.cnf"
+  mkdir -p "$lifecycle_security"
+  cat >"$lifecycle_openssl_config" <<'OPENSSL'
+[req]
+distinguished_name = subject
+x509_extensions = ca_extensions
+prompt = no
+
+[subject]
+CN = EPAR host-trust lifecycle smoke
+
+[ca_extensions]
+basicConstraints = critical,CA:true
+keyUsage = critical,keyCertSign,cRLSign
+OPENSSL
+  openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+    -config "$lifecycle_openssl_config" \
+    -keyout "$lifecycle_key" \
+    -out "$lifecycle_root" >/dev/null 2>&1
+  export EPAR_TEST_MACOS_LIFECYCLE_ROOT="$lifecycle_root"
+  cat >"$lifecycle_security/security" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+if [[ "$args" == *" user-trust-settings-enable "* ]]; then
+  echo 'User-level Trust Settings are Disabled'
+  exit 0
+fi
+if [[ "$args" == *" find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain "* ]]; then
+  cat "${EPAR_TEST_MACOS_LIFECYCLE_ROOT:?}"
+  exit 0
+fi
+if [[ "$args" == *" find-certificate "* ]]; then
+  exit 0
+fi
+if [[ "$args" == *" trust-settings-export "* ]]; then
+  if [[ "$args" == *" -s "* ]]; then
+    output="${!#}"
+    cat >"$output" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>trustVersion</key><integer>1</integer><key>trustList</key><dict/></dict></plist>
+PLIST
+    exit 0
+  fi
+  echo 'SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.' >&2
+  exit 1
+fi
+echo "unexpected security command in host-trust lifecycle smoke: $*" >&2
+exit 64
+SH
+  chmod +x "$lifecycle_security/security"
+  PATH="$lifecycle_security:$PATH"
 fi
 
 EPAR_HOST_TRUST_HELPER="$helper"
