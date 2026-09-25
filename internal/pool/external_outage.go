@@ -81,6 +81,9 @@ func (m *Manager) RunExternalOutageStage(ctx context.Context, stage string, oper
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if _, candidateFailure := recoverableCandidateFailure(err); candidateFailure {
+			return err
+		}
 		if attemptContextErr != nil {
 			if deadlineErr := supervisor.WaitUntilReady(ctx); deadlineErr != nil {
 				m.logExternalOutageExhaustion(deadlineErr)

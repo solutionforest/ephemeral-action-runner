@@ -291,7 +291,9 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 		quiesce := readTemplateFile(t, filepath.Join("guest", "quiesce-apt.sh"))
 		for _, required := range []string{
 			"systemctl stop apt-daily.timer",
-			"docker_sandboxes_bootstrap_command='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'",
+			"docker_sandboxes_bootstrap_command_legacy='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'",
+			"docker_sandboxes_bootstrap_command_current='{ command -v apt-get && apt-get update -qq -y || true; } >/dev/null 2>&1 </dev/null &'",
+			`[[ "${arguments[2]}" == "${docker_sandboxes_bootstrap_command_legacy}" || "${arguments[2]}" == "${docker_sandboxes_bootstrap_command_current}" ]]`,
 			"read_process_arguments",
 			"is_docker_sandboxes_bootstrap_parent",
 			"is_docker_sandboxes_bootstrap_apt",
@@ -301,11 +303,17 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			`kill -KILL "${remaining_pids[@]}"`,
 			"pgrep -x apt-get",
 			"pgrep -f -x '/usr/lib/apt/apt.systemd.daily.*'",
+			"EPAR_CANDIDATE_RECOVERY=package-manager-contention",
 			"timed out waiting for unexpected package-manager processes",
 		} {
 			if !strings.Contains(quiesce, required) {
 				t.Fatalf("Docker Sandboxes apt quiescence omitted %q", required)
 			}
+		}
+		recoveryMarkerIndex := strings.Index(quiesce, "EPAR_CANDIDATE_RECOVERY=package-manager-contention")
+		timeoutDiagnosticIndex := strings.Index(quiesce, "timed out waiting for unexpected package-manager processes")
+		if recoveryMarkerIndex < 0 || timeoutDiagnosticIndex < 0 || recoveryMarkerIndex >= timeoutDiagnosticIndex {
+			t.Fatal("Docker Sandboxes apt quiescence must emit the stable candidate-recovery marker before the human timeout diagnostic")
 		}
 		for _, forbidden := range []string{"pkill -f", "killall", "pkill apt"} {
 			if strings.Contains(quiesce, forbidden) {
