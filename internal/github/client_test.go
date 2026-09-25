@@ -534,6 +534,34 @@ func TestWaitRunnerOnlineIdleRejectsBusyRunner(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "did not become online and idle") {
 		t.Fatalf("WaitRunnerOnlineIdle() error = %v, want busy runner rejected", err)
 	}
+	var timeoutErr *RunnerReadinessTimeoutError
+	if !errors.As(err, &timeoutErr) || timeoutErr.Name != "epar-test-1" || timeoutErr.Timeout != 0 || !timeoutErr.RequireIdle {
+		t.Fatalf("WaitRunnerOnlineIdle() error = %#v, want typed idle readiness timeout", timeoutErr)
+	}
+}
+
+func TestWaitRunnerOnlineReturnsTypedTimeout(t *testing.T) {
+	keyPath := writeKey(t)
+	client := New(config.GitHubConfig{AppID: 123, Organization: "example", PrivateKeyPath: keyPath, APIBaseURL: "https://api.github.test"})
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/orgs/example/installation":
+			return response(http.StatusOK, `{"id":42}`), nil
+		case "/app/installations/42/access_tokens":
+			return response(http.StatusOK, `{"token":"installation-token","expires_at":"2099-01-01T00:00:00Z"}`), nil
+		case "/orgs/example/actions/runners":
+			return response(http.StatusOK, `{"total_count":0,"runners":[]}`), nil
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	_, err := client.WaitRunnerOnline(context.Background(), "epar-test-1", 0)
+	var timeoutErr *RunnerReadinessTimeoutError
+	if !errors.As(err, &timeoutErr) || timeoutErr.Name != "epar-test-1" || timeoutErr.Timeout != 0 || timeoutErr.RequireIdle {
+		t.Fatalf("WaitRunnerOnline() error = %#v, want typed online readiness timeout", timeoutErr)
+	}
 }
 
 func TestDeleteRunnerIfExistsIgnoresNotFound(t *testing.T) {

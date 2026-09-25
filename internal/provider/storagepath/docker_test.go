@@ -78,6 +78,41 @@ func TestClassifyDockerEndpoint(t *testing.T) {
 	}
 }
 
+func TestDiscoverOrbStackUnixContextIsAcceptedWithExplicitUnknownVMCapacity(t *testing.T) {
+	const endpoint = "unix:///Users/runner/.orbstack/run/docker.sock"
+	storage, err := DiscoverDockerStorage(DockerDiscoveryOptions{
+		Environment: Environment{GOOS: "darwin", HomeDir: "/Users/runner"},
+		Endpoint:    endpoint,
+		Info: DockerInfo{
+			DockerRootDir:   "/var/lib/docker",
+			OperatingSystem: "OrbStack",
+			Name:            "orbstack",
+		},
+		Stat: func(path string) (os.FileInfo, error) {
+			if path != "/var/lib/docker" {
+				t.Fatalf("stat path = %q, want OrbStack VM Docker root", path)
+			}
+			return nil, os.ErrNotExist
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storage.Endpoint != endpoint || storage.EndpointClass != DockerEndpointLocal || storage.Desktop {
+		t.Fatalf("OrbStack storage classification = %#v, want local non-Desktop Docker-compatible context", storage)
+	}
+	if len(storage.Roots) != 1 {
+		t.Fatalf("OrbStack roots = %#v, want one explicit Docker Engine observation", storage.Roots)
+	}
+	root := storage.Roots[0]
+	if root.Path != "/var/lib/docker" || root.CapacityPath != "" || root.Provenance != ProvenanceDockerInfo || root.Confidence != ConfidenceUnavailable {
+		t.Fatalf("OrbStack Docker root = %#v, want unmeasurable VM-local root retained as explicit capacity evidence", root)
+	}
+	if !strings.Contains(root.CapacityUnavailableReason, "does not exist") {
+		t.Fatalf("OrbStack capacity reason = %q, want host visibility failure", root.CapacityUnavailableReason)
+	}
+}
+
 func TestDiscoverDockerStorageRejectsRemoteContext(t *testing.T) {
 	_, err := DiscoverDockerStorage(DockerDiscoveryOptions{Endpoint: "ssh://builder.example"})
 	if err == nil || !errors.Is(err, ErrRemoteDockerEndpoint) {

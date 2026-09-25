@@ -18,8 +18,10 @@ import (
 )
 
 func TestRunRawCancellationKillsManagedProcessGroup(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
 	p := New("sh")
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
 	command := fmt.Sprintf("sleep 30 & echo $! > %q; printf ready; wait", childPIDPath)
 	started := make(chan struct{})
@@ -37,11 +39,20 @@ func TestRunRawCancellationKillsManagedProcessGroup(t *testing.T) {
 		})
 		finished <- rawResult{result: result, err: err}
 	}()
+	startupTimer := time.NewTimer(30 * time.Second)
+	defer startupTimer.Stop()
 	select {
 	case <-started:
-	case <-time.After(5 * time.Second):
+	case outcome := <-finished:
+		t.Fatalf("managed process group helper exited before signaling readiness: result=%+v error=%v", outcome.result, outcome.err)
+	case <-startupTimer.C:
 		cancel()
-		t.Fatal("managed process group helper did not start")
+		select {
+		case outcome := <-finished:
+			t.Fatalf("managed process group helper did not signal readiness within 30s and returned after cancellation: result=%+v error=%v", outcome.result, outcome.err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("managed process group helper did not signal readiness within 30s or return within 10s after cancellation")
+		}
 	}
 	var childPID int
 	childDeadline := time.Now().Add(5 * time.Second)

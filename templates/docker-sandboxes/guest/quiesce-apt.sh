@@ -17,7 +17,8 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
 fi
 
-docker_sandboxes_bootstrap_command='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'
+docker_sandboxes_bootstrap_command_legacy='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'
+docker_sandboxes_bootstrap_command_current='{ command -v apt-get && apt-get update -qq -y || true; } >/dev/null 2>&1 </dev/null &'
 
 read_process_arguments() {
   local pid="$1"
@@ -35,7 +36,7 @@ is_docker_sandboxes_bootstrap_parent() {
   [[ "${#arguments[@]}" == "3" ]] \
     && [[ "${arguments[0]}" == "sh" || "${arguments[0]}" == "/bin/sh" || "${arguments[0]}" == "/usr/bin/sh" ]] \
     && [[ "${arguments[1]}" == "-c" ]] \
-    && [[ "${arguments[2]}" == "${docker_sandboxes_bootstrap_command}" ]] \
+    && [[ "${arguments[2]}" == "${docker_sandboxes_bootstrap_command_legacy}" || "${arguments[2]}" == "${docker_sandboxes_bootstrap_command_current}" ]] \
     && [[ "${executable}" == "/usr/bin/dash" || "${executable}" == "/usr/bin/bash" ]]
 }
 
@@ -122,6 +123,7 @@ for attempt in $(seq 1 180); do
     exit 0
   fi
   if [[ "${attempt}" == "180" ]]; then
+    echo "EPAR_CANDIDATE_RECOVERY=package-manager-contention" >&2
     echo "EPAR Docker Sandboxes template: timed out waiting for unexpected package-manager processes: ${package_pids[*]}" >&2
     ps -o pid=,ppid=,stat=,comm=,args= -p "$(IFS=,; echo "${package_pids[*]}")" >&2 || true
     exit 1

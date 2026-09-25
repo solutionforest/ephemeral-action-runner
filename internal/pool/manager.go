@@ -445,6 +445,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
 	hostTrustBusyHandoff := make(map[string]bool)
+	candidateRetry := candidateRecoveryState{}
 	for len(active) < opts.Instances {
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
 			if ctx.Err() != nil {
@@ -482,6 +483,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			if ctx.Err() != nil {
 				return cleanup()
+			}
+			if candidateErr, recoverable := recoverableCandidateFailure(err); recoverable && opts.Register && opts.ReplaceCompleted {
+				m.scheduleCandidateRecovery(&candidateRetry, m.currentTime(), vm.Name, candidateErr, active, opts.Instances)
+				break
 			}
 			return m.cleanupAfterPoolFailure(err, active, opts.KeepOnExit)
 		}
@@ -862,6 +867,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				continue
 			}
 			retry.resetAfterAdoption(beforeReconcile, active)
+			if adoptedReadyInstance(beforeReconcile, active) {
+				m.resetCandidateRecovery(&candidateRetry, "a quarantined candidate was verified healthy", active, opts.Instances)
+			}
 			attemptCtx, cancelAttempt, attemptErr = m.externalOutageAttemptContext(ctx)
 			if attemptErr != nil {
 				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
@@ -916,7 +924,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if !trustCapacityReady || (!opts.ReplaceCompleted && trustRetired == 0 && !needsTrustCapacity) {
 				continue
 			}
-			if retry.active(now) {
+			if retry.active(now) || candidateRetry.active(now) {
 				continue
 			}
 			for replacementCapacity < opts.Instances {
@@ -992,6 +1000,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					if ctx.Err() != nil {
 						return cleanup()
 					}
+					if candidateErr, recoverable := recoverableCandidateFailure(err); recoverable && opts.Register && opts.ReplaceCompleted {
+						m.scheduleCandidateRecovery(&candidateRetry, m.currentTime(), name, candidateErr, active, opts.Instances)
+						break
+					}
 					m.warnf("[%s] replacement failed: %v\n", name, err)
 					if handled, outageErr := m.deferExternalOutage("replacement-provisioning", err); handled {
 						if outageErr != nil {
@@ -1007,6 +1019,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				active[vm.Name] = vm
 				retry.reset()
+				m.resetCandidateRecovery(&candidateRetry, "a replacement runner became ready", active, opts.Instances)
 				replacementCapacity++
 				if vm.HostTrustGeneration != "" {
 					poolTrustGeneration = vm.HostTrustGeneration
@@ -1137,10 +1150,26 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			continue
 		}
 		if vm.Phase == LifecycleCleanupPending {
-			// The local cleanup path already matched this exact lifecycle
-			// record. Keep its remote identity attached to the protected
-			// record instead of treating it as an orphan below.
+			// Cleanup-pending means a prior exact cleanup crossed its durable
+			// intent boundary. Retry that same identity while keeping the slot
+			// capacity-consuming until the full retirement succeeds.
+			runner, found := remoteByName[name]
 			delete(remoteByName, name)
+			if found && runner.Busy {
+				continue
+			}
+			if found && (vm.RunnerID == 0 || runner.ID != vm.RunnerID) {
+				m.warnf("[%s] cleanup-pending reconciliation retained the exact capacity because GitHub runner id=%d does not match persisted id=%d\n", name, runner.ID, vm.RunnerID)
+				continue
+			}
+			if err := m.retireInstance(ctx, vm, "resuming exact cleanup-pending reconciliation"); err != nil {
+				if errors.Is(err, provider.ErrControlPlaneFailure) {
+					return reconciled, err
+				}
+				m.warnf("[%s] cleanup-pending reconciliation will retry: %v\n", name, err)
+				continue
+			}
+			delete(reconciled, name)
 			continue
 		}
 		runner, found := remoteByName[name]
@@ -1610,6 +1639,47 @@ func (s *replacementRetryState) resetAfterAdoption(before, after map[string]Prov
 	}
 }
 
+type candidateRecoveryState struct {
+	replacementRetryState
+	lastOutcome            candidateRecoveryOutcome
+	consecutiveSameOutcome int
+}
+
+func (s *candidateRecoveryState) schedule(m *Manager, now time.Time) {
+	s.replacementRetryState.schedule(m, now, nil)
+}
+
+func (m *Manager) scheduleCandidateRecovery(state *candidateRecoveryState, now time.Time, name string, failure *candidateRecoveryError, active map[string]ProvisionedInstance, desired int) {
+	if state.lastOutcome == failure.outcome {
+		state.consecutiveSameOutcome++
+	} else {
+		state.lastOutcome = failure.outcome
+		state.consecutiveSameOutcome = 1
+	}
+	state.schedule(m, now)
+	m.warnf("[%s] candidate recovery scheduled: outcome=%s consecutive=%d available=%d desired=%d attempt=%d retryIn=%s nextRetry=%s: %v\n",
+		name,
+		failure.outcome,
+		state.consecutiveSameOutcome,
+		readyPoolCapacity(active),
+		desired,
+		state.attempt,
+		state.remaining(now),
+		state.next.In(time.Local).Format(time.RFC3339),
+		failure,
+	)
+}
+
+func (m *Manager) resetCandidateRecovery(state *candidateRecoveryState, reason string, active map[string]ProvisionedInstance, desired int) {
+	if state.attempt == 0 {
+		return
+	}
+	m.infof("candidate recovery complete after %d attempt(s): %s; available=%d desired=%d\n", state.attempt, reason, readyPoolCapacity(active), desired)
+	state.reset()
+	state.lastOutcome = ""
+	state.consecutiveSameOutcome = 0
+}
+
 func (m *Manager) replacementRetrySettings() (time.Duration, time.Duration, float64, float64) {
 	initialSeconds := m.Config.Pool.ReplacementRetryInitialSeconds
 	if initialSeconds <= 0 {
@@ -1965,7 +2035,15 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 		if configureAttempted && m.GitHub != nil {
 			runner, found, lookupErr := m.GitHub.RunnerByName(context.Background(), name)
 			if lookupErr != nil {
-				m.quarantineLifecycle(context.Background(), name, fmt.Errorf("%w; exact GitHub registration lookup failed: %v", err, lookupErr))
+				lookupFailure := fmt.Errorf("exact GitHub registration lookup after candidate failure: %w", lookupErr)
+				if candidateErr, candidateFailure := recoverableCandidateFailure(err); candidateFailure && isTransientDependencyError(lookupErr) {
+					err = &candidateRecoveryError{outcome: candidateErr.outcome, cause: errors.Join(candidateErr.cause, lookupFailure)}
+				} else {
+					err = errors.Join(err, lookupFailure)
+				}
+				if quarantineErr := m.quarantineLifecycle(context.Background(), name, err); quarantineErr != nil {
+					err = errors.Join(err, fmt.Errorf("persist runner quarantine after GitHub registration lookup failure: %w", quarantineErr))
+				}
 				vm.Phase = LifecycleQuarantined
 				return
 			}
@@ -1973,14 +2051,26 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			if found {
 				vm.RunnerID = runner.ID
 				if recordErr := m.recordLifecycleRegistered(context.Background(), name, runner.ID); recordErr != nil {
-					m.quarantineLifecycle(context.Background(), name, fmt.Errorf("%w; exact GitHub runner id=%d could not be recorded: %v", err, runner.ID, recordErr))
+					err = errors.Join(err, fmt.Errorf("record exact GitHub runner id=%d after candidate failure: %w", runner.ID, recordErr))
+					if quarantineErr := m.quarantineLifecycle(context.Background(), name, err); quarantineErr != nil {
+						err = errors.Join(err, fmt.Errorf("persist runner quarantine after GitHub identity record failure: %w", quarantineErr))
+					}
 					vm.Phase = LifecycleQuarantined
 					return
 				}
 			}
 		}
+		if _, candidateFailure := recoverableCandidateFailure(err); candidateFailure {
+			if quarantineErr := m.quarantineLifecycle(context.Background(), name, err); quarantineErr != nil {
+				err = errors.Join(err, fmt.Errorf("persist candidate recovery quarantine: %w", quarantineErr))
+			}
+			vm.Phase = LifecycleQuarantined
+			return
+		}
 		if listenerMayBeRunning {
-			m.quarantineLifecycle(context.Background(), name, err)
+			if quarantineErr := m.quarantineLifecycle(context.Background(), name, err); quarantineErr != nil {
+				err = errors.Join(err, fmt.Errorf("persist runner quarantine after listener readiness failure: %w", quarantineErr))
+			}
 			vm.Phase = LifecycleQuarantined
 			return
 		}
@@ -2294,8 +2384,13 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 				"RUNNER_NO_DEFAULT_LABELS": fmt.Sprintf("%t", m.Config.Runner.NoDefaultLabels),
 			}
 			configureAttempted = true
-			if _, err := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env, Stdin: token.Token + "\n", SensitiveValues: []string{token.Token}}); err != nil {
-				return provider.RedactError(err, token.Token)
+			configureResult, configureErr := m.execGuest(ctx, name, []string{"sudo", "-E", "bash", "/opt/epar/configure-runner.sh"}, provider.ExecOptions{Env: env, Stdin: token.Token + "\n", SensitiveValues: []string{token.Token}})
+			if configureErr != nil {
+				configureErr = provider.RedactError(configureErr, token.Token)
+				if m.Config.Provider.Type == "docker-sandboxes" && (strings.Contains(configureResult.Stderr, candidatePackageManagerContentionMarker) || strings.Contains(configureErr.Error(), candidatePackageManagerContentionMarker)) {
+					return &candidateRecoveryError{outcome: candidatePackageManagerContention, cause: configureErr}
+				}
+				return configureErr
 			}
 			m.infof("[%s] starting runner service\n", name)
 			listenerMayBeRunning = true
@@ -2371,6 +2466,55 @@ type runnerReadinessResult struct {
 	err    error
 }
 
+type candidateRecoveryOutcome string
+
+type candidateReadinessOutcome = candidateRecoveryOutcome
+
+const (
+	candidateReadinessListenerEnded         candidateRecoveryOutcome = "listener-ended"
+	candidateReadinessHealthUnknown         candidateRecoveryOutcome = "health-unknown"
+	candidateReadinessTimedOut              candidateRecoveryOutcome = "github-readiness-timeout"
+	candidatePackageManagerContention       candidateRecoveryOutcome = "package-manager-contention"
+	candidatePackageManagerContentionMarker                          = "EPAR_CANDIDATE_RECOVERY=package-manager-contention"
+)
+
+type candidateRecoveryError struct {
+	outcome candidateRecoveryOutcome
+	cause   error
+}
+
+type candidateReadinessError = candidateRecoveryError
+
+func (e *candidateRecoveryError) Error() string {
+	switch e.outcome {
+	case candidateReadinessListenerEnded:
+		return fmt.Sprintf("runner listener ended before readiness was observed: %v", e.cause)
+	case candidateReadinessHealthUnknown:
+		return fmt.Sprintf("runner process health remained unknown while waiting for readiness: %v", e.cause)
+	case candidateReadinessTimedOut:
+		return fmt.Sprintf("GitHub runner readiness was not observed before the timeout: %v", e.cause)
+	case candidatePackageManagerContention:
+		return fmt.Sprintf("candidate package-manager contention prevented runner configuration: %v", e.cause)
+	default:
+		return fmt.Sprintf("candidate provisioning failed: %v", e.cause)
+	}
+}
+
+func (e *candidateRecoveryError) Unwrap() error {
+	return e.cause
+}
+
+type runnerProcessInactiveError struct{}
+
+func (*runnerProcessInactiveError) Error() string {
+	return runnerProcessInactiveReason
+}
+
+func recoverableCandidateFailure(err error) (*candidateRecoveryError, bool) {
+	candidateErr, ok := err.(*candidateRecoveryError)
+	return candidateErr, ok
+}
+
 func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedInstance, timeout time.Duration, allowBusy bool) (gh.Runner, error) {
 	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -2393,13 +2537,20 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	consecutiveProbeFailures := 0
-	var lastProbeErr error
+	consecutiveInactive := 0
+	consecutiveUnknown := 0
 	nextLeaseRefresh := time.Now().Add(hostTrustRefreshInterval)
 
 	for {
 		select {
 		case result := <-resultCh:
+			if result.err == nil || ctx.Err() != nil {
+				return result.runner, result.err
+			}
+			var timeoutErr *gh.RunnerReadinessTimeoutError
+			if errors.As(result.err, &timeoutErr) {
+				return gh.Runner{}, &candidateReadinessError{outcome: candidateReadinessTimedOut, cause: result.err}
+			}
 			return result.runner, result.err
 		case <-ticker.C:
 			instance, instanceErr := m.providerInstance(waitCtx, vm.Name)
@@ -2432,31 +2583,46 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 			}
 			err := m.checkRunnerProcess(waitCtx, vm.Name)
 			if err == nil {
-				consecutiveProbeFailures = 0
-				lastProbeErr = nil
+				consecutiveInactive = 0
+				consecutiveUnknown = 0
 				continue
 			}
 			if ctx.Err() != nil {
 				cancel()
 				return gh.Runner{}, ctx.Err()
 			}
-			consecutiveProbeFailures++
-			lastProbeErr = err
-			if consecutiveProbeFailures < runnerReadinessProbeFailureLimit {
-				m.warnf("[%s] runner readiness process check failed (%d/%d): %v\n", vm.Name, consecutiveProbeFailures, runnerReadinessProbeFailureLimit, err)
+			var inactiveErr *runnerProcessInactiveError
+			if errors.As(err, &inactiveErr) {
+				consecutiveUnknown = 0
+				consecutiveInactive++
+				if consecutiveInactive < runnerReadinessProbeFailureLimit {
+					m.warnf("[%s] runner readiness process check confirmed the listener inactive (%d/%d); EPAR will verify again before recovery\n", vm.Name, consecutiveInactive, runnerReadinessProbeFailureLimit)
+					continue
+				}
+				cancel()
+				return gh.Runner{}, &candidateReadinessError{outcome: candidateReadinessListenerEnded, cause: err}
+			}
+			if !recoverableRunnerProcessProbeFailure(err) {
+				cancel()
+				return gh.Runner{}, err
+			}
+			consecutiveInactive = 0
+			consecutiveUnknown++
+			if consecutiveUnknown < runnerReadinessProbeFailureLimit {
+				m.warnf("[%s] runner readiness process health is unknown (%d/%d): %v\n", vm.Name, consecutiveUnknown, runnerReadinessProbeFailureLimit, err)
 				continue
 			}
 			cancel()
-			readiness := "online/idle"
-			if allowBusy {
-				readiness = "online"
-			}
-			return gh.Runner{}, fmt.Errorf("actions runner process failed %d consecutive checks while waiting for GitHub %s: %w", runnerReadinessProbeFailureLimit, readiness, lastProbeErr)
+			return gh.Runner{}, &candidateReadinessError{outcome: candidateReadinessHealthUnknown, cause: fmt.Errorf("process health probe failed %d consecutive checks: %w", runnerReadinessProbeFailureLimit, err)}
 		case <-ctx.Done():
 			cancel()
 			return gh.Runner{}, ctx.Err()
 		}
 	}
+}
+
+func recoverableRunnerProcessProbeFailure(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, provider.ErrControlPlaneFailure) || isTransientDependencyError(err)
 }
 
 func (m *Manager) captureRunnerReadinessDiagnostics(ctx context.Context, name, guestLogPath string) {
@@ -2541,7 +2707,7 @@ func (m *Manager) checkRunnerProcess(ctx context.Context, name string) error {
 		return err
 	}
 	if !running {
-		return fmt.Errorf(runnerProcessInactiveReason)
+		return &runnerProcessInactiveError{}
 	}
 	return nil
 }

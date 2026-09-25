@@ -2298,10 +2298,12 @@ func TestRunRawNormalizesCommandContextKillToCancellation(t *testing.T) {
 		time.Sleep(30 * time.Second)
 		return
 	}
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
 	t.Setenv("EPAR_DOCKER_SANDBOXES_RUN_RAW_HELPER", "1")
 
 	p := New(os.Args[0])
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	started := make(chan struct{})
 	type rawResult struct {
 		result provider.ExecResult
@@ -2317,11 +2319,20 @@ func TestRunRawNormalizesCommandContextKillToCancellation(t *testing.T) {
 		})
 		finished <- rawResult{result: result, err: err}
 	}()
+	startupTimer := time.NewTimer(30 * time.Second)
+	defer startupTimer.Stop()
 	select {
 	case <-started:
-	case <-time.After(5 * time.Second):
+	case outcome := <-finished:
+		t.Fatalf("runRaw helper exited before signaling readiness: result=%+v error=%v", outcome.result, outcome.err)
+	case <-startupTimer.C:
 		cancel()
-		t.Fatal("runRaw helper process did not start")
+		select {
+		case outcome := <-finished:
+			t.Fatalf("runRaw helper did not signal readiness within 30s and returned after cancellation: result=%+v error=%v", outcome.result, outcome.err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("runRaw helper did not signal readiness within 30s or return within 10s after cancellation")
+		}
 	}
 	cancel()
 	select {

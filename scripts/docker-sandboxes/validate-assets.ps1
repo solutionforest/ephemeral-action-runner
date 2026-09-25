@@ -208,11 +208,27 @@ foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.
 }
 $guestText = ($guestScripts | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
 $quiesceApt = Get-Content -Raw -LiteralPath (Join-Path (Join-Path $templateDirectory 'guest') 'quiesce-apt.sh')
-$dockerSandboxesBootstrapCommand = "docker_sandboxes_bootstrap_command='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'"
-if ([regex]::Matches($quiesceApt, [regex]::Escape($dockerSandboxesBootstrapCommand)).Count -ne 1) {
-    throw 'quiesce-apt.sh must identify the exact Docker Sandboxes bootstrap apt command once'
+$dockerSandboxesBootstrapCommands = @(
+    "docker_sandboxes_bootstrap_command_legacy='command -v apt-get > /dev/null 2>&1 && (apt-get update -qq -y > /dev/null 2>&1 || true) &'",
+    "docker_sandboxes_bootstrap_command_current='{ command -v apt-get && apt-get update -qq -y || true; } >/dev/null 2>&1 </dev/null &'"
+)
+foreach ($dockerSandboxesBootstrapCommand in $dockerSandboxesBootstrapCommands) {
+    if ([regex]::Matches($quiesceApt, [regex]::Escape($dockerSandboxesBootstrapCommand)).Count -ne 1) {
+        throw "quiesce-apt.sh must identify the exact Docker Sandboxes bootstrap apt command once: $dockerSandboxesBootstrapCommand"
+    }
 }
-$guestTextWithoutBootstrapIdentity = $guestText.Replace($dockerSandboxesBootstrapCommand, '')
+if (-not $quiesceApt.Contains('[[ "${arguments[2]}" == "${docker_sandboxes_bootstrap_command_legacy}" || "${arguments[2]}" == "${docker_sandboxes_bootstrap_command_current}" ]]')) {
+    throw 'quiesce-apt.sh must match both supported Docker Sandboxes bootstrap commands by their complete shell argument'
+}
+$candidateRecoveryMarkerIndex = $quiesceApt.IndexOf('EPAR_CANDIDATE_RECOVERY=package-manager-contention')
+$packageManagerTimeoutIndex = $quiesceApt.IndexOf('timed out waiting for unexpected package-manager processes')
+if ($candidateRecoveryMarkerIndex -lt 0 -or $packageManagerTimeoutIndex -lt 0 -or $candidateRecoveryMarkerIndex -ge $packageManagerTimeoutIndex) {
+    throw 'quiesce-apt.sh must emit the stable candidate-recovery marker before the human package-manager timeout diagnostic'
+}
+$guestTextWithoutBootstrapIdentity = $guestText
+foreach ($dockerSandboxesBootstrapCommand in $dockerSandboxesBootstrapCommands) {
+    $guestTextWithoutBootstrapIdentity = $guestTextWithoutBootstrapIdentity.Replace($dockerSandboxesBootstrapCommand, '')
+}
 if ($guestTextWithoutBootstrapIdentity -match '(?im)apt-get\s+update|(?im)(^|[;&|]\s*)dockerd(?:\s|$)|(?im)-----BEGIN .*PRIVATE KEY-----|(?im)AKIA[0-9A-Z]{16}') {
     throw 'Guest helpers contain a boot-time package update, dockerd start, or credential pattern'
 }
