@@ -695,6 +695,11 @@ func TestHealthStageCancellationAndRetry(t *testing.T) {
 					if !errors.Is(err, wantErr) || done || gotPhase != phase || time.Since(start) != wantElapsed {
 						t.Fatalf("canceled phase: done=%t phase=%s err=%v elapsed=%s", done, gotPhase, err, time.Since(start))
 					}
+					_, providerBudget := asProviderCallerBudgetTimeout(err)
+					wantProviderBudget := (mode == "parent-deadline" || mode == "stage-deadline") && (phase == "instance-admission" || phase == "process")
+					if providerBudget != wantProviderBudget {
+						t.Fatalf("provider caller-budget outcome = %t, want %t for phase=%s mode=%s error=%v", providerBudget, wantProviderBudget, phase, mode, err)
+					}
 					wantCalls := 1
 					if mode == "already-canceled" {
 						wantCalls = 0

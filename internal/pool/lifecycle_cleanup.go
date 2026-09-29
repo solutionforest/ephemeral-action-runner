@@ -124,16 +124,22 @@ func (m *Manager) cleanupPrefixOrphanInventory(ctx context.Context, item provide
 		}
 	}
 	stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
-	_ = m.stopProviderInstance(stopCtx, instance)
+	stopErr := m.stopProviderInstance(stopCtx, instance)
+	classifiedStopErr := classifyProviderOperationError(ctx, stopCtx, instance, "stop exact prefix-owned provider instance", stopErr)
 	stopCancel()
+	if classifiedStopErr != nil && (isProviderRecoverySignal(classifiedStopErr) || errors.Is(classifiedStopErr, context.Canceled)) {
+		return false, retain(classifiedStopErr)
+	}
 	deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
 	deleteErr := m.deleteProviderInstance(deleteCtx, instance)
+	deleteErr = classifyProviderOperationError(ctx, deleteCtx, instance, "delete exact prefix-owned provider instance", deleteErr)
 	deleteCancel()
 	if deleteErr != nil {
 		return false, retain(fmt.Errorf("delete exact prefix-owned provider instance %s id=%s: %w", instance.Name, instance.ProviderID, deleteErr))
 	}
 	remaining, inventoryErr := m.inventoryProvider(ctx)
 	if inventoryErr != nil {
+		inventoryErr = classifyProviderOperationError(ctx, ctx, instance, "verify exact prefix-owned provider instance absence", inventoryErr)
 		return false, retain(fmt.Errorf("verify exact prefix-owned provider instance absence: %w", inventoryErr))
 	}
 	for _, remainingItem := range remaining {
@@ -461,17 +467,22 @@ func (m *Manager) removeExactProviderInstance(ctx context.Context, record poolst
 	exact.ReceiptVersion = record.Receipt.Version
 	exact.Receipt = append([]byte(nil), record.Receipt.Payload...)
 	stopCtx, stopCancel := context.WithTimeout(ctx, 60*time.Second)
-	_ = m.stopProviderInstance(stopCtx, *exact)
+	stopErr := m.stopProviderInstance(stopCtx, *exact)
+	classifiedStopErr := classifyProviderOperationError(ctx, stopCtx, *exact, "stop exact provider instance", stopErr)
 	stopCancel()
+	if classifiedStopErr != nil && (isProviderCallerBudgetTimeout(classifiedStopErr) || errors.Is(classifiedStopErr, provider.ErrControlPlaneFailure) || errors.Is(classifiedStopErr, provider.ErrControlPlaneAdmissionFailure) || errors.Is(classifiedStopErr, context.Canceled)) {
+		return classifiedStopErr
+	}
 	deleteCtx, deleteCancel := context.WithTimeout(ctx, 60*time.Second)
 	err := m.deleteProviderInstance(deleteCtx, *exact)
+	err = classifyProviderOperationError(ctx, deleteCtx, *exact, "delete exact provider instance", err)
 	deleteCancel()
 	if err != nil {
 		return err
 	}
 	remaining, err := m.inventoryProvider(ctx)
 	if err != nil {
-		return err
+		return classifyProviderOperationError(ctx, ctx, *exact, "verify exact provider instance absence", err)
 	}
 	for _, item := range remaining {
 		if item.Instance.ProviderID == record.ProviderID {

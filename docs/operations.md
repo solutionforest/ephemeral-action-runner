@@ -47,6 +47,8 @@ Candidate recovery and transient GitHub or network failures during replacement, 
 
 Runner health monitoring preserves uncertain capacity and uses bounded, fair progress so one slow check cannot consume every runner's monitoring opportunity or indefinitely postpone host-trust maintenance. Repeated unknown-health warnings are summarized, with a recovery message when health is verified again. This limits console and manager-log noise without changing exact cleanup, inactive-process confirmation, or provider recovery authorization. See [Health warnings](troubleshooting.md#an-idle-runner-reports-github-or-sandbox-health-warnings).
 
+Docker Sandboxes can report healthy global inventory while one sandbox's guest-session commands remain wedged. If host-trust lease maintenance then fails, EPAR quarantines that exact instance and deletes its immutable GitHub registration so it cannot accept another job with an expired lease. The local `cleanup-pending` record still consumes capacity, so the pool may show zero GitHub runners while the supervisor remains alive. Repeated caller-budget deadlines trigger a fresh harmless command-path verification for the same sandbox; only that independently bounded typed failure can enter `exclusive-auto` daemon recovery. This path is enabled by default and is independent of `--external-outage-retry`.
+
 ## Inspect status and logs
 
 ```bash

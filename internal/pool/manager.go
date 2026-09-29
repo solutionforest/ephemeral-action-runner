@@ -194,6 +194,9 @@ func (m *Manager) resumePendingLifecycleCleanup(ctx context.Context) error {
 	var firstErr error
 	for _, record := range pending {
 		if err := m.cleanupLifecycleRecord(ctx, record, byName[record.Name]); err != nil {
+			if isProviderRecoverySignal(err) || errors.Is(err, context.Canceled) {
+				return fmt.Errorf("resume cleanup %s: %w", record.Name, err)
+			}
 			firstErr = errors.Join(firstErr, fmt.Errorf("resume cleanup %s: %w", record.Name, err))
 		}
 	}
@@ -320,8 +323,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
 		return err
 	}
-	if err := m.resumePendingLifecycleCleanup(ctx); err != nil {
-		m.warnf("startup cleanup of pending lifecycle records is incomplete; preserving the exact capacity fence: %v\n", err)
+	providerDeadlineRecovery := &providerDeadlineRecoveryState{enabled: opts.Register && opts.ReplaceCompleted}
+	hostTrustBusyHandoff := make(map[string]bool)
+	startupCleanupCtx, cancelStartupCleanup := m.steadyStateMaintenanceContext(ctx)
+	startupCleanupErr := m.resumePendingLifecycleCleanup(startupCleanupCtx)
+	cancelStartupCleanup()
+	if startupCleanupErr != nil {
+		if isProviderCallerBudgetTimeout(startupCleanupErr) {
+			_, _ = m.recoverProviderFailure(ctx, providerDeadlineRecovery, startupCleanupErr, nil, hostTrustBusyHandoff)
+		}
+		m.warnf("startup cleanup of pending lifecycle records is incomplete; preserving the exact capacity fence: %v\n", startupCleanupErr)
 	}
 	if !opts.HostTrustLockHeld {
 		controllerLock, err := m.AcquireHostTrustControllerLock()
@@ -355,19 +366,26 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	var active map[string]ProvisionedInstance
 	for {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			err = waitErr
+			break
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
 			err = waitErr
 			break
 		}
 		err = m.RunExternalOutageStage(ctx, "initial-pool-reconciliation", func(attemptCtx context.Context) error {
+			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
+			defer cancelMaintenance()
 			var reconcileErr error
-			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
 			return reconcileErr
 		})
 		if err == nil {
+			providerDeadlineRecovery.sync(active)
 			break
 		}
-		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 		if !handled {
 			break
 		}
@@ -382,19 +400,25 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial pool reconciliation: %w", err), active, opts.KeepOnExit)
 	}
 	for {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			err = waitErr
+			break
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
 			err = waitErr
 			break
 		}
 		err = m.RunExternalOutageStage(ctx, "initial-over-capacity-reconciliation", func(attemptCtx context.Context) error {
+			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
+			defer cancelMaintenance()
 			var reconcileErr error
-			active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
+			active, reconcileErr = m.reduceOverCapacity(maintenanceCtx, active, opts.Instances, opts.Register)
 			return reconcileErr
 		})
 		if err == nil {
 			break
 		}
-		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 		if !handled {
 			break
 		}
@@ -410,6 +434,10 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	}
 	var poolTrustGeneration string
 	for {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			err = waitErr
+			break
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
 			err = waitErr
 			break
@@ -422,7 +450,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		if err == nil {
 			break
 		}
-		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 		if !handled {
 			break
 		}
@@ -444,9 +472,14 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		}
 		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
-	hostTrustBusyHandoff := make(map[string]bool)
 	candidateRetry := candidateRecoveryState{}
 	for len(active) < opts.Instances {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			return m.cleanupAfterPoolFailure(waitErr, active, opts.KeepOnExit)
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
 			if ctx.Err() != nil {
 				return cleanup()
@@ -471,7 +504,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			return provisionErr
 		})
 		if err != nil {
-			handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+			handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 			if handled {
 				if recoveryErr != nil {
 					if ctx.Err() != nil {
@@ -582,7 +615,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if imageMaintenancePending {
 				remaining, drainErr := m.drainPoolForImageUpdate(ctx, active, imageMaintenanceIdleChecks)
 				if drainErr != nil {
-					handled, recoveryErr := m.recoverProviderControlPlane(ctx, drainErr)
+					handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, drainErr, active, hostTrustBusyHandoff)
 					if handled {
 						if recoveryErr != nil {
 							if ctx.Err() != nil {
@@ -729,7 +762,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
 						m.reportUnknownHealth(ctx, livenessCtx, &health, vm, stage, err)
-						handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+						handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 						if handled {
 							if recoveryErr != nil {
 								if ctx.Err() != nil {
@@ -753,6 +786,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 						failedHealth[name] = true
 						continue
+					}
+					if stage == "instance-admission" || stage == "process" {
+						providerDeadlineRecovery.resetInstance(provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID})
 					}
 					if !done {
 						continue
@@ -836,7 +872,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
-				handled, recoveryErr := m.recoverProviderControlPlane(ctx, reconcileErr)
+				handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, reconcileErr, active, hostTrustBusyHandoff)
 				if handled {
 					if recoveryErr != nil {
 						if ctx.Err() != nil {
@@ -866,6 +902,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				m.warnf("pool reconciliation deferred during transient dependency failure; retrying after %s: %v\n", retry.remaining(now), reconcileErr)
 				continue
 			}
+			providerDeadlineRecovery.sync(active)
 			retry.resetAfterAdoption(beforeReconcile, active)
 			if adoptedReadyInstance(beforeReconcile, active) {
 				m.resetCandidateRecovery(&candidateRetry, "a quarantined candidate was verified healthy", active, opts.Instances)
@@ -879,7 +916,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
-				handled, recoveryErr := m.recoverProviderControlPlane(ctx, reconcileErr)
+				handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, reconcileErr, active, hostTrustBusyHandoff)
 				if handled {
 					if recoveryErr != nil {
 						if ctx.Err() != nil {
@@ -944,7 +981,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				cancelMaintenance()
 				cancelAttempt()
 				if err != nil {
-					handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+					handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 					if handled {
 						if recoveryErr != nil {
 							if ctx.Err() != nil {
@@ -987,7 +1024,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					active[vm.Name] = vm
 				}
 				if err != nil {
-					handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+					handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 					if handled {
 						if recoveryErr != nil {
 							if ctx.Err() != nil {
@@ -1163,7 +1200,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				continue
 			}
 			if err := m.retireInstance(ctx, vm, "resuming exact cleanup-pending reconciliation"); err != nil {
-				if errors.Is(err, provider.ErrControlPlaneFailure) {
+				if isProviderRecoverySignal(err) {
 					return reconciled, err
 				}
 				m.warnf("[%s] cleanup-pending reconciliation will retry: %v\n", name, err)
@@ -1205,7 +1242,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				return reconciled, fmt.Errorf("record GitHub runner absence for %s: %w", name, err)
 			}
 			if err := m.deleteLocalInstance(ctx, vm); err != nil {
-				if errors.Is(err, provider.ErrControlPlaneFailure) {
+				if isProviderRecoverySignal(err) {
 					return reconciled, err
 				}
 				vm.Phase = LifecycleCleanupPending
@@ -1255,7 +1292,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 					continue
 				}
 				if err := m.retireInstance(ctx, vm, "durably quarantined runner became idle"); err != nil {
-					if errors.Is(err, provider.ErrControlPlaneFailure) {
+					if isProviderRecoverySignal(err) {
 						return reconciled, err
 					}
 					vm.Phase = LifecycleCleanupPending
@@ -1279,7 +1316,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 		}
 		if vm.Phase == LifecycleQuarantined {
 			if err := m.retireInstance(ctx, vm, "GitHub recovered but quarantined runner remained offline"); err != nil {
-				if errors.Is(err, provider.ErrControlPlaneFailure) {
+				if isProviderRecoverySignal(err) {
 					return reconciled, err
 				}
 				vm.Phase = LifecycleCleanupPending
@@ -1303,7 +1340,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			continue
 		}
 		if err := m.retireInstance(ctx, vm, "reconciliation found offline runner with inactive listener"); err != nil {
-			if errors.Is(err, provider.ErrControlPlaneFailure) {
+			if isProviderRecoverySignal(err) {
 				return reconciled, err
 			}
 			vm.Phase = LifecycleCleanupPending
@@ -1356,7 +1393,7 @@ func (m *Manager) reduceOverCapacity(ctx context.Context, active map[string]Prov
 		}
 		vm.RunnerID = runner.ID
 		if err := m.retireInstance(ctx, vm, "reconciling legacy physical inventory above pool.instances"); err != nil {
-			if errors.Is(err, provider.ErrControlPlaneFailure) {
+			if isProviderRecoverySignal(err) {
 				return active, err
 			}
 			vm.Phase = LifecycleCleanupPending
@@ -1435,6 +1472,9 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			if m.LifecycleState != nil {
 				cleaned, cleanupErr := m.cleanupPrefixOrphanInventory(ctx, item)
 				if cleanupErr != nil {
+					if isProviderRecoverySignal(cleanupErr) {
+						return reconciled, cleanupErr
+					}
 					discoveries, discoveryErr := m.LifecycleState.Discoveries(ctx)
 					if discoveryErr != nil {
 						return known, fmt.Errorf("read prefix-owned cleanup discovery %s: %w", local.Name, errors.Join(cleanupErr, discoveryErr))
@@ -1476,7 +1516,7 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			continue
 		}
 		if err := m.deleteLocalInstance(ctx, vm); err != nil {
-			if errors.Is(err, provider.ErrControlPlaneFailure) {
+			if isProviderRecoverySignal(err) {
 				return reconciled, err
 			}
 			vm.Phase = LifecycleCleanupPending
@@ -1561,7 +1601,7 @@ func (m *Manager) deleteLocalInstance(ctx context.Context, vm ProvisionedInstanc
 		}
 		inventory, err := m.inventoryProvider(ctx)
 		if err != nil {
-			return err
+			return classifyProviderOperationError(ctx, ctx, provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID}, "inventory before exact provider cleanup", err)
 		}
 		return m.cleanupLifecycleRecord(ctx, record, inventoryByName(inventory)[vm.Name])
 	}
@@ -2687,7 +2727,7 @@ func recordRunnerLiveness(confirmedInactive map[string]int, name string, alive b
 }
 
 func shouldProbeRunnerLiveness(vm ProvisionedInstance) bool {
-	return vm.ProviderOwned && vm.ProviderID != "" && !vm.CreateOutcomeUncertain && !vm.RecoveryInventoryUncertain
+	return vm.ProviderOwned && vm.ProviderID != "" && vm.Phase != LifecycleCleanupPending && vm.Phase != LifecycleProvisioning && !vm.CreateOutcomeUncertain && !vm.RecoveryInventoryUncertain
 }
 
 func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
@@ -2754,7 +2794,7 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 		}
 		inventory, err := m.inventoryProvider(ctx)
 		if err != nil {
-			return err
+			return classifyProviderOperationError(ctx, ctx, provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID}, "inventory before exact provider retirement", err)
 		}
 		return m.cleanupLifecycleRecord(ctx, record, inventoryByName(inventory)[vm.Name])
 	}
