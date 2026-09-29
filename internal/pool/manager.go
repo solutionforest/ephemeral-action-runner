@@ -295,6 +295,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
+	unownedRunnerWarnings := newUnownedRunnerWarningReporter()
 	if !opts.ExternalOutageRetry.IsOff() {
 		if err := m.ConfigureExternalOutageRetry(opts.ExternalOutageRetry); err != nil {
 			return err
@@ -378,7 +379,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
 			defer cancelMaintenance()
 			var reconcileErr error
-			active, reconcileErr = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPoolWithReporter(maintenanceCtx, active, opts.Register, unownedRunnerWarnings)
 			return reconcileErr
 		})
 		if err == nil {
@@ -490,7 +491,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		err = m.RunExternalOutageStage(ctx, "initial-capacity-provisioning", func(attemptCtx context.Context) error {
 			vm = ProvisionedInstance{}
 			var reconcileErr error
-			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPoolWithReporter(attemptCtx, active, opts.Register, unownedRunnerWarnings)
 			if reconcileErr != nil || len(active) >= opts.Instances {
 				return reconcileErr
 			}
@@ -868,7 +869,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 			}
 			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
-			active, reconcileErr = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPoolWithReporter(maintenanceCtx, active, opts.Register, unownedRunnerWarnings)
 			cancelMaintenance()
 			cancelAttempt()
 			if reconcileErr != nil {
@@ -977,7 +978,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
 				maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
-				active, err = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+				active, err = m.reconcilePhysicalPoolWithReporter(maintenanceCtx, active, opts.Register, unownedRunnerWarnings)
 				cancelMaintenance()
 				cancelAttempt()
 				if err != nil {
@@ -1147,6 +1148,10 @@ func adoptedReadyInstance(before, after map[string]ProvisionedInstance) bool {
 }
 
 func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]ProvisionedInstance, register bool) (map[string]ProvisionedInstance, error) {
+	return m.reconcilePhysicalPoolWithReporter(ctx, known, register, newUnownedRunnerWarningReporter())
+}
+
+func (m *Manager) reconcilePhysicalPoolWithReporter(ctx context.Context, known map[string]ProvisionedInstance, register bool, unownedWarnings *unownedRunnerWarningReporter) (map[string]ProvisionedInstance, error) {
 	reconciled, err := m.reconcileLocalInventoryWithContext(ctx, known)
 	if err != nil {
 		return known, err
@@ -1172,6 +1177,9 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				reconciled[name] = vm
 			}
 		}
+		return reconciled, err
+	}
+	if err := ctx.Err(); err != nil {
 		return reconciled, err
 	}
 	for _, runner := range runners {
@@ -1350,19 +1358,30 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			delete(reconciled, name)
 		}
 	}
+	unownedRunners := make([]gh.Runner, 0)
 	for _, runner := range remoteByName {
 		owned, ownershipErr := m.lifecycleOwnsRunner(ctx, runner.Name, runner.ID)
 		if ownershipErr != nil {
 			return reconciled, ownershipErr
 		}
 		if !owned {
-			m.warnf("reconciliation: quarantined unowned GitHub runner %s id=%d; prefix-only resources are report-only\n", runner.Name, runner.ID)
+			unownedRunners = append(unownedRunners, runner)
 			continue
 		}
 		if err := m.deleteRemoteRunner(ctx, runner); err != nil {
 			return reconciled, err
 		}
 		m.infof("reconciliation: deleted stale GitHub runner %s id=%d\n", runner.Name, runner.ID)
+	}
+	if err := ctx.Err(); err != nil {
+		return reconciled, err
+	}
+	warning, resolved := unownedWarnings.observeSuccessful(m.currentTime(), unownedRunners)
+	if warning != "" {
+		m.warnf("%s\n", warning)
+	}
+	if resolved != "" {
+		m.infof("%s\n", resolved)
 	}
 	return reconciled, nil
 }
