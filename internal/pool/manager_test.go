@@ -443,6 +443,29 @@ func TestRunPoolDoesNotReplaceWhenRetirementIsDeferred(t *testing.T) {
 	})
 }
 
+type textSignalWriter struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+	match  string
+	signal chan struct{}
+	once   sync.Once
+}
+
+func newTextSignalWriter(match string) *textSignalWriter {
+	return &textSignalWriter{match: match, signal: make(chan struct{})}
+}
+
+func (w *textSignalWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	_, _ = w.buffer.Write(data)
+	matched := strings.Contains(w.buffer.String(), w.match)
+	w.mu.Unlock()
+	if matched {
+		w.once.Do(func() { close(w.signal) })
+	}
+	return len(data), nil
+}
+
 func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		provider := &fakeProvider{ip: "127.0.0.1"}
@@ -451,7 +474,7 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 		}
 		manager := Manager{
 			Config: config.Config{
-				Provider: config.ProviderConfig{SourceImage: "image"},
+				Provider: config.ProviderConfig{SourceImage: "image", Type: "docker-container"},
 				Pool:     config.PoolConfig{Instances: 1, NamePrefix: "epar-test"},
 				Logging:  config.LoggingConfig{Directory: t.TempDir()},
 				Runner:   config.RunnerConfig{Labels: []string{"self-hosted"}, Ephemeral: true},
@@ -461,30 +484,133 @@ func TestRunPoolReplacesCompletedRunnerAfterBusyProvisioning(t *testing.T) {
 			GitHub:      github,
 			ProjectRoot: t.TempDir(),
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-		defer cancel()
-
-		if err := manager.RunPool(ctx, RunOptions{
-			Instances:        1,
-			Register:         true,
-			KeepOnExit:       true,
-			ReplaceCompleted: true,
-			MonitorInterval:  5 * time.Millisecond,
-			PoolLockHeld:     true,
-		}); err != nil {
+		replacementLogged := newTextSignalWriter("Replacement runner ")
+		runtime, err := logging.NewRuntime(logging.Options{Directory: manager.Config.Logging.Directory, ManagerSinks: logging.SinkConsole, Stdout: replacementLogged, Stderr: replacementLogged})
+		if err != nil {
 			t.Fatal(err)
 		}
-		if got := atomic.LoadInt32(&provider.cloneCalls); got < 2 {
-			t.Fatalf("Clone called %d time(s), want a replacement after the initially busy ephemeral runner disappeared", got)
+		defer runtime.Close()
+		manager.Logging = runtime
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.RunPool(ctx, RunOptions{
+				Instances:        1,
+				Register:         true,
+				KeepOnExit:       true,
+				ReplaceCompleted: true,
+				MonitorInterval:  5 * time.Millisecond,
+				PoolLockHeld:     true,
+			})
+		}()
+		select {
+		case <-replacementLogged.signal:
+		case err := <-done:
+			t.Fatalf("RunPool() returned before a replacement was verified: %v", err)
 		}
-		if got := atomic.LoadInt32(&provider.deleteCalls); got < 1 {
-			t.Fatalf("Delete called %d time(s), want completed runner instance retired", got)
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
 		}
-		if got := atomic.LoadInt32(&github.waitOnlineCalls); got < 2 {
-			t.Fatalf("WaitRunnerOnline called %d time(s), want initial busy runner and replacement", got)
+		if got := atomic.LoadInt32(&provider.cloneCalls); got != 2 {
+			t.Fatalf("Clone called %d time(s), want one initial runner and one verified replacement", got)
+		}
+		if got := atomic.LoadInt32(&provider.deleteCalls); got != 1 {
+			t.Fatalf("Delete called %d time(s), want only the completed initial runner retired", got)
+		}
+		if got := atomic.LoadInt32(&github.waitOnlineCalls); got != 2 {
+			t.Fatalf("WaitRunnerOnline called %d time(s), want initial busy runner and one replacement", got)
 		}
 		if got := atomic.LoadInt32(&github.waitOnlineIdleCalls); got != 0 {
 			t.Fatalf("WaitRunnerOnlineIdle called %d time(s), want supervised pool to accept busy runners", got)
+		}
+	})
+}
+
+func TestRunPoolReplacesCompletedRunnerCancellationDuringPreallocationReconciliation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		host := &fakeProvider{ip: "127.0.0.1"}
+		var canceledPreallocation atomic.Bool
+		var postRetirementLists atomic.Int32
+		host.listFunc = func(listCtx context.Context) ([]provider.Instance, error) {
+			if atomic.LoadInt32(&host.deleteCalls) > 0 && postRetirementLists.Add(1) == 2 && canceledPreallocation.CompareAndSwap(false, true) {
+				cancel()
+				<-listCtx.Done()
+				return nil, listCtx.Err()
+			}
+			host.mu.Lock()
+			defer host.mu.Unlock()
+			return append([]provider.Instance(nil), host.instances...), nil
+		}
+		github := &fakeGitHub{waitRunner: gh.Runner{ID: 123, Status: "online", Busy: true}}
+		manager := newRegisteredTestManager(t, host, github)
+
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatalf("RunPool() cancellation error = %v, want normal shutdown cleanup", err)
+		}
+		if !canceledPreallocation.Load() {
+			t.Fatal("replacement preallocation reconciliation was not reached")
+		}
+		if got := atomic.LoadInt32(&host.cloneCalls); got != 1 {
+			t.Fatalf("Clone called %d time(s), want cancellation before replacement allocation", got)
+		}
+		if got := atomic.LoadInt32(&host.deleteCalls); got != 1 {
+			t.Fatalf("Delete called %d time(s), want exact retirement of the completed initial runner", got)
+		}
+	})
+}
+
+func TestLegacyOverCapacityCancellationDuringSteadyReconciliationUsesNormalShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		const excessName = "epar-test-z-excess"
+		host := &fakeProvider{ip: "127.0.0.1"}
+		var initialName string
+		github := &fakeGitHub{}
+		github.waitFunc = func(_ context.Context, name string, _ time.Duration) (gh.Runner, error) {
+			initialName = name
+			host.mu.Lock()
+			host.instances = append(host.instances, provider.Instance{Name: excessName, ProviderID: "fake:" + excessName, State: "running"})
+			host.mu.Unlock()
+			return gh.Runner{Name: name, ID: 123, Status: "online"}, nil
+		}
+		github.listFunc = func(context.Context) ([]gh.Runner, error) {
+			if initialName == "" {
+				return nil, nil
+			}
+			return []gh.Runner{{Name: initialName, ID: 123, Status: "online"}, {Name: excessName, ID: 124, Status: "online"}}, nil
+		}
+		var canceledOverCapacity atomic.Bool
+		github.runnerByNameFunc = func(lookupCtx context.Context, name string) (gh.Runner, bool, error) {
+			if name == excessName && canceledOverCapacity.CompareAndSwap(false, true) {
+				cancel()
+				<-lookupCtx.Done()
+				return gh.Runner{}, false, lookupCtx.Err()
+			}
+			id := int64(123)
+			if name == excessName {
+				id = 124
+			}
+			return gh.Runner{Name: name, ID: id, Status: "online"}, true, nil
+		}
+		manager := newRegisteredTestManager(t, host, github)
+
+		if err := manager.RunPool(ctx, RunOptions{Instances: 1, Register: true, ReplaceCompleted: true, MonitorInterval: 5 * time.Millisecond, PoolLockHeld: true}); err != nil {
+			t.Fatalf("RunPool() cancellation error = %v, want normal shutdown cleanup", err)
+		}
+		if !canceledOverCapacity.Load() {
+			t.Fatal("steady-state over-capacity reconciliation was not reached")
+		}
+		if got := atomic.LoadInt32(&host.cloneCalls); got != 1 {
+			t.Fatalf("Clone called %d time(s), want no allocation while physical capacity exceeds the target", got)
+		}
+		if got := atomic.LoadInt32(&host.deleteCalls); got != 2 {
+			t.Fatalf("Delete called %d time(s), want normal shutdown cleanup of both exact provider instances", got)
 		}
 	})
 }
@@ -2844,6 +2970,7 @@ type fakeProvider struct {
 	deleteErr  error
 	listErr    error
 	deleteFunc func(context.Context, string) error
+	listFunc   func(context.Context) ([]provider.Instance, error)
 	mu         sync.Mutex
 
 	configureEnv     map[string]string
@@ -2971,6 +3098,9 @@ func (p *fakeProvider) List(ctx context.Context) ([]provider.Instance, error) {
 	if ctx.Err() != nil {
 		atomic.AddInt32(&p.canceledListCalls, 1)
 		return nil, ctx.Err()
+	}
+	if p.listFunc != nil {
+		return p.listFunc(ctx)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
