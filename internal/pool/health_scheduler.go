@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -274,7 +275,12 @@ func (m *Manager) visitRunnerHealth(ctx context.Context, s *healthScheduler, p *
 	started := m.currentTime()
 	defer func() {
 		if deadlineErr := contextErr(); deadlineErr != nil {
-			done, alive, err = false, true, deadlineErr
+			done, alive = false, true
+			if errors.Is(deadlineErr, context.DeadlineExceeded) && (stage == "instance-admission" || stage == "process") {
+				err = newProviderCallerBudgetTimeout(provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID}, "runner health "+stage)
+			} else {
+				err = deadlineErr
+			}
 		}
 		if done && !s.evidenceFresh(p, m.currentTime()) {
 			done, alive, err = false, true, fmt.Errorf("health admission evidence expired")

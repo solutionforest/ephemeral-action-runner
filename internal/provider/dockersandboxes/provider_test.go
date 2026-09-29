@@ -482,7 +482,7 @@ func TestStartKeepaliveWaitsForControlPlaneRecovery(t *testing.T) {
 	}
 	keepaliveDone := make(chan error, 1)
 	go func() {
-		_, err := p.startKeepalive(context.Background(), testName, commandRequest{args: []string{"exec", "keepalive"}, operation: "test managed keepalive"})
+		_, err := p.startKeepalive(context.Background(), testInstance, commandRequest{args: []string{"exec", "keepalive"}, operation: "test managed keepalive"})
 		keepaliveDone <- err
 	}()
 	select {
@@ -1893,6 +1893,127 @@ func TestAdmissionRechecksDiagnostics(t *testing.T) {
 	done()
 }
 
+func TestVerifyControlPlaneIncidentUsesExactIdentityAndHarmlessExec(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"exec", testName, "--", "/bin/true"}},
+	)
+	if err := p.VerifyControlPlaneIncident(context.Background(), testInstance); err != nil {
+		t.Fatal(err)
+	}
+	done()
+}
+
+func TestVerifyControlPlaneIncidentClassifiesProviderOwnedTimeout(t *testing.T) {
+	p := New("sbx-test-double")
+	call := 0
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		call++
+		switch call {
+		case 1:
+			if !reflect.DeepEqual(request.args, []string{"ls", "--json"}) {
+				t.Fatalf("identity args = %#v", request.args)
+			}
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case 2:
+			if !reflect.DeepEqual(request.args, []string{"exec", testName, "--", "/bin/true"}) {
+				t.Fatalf("probe args = %#v", request.args)
+			}
+			if request.timeout != providerReadbackTimeout {
+				t.Fatalf("probe timeout = %s, want %s", request.timeout, providerReadbackTimeout)
+			}
+			return provider.ExecResult{}, context.DeadlineExceeded
+		default:
+			t.Fatalf("unexpected command %d: %#v", call, request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+	err := p.VerifyControlPlaneIncident(context.Background(), testInstance)
+	if err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("provider-owned timeout error = %v, want typed admission incident with deadline cause", err)
+	}
+}
+
+func TestVerifyControlPlaneIncidentPreservesCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := New("sbx-test-double")
+	call := 0
+	p.runCommand = func(operationCtx context.Context, request commandRequest) (provider.ExecResult, error) {
+		call++
+		if call == 1 {
+			return provider.ExecResult{Stdout: readyListJSON}, nil
+		}
+		cancel()
+		<-operationCtx.Done()
+		return provider.ExecResult{}, operationCtx.Err()
+	}
+	err := p.VerifyControlPlaneIncident(ctx, testInstance)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller cancellation error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("caller cancellation incorrectly authorized control-plane recovery: %v", err)
+	}
+}
+
+func TestVerifyControlPlaneIncidentPreservesCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	p := New("sbx-test-double")
+	p.runCommand = func(context.Context, commandRequest) (provider.ExecResult, error) {
+		t.Fatal("expired caller deadline reached a provider command")
+		return provider.ExecResult{}, nil
+	}
+	err := p.VerifyControlPlaneIncident(ctx, testInstance)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("caller deadline error = %v, want context.DeadlineExceeded", err)
+	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("caller deadline incorrectly authorized control-plane recovery: %v", err)
+	}
+}
+
+func TestVerifyControlPlaneIncidentClassifiesProviderFailure(t *testing.T) {
+	expected := errors.New("exact exec transport failed")
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+		commandStep{args: []string{"exec", testName, "--", "/bin/true"}, err: expected},
+	)
+	err := p.VerifyControlPlaneIncident(context.Background(), testInstance)
+	if err == nil || !errors.Is(err, provider.ErrControlPlaneFailure) || !errors.Is(err, expected) {
+		t.Fatalf("provider failure error = %v, want typed control-plane incident preserving cause", err)
+	}
+	if strings.Contains(err.Error(), expected.Error()) {
+		t.Fatalf("typed provider incident leaked command detail: %v", err)
+	}
+	done()
+}
+
+func TestVerifyControlPlaneIncidentRejectsIdentityMismatchBeforeExec(t *testing.T) {
+	mismatch := strings.Replace(readyListJSON, testID, "different-id", 1)
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}},
+	)
+	err := p.VerifyControlPlaneIncident(context.Background(), testInstance)
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("identity mismatch error = %v", err)
+	}
+	if errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || errors.Is(err, provider.ErrControlPlaneFailure) {
+		t.Fatalf("identity mismatch incorrectly authorized control-plane recovery: %v", err)
+	}
+	done()
+}
+
+func TestVerifyControlPlaneIncidentAcceptsAuthoritativeExactAbsence(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+	)
+	if err := p.VerifyControlPlaneIncident(context.Background(), testInstance); err != nil {
+		t.Fatalf("authoritative exact absence reported an incident: %v", err)
+	}
+	done()
+}
+
 func TestInventoryParsesWrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
 	items, err := parseInventory([]byte(readyListJSON))
 	if err != nil {
@@ -2216,7 +2337,7 @@ func TestKeepaliveSurvivesSuccessfulStartContextCancellation(t *testing.T) {
 	}
 	p := New(helper)
 	ctx, cancel := context.WithCancel(context.Background())
-	process, err := p.startKeepalive(ctx, testName, commandRequest{
+	process, err := p.startKeepalive(ctx, testInstance, commandRequest{
 		args:      []string{"exec", marker},
 		operation: "test managed keepalive",
 	})
@@ -2256,7 +2377,7 @@ func TestKeepaliveCancellationDuringStartupStopsProcess(t *testing.T) {
 	p := New(helper)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, cancel)
-	_, err := p.startKeepalive(ctx, testName, commandRequest{
+	_, err := p.startKeepalive(ctx, testInstance, commandRequest{
 		args:      []string{"exec", marker},
 		operation: "test managed keepalive",
 	})
@@ -2282,13 +2403,231 @@ func TestKeepaliveCancellationDuringStartupStopsProcessTree(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, cancel)
 	p := New(helper)
-	_, err := p.startKeepalive(ctx, testName, commandRequest{args: []string{"exec", marker}, operation: "test managed keepalive"})
+	_, err := p.startKeepalive(ctx, testInstance, commandRequest{args: []string{"exec", marker}, operation: "test managed keepalive"})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context cancellation", err)
 	}
 	time.Sleep(1500 * time.Millisecond)
 	if _, statErr := os.Stat(marker + ".child"); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("canceled startup left a descendant running: %v", statErr)
+	}
+}
+
+func TestManagedKeepaliveRegistersAndRemovesOnlyAfterNaturalExit(t *testing.T) {
+	p := newManagedKeepaliveTestProvider(t)
+	marker := filepath.Join(t.TempDir(), "natural")
+	handle := startManagedKeepaliveForTest(t, p, testInstance, marker)
+
+	p.keepaliveMu.Lock()
+	registered := p.keepalives[testName]
+	p.keepaliveMu.Unlock()
+	if registered != handle {
+		t.Fatalf("registered keepalive = %p, want exact handle %p", registered, handle)
+	}
+	if err := os.WriteFile(marker+".release", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForKeepaliveExit(t, handle)
+	if err := handle.result(); err != nil {
+		t.Fatalf("naturally exited keepalive error = %v", err)
+	}
+	p.keepaliveMu.Lock()
+	_, stillRegistered := p.keepalives[testName]
+	p.keepaliveMu.Unlock()
+	if stillRegistered {
+		t.Fatal("naturally exited keepalive remained registered")
+	}
+}
+
+func TestManagedKeepaliveRejectsDuplicateWithoutOrphaningSession(t *testing.T) {
+	p := newManagedKeepaliveTestProvider(t)
+	firstMarker := filepath.Join(t.TempDir(), "first")
+	first := startManagedKeepaliveForTest(t, p, testInstance, firstMarker)
+	secondMarker := filepath.Join(t.TempDir(), "second")
+	_, err := p.startKeepalive(context.Background(), testInstance, commandRequest{
+		args:      []string{"exec", secondMarker},
+		operation: "test managed keepalive",
+	})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("duplicate keepalive error = %v", err)
+	}
+	if _, statErr := os.Stat(secondMarker + ".ready"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("duplicate keepalive started another process: %v", statErr)
+	}
+	p.keepaliveMu.Lock()
+	registered := p.keepalives[testName]
+	p.keepaliveMu.Unlock()
+	if registered != first {
+		t.Fatalf("duplicate start replaced exact handle: got %p, want %p", registered, first)
+	}
+}
+
+func TestStopAndDeleteReapManagedKeepaliveBeforeExactMutationAndRemainIdempotent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		call func(*Provider) error
+	}{
+		{name: "stop", args: []string{"stop", testName}, call: func(p *Provider) error { return p.Stop(context.Background(), testInstance) }},
+		{name: "delete", args: []string{"rm", "--force", testName}, call: func(p *Provider) error { return p.Delete(context.Background(), testInstance) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := newManagedKeepaliveTestProvider(t)
+			handle := startManagedKeepaliveForTest(t, p, testInstance, filepath.Join(t.TempDir(), test.name))
+			calls := 0
+			p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+				calls++
+				switch calls {
+				case 1:
+					if !reflect.DeepEqual(request.args, []string{"ls", "--json"}) {
+						t.Fatalf("identity args = %#v", request.args)
+					}
+					return provider.ExecResult{Stdout: readyListJSON}, nil
+				case 2:
+					if !reflect.DeepEqual(request.args, test.args) {
+						t.Fatalf("mutation args = %#v, want %#v", request.args, test.args)
+					}
+					select {
+					case <-handle.done:
+					default:
+						t.Fatal("exact sandbox mutation began before its managed keepalive was reaped")
+					}
+					p.keepaliveMu.Lock()
+					_, registered := p.keepalives[testName]
+					p.keepaliveMu.Unlock()
+					if registered {
+						t.Fatal("exact sandbox mutation began while its keepalive remained registered")
+					}
+					return provider.ExecResult{}, nil
+				case 3:
+					if !reflect.DeepEqual(request.args, []string{"ls", "--json"}) {
+						t.Fatalf("idempotent identity args = %#v", request.args)
+					}
+					return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+				default:
+					t.Fatalf("unexpected command %d: %#v", calls, request.args)
+					return provider.ExecResult{}, nil
+				}
+			}
+			if err := test.call(p); err != nil {
+				t.Fatalf("first %s failed: %v", test.name, err)
+			}
+			if err := test.call(p); err != nil {
+				t.Fatalf("idempotent %s failed: %v", test.name, err)
+			}
+			if calls != 3 {
+				t.Fatalf("provider command count = %d, want identity, exact mutation, and absence readback", calls)
+			}
+		})
+	}
+}
+
+func TestRecoverControlPlaneReapsAllManagedKeepalivesBeforeDaemonStop(t *testing.T) {
+	p := newManagedKeepaliveTestProvider(t)
+	secondInstance := provider.Instance{Name: "epar-sandbox-2", ProviderID: "provider-id-2", Source: "shell", State: "running"}
+	first := startManagedKeepaliveForTest(t, p, testInstance, filepath.Join(t.TempDir(), "first"))
+	second := startManagedKeepaliveForTest(t, p, secondInstance, filepath.Join(t.TempDir(), "second"))
+	statusCalls := 0
+	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
+		switch {
+		case reflect.DeepEqual(request.args, []string{"daemon", "stop"}):
+			for _, handle := range []*keepaliveHandle{first, second} {
+				select {
+				case <-handle.done:
+				default:
+					t.Fatalf("daemon stop began before keepalive %q was reaped", handle.instance.Name)
+				}
+			}
+			p.keepaliveMu.Lock()
+			remaining := len(p.keepalives)
+			p.keepaliveMu.Unlock()
+			if remaining != 0 {
+				t.Fatalf("daemon stop began with %d managed keepalive(s)", remaining)
+			}
+			return provider.ExecResult{}, nil
+		case reflect.DeepEqual(request.args, []string{"daemon", "status", "--json"}):
+			statusCalls++
+			if statusCalls < 3 {
+				return provider.ExecResult{Stdout: `{"status":"stopped"}`}, nil
+			}
+			return provider.ExecResult{Stdout: `{"status":"running"}`}, nil
+		case reflect.DeepEqual(request.args, []string{"daemon", "start", "--detach"}):
+			return provider.ExecResult{}, nil
+		default:
+			t.Fatalf("unexpected recovery command: %#v", request.args)
+			return provider.ExecResult{}, nil
+		}
+	}
+	p.wait = func(context.Context, time.Duration) error { return nil }
+	if err := p.RecoverControlPlane(context.Background(), provider.ControlPlaneRecoveryRequest{Quiescence: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	p.keepaliveMu.Lock()
+	remaining := len(p.keepalives)
+	p.keepaliveMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("control-plane recovery restarted %d managed keepalive(s)", remaining)
+	}
+}
+
+func newManagedKeepaliveTestProvider(t *testing.T) *Provider {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("managed keepalive helper uses a POSIX shell script")
+	}
+	t.Setenv("EPAR_STATE_HOME", t.TempDir())
+	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
+	script := `#!/bin/sh
+set -eu
+test "$#" -eq 2
+test "$1" = exec
+marker="$2"
+: > "${marker}.ready"
+while test ! -e "${marker}.release"; do
+  sleep 0.02
+done
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := New(helper)
+	t.Cleanup(func() {
+		if err := p.terminateAllKeepalives(); err != nil {
+			t.Errorf("clean up managed keepalive helper: %v", err)
+		}
+	})
+	return p
+}
+
+func startManagedKeepaliveForTest(t *testing.T, p *Provider, instance provider.Instance, marker string) *keepaliveHandle {
+	t.Helper()
+	process, err := p.startKeepalive(context.Background(), instance, commandRequest{
+		args:      []string{"exec", marker},
+		operation: "test managed keepalive",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.keepaliveMu.Lock()
+	handle := p.keepalives[instance.Name]
+	p.keepaliveMu.Unlock()
+	if handle == nil {
+		t.Fatalf("managed keepalive %q was not registered", instance.Name)
+	}
+	if process.PID <= 0 || handle.command.Process == nil || process.PID != handle.command.Process.Pid {
+		t.Fatalf("managed keepalive process = %#v, handle PID = %v", process, handle.command.Process)
+	}
+	return handle
+}
+
+func waitForKeepaliveExit(t *testing.T, handle *keepaliveHandle) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-handle.done:
+	case <-timer.C:
+		t.Fatalf("managed keepalive %q did not exit", handle.instance.Name)
 	}
 }
 

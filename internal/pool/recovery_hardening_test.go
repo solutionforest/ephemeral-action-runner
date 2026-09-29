@@ -1004,6 +1004,8 @@ func TestReportOnlyInstancesAreExcludedFromRunnerLivenessProbes(t *testing.T) {
 		{name: "owned identityless report-only", vm: ProvisionedInstance{Phase: LifecycleQuarantined, ProviderOwned: true}, want: false},
 		{name: "owned uncertain create", vm: ProvisionedInstance{Phase: LifecycleQuarantined, ProviderOwned: true, CreateOutcomeUncertain: true}, want: false},
 		{name: "owned recovery inventory uncertain", vm: ProvisionedInstance{Phase: LifecycleQuarantined, ProviderOwned: true, ProviderID: "provider:one", RecoveryInventoryUncertain: true}, want: false},
+		{name: "owned cleanup pending", vm: ProvisionedInstance{Phase: LifecycleCleanupPending, ProviderOwned: true, ProviderID: "provider:one"}, want: false},
+		{name: "owned provisioning", vm: ProvisionedInstance{Phase: LifecycleProvisioning, ProviderOwned: true, ProviderID: "provider:one"}, want: false},
 		{name: "owned exact identity", vm: ProvisionedInstance{Phase: LifecycleQuarantined, ProviderOwned: true, ProviderID: "provider:one"}, want: true},
 	}
 	for _, test := range tests {
