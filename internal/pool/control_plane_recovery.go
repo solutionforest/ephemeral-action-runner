@@ -100,7 +100,7 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 			}
 			return true, nil
 		}
-		m.warnf("Docker Sandboxes create-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
+		m.warnf("Docker Sandboxes provider-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
 		return true, nil
 	}
 	proofOnly := false
@@ -238,7 +238,7 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 
 	recoveryCause := "inventory failure"
 	if admissionFailure {
-		recoveryCause = "create-admission failure"
+		recoveryCause = "provider admission failure"
 	}
 	quiescence := time.Duration(m.Config.DockerSandboxes.RecoveryQuiescenceSeconds) * time.Second
 	if quiescence <= 0 {
@@ -259,7 +259,7 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 			}
 		}
 		if start.admissionIncident {
-			m.warnf("Docker Sandboxes create-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
+			m.warnf("Docker Sandboxes provider-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
 		} else {
 			m.warnf("Docker Sandboxes inventory recovery is cooling down; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
 		}

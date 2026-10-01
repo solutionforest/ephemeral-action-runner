@@ -490,6 +490,7 @@ func (m *Manager) fenceHostTrustRunnerRegistration(ctx context.Context, instance
 		return fmt.Errorf("verify exact GitHub runner before host-trust fence: %w", err)
 	}
 	if !found {
+		m.infof("[%s] host-trust safety fence confirmed the exact GitHub runner is already absent: runnerID=%d providerID=%s\n", instance.Name, instance.RunnerID, instance.ProviderID)
 		return nil
 	}
 	if runner.ID != instance.RunnerID {
@@ -498,6 +499,7 @@ func (m *Manager) fenceHostTrustRunnerRegistration(ctx context.Context, instance
 	if err := m.GitHub.DeleteRunnerIfExists(fenceCtx, runner.ID); err != nil {
 		return fmt.Errorf("delete exact GitHub runner id=%d: %w", instance.RunnerID, err)
 	}
+	m.warnf("[%s] host-trust safety fence deleted the exact GitHub runner registration after lease maintenance failed; the local instance remains capacity-counting until exact cleanup succeeds: runnerID=%d providerID=%s\n", instance.Name, instance.RunnerID, instance.ProviderID)
 	return nil
 }
 

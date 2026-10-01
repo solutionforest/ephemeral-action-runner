@@ -194,6 +194,9 @@ func (m *Manager) resumePendingLifecycleCleanup(ctx context.Context) error {
 	var firstErr error
 	for _, record := range pending {
 		if err := m.cleanupLifecycleRecord(ctx, record, byName[record.Name]); err != nil {
+			if isProviderRecoverySignal(err) || errors.Is(err, context.Canceled) {
+				return fmt.Errorf("resume cleanup %s: %w", record.Name, err)
+			}
 			firstErr = errors.Join(firstErr, fmt.Errorf("resume cleanup %s: %w", record.Name, err))
 		}
 	}
@@ -292,6 +295,7 @@ func (m *Manager) Verify(ctx context.Context, opts VerifyOptions) error {
 }
 
 func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
+	unownedRunnerWarnings := newUnownedRunnerWarningReporter()
 	if !opts.ExternalOutageRetry.IsOff() {
 		if err := m.ConfigureExternalOutageRetry(opts.ExternalOutageRetry); err != nil {
 			return err
@@ -320,8 +324,16 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if err := m.recoverInterruptedProvisionLeases(ctx); err != nil {
 		return err
 	}
-	if err := m.resumePendingLifecycleCleanup(ctx); err != nil {
-		m.warnf("startup cleanup of pending lifecycle records is incomplete; preserving the exact capacity fence: %v\n", err)
+	providerDeadlineRecovery := &providerDeadlineRecoveryState{enabled: opts.Register && opts.ReplaceCompleted}
+	hostTrustBusyHandoff := make(map[string]bool)
+	startupCleanupCtx, cancelStartupCleanup := m.steadyStateMaintenanceContext(ctx)
+	startupCleanupErr := m.resumePendingLifecycleCleanup(startupCleanupCtx)
+	cancelStartupCleanup()
+	if startupCleanupErr != nil {
+		if isProviderCallerBudgetTimeout(startupCleanupErr) {
+			_, _ = m.recoverProviderFailure(ctx, providerDeadlineRecovery, startupCleanupErr, nil, hostTrustBusyHandoff)
+		}
+		m.warnf("startup cleanup of pending lifecycle records is incomplete; preserving the exact capacity fence: %v\n", startupCleanupErr)
 	}
 	if !opts.HostTrustLockHeld {
 		controllerLock, err := m.AcquireHostTrustControllerLock()
@@ -346,71 +358,121 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if opts.MonitorInterval <= 0 {
 		opts.MonitorInterval = 15 * time.Second
 	}
-	if ctx.Err() != nil {
+	cleanup := func() error {
 		if opts.KeepOnExit {
 			m.infof("Stopping EPAR pool. --keep-on-exit is enabled, so owned runner resources will remain running.\n")
 			return nil
 		}
 		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
 	}
+	if ctx.Err() != nil {
+		return cleanup()
+	}
 	var active map[string]ProvisionedInstance
 	for {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			err = waitErr
+			break
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
 			err = waitErr
 			break
 		}
 		err = m.RunExternalOutageStage(ctx, "initial-pool-reconciliation", func(attemptCtx context.Context) error {
+			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
+			defer cancelMaintenance()
 			var reconcileErr error
-			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPoolWithReporter(maintenanceCtx, active, opts.Register, unownedRunnerWarnings)
 			return reconcileErr
 		})
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		if err == nil {
+			providerDeadlineRecovery.sync(active)
 			break
 		}
-		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 		if !handled {
 			break
 		}
 		if recoveryErr != nil {
 			if ctx.Err() != nil {
-				return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
+				return cleanup()
 			}
 			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial pool reconciliation: %w", err), active, opts.KeepOnExit)
 	}
 	for {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			err = waitErr
+			break
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
 			err = waitErr
 			break
 		}
 		err = m.RunExternalOutageStage(ctx, "initial-over-capacity-reconciliation", func(attemptCtx context.Context) error {
+			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
+			defer cancelMaintenance()
 			var reconcileErr error
-			active, reconcileErr = m.reduceOverCapacity(attemptCtx, active, opts.Instances, opts.Register)
+			active, reconcileErr = m.reduceOverCapacity(maintenanceCtx, active, opts.Instances, opts.Register)
 			return reconcileErr
 		})
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		if err == nil {
 			break
 		}
-		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 		if !handled {
 			break
 		}
 		if recoveryErr != nil {
 			if ctx.Err() != nil {
-				return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
+				return cleanup()
 			}
 			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial over-capacity reconciliation: %w", err), active, opts.KeepOnExit)
 	}
 	var poolTrustGeneration string
 	for {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			err = waitErr
+			break
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
 			err = waitErr
 			break
 		}
@@ -419,34 +481,38 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			poolTrustGeneration, prepareErr = m.prepareExistingHostTrustRuntimes(attemptCtx, active, opts.Register)
 			return prepareErr
 		})
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		if err == nil {
 			break
 		}
-		handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+		handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 		if !handled {
 			break
 		}
 		if recoveryErr != nil {
 			if ctx.Err() != nil {
-				return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
+				return cleanup()
 			}
 			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
 		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		return m.withOutageExhaustionCleanup(fmt.Errorf("initial host-trust runtime preparation: %w", err), active, opts.KeepOnExit)
 	}
 	sequence := 1
-	cleanup := func() error {
-		if opts.KeepOnExit {
-			m.infof("Stopping EPAR pool. --keep-on-exit is enabled, so owned runner resources will remain running.\n")
-			return nil
-		}
-		return m.cleanupPoolWithStatus("owned GitHub runner registrations and provider instances", m.cleanupWithFreshContext)
-	}
-	hostTrustBusyHandoff := make(map[string]bool)
 	candidateRetry := candidateRecoveryState{}
 	for len(active) < opts.Instances {
+		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
+			if ctx.Err() != nil {
+				return cleanup()
+			}
+			return m.cleanupAfterPoolFailure(waitErr, active, opts.KeepOnExit)
+		}
 		if waitErr := m.waitForProviderRecoveryWindow(ctx); waitErr != nil {
 			if ctx.Err() != nil {
 				return cleanup()
@@ -457,7 +523,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 		err = m.RunExternalOutageStage(ctx, "initial-capacity-provisioning", func(attemptCtx context.Context) error {
 			vm = ProvisionedInstance{}
 			var reconcileErr error
-			active, reconcileErr = m.reconcilePhysicalPool(attemptCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPoolWithReporter(attemptCtx, active, opts.Register, unownedRunnerWarnings)
 			if reconcileErr != nil || len(active) >= opts.Instances {
 				return reconcileErr
 			}
@@ -470,8 +536,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			return provisionErr
 		})
+		if ctx.Err() != nil {
+			return cleanup()
+		}
 		if err != nil {
-			handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+			handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 			if handled {
 				if recoveryErr != nil {
 					if ctx.Err() != nil {
@@ -582,7 +651,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			if imageMaintenancePending {
 				remaining, drainErr := m.drainPoolForImageUpdate(ctx, active, imageMaintenanceIdleChecks)
 				if drainErr != nil {
-					handled, recoveryErr := m.recoverProviderControlPlane(ctx, drainErr)
+					handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, drainErr, active, hostTrustBusyHandoff)
 					if handled {
 						if recoveryErr != nil {
 							if ctx.Err() != nil {
@@ -638,11 +707,20 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 							for attempt := 1; attempt <= 3; attempt++ {
 								generationBeforeEnsure := current.Generation
 								attemptCtx, cancelAttempt, attemptErr := m.externalOutageAttemptContext(ctx)
+								if ctx.Err() != nil {
+									if cancelAttempt != nil {
+										cancelAttempt()
+									}
+									return cleanup()
+								}
 								if attemptErr != nil {
 									return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 								}
 								ensureErr := m.ensureHostTrustImage(attemptCtx)
 								cancelAttempt()
+								if ctx.Err() != nil {
+									return cleanup()
+								}
 								if ensureErr != nil {
 									if handled, outageErr := m.deferExternalOutage("host-trust-replacement-image", ensureErr); handled {
 										if outageErr != nil {
@@ -655,6 +733,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 									break
 								}
 								current, err = m.resolveHostTrust(ctx)
+								if ctx.Err() != nil {
+									return cleanup()
+								}
 								if err != nil {
 									m.warnf("host trust post-build refresh warning: %v\n", err)
 									nextHostTrustCollection = time.Now()
@@ -729,7 +810,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 						recordRunnerLiveness(confirmedInactiveChecks, name, alive, reason, err)
 						m.reportUnknownHealth(ctx, livenessCtx, &health, vm, stage, err)
-						handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+						handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 						if handled {
 							if recoveryErr != nil {
 								if ctx.Err() != nil {
@@ -753,6 +834,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						}
 						failedHealth[name] = true
 						continue
+					}
+					if stage == "instance-admission" || stage == "process" {
+						providerDeadlineRecovery.resetInstance(provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID})
 					}
 					if !done {
 						continue
@@ -828,15 +912,24 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			var reconcileErr error
 			beforeReconcile := active
 			attemptCtx, cancelAttempt, attemptErr := m.externalOutageAttemptContext(ctx)
+			if ctx.Err() != nil {
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
+				return cleanup()
+			}
 			if attemptErr != nil {
 				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 			}
 			maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
-			active, reconcileErr = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+			active, reconcileErr = m.reconcilePhysicalPoolWithReporter(maintenanceCtx, active, opts.Register, unownedRunnerWarnings)
 			cancelMaintenance()
 			cancelAttempt()
+			if ctx.Err() != nil {
+				return cleanup()
+			}
 			if reconcileErr != nil {
-				handled, recoveryErr := m.recoverProviderControlPlane(ctx, reconcileErr)
+				handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, reconcileErr, active, hostTrustBusyHandoff)
 				if handled {
 					if recoveryErr != nil {
 						if ctx.Err() != nil {
@@ -866,11 +959,18 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				m.warnf("pool reconciliation deferred during transient dependency failure; retrying after %s: %v\n", retry.remaining(now), reconcileErr)
 				continue
 			}
+			providerDeadlineRecovery.sync(active)
 			retry.resetAfterAdoption(beforeReconcile, active)
 			if adoptedReadyInstance(beforeReconcile, active) {
 				m.resetCandidateRecovery(&candidateRetry, "a quarantined candidate was verified healthy", active, opts.Instances)
 			}
 			attemptCtx, cancelAttempt, attemptErr = m.externalOutageAttemptContext(ctx)
+			if ctx.Err() != nil {
+				if cancelAttempt != nil {
+					cancelAttempt()
+				}
+				return cleanup()
+			}
 			if attemptErr != nil {
 				return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 			}
@@ -878,8 +978,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			active, reconcileErr = m.reduceOverCapacity(maintenanceCtx, active, opts.Instances, opts.Register)
 			cancelMaintenance()
 			cancelAttempt()
+			if ctx.Err() != nil {
+				return cleanup()
+			}
 			if reconcileErr != nil {
-				handled, recoveryErr := m.recoverProviderControlPlane(ctx, reconcileErr)
+				handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, reconcileErr, active, hostTrustBusyHandoff)
 				if handled {
 					if recoveryErr != nil {
 						if ctx.Err() != nil {
@@ -936,15 +1039,24 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 				sequence++
 				attemptCtx, cancelAttempt, attemptErr := m.externalOutageAttemptContext(ctx)
+				if ctx.Err() != nil {
+					if cancelAttempt != nil {
+						cancelAttempt()
+					}
+					return cleanup()
+				}
 				if attemptErr != nil {
 					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
 				maintenanceCtx, cancelMaintenance := m.steadyStateMaintenanceContext(attemptCtx)
-				active, err = m.reconcilePhysicalPool(maintenanceCtx, active, opts.Register)
+				active, err = m.reconcilePhysicalPoolWithReporter(maintenanceCtx, active, opts.Register, unownedRunnerWarnings)
 				cancelMaintenance()
 				cancelAttempt()
+				if ctx.Err() != nil {
+					return cleanup()
+				}
 				if err != nil {
-					handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+					handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 					if handled {
 						if recoveryErr != nil {
 							if ctx.Err() != nil {
@@ -978,6 +1090,12 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				}
 				m.infof("[%s] creating replacement runner\n", name)
 				attemptCtx, cancelAttempt, attemptErr = m.externalOutageAttemptContext(ctx)
+				if ctx.Err() != nil {
+					if cancelAttempt != nil {
+						cancelAttempt()
+					}
+					return cleanup()
+				}
 				if attemptErr != nil {
 					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
@@ -986,8 +1104,11 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				if isPhysicalPhase(vm.Phase) {
 					active[vm.Name] = vm
 				}
+				if ctx.Err() != nil {
+					return cleanup()
+				}
 				if err != nil {
-					handled, recoveryErr := m.recoverProviderControlPlane(ctx, err)
+					handled, recoveryErr := m.recoverProviderFailure(ctx, providerDeadlineRecovery, err, active, hostTrustBusyHandoff)
 					if handled {
 						if recoveryErr != nil {
 							if ctx.Err() != nil {
@@ -1110,6 +1231,10 @@ func adoptedReadyInstance(before, after map[string]ProvisionedInstance) bool {
 }
 
 func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]ProvisionedInstance, register bool) (map[string]ProvisionedInstance, error) {
+	return m.reconcilePhysicalPoolWithReporter(ctx, known, register, newUnownedRunnerWarningReporter())
+}
+
+func (m *Manager) reconcilePhysicalPoolWithReporter(ctx context.Context, known map[string]ProvisionedInstance, register bool, unownedWarnings *unownedRunnerWarningReporter) (map[string]ProvisionedInstance, error) {
 	reconciled, err := m.reconcileLocalInventoryWithContext(ctx, known)
 	if err != nil {
 		return known, err
@@ -1135,6 +1260,9 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				reconciled[name] = vm
 			}
 		}
+		return reconciled, err
+	}
+	if err := ctx.Err(); err != nil {
 		return reconciled, err
 	}
 	for _, runner := range runners {
@@ -1163,7 +1291,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				continue
 			}
 			if err := m.retireInstance(ctx, vm, "resuming exact cleanup-pending reconciliation"); err != nil {
-				if errors.Is(err, provider.ErrControlPlaneFailure) {
+				if isProviderRecoverySignal(err) {
 					return reconciled, err
 				}
 				m.warnf("[%s] cleanup-pending reconciliation will retry: %v\n", name, err)
@@ -1205,7 +1333,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 				return reconciled, fmt.Errorf("record GitHub runner absence for %s: %w", name, err)
 			}
 			if err := m.deleteLocalInstance(ctx, vm); err != nil {
-				if errors.Is(err, provider.ErrControlPlaneFailure) {
+				if isProviderRecoverySignal(err) {
 					return reconciled, err
 				}
 				vm.Phase = LifecycleCleanupPending
@@ -1255,7 +1383,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 					continue
 				}
 				if err := m.retireInstance(ctx, vm, "durably quarantined runner became idle"); err != nil {
-					if errors.Is(err, provider.ErrControlPlaneFailure) {
+					if isProviderRecoverySignal(err) {
 						return reconciled, err
 					}
 					vm.Phase = LifecycleCleanupPending
@@ -1279,7 +1407,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 		}
 		if vm.Phase == LifecycleQuarantined {
 			if err := m.retireInstance(ctx, vm, "GitHub recovered but quarantined runner remained offline"); err != nil {
-				if errors.Is(err, provider.ErrControlPlaneFailure) {
+				if isProviderRecoverySignal(err) {
 					return reconciled, err
 				}
 				vm.Phase = LifecycleCleanupPending
@@ -1303,7 +1431,7 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			continue
 		}
 		if err := m.retireInstance(ctx, vm, "reconciliation found offline runner with inactive listener"); err != nil {
-			if errors.Is(err, provider.ErrControlPlaneFailure) {
+			if isProviderRecoverySignal(err) {
 				return reconciled, err
 			}
 			vm.Phase = LifecycleCleanupPending
@@ -1313,19 +1441,30 @@ func (m *Manager) reconcilePhysicalPool(ctx context.Context, known map[string]Pr
 			delete(reconciled, name)
 		}
 	}
+	unownedRunners := make([]gh.Runner, 0)
 	for _, runner := range remoteByName {
 		owned, ownershipErr := m.lifecycleOwnsRunner(ctx, runner.Name, runner.ID)
 		if ownershipErr != nil {
 			return reconciled, ownershipErr
 		}
 		if !owned {
-			m.warnf("reconciliation: quarantined unowned GitHub runner %s id=%d; prefix-only resources are report-only\n", runner.Name, runner.ID)
+			unownedRunners = append(unownedRunners, runner)
 			continue
 		}
 		if err := m.deleteRemoteRunner(ctx, runner); err != nil {
 			return reconciled, err
 		}
 		m.infof("reconciliation: deleted stale GitHub runner %s id=%d\n", runner.Name, runner.ID)
+	}
+	if err := ctx.Err(); err != nil {
+		return reconciled, err
+	}
+	warning, resolved := unownedWarnings.observeSuccessful(m.currentTime(), unownedRunners)
+	if warning != "" {
+		m.warnf("%s\n", warning)
+	}
+	if resolved != "" {
+		m.infof("%s\n", resolved)
 	}
 	return reconciled, nil
 }
@@ -1356,7 +1495,7 @@ func (m *Manager) reduceOverCapacity(ctx context.Context, active map[string]Prov
 		}
 		vm.RunnerID = runner.ID
 		if err := m.retireInstance(ctx, vm, "reconciling legacy physical inventory above pool.instances"); err != nil {
-			if errors.Is(err, provider.ErrControlPlaneFailure) {
+			if isProviderRecoverySignal(err) {
 				return active, err
 			}
 			vm.Phase = LifecycleCleanupPending
@@ -1435,6 +1574,9 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			if m.LifecycleState != nil {
 				cleaned, cleanupErr := m.cleanupPrefixOrphanInventory(ctx, item)
 				if cleanupErr != nil {
+					if isProviderRecoverySignal(cleanupErr) {
+						return reconciled, cleanupErr
+					}
 					discoveries, discoveryErr := m.LifecycleState.Discoveries(ctx)
 					if discoveryErr != nil {
 						return known, fmt.Errorf("read prefix-owned cleanup discovery %s: %w", local.Name, errors.Join(cleanupErr, discoveryErr))
@@ -1476,7 +1618,7 @@ func (m *Manager) reconcileLocalInventoryWithContext(ctx context.Context, known 
 			continue
 		}
 		if err := m.deleteLocalInstance(ctx, vm); err != nil {
-			if errors.Is(err, provider.ErrControlPlaneFailure) {
+			if isProviderRecoverySignal(err) {
 				return reconciled, err
 			}
 			vm.Phase = LifecycleCleanupPending
@@ -1561,7 +1703,7 @@ func (m *Manager) deleteLocalInstance(ctx context.Context, vm ProvisionedInstanc
 		}
 		inventory, err := m.inventoryProvider(ctx)
 		if err != nil {
-			return err
+			return classifyProviderOperationError(ctx, ctx, provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID}, "inventory before exact provider cleanup", err)
 		}
 		return m.cleanupLifecycleRecord(ctx, record, inventoryByName(inventory)[vm.Name])
 	}
@@ -2687,7 +2829,7 @@ func recordRunnerLiveness(confirmedInactive map[string]int, name string, alive b
 }
 
 func shouldProbeRunnerLiveness(vm ProvisionedInstance) bool {
-	return vm.ProviderOwned && vm.ProviderID != "" && !vm.CreateOutcomeUncertain && !vm.RecoveryInventoryUncertain
+	return vm.ProviderOwned && vm.ProviderID != "" && vm.Phase != LifecycleCleanupPending && vm.Phase != LifecycleProvisioning && !vm.CreateOutcomeUncertain && !vm.RecoveryInventoryUncertain
 }
 
 func (m *Manager) runnerProcessAlive(ctx context.Context, vm ProvisionedInstance) (bool, string, error) {
@@ -2754,7 +2896,7 @@ func (m *Manager) retireInstance(ctx context.Context, vm ProvisionedInstance, re
 		}
 		inventory, err := m.inventoryProvider(ctx)
 		if err != nil {
-			return err
+			return classifyProviderOperationError(ctx, ctx, provider.Instance{Name: vm.Name, ProviderID: vm.ProviderID}, "inventory before exact provider retirement", err)
 		}
 		return m.cleanupLifecycleRecord(ctx, record, inventoryByName(inventory)[vm.Name])
 	}

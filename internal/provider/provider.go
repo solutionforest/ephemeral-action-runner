@@ -285,6 +285,19 @@ type ControlPlaneRecoveryCoordinator interface {
 	CoordinateControlPlaneRecovery(ctx context.Context, operation func(context.Context) error) error
 }
 
+// ControlPlaneIncidentVerifier is an optional, independently bounded probe of
+// one exact provider instance. A nil result is authoritative evidence that the
+// instance control path is responsive or that the exact identity is absent,
+// either of which rules out the suspected control-plane incident.
+// Implementations may return
+// ErrControlPlaneAdmissionFailure or ErrControlPlaneFailure when their own
+// bounded probe times out or fails. Caller cancellation and caller-owned
+// deadlines must remain ordinary context errors and must never authorize a
+// provider control-plane recovery.
+type ControlPlaneIncidentVerifier interface {
+	VerifyControlPlaneIncident(ctx context.Context, instance Instance) error
+}
+
 // ControlPlaneIdentityAbsenceVerifier is an optional independent readback used
 // inside a recovery coordinator lease to reconcile historical discoveries.
 // True requires authoritative exact-name absence, not omission from Inventory.

@@ -85,6 +85,8 @@ type Provider struct {
 	logger                 *slog.Logger
 	createTimeout          time.Duration
 	instanceOperationGates [64]sync.Mutex
+	keepaliveMu            sync.Mutex
+	keepalives             map[string]*keepaliveHandle
 	relayMu                sync.Mutex
 	relay                  *egressRelay
 	relayTokens            map[string]relayTokenBinding
@@ -92,6 +94,27 @@ type Provider struct {
 	relayConnections       map[string]map[net.Conn]struct{}
 	hostTrustRelayEnabled  bool
 	hostTrustRelayPort     int
+}
+
+type keepaliveHandle struct {
+	instance provider.Instance
+	command  *exec.Cmd
+	done     chan struct{}
+	waitMu   sync.Mutex
+	waitErr  error
+}
+
+func (handle *keepaliveHandle) finish(err error) {
+	handle.waitMu.Lock()
+	handle.waitErr = err
+	handle.waitMu.Unlock()
+	close(handle.done)
+}
+
+func (handle *keepaliveHandle) result() error {
+	handle.waitMu.Lock()
+	defer handle.waitMu.Unlock()
+	return handle.waitErr
 }
 
 type instanceReceipt struct {
@@ -175,7 +198,7 @@ func newWithArchitectureEmulation(binary string, dryRun bool, enabler architectu
 	if binary == "" {
 		binary = "sbx"
 	}
-	return &Provider{Binary: binary, wait: waitForContext, dryRun: dryRun, architectureEmulation: enabler, relayTokens: make(map[string]relayTokenBinding), relayConnections: make(map[string]map[net.Conn]struct{})}
+	return &Provider{Binary: binary, wait: waitForContext, dryRun: dryRun, architectureEmulation: enabler, keepalives: make(map[string]*keepaliveHandle), relayTokens: make(map[string]relayTokenBinding), relayConnections: make(map[string]map[net.Conn]struct{})}
 }
 
 // ConfigureHostTrustRelay enables the Windows-host trust transport used by
@@ -306,6 +329,9 @@ func (p *Provider) recoverControlPlaneUnderCoordinator(ctx context.Context, requ
 		return errors.New("Docker Sandboxes control-plane recovery requires its provider coordinator lease")
 	}
 
+	if err := p.terminateAllKeepalives(); err != nil {
+		return fmt.Errorf("terminate managed Docker Sandboxes keepalives before control-plane recovery: %w", err)
+	}
 	_, stopErr := p.run(ctx, commandRequest{
 		args:        []string{"daemon", "stop"},
 		operation:   "stop docker sandboxes daemon for control-plane recovery",
@@ -933,6 +959,39 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	return nil
 }
 
+// VerifyControlPlaneIncident independently probes the command path to one
+// exact sandbox. A healthy global inventory alone is insufficient because an
+// individual long-lived sbx session can remain wedged while `sbx ls` succeeds.
+func (p *Provider) VerifyControlPlaneIncident(ctx context.Context, instance provider.Instance) error {
+	present, err := p.assertIdentity(ctx, instance)
+	if err != nil {
+		return err
+	}
+	if !present {
+		// Authoritative exact absence rules out a live per-instance session
+		// wedge and lets common reconciliation finish the pending cleanup.
+		return nil
+	}
+	_, err = p.run(ctx, commandRequest{
+		args:        []string{"exec", instance.Name, "--", "/bin/true"},
+		operation:   "probe exact Docker Sandboxes control path",
+		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
+	})
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		// The caller owns this cancellation or deadline. Preserve the raw
+		// command error so it cannot authorize shared-daemon recovery.
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return provider.NewControlPlaneAdmissionFailure("probe exact Docker Sandboxes control path", err)
+	}
+	return provider.NewControlPlaneFailure("probe exact Docker Sandboxes control path", err)
+}
+
 // classifyAdmissionTimeout marks only a provider-owned command deadline as a
 // recovery-authorizing admission incident. A live caller deadline is handled
 // by the caller's cancellation path and must never restart the shared daemon.
@@ -1083,6 +1142,11 @@ func containsExactWorkspace(workspaces []string, expected string) bool {
 }
 
 func (p *Provider) Start(ctx context.Context, instance provider.Instance, opts provider.StartOptions) (*provider.RunningProcess, error) {
+	if err := validateInstance(instance, true); err != nil {
+		return nil, err
+	}
+	releaseInstanceOperation := p.lockInstanceOperation(instance.Name)
+	defer releaseInstanceOperation()
 	present, err := p.assertIdentity(ctx, instance)
 	if err != nil || !present {
 		if err == nil {
@@ -1103,10 +1167,13 @@ func (p *Provider) Start(ctx context.Context, instance provider.Instance, opts p
 		}
 		return &provider.RunningProcess{Name: instance.Name}, nil
 	}
-	return p.startKeepalive(ctx, instance.Name, request)
+	return p.startKeepalive(ctx, instance, request)
 }
 
-func (p *Provider) startKeepalive(ctx context.Context, name string, request commandRequest) (*provider.RunningProcess, error) {
+func (p *Provider) startKeepalive(ctx context.Context, instance provider.Instance, request commandRequest) (*provider.RunningProcess, error) {
+	if err := validateInstance(instance, true); err != nil {
+		return nil, err
+	}
 	if err := validateCommandRequest(request); err != nil {
 		return nil, err
 	}
@@ -1136,25 +1203,40 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 	stderr := &boundedBuffer{limit: defaultOutputLimit}
 	command.Stdout = captureWriter(stdout, request.stdout)
 	command.Stderr = captureWriter(stderr, request.stderr)
+	p.keepaliveMu.Lock()
+	if _, exists := p.keepalives[instance.Name]; exists {
+		p.keepaliveMu.Unlock()
+		return nil, fmt.Errorf("managed Docker Sandboxes keepalive already exists for %q", instance.Name)
+	}
 	if err := command.Start(); err != nil {
+		p.keepaliveMu.Unlock()
 		return nil, fmt.Errorf("%s failed: %w", request.operation, err)
 	}
 	cleanup, attachErr := attachManagedProcess(command, false)
 	if attachErr != nil {
 		killErr := killManagedProcess(command)
 		waitErr := waitForManagedCommandExit(command, commandWaitDelay)
+		p.keepaliveMu.Unlock()
 		return nil, fmt.Errorf("%s failed to establish process containment: %w", request.operation, errors.Join(attachErr, killErr, waitErr))
 	}
-	finished := make(chan error, 1)
+	handle := &keepaliveHandle{instance: instance, command: command, done: make(chan struct{})}
+	p.keepalives[instance.Name] = handle
+	p.keepaliveMu.Unlock()
 	go func() {
 		err := command.Wait()
 		cleanup()
-		finished <- err
+		p.keepaliveMu.Lock()
+		if p.keepalives[instance.Name] == handle {
+			delete(p.keepalives, instance.Name)
+		}
+		p.keepaliveMu.Unlock()
+		handle.finish(err)
 	}()
 	timer := time.NewTimer(keepaliveStartupDelay)
 	defer timer.Stop()
 	select {
-	case err := <-finished:
+	case <-handle.done:
+		err := handle.result()
 		detail := strings.TrimSpace(stderr.String())
 		if err == nil {
 			err = fmt.Errorf("keepalive command exited before startup completed")
@@ -1164,17 +1246,18 @@ func (p *Provider) startKeepalive(ctx context.Context, name string, request comm
 		}
 		return nil, fmt.Errorf("%s failed: %w", request.operation, err)
 	case <-ctx.Done():
-		killErr := killManagedProcess(command)
-		waitErr := waitForManagedProcessExit(finished, commandWaitDelay)
-		if waitErr != nil {
-			if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-				return nil, errors.Join(ctx.Err(), fmt.Errorf("stop keepalive after canceled startup: %w", killErr), waitErr)
-			}
-			return nil, errors.Join(ctx.Err(), waitErr)
+		if terminateErr := terminateKeepaliveHandles([]*keepaliveHandle{handle}); terminateErr != nil {
+			return nil, errors.Join(ctx.Err(), fmt.Errorf("stop keepalive after canceled startup: %w", terminateErr))
 		}
 		return nil, ctx.Err()
 	case <-timer.C:
-		return &provider.RunningProcess{Name: name, PID: command.Process.Pid}, nil
+		if err := ctx.Err(); err != nil {
+			if terminateErr := terminateKeepaliveHandles([]*keepaliveHandle{handle}); terminateErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("stop keepalive after canceled startup: %w", terminateErr))
+			}
+			return nil, err
+		}
+		return &provider.RunningProcess{Name: instance.Name, PID: command.Process.Pid}, nil
 	}
 }
 
@@ -1197,15 +1280,76 @@ func waitForManagedCommandExit(command *exec.Cmd, timeout time.Duration) error {
 	}
 }
 
-func waitForManagedProcessExit(finished <-chan error, timeout time.Duration) error {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-finished:
+func (p *Provider) terminateKeepalive(instance provider.Instance) error {
+	p.keepaliveMu.Lock()
+	handle := p.keepalives[instance.Name]
+	p.keepaliveMu.Unlock()
+	if handle == nil {
 		return nil
-	case <-timer.C:
-		return fmt.Errorf("managed process did not exit within %s", timeout)
 	}
+	if handle.instance.ProviderID != instance.ProviderID {
+		return fmt.Errorf("refusing to terminate managed Docker Sandboxes keepalive because the exact provider identity changed")
+	}
+	return terminateKeepaliveHandles([]*keepaliveHandle{handle})
+}
+
+func (p *Provider) terminateAllKeepalives() error {
+	p.keepaliveMu.Lock()
+	handles := make([]*keepaliveHandle, 0, len(p.keepalives))
+	for _, handle := range p.keepalives {
+		handles = append(handles, handle)
+	}
+	p.keepaliveMu.Unlock()
+	return terminateKeepaliveHandles(handles)
+}
+
+func terminateKeepaliveHandles(handles []*keepaliveHandle) error {
+	if len(handles) == 0 {
+		return nil
+	}
+	var terminationErrors []error
+	for _, handle := range handles {
+		select {
+		case <-handle.done:
+			continue
+		default:
+		}
+		if err := killManagedProcess(handle.command); err != nil {
+			terminationErrors = append(terminationErrors, fmt.Errorf("terminate managed keepalive for %q: %w", handle.instance.Name, err))
+		}
+	}
+	deadline := time.Now().Add(commandWaitDelay)
+	for _, handle := range handles {
+		select {
+		case <-handle.done:
+			continue
+		default:
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			terminationErrors = append(terminationErrors, fmt.Errorf("managed keepalive for %q did not exit within %s", handle.instance.Name, commandWaitDelay))
+			continue
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-handle.done:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			terminationErrors = append(terminationErrors, fmt.Errorf("managed keepalive for %q did not exit within %s", handle.instance.Name, commandWaitDelay))
+		}
+	}
+	// A failed kill is harmless when the process had already exited and was
+	// reaped. Retain kill errors only for handles that remain unreaped.
+	for _, handle := range handles {
+		select {
+		case <-handle.done:
+		default:
+			return errors.Join(terminationErrors...)
+		}
+	}
+	return nil
 }
 
 func (p *Provider) VerifyRuntime(ctx context.Context, instance provider.Instance) (provider.RuntimeInfo, error) {
@@ -1332,14 +1476,18 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 	defer releaseInstanceOperation()
 	defer p.releaseRelayTokenForInstance(instance)
 	present, err := p.assertIdentity(ctx, instance)
-	if err != nil || !present {
+	if err != nil {
 		return err
+	}
+	keepaliveErr := p.terminateKeepalive(instance)
+	if !present {
+		return keepaliveErr
 	}
 	result, err := p.run(ctx, commandRequest{args: []string{"stop", instance.Name}, operation: "stop docker sandbox", timeout: providerCleanupTimeout})
 	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error(), instance.Name) {
-		return nil
+		err = nil
 	}
-	return err
+	return errors.Join(keepaliveErr, err)
 }
 
 func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error {
@@ -1350,8 +1498,11 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 	defer releaseInstanceOperation()
 	defer p.releaseRelayTokenForInstance(instance)
 	present, err := p.assertIdentity(ctx, instance)
-	if err != nil || !present {
+	if err != nil {
 		return err
+	}
+	if !present {
+		return p.terminateKeepalive(instance)
 	}
 	var receipt instanceReceipt
 	if p.runCommand == nil {
@@ -1370,27 +1521,28 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 			return fmt.Errorf("refusing Docker Sandbox deletion without an exact staging ownership receipt")
 		}
 	}
+	keepaliveErr := p.terminateKeepalive(instance)
 	result, err := p.run(ctx, commandRequest{args: []string{"rm", "--force", instance.Name}, operation: "delete docker sandbox", timeout: providerCleanupTimeout})
 	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error(), instance.Name) {
 		err = nil
 	}
 	if err != nil {
-		return err
+		return errors.Join(keepaliveErr, err)
 	}
 	p.architectureLogged.Delete(instance.Name)
 	if p.runCommand == nil {
 		stagingRoot, openErr := staging.Open(filepath.Dir(receipt.StagingPath))
 		if openErr != nil {
-			return openErr
+			return errors.Join(keepaliveErr, openErr)
 		}
 		if filepath.Clean(receipt.StagingPath) != filepath.Join(stagingRoot.Root(), instance.Name) {
-			return fmt.Errorf("refusing Docker Sandbox staging cleanup outside the exact owned path")
+			return errors.Join(keepaliveErr, fmt.Errorf("refusing Docker Sandbox staging cleanup outside the exact owned path"))
 		}
 		if purgeErr := stagingRoot.PurgeOwned(instance.Name, receipt.StagingIdentity); purgeErr != nil {
-			return purgeErr
+			return errors.Join(keepaliveErr, purgeErr)
 		}
 	}
-	return nil
+	return keepaliveErr
 }
 
 func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, error) {
@@ -2017,6 +2169,7 @@ func decodeStrictJSON(data []byte, destination any) error {
 var _ provider.Lifecycle = (*Provider)(nil)
 var _ provider.ControlPlaneRecoverer = (*Provider)(nil)
 var _ provider.ControlPlaneRecoveryCoordinator = (*Provider)(nil)
+var _ provider.ControlPlaneIncidentVerifier = (*Provider)(nil)
 var _ provider.ControlPlaneIdentityAbsenceVerifier = (*Provider)(nil)
 var _ provider.OrphanCleanupPreparer = (*Provider)(nil)
 var _ provider.AdmissionVerifier = (*Provider)(nil)
