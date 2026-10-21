@@ -7,10 +7,10 @@ Docker Sandboxes requires an EPAR runner template built from the desired Cattheh
 Use a native Docker server that matches the template platform. An amd64 server builds `linux/amd64`; an ARM64 server builds `linux/arm64`. The pinned build intentionally does not use emulation. Confirm Docker Sandboxes readiness before loading a template:
 
 ```bash
-sbx diagnose --output json
+sbx diagnose --format json
 ```
 
-EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) pins build tooling and platform inputs. The selected Catthehacker source tag and Actions runner selector are resolved independently to exact immutable identities when the update schedule is due.
+Before sbx v0.48, use `sbx diagnose --output json` instead. EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) pins build tooling and platform inputs. The selected Catthehacker source tag and Actions runner selector are resolved independently to exact immutable identities when the update schedule is due.
 
 ## Build, Import, And Review
 

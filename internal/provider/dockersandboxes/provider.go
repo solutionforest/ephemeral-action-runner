@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	sandboxcli "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/cli"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/staging"
 )
 
@@ -135,7 +136,7 @@ type CachedTemplate struct {
 }
 
 // HostReadiness is the validated machine-readable summary returned by
-// `sbx diagnose --output json`.
+// `sbx diagnose --format json`.
 type HostReadiness struct {
 	ChecksPassed  int
 	ChecksWarned  int
@@ -436,13 +437,13 @@ func waitForContext(ctx context.Context, duration time.Duration) error {
 func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, error) {
 	readiness, err := p.readHostReadiness(ctx)
 	if err != nil {
-		return HostReadiness{}, fmt.Errorf("%w; run 'sbx diagnose --output json' and review its output", err)
+		return HostReadiness{}, fmt.Errorf("%w; run 'sbx diagnose --format json' and review its output", err)
 	}
 	if readiness.ChecksFailed != 0 {
-		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported %d failed check(s); run 'sbx diagnose --output json' and review the hints for each failed check", readiness.ChecksFailed)
+		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported %d failed check(s); run 'sbx diagnose --format json' and review the hints for each failed check", readiness.ChecksFailed)
 	}
 	if readiness.ChecksPassed == 0 {
-		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported no passing checks; run 'sbx diagnose --output json' and review its check details")
+		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported no passing checks; run 'sbx diagnose --format json' and review its check details")
 	}
 	return readiness, nil
 }
@@ -1447,16 +1448,19 @@ func (p *Provider) Diagnostics(ctx context.Context, instance provider.Instance) 
 }
 
 func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error) {
-	diagnoseResult, err := p.run(ctx, commandRequest{
-		args:        []string{"diagnose", "--output", "json"},
-		operation:   "diagnose docker sandboxes",
-		outputLimit: diagnosticOutputLimit,
-		timeout:     providerReadbackTimeout,
+	output, err := sandboxcli.Diagnose(ctx, func(ctx context.Context, args []string) ([]byte, error) {
+		result, err := p.run(ctx, commandRequest{
+			args:        args,
+			operation:   "diagnose docker sandboxes",
+			outputLimit: diagnosticOutputLimit,
+			timeout:     providerReadbackTimeout,
+		})
+		return []byte(result.Stdout), err
 	})
 	if err != nil {
 		return HostReadiness{}, err
 	}
-	passed, warned, failed, skipped, err := parseDiagnose([]byte(diagnoseResult.Stdout))
+	passed, warned, failed, skipped, err := parseDiagnose(output)
 	if err != nil {
 		return HostReadiness{}, err
 	}

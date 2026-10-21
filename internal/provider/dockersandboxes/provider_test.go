@@ -733,7 +733,7 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 		"shell", testWorkspace,
 	}
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{
@@ -781,7 +781,7 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 	const daemonFailure = "500 Internal Server Error: failed to run sandbox container"
 	cause := errors.New("exit status 1")
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: daemonFailure}, err: cause},
@@ -976,7 +976,7 @@ func TestCreateAdmissionClassificationUsesImmediateCreateStderrOnly(t *testing.T
 func TestCreateDoesNotClassifyWrappedSignatureWithoutCreateStderr(t *testing.T) {
 	const signature = "500 Internal Server Error: failed to run sandbox container"
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: "permission denied"}, err: errors.New(signature)},
@@ -1003,7 +1003,7 @@ func TestCreateRemovesEmptyStagingAfterImmediateCreateFailure(t *testing.T) {
 	helper := filepath.Join(t.TempDir(), "sbx-test-helper")
 	script := fmt.Sprintf(`#!/bin/sh
 case "$1:$2" in
-diagnose:--output) printf '%%s' '%s' ;;
+diagnose:--format) printf '%%s' '%s' ;;
 template:ls) printf '%%s' '%s' ;;
 ls:--json) printf '%%s' '{"sandboxes":[]}' ;;
 create:*) printf '%%s\n' '500 Internal Server Error: failed to run sandbox container' >&2; exit 1 ;;
@@ -1027,7 +1027,7 @@ esac
 func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
 	cause := errors.New("permission denied")
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, err: cause},
@@ -1046,7 +1046,7 @@ func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
 
 func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1113,7 +1113,7 @@ func TestCreateArchitectureProviderDeadlineIsAdmissionFailureWithExactReceipt(t 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			steps := []commandStep{
-				{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+				{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 				{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 				{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 				{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1145,7 +1145,7 @@ func TestCreateCallerCancellationDuringArchitectureAdmissionIsNotRecoveryAuthori
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1182,7 +1182,7 @@ func TestCreateCallerCancellationDuringArchitectureAdmissionIsNotRecoveryAuthori
 func TestCreateArchitectureNonDeadlinePreservesOrdinaryFailure(t *testing.T) {
 	cause := errors.New("native architecture helper rejected the request")
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1480,7 +1480,7 @@ func TestQEMUBinfmtEnablerFailsClosedOnUnsupportedEvidence(t *testing.T) {
 
 func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1508,7 +1508,7 @@ func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) 
 
 func TestCreateReturnsExactReceiptWhenArchitectureEmulationSetupFails(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1553,7 +1553,7 @@ func TestSplitTemplateReferenceCanonicalizesDockerHubNames(t *testing.T) {
 func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 	mismatch := strings.Replace(templateListJSON, "39cf20eca861", "aaaaaaaaaaaa", 1)
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: mismatch}},
 	)
 	if _, err := p.Create(context.Background(), validCreateRequest()); err == nil || !strings.Contains(err.Error(), "does not match") {
@@ -1564,7 +1564,7 @@ func TestCreateFailsClosedOnCachedTemplateIdentityMismatch(t *testing.T) {
 
 func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1583,7 +1583,7 @@ func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
 	opaqueTemplateList := strings.Replace(templateListJSON, "39cf20eca861", "ec2006fea720", 1)
 	opaqueInspection := strings.Replace(inspectionJSON, testDigest, "sha256:ec2006fea720"+strings.Repeat("9", 52), 1)
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: opaqueTemplateList}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
@@ -1699,7 +1699,7 @@ func TestInstanceAdmissionRechecksConfiguredArchitectureCapability(t *testing.T)
 }
 
 func TestAdmissionTimeoutIsRecoveryAuthorizingForLiveCaller(t *testing.T) {
-	p, done := scriptedProvider(t, commandStep{args: []string{"diagnose", "--output", "json"}, err: context.DeadlineExceeded})
+	p, done := scriptedProvider(t, commandStep{args: []string{"diagnose", "--format", "json"}, err: context.DeadlineExceeded})
 	err := p.VerifyAdmission(context.Background())
 	if err == nil || !errors.Is(err, provider.ErrControlPlaneAdmissionFailure) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("VerifyAdmission() error = %v, want live provider timeout admission failure", err)
@@ -1779,7 +1779,7 @@ func TestDirectWorkspaceVerificationRejectsSSHAgentForwardingWithRemediation(t *
 
 func TestTemplateInventorySchemaFailsClosed(t *testing.T) {
 	for _, fixture := range []string{
-		`[]`,
+		`null`,
 		`{"templates":[]}`,
 		`{"images":null}`,
 		`{"images":[{"id":"39cf20eca861","repository":"docker.io/docker/sandbox-templates","tag":"shell-docker","flavor":"shell-docker","created_at":"not-a-time","size":599103243}]}`,
@@ -1789,6 +1789,17 @@ func TestTemplateInventorySchemaFailsClosed(t *testing.T) {
 			t.Fatalf("template schema drift was accepted: %s", fixture)
 		}
 	}
+}
+
+func TestHostReadinessSupportsLegacyDiagnosticFlag(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stderr: "Error: unknown flag: --format"}, err: errors.New("exit status 1")},
+		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+	)
+	if readiness, err := p.VerifyHostReadiness(context.Background()); err != nil || readiness.ChecksPassed != 1 {
+		t.Fatalf("legacy readiness = %v, %v", readiness, err)
+	}
+	done()
 }
 
 func TestParseTemplateInventoryAcceptsCustomTemplateWithoutFlavor(t *testing.T) {
@@ -1860,10 +1871,10 @@ func TestReadGlobalNetworkPolicyFailsClosedOnMalformedJSON(t *testing.T) {
 
 func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
-	if err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --output json") || !strings.Contains(err.Error(), "hints for each failed check") {
+	if err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --format json") || !strings.Contains(err.Error(), "hints for each failed check") {
 		t.Fatalf("err = %v", err)
 	}
 	done()
@@ -1871,7 +1882,7 @@ func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {
 
 func TestAdmissionUsesDiagnosticsWithoutReadingGlobalSecrets(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1881,13 +1892,13 @@ func TestAdmissionUsesDiagnosticsWithoutReadingGlobalSecrets(t *testing.T) {
 
 func TestAdmissionRechecksDiagnostics(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	if err := p.VerifyAdmission(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.VerifyAdmission(context.Background()); err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --output json") || !strings.Contains(err.Error(), "hints for each failed check") {
+	if err := p.VerifyAdmission(context.Background()); err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --format json") || !strings.Contains(err.Error(), "hints for each failed check") {
 		t.Fatalf("failed diagnostics were accepted: %v", err)
 	}
 	done()
@@ -2014,16 +2025,26 @@ func TestVerifyControlPlaneIncidentAcceptsAuthoritativeExactAbsence(t *testing.T
 	done()
 }
 
-func TestInventoryParsesWrapperAndFailsClosedOnSchemaDrift(t *testing.T) {
-	items, err := parseInventory([]byte(readyListJSON))
-	if err != nil {
-		t.Fatal(err)
+func TestInventoryParsesSupportedEnvelopesAndFailsClosedOnSchemaDrift(t *testing.T) {
+	for _, fixture := range []string{readyListJSON, inventoryArray(t, readyListJSON, "sandboxes")} {
+		items, err := parseInventory([]byte(fixture))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || items[0].Instance.Name != testInstance.Name || items[0].Instance.ProviderID != testInstance.ProviderID || !reflect.DeepEqual(items[0].Workspaces, []string{testWorkspace}) {
+			t.Fatalf("items = %#v", items)
+		}
 	}
-	if len(items) != 1 || items[0].Instance.Name != testInstance.Name || items[0].Instance.ProviderID != testInstance.ProviderID || !reflect.DeepEqual(items[0].Workspaces, []string{testWorkspace}) {
-		t.Fatalf("items = %#v", items)
+	for _, fixture := range []string{`[]`, `{"sandboxes":[]}`} {
+		if items, err := parseInventory([]byte(fixture)); err != nil || items == nil || len(items) != 0 {
+			t.Fatalf("explicit empty inventory = %v, %v", items, err)
+		}
 	}
 	for _, fixture := range []string{
-		`[]`,
+		`null`,
+		`[null]`,
+		`[] {}`,
+		`[{"id":"id-1"}]`,
 		`{"items":[]}`,
 		`{"sandboxes":null}`,
 		`{"sandboxes":[{"name":"epar-sandbox-1","status":"running","workspaces":["/staging"]}]}`,
@@ -2044,6 +2065,8 @@ func TestInventoryRejectsDuplicateJSONKeysRecursively(t *testing.T) {
 		"top-level inventory key": `{"sandboxes":[],"sandboxes":[]}`,
 		"sandbox identity key":    `{"sandboxes":[{` + validRecord + `,"id":"` + testID + `"}]}`,
 		"nested additive key":     `{"sandboxes":[{` + validRecord + `,"metadata":{"generation":1,"generation":2}}]}`,
+		"array identity key":      `[{` + validRecord + `,"id":"` + testID + `"}]`,
+		"array nested key":        `[{` + validRecord + `,"metadata":{"generation":1,"generation":2}}]`,
 	}
 	for name, fixture := range fixtures {
 		t.Run(name, func(t *testing.T) {
@@ -2796,7 +2819,7 @@ func TestDiagnosticsUsesBoundedMachineReadableCommands(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"daemon", "status", "--json"}, result: provider.ExecResult{Stdout: `{"status":"running","socket":"\\\\.\\pipe\\docker_kaname_sandboxd","logs":"C:\\logs\\daemon.log"}`}},
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"ok","detail":"","hint":""},{"name":"optional update","status":"warn","message":"available","detail":"","hint":""},{"name":"optional integration","status":"skip","message":"not configured","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":1}}`}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"ok","detail":"","hint":""},{"name":"optional update","status":"warn","message":"available","detail":"","hint":""},{"name":"optional integration","status":"skip","message":"not configured","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":1}}`}},
 	)
 	diagnostics, err := p.Diagnostics(context.Background(), testInstance)
 	if err != nil || !diagnostics.Healthy || diagnostics.ChecksPassed != 1 || diagnostics.ChecksWarned != 1 || diagnostics.ChecksSkipped != 1 {
@@ -2807,7 +2830,7 @@ func TestDiagnosticsUsesBoundedMachineReadableCommands(t *testing.T) {
 
 func TestVerifyHostReadinessAcceptsWarningsWithPassingChecksAndNoFailures(t *testing.T) {
 	p, done := scriptedProvider(t,
-		commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""},{"name":"optional update","status":"warn","message":"available","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":0}}`}},
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""},{"name":"optional update","status":"warn","message":"available","detail":"","hint":""}],"summary":{"pass":1,"warn":1,"fail":0,"skip":0}}`}},
 	)
 	readiness, err := p.VerifyHostReadiness(context.Background())
 	if err != nil {
@@ -2839,9 +2862,9 @@ func TestVerifyHostReadinessRejectsFailedOrEmptyDiagnostics(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t,
-				commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: test.fixture}},
+				commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: test.fixture}},
 			)
-			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "sbx diagnose --output json") {
+			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "sbx diagnose --format json") {
 				t.Fatalf("VerifyHostReadiness() error = %v, want %q and diagnostic command", err, test.want)
 			}
 			done()
@@ -2857,19 +2880,19 @@ func TestVerifyHostReadinessRejectsCommandAndSchemaFailures(t *testing.T) {
 	}{
 		{
 			name: "command failure",
-			step: commandStep{args: []string{"diagnose", "--output", "json"}, err: errors.New("diagnose unavailable")},
+			step: commandStep{args: []string{"diagnose", "--format", "json"}, err: errors.New("diagnose unavailable")},
 			want: "diagnose unavailable",
 		},
 		{
 			name: "malformed json",
-			step: commandStep{args: []string{"diagnose", "--output", "json"}, result: provider.ExecResult{Stdout: `{"summary":`}},
+			step: commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"summary":`}},
 			want: "unsupported json schema",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t, test.step)
-			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "sbx diagnose --output json") {
+			if _, err := p.VerifyHostReadiness(context.Background()); err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "sbx diagnose --format json") {
 				t.Fatalf("VerifyHostReadiness() error = %v, want %q and diagnostic command", err, test.want)
 			}
 			done()

@@ -36,13 +36,18 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, invalid("duplicate_json_key")
 	}
-	var wrapper map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &wrapper); err != nil || wrapper == nil {
-		return nil, invalid("invalid_root_type")
-	}
-	rawImages, ok := wrapper["images"]
-	if !ok {
-		return nil, invalid("missing_images")
+	// v0.48+ returns an array; earlier releases wrap it in {"images":...}.
+	rawImages := bytes.TrimSpace(data)
+	if rawImages[0] != '[' {
+		var wrapper map[string]json.RawMessage
+		if err := decodeStrictJSON(data, &wrapper); err != nil || wrapper == nil {
+			return nil, invalid("invalid_root_type")
+		}
+		var ok bool
+		rawImages, ok = wrapper["images"]
+		if !ok {
+			return nil, invalid("missing_images")
+		}
 	}
 	if bytes.Equal(bytes.TrimSpace(rawImages), []byte("null")) || bytes.TrimSpace(rawImages)[0] != '[' {
 		return nil, invalid("invalid_images_type")
@@ -93,18 +98,17 @@ func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var wrapper map[string]json.RawMessage
-	if err := decoder.Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
+	// Both documented envelopes carry the same identity/workspace contract.
+	rawSandboxes := bytes.TrimSpace(data)
+	if rawSandboxes[0] != '[' {
+		var wrapper map[string]json.RawMessage
+		if err := decodeStrictJSON(data, &wrapper); err != nil {
+			return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
+		}
+		rawSandboxes = wrapper["sandboxes"]
 	}
 	var records []map[string]json.RawMessage
-	rawSandboxes, ok := wrapper["sandboxes"]
-	if !ok || bytes.Equal(bytes.TrimSpace(rawSandboxes), []byte("null")) || json.Unmarshal(rawSandboxes, &records) != nil {
+	if bytes.Equal(bytes.TrimSpace(rawSandboxes), []byte("null")) || json.Unmarshal(rawSandboxes, &records) != nil {
 		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
 	}
 	items := make([]provider.InventoryItem, 0, len(records))

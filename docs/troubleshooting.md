@@ -144,14 +144,16 @@ The `best-effort` and `required` modes remain available as explicit configuratio
 
 ### Symptom
 
-The wizard marks Docker Sandboxes unavailable, or `sbx diagnose --output json` reports failures.
+The wizard marks Docker Sandboxes unavailable, or `sbx diagnose --format json` reports failures. Before sbx v0.48, use `sbx diagnose --output json` instead.
+
+If upgrading to sbx v0.48 or later causes `docker sandbox template inventory parse failure: category=invalid_root_type`, update EPAR and rerun `./start`. Those sbx versions changed inventory JSON from wrapped objects to arrays. This error occurs while parsing the inventory and does not indicate image corruption; clearing the image cache or rebuilding Full is unnecessary for this failure.
 
 ### Diagnosis and remediation
 
 Check the diagnostic result before editing configuration:
 
 ```bash
-sbx diagnose --output json
+sbx diagnose --format json
 ```
 
 EPAR requires a controller architecture with an available Linux guest template and at least one diagnostic pass with zero failures. Diagnostic warnings and skipped checks remain visible but do not disable the provider. Review the failed item and its hint in the JSON output, fix the prerequisite, then choose `R` to refresh availability; do not manually force a provider selection or substitute a compatibility provider for a configured Docker Sandboxes pool. Use `C. Show compatibility providers` only when you deliberately intend to create or maintain a compatibility configuration.
@@ -160,7 +162,7 @@ EPAR requires a controller architecture with an available Linux guest template a
 
 ### Symptom
 
-`sbx daemon status --json` reports `running` and `sbx diagnose -o json` passes, but `sbx ls --json` hangs, returns an empty response slowly, or ends with a runtime-list cancellation. EPAR may repeatedly report `context canceled`, quarantine instances after the host-trust or inventory deadline, and keep the controller process alive with no ready capacity.
+`sbx daemon status --json` reports `running` and `sbx diagnose --format json` passes, but `sbx ls --json` hangs, returns an empty response slowly, or ends with a runtime-list cancellation. EPAR may repeatedly report `context canceled`, quarantine instances after the host-trust or inventory deadline, and keep the controller process alive with no ready capacity.
 
 ### Diagnosis and remediation
 
@@ -170,7 +172,7 @@ Preserve the controller output, daemon log, process tree, durable pool lifecycle
 
 With the default `dockerSandboxes.recoveryMode: exclusive-auto`, EPAR keeps the controller alive and holds one host-wide provider recovery lease from the complete authoritative census through the durable reservation, cold stop, authoritative stopped-state confirmation, configured quiescence interval, sanitized detached start, and three identical parsed safety-evidence inventory snapshots covering name, stable provider ID, status, agent/source, and exact workspaces. During that sequence it lets already-running provider commands drain and gates new provider commands through the same host lock, so another cooperating configuration cannot create a sandbox or race the daemon restart. The installed `sbx ls --json` API is treated as the complete snapshot because it exposes no independent count or generation; duplicate keys and durable-identity omissions fail closed, while an otherwise valid response that omits an unrelated sandbox outside the cooperating lease cannot be independently detected. It backs off after failed attempts and preserves exact capacity while recovery is unresolved. The recovery path never invokes `sbx reset`, `sbx logout`, `sbx prune`, or wildcard deletion. Set `recoveryMode: observe` only when an operator deliberately needs to prevent daemon mutation during maintenance.
 
-If automatic recovery is disabled or the controller is not running, stop only the affected controller before a manual daemon interruption. Then run `sbx daemon stop`, wait until `sbx daemon status --json` reports `stopped`, and start with `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach`. Before starting a new EPAR controller, require `sbx daemon status --json` to report `running`, `sbx diagnose -o json` to have no failed checks, and repeated bounded `sbx ls --json` calls to complete with valid JSON in a stable time. A passing diagnostic report without a responsive inventory is not a healthy Sandbox provider.
+If automatic recovery is disabled or the controller is not running, stop only the affected controller before a manual daemon interruption. Then run `sbx daemon stop`, wait until `sbx daemon status --json` reports `stopped`, and start with `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach`. Before starting a new EPAR controller, require `sbx daemon status --json` to report `running`, `sbx diagnose --format json` to have no failed checks, and repeated bounded `sbx ls --json` calls to complete with valid JSON in a stable time. A passing diagnostic report without a responsive inventory is not a healthy Sandbox provider.
 
 ## Docker Sandboxes rejects template, policy, or capacity
 
@@ -198,7 +200,7 @@ Docker Sandboxes uses `mkfs.ext4` to create an ext4 filesystem inside each sandb
 
 If each executable belongs to the Docker Sandboxes installation you intentionally installed and any displayed target is the expected sandbox-owned file, allow the operation through the host's security or application-control prompt, then rerun the same EPAR start or verification command if creation already failed. Do not invoke a formatter or shim yourself, disable host security broadly, or approve a command with an unfamiliar target. The configured private Docker disk is sparse, so its logical maximum does not mean the formatter immediately consumes that amount of physical storage.
 
-If no prompt appeared, or approval still produces the 500 error, preserve the failed runner evidence and inspect the Docker Sandboxes daemon/client logs and `sbx diagnose --output json`; the same top-level error can also represent a runtime, capacity, or host-policy failure. See [Private Filesystem and VM Helper Approval](providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) for the provider contract.
+If no prompt appeared, or approval still produces the 500 error, preserve the failed runner evidence and inspect the Docker Sandboxes daemon/client logs and `sbx diagnose --format json`; the same top-level error can also represent a runtime, capacity, or host-policy failure. See [Private Filesystem and VM Helper Approval](providers/docker-sandboxes.md#private-filesystem-and-vm-helper-approval) for the provider contract.
 
 ## Docker Sandboxes rejects a staging workspace because SSH-agent forwarding is present
 
