@@ -858,7 +858,7 @@ func (p *Provider) RemoveTemplate(ctx context.Context, artifact provider.Templat
 		return nil
 	}
 	if _, err := p.run(ctx, commandRequest{
-		args:        []string{"template", "rm", artifact.CacheID},
+		args:        []string{"template", "rm", "--force", artifact.CacheID},
 		operation:   "remove exact Docker Sandboxes runner template",
 		outputLimit: diagnosticOutputLimit,
 		timeout:     providerCleanupTimeout,

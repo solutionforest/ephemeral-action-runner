@@ -578,7 +578,7 @@ func TestRemoveTemplateUsesExactCacheIDAndRefusesLiveSandboxes(t *testing.T) {
 	p, done := scriptedProvider(t,
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: template}},
-		commandStep{args: []string{"template", "rm", "aaaaaaaaaaaa"}},
+		commandStep{args: []string{"template", "rm", "--force", "aaaaaaaaaaaa"}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `{"images":[]}`}},
 	)
 	if err := p.RemoveTemplate(context.Background(), artifact); err != nil {
