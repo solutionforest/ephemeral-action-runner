@@ -114,9 +114,15 @@ func (p *Provider) ApplyNetworkPolicy(ctx context.Context, instance provider.Ins
 			return err
 		}
 		args := []string{"policy", string(rule.Decision), "network", "--sandbox", instance.Name, strings.Join(rule.Resources, ",")}
-		result, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy", timeout: providerCleanupTimeout})
-		if runErr != nil && !strings.Contains(strings.ToLower(result.Stdout+"\n"+result.Stderr), "already covered") {
-			return classifyApplyNetworkPolicyAdmissionTimeout(ctx, runErr)
+		_, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy", timeout: providerCleanupTimeout})
+		if runErr != nil {
+			if ctx.Err() != nil || !isOnlyCommandExitOne(runErr) {
+				return classifyApplyNetworkPolicyAdmissionTimeout(ctx, runErr)
+			}
+			actual, readbackErr := p.ReadNetworkPolicy(ctx, instance)
+			if readbackErr != nil || !containsSandboxPolicyRule(actual, rule, instance.Name) {
+				return classifyApplyNetworkPolicyAdmissionTimeout(ctx, errors.Join(runErr, readbackErr))
+			}
 		}
 	}
 	actual, err := p.readNetworkPolicyVerified(ctx, instance)
@@ -201,13 +207,19 @@ func (p *Provider) RemoveNetworkPolicy(ctx context.Context, instance provider.In
 		if !sameStablePolicyRuleIdentity(matched, rule) {
 			return fmt.Errorf("refusing to remove a network policy rule whose stable identity changed")
 		}
-		result, runErr := p.run(ctx, commandRequest{
+		_, runErr := p.run(ctx, commandRequest{
 			args:      []string{"policy", "rm", "network", "--sandbox", instance.Name, "--id", rule.ID},
 			operation: "remove docker sandbox network policy",
 			timeout:   providerCleanupTimeout,
 		})
-		if runErr != nil && !isMissingPolicyRule(result.Stdout+"\n"+result.Stderr+"\n"+runErr.Error()) {
-			return runErr
+		if runErr != nil {
+			if ctx.Err() != nil || !isOnlyCommandExitOne(runErr) {
+				return errors.Join(runErr, ctx.Err())
+			}
+			remaining, readbackErr := p.ReadNetworkPolicy(ctx, instance)
+			if readbackErr != nil || containsPolicyRuleID(remaining, rule.ID) {
+				return errors.Join(runErr, readbackErr)
+			}
 		}
 	}
 	remaining, err := p.readNetworkPolicyVerified(ctx, instance)
@@ -454,9 +466,4 @@ func sameStablePolicyRuleIdentity(actual, expected provider.NetworkPolicyRule) b
 	sort.Strings(actualResources)
 	sort.Strings(expectedResources)
 	return slices.Equal(actualResources, expectedResources)
-}
-
-func isMissingPolicyRule(text string) bool {
-	text = strings.ToLower(text)
-	return strings.Contains(text, "rule not found") || strings.Contains(text, "no matching rule") || strings.Contains(text, "status 404")
 }

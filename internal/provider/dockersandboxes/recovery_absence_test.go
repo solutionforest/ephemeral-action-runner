@@ -20,22 +20,24 @@ func TestRecoveryAbsenceExitHelper(t *testing.T) {
 	}
 }
 
-func TestRecoveryIdentityAbsenceRequiresIndependentExactDiagnostic(t *testing.T) {
+func sandboxCLIExitFailure(t *testing.T, code string) error {
+	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	exitFailure := func(code string) error {
-		command := exec.Command(executable, "-test.run=^TestRecoveryAbsenceExitHelper$")
-		command.Env = append(os.Environ(), "EPAR_TEST_RECOVERY_ABSENCE_EXIT="+code)
-		err := command.Run()
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			t.Fatalf("helper did not return process exit: %v", err)
-		}
-		return err
+	command := exec.Command(executable, "-test.run=^TestRecoveryAbsenceExitHelper$")
+	command.Env = append(os.Environ(), "EPAR_TEST_RECOVERY_ABSENCE_EXIT="+code)
+	err = command.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("helper did not return process exit: %v", err)
 	}
-	exitOne, exitTwo := exitFailure("1"), exitFailure("2")
+	return err
+}
+
+func TestRecoveryIdentityAbsenceRequiresIndependentExactDiagnostic(t *testing.T) {
+	exitOne, exitTwo := sandboxCLIExitFailure(t, "1"), sandboxCLIExitFailure(t, "2")
 	absent := "ERROR: sandbox '" + testName + "' not found"
 	for _, test := range []struct {
 		name       string
@@ -47,6 +49,9 @@ func TestRecoveryIdentityAbsenceRequiresIndependentExactDiagnostic(t *testing.T)
 	}{
 		{name: "live inspect diagnostic", stderr: absent, err: exitOne, wantAbsent: true},
 		{name: "known ls hint", stderr: absent + " (run 'sbx ls' to see your sandboxes)", err: exitOne, wantAbsent: true},
+		{name: "current separate ls hint", stderr: "error: sandbox '" + testName + "' not found\n  try: sbx ls\n", err: exitOne, wantAbsent: true},
+		{name: "hint followed by failure", stderr: absent + "\n  try: sbx ls\ntransport failure", err: exitOne, wantErr: true},
+		{name: "unknown hint", stderr: absent + "\n  try: sbx reset", err: exitOne, wantErr: true},
 		{name: "wrong identity", stderr: "ERROR: sandbox 'other' not found", err: exitOne, wantErr: true},
 		{name: "broad legacy 404 is insufficient", stderr: "status 404", err: exitOne, wantErr: true},
 		{name: "success empty is not absence"},

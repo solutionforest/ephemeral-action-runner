@@ -2303,14 +2303,22 @@ func TestLifecycleCommandsUseExactIdentityAndArgv(t *testing.T) {
 		done()
 	})
 	t.Run("stop_preserves_state", func(t *testing.T) {
-		p, done := identityScript(t, commandStep{args: []string{"stop", testName}})
+		p, done := scriptedProvider(t,
+			commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+			commandStep{args: []string{"stop", testName}},
+			commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: strings.Replace(readyListJSON, `"running"`, `"stopped"`, 1)}},
+		)
 		if err := p.Stop(context.Background(), testInstance); err != nil {
 			t.Fatal(err)
 		}
 		done()
 	})
 	t.Run("delete_is_exact_force_remove", func(t *testing.T) {
-		p, done := identityScript(t, commandStep{args: []string{"rm", "--force", testName}})
+		p, done := scriptedProvider(t,
+			commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+			commandStep{args: []string{"rm", "--force", testName}},
+			commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
+		)
 		if err := p.Delete(context.Background(), testInstance); err != nil {
 			t.Fatal(err)
 		}
@@ -2560,7 +2568,7 @@ func TestStopAndDeleteReapManagedKeepaliveBeforeExactMutationAndRemainIdempotent
 						t.Fatal("exact sandbox mutation began while its keepalive remained registered")
 					}
 					return provider.ExecResult{}, nil
-				case 3:
+				case 3, 4:
 					if !reflect.DeepEqual(request.args, []string{"ls", "--json"}) {
 						t.Fatalf("idempotent identity args = %#v", request.args)
 					}
@@ -2576,8 +2584,8 @@ func TestStopAndDeleteReapManagedKeepaliveBeforeExactMutationAndRemainIdempotent
 			if err := test.call(p); err != nil {
 				t.Fatalf("idempotent %s failed: %v", test.name, err)
 			}
-			if calls != 3 {
-				t.Fatalf("provider command count = %d, want identity, exact mutation, and absence readback", calls)
+			if calls != 4 {
+				t.Fatalf("provider command count = %d, want identity, exact mutation, outcome readback, and idempotent absence check", calls)
 			}
 		})
 	}
@@ -2767,40 +2775,8 @@ func TestStopAndDeleteAreIdempotentWhenInventorySaysMissing(t *testing.T) {
 	}
 }
 
-func TestIsMissingSandboxPreservesLegacyAndMatchesOnlyTheRequestedSbx042Name(t *testing.T) {
-	tests := []struct {
-		name       string
-		targetName string
-		message    string
-		want       bool
-	}{
-		{name: "legacy sandbox not found", targetName: testName, message: "sandbox not found", want: true},
-		{name: "legacy no such sandbox", targetName: testName, message: "no such sandbox", want: true},
-		{name: "legacy status 404", targetName: testName, message: "status 404", want: true},
-		{name: "sbx 0.42 exact name", targetName: testName, message: "sandbox 'epar-sandbox-1' not found", want: true},
-		{name: "sbx 0.42 Error wrapper", targetName: testName, message: "Error: sandbox 'epar-sandbox-1' not found", want: true},
-		{name: "sbx 0.42 error wrapper", targetName: testName, message: "error: sandbox 'epar-sandbox-1' not found", want: true},
-		{name: "live sbx 0.42.1 stop and rm", targetName: testName, message: "ERROR: sandbox 'epar-sandbox-1' not found (run 'sbx ls' to see your sandboxes)", want: true},
-		{name: "live format wrong name", targetName: testName, message: "ERROR: sandbox 'other-sandbox' not found (run 'sbx ls' to see your sandboxes)", want: false},
-		{name: "unknown guidance", targetName: testName, message: "ERROR: sandbox 'epar-sandbox-1' not found (in local cache)", want: false},
-		{name: "uppercase target remains exact", targetName: "EPAR-SANDBOX-1", message: "sandbox 'EPAR-SANDBOX-1' not found", want: true},
-		{name: "uppercase mismatch", targetName: testName, message: "sandbox 'EPAR-SANDBOX-1' not found", want: false},
-		{name: "different sandbox", targetName: testName, message: "sandbox 'other-sandbox' not found", want: false},
-		{name: "name prefix", targetName: testName, message: "sandbox 'epar-sandbox-10' not found", want: false},
-		{name: "unrelated resource", targetName: testName, message: "resource 'epar-sandbox-1' not found", want: false},
-		{name: "unrelated prefix", targetName: testName, message: "volume for sandbox 'epar-sandbox-1' not found", want: false},
-		{name: "unrelated suffix", targetName: testName, message: "sandbox 'epar-sandbox-1' not found in local cache; permission denied", want: false},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := isMissingSandbox(test.message, test.targetName); got != test.want {
-				t.Fatalf("isMissingSandbox(%q, %q) = %t, want %t", test.message, test.targetName, got, test.want)
-			}
-		})
-	}
-}
-
 func TestStopAndDeleteTreatExactSbx042MissingSandboxErrorsAsIdempotent(t *testing.T) {
+	exitOne := sandboxCLIExitFailure(t, "1")
 	for _, test := range []struct {
 		name string
 		call func(*Provider) error
@@ -2812,7 +2788,8 @@ func TestStopAndDeleteTreatExactSbx042MissingSandboxErrorsAsIdempotent(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t,
 				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
-				commandStep{args: test.args, result: provider.ExecResult{Stderr: "ERROR: sandbox '" + testName + "' not found (run 'sbx ls' to see your sandboxes)"}, err: errors.New("exit status 1")},
+				commandStep{args: test.args, result: provider.ExecResult{Stderr: "ERROR: sandbox '" + testName + "' not found (run 'sbx ls' to see your sandboxes)"}, err: exitOne},
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
 			)
 			if err := test.call(p); err != nil {
 				t.Fatal(err)
@@ -2823,6 +2800,7 @@ func TestStopAndDeleteTreatExactSbx042MissingSandboxErrorsAsIdempotent(t *testin
 }
 
 func TestStopAndDeleteDoNotSwallowUnrelatedResourceNotFoundErrors(t *testing.T) {
+	exitOne := sandboxCLIExitFailure(t, "1")
 	for _, test := range []struct {
 		name string
 		call func(*Provider) error
@@ -2834,7 +2812,8 @@ func TestStopAndDeleteDoNotSwallowUnrelatedResourceNotFoundErrors(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			p, done := scriptedProvider(t,
 				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
-				commandStep{args: test.args, result: provider.ExecResult{Stderr: "resource '" + testName + "' not found"}, err: errors.New("exit status 1")},
+				commandStep{args: test.args, result: provider.ExecResult{Stderr: "resource '" + testName + "' not found"}, err: exitOne},
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 			)
 			if err := test.call(p); err == nil || !strings.Contains(err.Error(), "resource '") {
 				t.Fatalf("error = %v, want unrelated resource error", err)

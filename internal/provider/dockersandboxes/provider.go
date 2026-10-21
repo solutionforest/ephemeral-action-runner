@@ -858,21 +858,22 @@ func (p *Provider) RemoveTemplate(ctx context.Context, artifact provider.Templat
 	if !found {
 		return nil
 	}
-	if _, err := p.run(ctx, commandRequest{
+	_, removeErr := p.run(ctx, commandRequest{
 		args:        []string{"template", "rm", "--force", artifact.CacheID},
 		operation:   "remove exact Docker Sandboxes runner template",
 		outputLimit: diagnosticOutputLimit,
 		timeout:     providerCleanupTimeout,
-	}); err != nil {
-		return err
+	})
+	if ctx.Err() != nil || (removeErr != nil && !isOnlyCommandExitOne(removeErr)) {
+		return errors.Join(removeErr, ctx.Err())
 	}
 	templates, err = p.CachedTemplates(ctx)
 	if err != nil {
-		return err
+		return errors.Join(removeErr, err)
 	}
 	for _, item := range templates {
 		if item.CacheID == artifact.CacheID {
-			return fmt.Errorf("Docker Sandboxes template %s still exists after exact removal", artifact.CacheID)
+			return errors.Join(removeErr, fmt.Errorf("Docker Sandboxes template %s still exists after exact removal", artifact.CacheID))
 		}
 	}
 	return nil
@@ -1487,14 +1488,25 @@ func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
 	if !present {
 		return keepaliveErr
 	}
-	result, err := p.run(ctx, commandRequest{args: []string{"stop", instance.Name}, operation: "stop docker sandbox", timeout: providerCleanupTimeout})
-	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error(), instance.Name) {
-		err = nil
+	_, stopErr := p.run(ctx, commandRequest{args: []string{"stop", instance.Name}, operation: "stop docker sandbox", timeout: providerCleanupTimeout})
+	if ctx.Err() != nil || (stopErr != nil && !isOnlyCommandExitOne(stopErr)) {
+		return errors.Join(keepaliveErr, stopErr, ctx.Err())
 	}
-	return errors.Join(keepaliveErr, err)
+	if err := p.verifyCleanupOutcome(ctx, instance, false); err != nil {
+		return errors.Join(keepaliveErr, stopErr, err)
+	}
+	return keepaliveErr
 }
 
 func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error {
+	return p.delete(ctx, instance, false)
+}
+
+func (p *Provider) FinalizeAbsentInstance(ctx context.Context, instance provider.Instance) error {
+	return p.delete(ctx, instance, true)
+}
+
+func (p *Provider) delete(ctx context.Context, instance provider.Instance, requireAbsent bool) error {
 	if err := validateInstance(instance, true); err != nil {
 		return err
 	}
@@ -1505,8 +1517,8 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 	if err != nil {
 		return err
 	}
-	if !present {
-		return p.terminateKeepalive(instance)
+	if requireAbsent && present {
+		return fmt.Errorf("docker sandbox reappeared before local cleanup")
 	}
 	var receipt instanceReceipt
 	if p.runCommand == nil {
@@ -1526,12 +1538,14 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 		}
 	}
 	keepaliveErr := p.terminateKeepalive(instance)
-	result, err := p.run(ctx, commandRequest{args: []string{"rm", "--force", instance.Name}, operation: "delete docker sandbox", timeout: providerCleanupTimeout})
-	if err != nil && isMissingSandbox(result.Stdout+"\n"+result.Stderr+"\n"+err.Error(), instance.Name) {
-		err = nil
-	}
-	if err != nil {
-		return errors.Join(keepaliveErr, err)
+	if present {
+		_, removeErr := p.run(ctx, commandRequest{args: []string{"rm", "--force", instance.Name}, operation: "delete docker sandbox", timeout: providerCleanupTimeout})
+		if ctx.Err() != nil || (removeErr != nil && !isOnlyCommandExitOne(removeErr)) {
+			return errors.Join(keepaliveErr, removeErr, ctx.Err())
+		}
+		if err := p.verifyCleanupOutcome(ctx, instance, true); err != nil {
+			return errors.Join(keepaliveErr, removeErr, err)
+		}
 	}
 	p.architectureLogged.Delete(instance.Name)
 	if p.runCommand == nil {
@@ -1547,6 +1561,31 @@ func (p *Provider) Delete(ctx context.Context, instance provider.Instance) error
 		}
 	}
 	return keepaliveErr
+}
+
+// Mutation output is presentation, including success and not-found messages.
+// Only a fresh structured readback proves completion; a changed name/ID or an
+// asynchronous operation still in progress must retain the cleanup fence.
+func (p *Provider) verifyCleanupOutcome(ctx context.Context, expected provider.Instance, deleted bool) error {
+	items, err := p.inventoryVerified(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Instance.Name != expected.Name && item.Instance.ProviderID != expected.ProviderID {
+			continue
+		}
+		if item.Instance.Name != expected.Name || item.Instance.ProviderID != expected.ProviderID {
+			return fmt.Errorf("docker sandbox identity changed during cleanup")
+		}
+		if deleted {
+			return fmt.Errorf("docker sandbox remains after exact deletion")
+		}
+		if !strings.EqualFold(item.State, "stopped") {
+			return fmt.Errorf("docker sandbox is not stopped after exact stop")
+		}
+	}
+	return nil
 }
 
 func (p *Provider) Inventory(ctx context.Context) ([]provider.InventoryItem, error) {
@@ -1726,10 +1765,10 @@ func (p *Provider) assertIdentity(ctx context.Context, instance provider.Instanc
 		return false, err
 	}
 	for _, item := range items {
-		if item.Instance.Name != instance.Name {
+		if item.Instance.Name != instance.Name && item.Instance.ProviderID != instance.ProviderID {
 			continue
 		}
-		if item.Instance.ProviderID != instance.ProviderID {
+		if item.Instance.Name != instance.Name || item.Instance.ProviderID != instance.ProviderID {
 			return false, fmt.Errorf("docker sandbox identity changed")
 		}
 		return true, nil
@@ -2121,25 +2160,18 @@ func isOnlyCommandExitOne(err error) bool {
 	return false
 }
 
-func isMissingSandbox(text, name string) bool {
-	lowerText := strings.ToLower(text)
-	legacy := strings.Contains(lowerText, "sandbox not found") || strings.Contains(lowerText, "no such sandbox") || strings.Contains(lowerText, "status 404")
-	if legacy {
-		return true
-	}
-	// sbx v0.42 standardizes this as a complete quoted diagnostic line. Keep
-	// the target name case-sensitive and reject arbitrary prefixes/suffixes so
-	// an unrelated resource error cannot make Stop/Delete appear successful.
-	for _, line := range strings.Split(text, "\n") {
-		if isExactMissingSandboxDiagnostic(line, name) {
-			return true
-		}
-	}
-	return false
-}
-
 func isExactMissingSandboxDiagnostic(text, name string) bool {
-	line := strings.TrimSpace(text)
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	// v0.48+ moves the known read-only hint onto its own line. Inspect still
+	// has no structured not-found result; accept only this exact hint, never
+	// discard additional failure lines when proving historical absence.
+	if len(lines) == 2 && strings.TrimSpace(lines[1]) == "try: sbx ls" {
+		lines = lines[:1]
+	}
+	if len(lines) != 1 {
+		return false
+	}
+	line := strings.TrimSpace(lines[0])
 	for _, prefix := range []string{"ERROR: ", "Error: ", "error: "} {
 		if strings.HasPrefix(line, prefix) {
 			line = strings.TrimPrefix(line, prefix)

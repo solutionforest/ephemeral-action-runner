@@ -320,6 +320,15 @@ type OrphanCleanupPreparer interface {
 	PrepareOrphanCleanup(ctx context.Context, item InventoryItem, expectedWorkspace string) (Instance, error)
 }
 
+// AbsentInstanceFinalizer completes receipt-owned local cleanup after inventory
+// reports an instance absent, including a deletion that finished between retries.
+// Implementations must independently verify exact identity absence before local
+// cleanup and must not mutate a sandbox that reappears. Failure retains the
+// lifecycle cleanup fence; providers without local artifacts need not implement it.
+type AbsentInstanceFinalizer interface {
+	FinalizeAbsentInstance(ctx context.Context, instance Instance) error
+}
+
 // ArtifactManager is an optional provider capability for runtimes whose
 // reusable artifact is not prepared by the shared OCI image pipeline.
 type ArtifactManager interface {
