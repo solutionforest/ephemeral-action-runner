@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -307,45 +308,52 @@ func TestProviderInventoryEvidenceIgnoresWorkspaceOrdering(t *testing.T) {
 }
 
 func TestRecoveryPersistsForeignPrefixCensusAndFencesItsOmission(t *testing.T) {
-	t.Setenv("EPAR_STATE_HOME", t.TempDir())
-	ledger, err := provider.OpenControlPlaneRecoveryLedger()
-	if err != nil {
-		t.Fatal(err)
-	}
-	local := recoveryInventoryItem("epar-test-local-runner", "provider:local-runner")
-	foreign := recoveryInventoryItem("another-config-runner", "provider:foreign-runner")
-	lifecycle := &controlPlaneRecoveryLifecycle{
-		inventorySets: [][]provider.InventoryItem{
-			{local, foreign}, // required pre-intervention host-wide census
-			{local},          // every post-recovery view omits the foreign identity
-			{local},
-			{local},
-		},
-	}
-	manager := Manager{
-		Config:                 configForRecoveryHardeningTest(),
-		Lifecycle:              lifecycle,
-		providerRecoveryLedger: ledger,
-	}
+	for _, workspaceFree := range []bool{false, true} {
+		t.Run(fmt.Sprintf("workspace-free=%t", workspaceFree), func(t *testing.T) {
+			t.Setenv("EPAR_STATE_HOME", t.TempDir())
+			ledger, err := provider.OpenControlPlaneRecoveryLedger()
+			if err != nil {
+				t.Fatal(err)
+			}
+			local := recoveryInventoryItem("epar-test-local-runner", "provider:local-runner")
+			foreign := recoveryInventoryItem("another-config-runner", "provider:foreign-runner")
+			if workspaceFree {
+				foreign.Workspaces = []string{}
+			}
+			lifecycle := &controlPlaneRecoveryLifecycle{
+				inventorySets: [][]provider.InventoryItem{
+					{local, foreign}, // required pre-intervention host-wide census
+					{local},          // every post-recovery view omits the foreign identity
+					{local},
+					{local},
+				},
+			}
+			manager := Manager{
+				Config:                 configForRecoveryHardeningTest(),
+				Lifecycle:              lifecycle,
+				providerRecoveryLedger: ledger,
+			}
 
-	handled, recoveryErr := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
-	if !handled || recoveryErr != nil {
-		t.Fatalf("foreign-prefix recovery = handled %t error %v, want handled verification retry", handled, recoveryErr)
-	}
-	state, err := ledger.State(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.ExpectedIdentities[local.Instance.Name] != local.Instance.ProviderID || state.ExpectedIdentities[foreign.Instance.Name] != foreign.Instance.ProviderID {
-		t.Fatalf("durable host-wide census = %#v, want local and foreign exact identities", state.ExpectedIdentities)
-	}
-	if state.RecoveryReservationPhase != provider.RecoveryReservationVerifying || state.RecoveryReservationToken == 0 {
-		t.Fatalf("post-omission recovery state = %#v, want retained verification-only reservation", state)
-	}
-	lifecycle.mu.Lock()
-	defer lifecycle.mu.Unlock()
-	if lifecycle.recoverCalls != 1 || lifecycle.inventoryCalls != 2 {
-		t.Fatalf("foreign omission calls = intervention=%d inventory=%d, want one census, one failed verification, and one intervention", lifecycle.recoverCalls, lifecycle.inventoryCalls)
+			handled, recoveryErr := manager.recoverProviderControlPlane(context.Background(), provider.ErrControlPlaneAdmissionFailure)
+			if !handled || recoveryErr != nil {
+				t.Fatalf("foreign-prefix recovery = handled %t error %v, want handled verification retry", handled, recoveryErr)
+			}
+			state, err := ledger.State(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.ExpectedIdentities[local.Instance.Name] != local.Instance.ProviderID || state.ExpectedIdentities[foreign.Instance.Name] != foreign.Instance.ProviderID {
+				t.Fatalf("durable host-wide census = %#v, want local and foreign exact identities", state.ExpectedIdentities)
+			}
+			if state.RecoveryReservationPhase != provider.RecoveryReservationVerifying || state.RecoveryReservationToken == 0 {
+				t.Fatalf("post-omission recovery state = %#v, want retained verification-only reservation", state)
+			}
+			lifecycle.mu.Lock()
+			defer lifecycle.mu.Unlock()
+			if lifecycle.recoverCalls != 1 || lifecycle.inventoryCalls != 2 {
+				t.Fatalf("foreign omission calls = intervention=%d inventory=%d, want one census, one failed verification, and one intervention", lifecycle.recoverCalls, lifecycle.inventoryCalls)
+			}
+		})
 	}
 }
 

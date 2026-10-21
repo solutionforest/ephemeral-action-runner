@@ -131,9 +131,9 @@ func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 		if err != nil {
 			return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported agent field")
 		}
-		workspaces, err := requiredStringArray(record, "workspaces")
-		if err != nil || len(workspaces) == 0 {
-			return nil, fmt.Errorf("docker sandboxes inventory omitted workspaces")
+		workspaces, err := inventoryWorkspaces(record)
+		if err != nil {
+			return nil, fmt.Errorf("docker sandboxes inventory contained invalid workspaces")
 		}
 		if _, duplicate := seenNames[name]; duplicate {
 			return nil, fmt.Errorf("docker sandboxes inventory returned a duplicate name")
@@ -214,13 +214,16 @@ func consumeUniqueJSONValue(decoder *json.Decoder) error {
 	}
 }
 
-func requiredStringArray(record map[string]json.RawMessage, key string) ([]string, error) {
-	raw, ok := record[key]
+func inventoryWorkspaces(record map[string]json.RawMessage) ([]string, error) {
+	raw, ok := record["workspaces"]
 	if !ok {
-		return nil, fmt.Errorf("missing field")
+		// sbx omits this field for a sandbox created without workspace mounts.
+		// Normalize that documented state to an explicit, known-empty list;
+		// EPAR-owned instances still require their exact staging workspace.
+		return []string{}, nil
 	}
 	var values []string
-	if err := json.Unmarshal(raw, &values); err != nil || len(values) == 0 {
+	if err := json.Unmarshal(raw, &values); err != nil || values == nil {
 		return nil, fmt.Errorf("invalid field")
 	}
 	seen := make(map[string]struct{}, len(values))

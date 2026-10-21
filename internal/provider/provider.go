@@ -213,6 +213,8 @@ type InventoryItem struct {
 	// Workspaces are the exact host paths reported by the provider for this
 	// instance. They are ownership evidence for crash reconciliation; callers
 	// must compare canonical paths using host-platform path semantics.
+	// A non-nil empty slice means the provider confirms no workspace mounts;
+	// nil means workspace evidence is unavailable.
 	Workspaces []string
 }
 

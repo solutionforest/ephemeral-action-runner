@@ -106,6 +106,10 @@ func TestPrepareOrphanCleanupRejectsWorkspaceMismatch(t *testing.T) {
 	if _, err := p.PrepareOrphanCleanup(context.Background(), item, filepath.Join(root, "other")); err == nil {
 		t.Fatal("workspace mismatch was accepted for orphan cleanup")
 	}
+	item.Workspaces = []string{}
+	if _, err := p.PrepareOrphanCleanup(context.Background(), item, owned.Path); err == nil {
+		t.Fatal("workspace-free sandbox was accepted for orphan cleanup")
+	}
 }
 
 func TestCreateDryRunFailsBeforeProviderSideEffects(t *testing.T) {
@@ -1579,6 +1583,25 @@ func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T)
 	done()
 }
 
+func TestCreateFencesWorkspaceFreeReadback(t *testing.T) {
+	workspaceFree := strings.Replace(readyListJSON, `,"workspaces":[`+strconv.Quote(testWorkspace)+`]`, "", 1)
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
+		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: workspaceFree}},
+	)
+	instance, err := p.Create(context.Background(), validCreateRequest())
+	if !errors.Is(err, provider.ErrCreateOutcomeUncertain) || !strings.Contains(err.Error(), "exact shell workspace") {
+		t.Fatalf("workspace-free create error = %v, want uncertain outcome with workspace mismatch", err)
+	}
+	if instance.ReceiptVersion != "" || len(instance.Receipt) != 0 {
+		t.Fatalf("workspace-free readback acquired ownership receipt: %#v", instance)
+	}
+	done()
+}
+
 func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
 	opaqueTemplateList := strings.Replace(templateListJSON, "39cf20eca861", "ec2006fea720", 1)
 	opaqueInspection := strings.Replace(inspectionJSON, testDigest, "sha256:ec2006fea720"+strings.Repeat("9", 52), 1)
@@ -2040,6 +2063,20 @@ func TestInventoryParsesSupportedEnvelopesAndFailsClosedOnSchemaDrift(t *testing
 			t.Fatalf("explicit empty inventory = %v, %v", items, err)
 		}
 	}
+	workspaceFree, err := os.ReadFile("testdata/sbx-v0.49.1-workspace-free.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []string{
+		string(workspaceFree),
+		`{"sandboxes":` + string(workspaceFree) + `}`,
+		strings.Replace(readyListJSON, `"workspaces":[`+strconv.Quote(testWorkspace)+`]`, `"workspaces":[]`, 1),
+	} {
+		items, err := parseInventory([]byte(fixture))
+		if err != nil || len(items) != 1 || items[0].Workspaces == nil || len(items[0].Workspaces) != 0 {
+			t.Fatalf("workspace-free inventory = %#v, %v", items, err)
+		}
+	}
 	for _, fixture := range []string{
 		`null`,
 		`[null]`,
@@ -2049,8 +2086,9 @@ func TestInventoryParsesSupportedEnvelopesAndFailsClosedOnSchemaDrift(t *testing
 		`{"sandboxes":null}`,
 		`{"sandboxes":[{"name":"epar-sandbox-1","status":"running","workspaces":["/staging"]}]}`,
 		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","state":"running","workspaces":["/staging"]}]}`,
-		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","status":"running"}]}`,
-		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","status":"running","workspaces":[]}]}`,
+		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","status":"running","workspaces":null}]}`,
+		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","status":"running","workspaces":"/staging"}]}`,
+		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","status":"running","workspaces":[""]}]}`,
 		`{"sandboxes":[{"id":"id-1","name":"epar-sandbox-1","status":"running","workspaces":["/staging","/staging"]}]}`,
 	} {
 		if _, err := parseInventory([]byte(fixture)); err == nil {
