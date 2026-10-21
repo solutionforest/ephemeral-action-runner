@@ -39,6 +39,13 @@ func (environment *dockerSourceResolutionEnvironment) RunHostOutput(_ context.Co
 
 func TestDockerSandboxesHelperChecksumsMatchGuestScripts(t *testing.T) {
 	templateRoot := filepath.Join("..", "..", "templates", "docker-sandboxes")
+	ignore, err := os.ReadFile(filepath.Join(templateRoot, ".dockerignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains("\n"+string(ignore), "\n!guest/package-locks.py\n") {
+		t.Fatal("package lock observer is excluded from the runner template build context")
+	}
 	content, err := os.ReadFile(filepath.Join(templateRoot, "helpers.sha256"))
 	if err != nil {
 		t.Fatal(err)
@@ -303,6 +310,7 @@ func TestDockerSandboxesRunnerIdentityAndCredentialHygieneContract(t *testing.T)
 			`kill -KILL "${remaining_pids[@]}"`,
 			"pgrep -x apt-get",
 			"pgrep -f -x '/usr/lib/apt/apt.systemd.daily.*'",
+			"/usr/bin/python3 /opt/epar/package-locks.py",
 			"EPAR_CANDIDATE_RECOVERY=package-manager-contention",
 			"timed out waiting for unexpected package-manager processes",
 		} {

@@ -10,8 +10,9 @@ fi
 # fixed command. On some hosts its network requests never finish, so merely
 # waiting for the lock can permanently prevent runner registration. The
 # template also masks Ubuntu's periodic units; terminate only the exact
-# Docker-Sandboxes-owned refresh, then wait for every package-manager process
-# to release its locks before registration. Never use a broad apt kill pattern:
+# Docker-Sandboxes-owned refresh, then wait for live package-manager processes
+# and actual apt/dpkg locks before registration. Lock ownership is independent
+# of sbx's shell command and process naming. Never use a broad apt kill pattern:
 # an unexpected package operation must remain visible and fail closed.
 if command -v systemctl >/dev/null 2>&1; then
   systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
@@ -108,24 +109,44 @@ terminate_docker_sandboxes_bootstrap_refresh() {
 terminate_docker_sandboxes_bootstrap_refresh
 
 apt_processes() {
+  local pid key state rest
   {
     pgrep -x apt-get 2>/dev/null || true
     pgrep -x apt 2>/dev/null || true
     pgrep -x dpkg 2>/dev/null || true
     pgrep -x unattended-upgr 2>/dev/null || true
     pgrep -f -x '/usr/lib/apt/apt.systemd.daily.*' 2>/dev/null || true
-  } | sort -u
+  } | sort -u | while IFS= read -r pid; do
+    # A dead process cannot hold locks. A new sbx process supervisor may reap
+    # children differently; an unreaped zombie must not block registration.
+    state=""
+    while read -r key state rest; do
+      [[ "${key}" == "State:" ]] && break
+    done 2>/dev/null < "/proc/${pid}/status" || true
+    [[ -d "/proc/${pid}" ]] || continue
+    [[ "${state}" == "Z" || "${state}" == "X" ]] || printf '%s\n' "${pid}"
+  done
 }
 
 for attempt in $(seq 1 180); do
   mapfile -t package_pids < <(apt_processes)
-  if [[ "${#package_pids[@]}" == "0" ]]; then
+  lock_status=0
+  package_locks="$(/usr/bin/python3 /opt/epar/package-locks.py)" || lock_status=$?
+  if [[ "${lock_status}" != "0" && "${lock_status}" != "1" ]]; then
+    exit 1
+  fi
+  if [[ "${#package_pids[@]}" == "0" && "${lock_status}" == "0" ]]; then
     exit 0
   fi
   if [[ "${attempt}" == "180" ]]; then
     echo "EPAR_CANDIDATE_RECOVERY=package-manager-contention" >&2
     echo "EPAR Docker Sandboxes template: timed out waiting for unexpected package-manager processes: ${package_pids[*]}" >&2
-    ps -o pid=,ppid=,stat=,comm=,args= -p "$(IFS=,; echo "${package_pids[*]}")" >&2 || true
+    if [[ -n "${package_locks}" ]]; then
+      printf 'EPAR package-manager locks still held:\n%s\n' "${package_locks}" >&2
+    fi
+    if [[ "${#package_pids[@]}" != "0" ]]; then
+      ps -o pid=,ppid=,stat=,comm=,args= -p "$(IFS=,; echo "${package_pids[*]}")" >&2 || true
+    fi
     exit 1
   fi
   sleep 1

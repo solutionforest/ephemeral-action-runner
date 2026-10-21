@@ -213,6 +213,8 @@ type InventoryItem struct {
 	// Workspaces are the exact host paths reported by the provider for this
 	// instance. They are ownership evidence for crash reconciliation; callers
 	// must compare canonical paths using host-platform path semantics.
+	// A non-nil empty slice means the provider confirms no workspace mounts;
+	// nil means workspace evidence is unavailable.
 	Workspaces []string
 }
 
@@ -316,6 +318,15 @@ type ControlPlaneIdentityAbsenceVerifier interface {
 // the configured prefix boundary before invoking cleanup.
 type OrphanCleanupPreparer interface {
 	PrepareOrphanCleanup(ctx context.Context, item InventoryItem, expectedWorkspace string) (Instance, error)
+}
+
+// AbsentInstanceFinalizer completes receipt-owned local cleanup after inventory
+// reports an instance absent, including a deletion that finished between retries.
+// Implementations must independently verify exact identity absence before local
+// cleanup and must not mutate a sandbox that reappears. Failure retains the
+// lifecycle cleanup fence; providers without local artifacts need not implement it.
+type AbsentInstanceFinalizer interface {
+	FinalizeAbsentInstance(ctx context.Context, instance Instance) error
 }
 
 // ArtifactManager is an optional provider capability for runtimes whose

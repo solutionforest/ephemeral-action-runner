@@ -203,7 +203,7 @@ func TestInitCreatesDockerContainerConfigAfterUnavailableSandboxesDefault(t *tes
 	if !strings.Contains(out.String(), "4. Change runner image") {
 		t.Fatalf("review did not retain the simplified runner-image edit action:\n%s", out.String())
 	}
-	for _, want := range []string{"1. Docker Sandboxes — recommended (default)", "C. Show compatibility providers", "2. Docker Container — private daemon", "Docker Sandboxes — recommended is unavailable", "Docker Sandboxes unavailable in provider-neutral wizard test", "verify Docker with 'docker info'", "run 'sbx diagnose --output json'", "EPAR will not fall back to another provider"} {
+	for _, want := range []string{"1. Docker Sandboxes — recommended (default)", "C. Show compatibility providers", "2. Docker Container — private daemon", "Docker Sandboxes — recommended is unavailable", "Docker Sandboxes unavailable in provider-neutral wizard test", "verify Docker with 'docker info'", "run 'sbx diagnose --format json'", "EPAR will not fall back to another provider"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("init output did not preserve the fixed provider order and unavailable-default remediation %q:\n%s", want, out.String())
 		}
@@ -1594,7 +1594,7 @@ func TestDockerSandboxesPrerequisitesExplainHowToInspectFailedDiagnosticHints(t 
 	if got.DockerSandboxesAvailable {
 		t.Fatal("Docker Sandboxes was available despite failed diagnostics")
 	}
-	for _, want := range []string{"1 failed check", "sbx diagnose --output json", "hints for each failed check"} {
+	for _, want := range []string{"1 failed check", "sbx diagnose --format json", "hints for each failed check"} {
 		if !strings.Contains(got.DockerSandboxesStatus, want) {
 			t.Fatalf("Docker Sandboxes status omitted %q: %s", want, got.DockerSandboxesStatus)
 		}

@@ -368,7 +368,7 @@ func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding 
 	foundBlocked := false
 	foundAllowed := false
 	for _, record := range document.Allowed {
-		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
+		if record.SandboxName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
 			continue
 		}
 		if _, exactRelay := relayHosts[record.Host]; !exactRelay {
@@ -380,7 +380,7 @@ func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding 
 		foundAllowed = true
 	}
 	for _, record := range document.Blocked {
-		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) || record.Count <= 0 {
+		if record.SandboxName != binding.Instance.Name || record.LastSeen.Before(startedAt) || record.Count <= 0 {
 			continue
 		}
 		if _, exactRelay := relayHosts[record.Host]; exactRelay {
@@ -410,13 +410,7 @@ func (p *Provider) readHostTrustRelayPolicyLog(ctx context.Context, instance pro
 	if err != nil {
 		return policyLogDocument{}, err
 	}
-	decoder := json.NewDecoder(strings.NewReader(result.Stdout))
-	decoder.DisallowUnknownFields()
-	var document policyLogDocument
-	if err := decoder.Decode(&document); err != nil || requireJSONEOF(decoder) != nil {
-		return policyLogDocument{}, fmt.Errorf("Docker Sandboxes policy log returned an unsupported json schema")
-	}
-	return document, nil
+	return parsePolicyLog([]byte(result.Stdout))
 }
 
 func hostTrustRelayPolicyHosts(port int) map[string]struct{} {
@@ -436,7 +430,7 @@ func (p *Provider) verifyBoundHostTrustRelayPolicy(ctx context.Context, binding 
 	}
 	relayHosts := hostTrustRelayPolicyHosts(binding.Port)
 	for _, record := range document.Blocked {
-		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
+		if record.SandboxName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
 			continue
 		}
 		if _, exactRelay := relayHosts[record.Host]; exactRelay {
@@ -446,7 +440,7 @@ func (p *Provider) verifyBoundHostTrustRelayPolicy(ctx context.Context, binding 
 	foundTransparentRelay := false
 	foundUnattributedRelay := false
 	for _, record := range document.Allowed {
-		if record.VMName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
+		if record.SandboxName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
 			continue
 		}
 		if record.Host == "registry-1.docker.io:443" && record.ProxyType == "forward" {

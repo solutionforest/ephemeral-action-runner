@@ -201,7 +201,7 @@ if (@($neutralMarker.scopes).Count -ne 0) { throw 'prebuilt host-trust marker sc
 if ($dockerfile -match '(?im)apt-get\s+update|(?im)\blatest\b|(?im)COPY\s+.*var/lib/docker|(?im)--privileged|(?im)--secret') {
     throw 'Dockerfile contains an unpinned, privileged, secret, or /var/lib/docker preload pattern'
 }
-foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!guest/docker-daemon.json', '!inputs/emulation-licenses/*.txt', '!hook-launcher/*.go', '!egress-bridge/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
+foreach ($requiredContextEntry in @('!Dockerfile', '!helpers.sha256', '!guest/*.sh', '!guest/package-locks.py', '!guest/docker-daemon.json', '!inputs/emulation-licenses/*.txt', '!hook-launcher/*.go', '!egress-bridge/*.go', '!custom-install/run.sh', '!profiles/*.compatibility.json')) {
     if (-not ($dockerignore -split "`r?`n").Contains($requiredContextEntry)) {
         throw ".dockerignore is missing deterministic context entry: $requiredContextEntry"
     }

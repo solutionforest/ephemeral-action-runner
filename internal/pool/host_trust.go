@@ -43,6 +43,7 @@ var hostTrustControllerInContainer = linuxControllerInContainer
 var hostTrustControllerOS = runtime.GOOS
 
 var errHostTrustLeaseSnapshot = errors.New("host trust lease snapshot unavailable")
+var errHostTrustLeaseWriteTimeout = errors.New("host trust lease write exceeded")
 
 type hostTrustImageMetadata = artifactimage.HostTrustMetadata
 
@@ -462,7 +463,7 @@ func (m *Manager) issueHostTrustLeaseWithLifetime(ctx context.Context, instanceN
 			revokeErr = fmt.Errorf("host trust lease revocation failed: %w", revokeErr)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return errors.Join(fmt.Errorf("host trust lease write exceeded %s: %w", hostTrustWriteTimeout, err), revokeErr)
+			return errors.Join(fmt.Errorf("%w %s: %w", errHostTrustLeaseWriteTimeout, hostTrustWriteTimeout, err), revokeErr)
 		}
 		return errors.Join(err, revokeErr)
 	}

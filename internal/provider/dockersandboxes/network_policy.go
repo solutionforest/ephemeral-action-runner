@@ -15,22 +15,6 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
-type policyLogRecord struct {
-	Host      string    `json:"host"`
-	VMName    string    `json:"vm_name"`
-	ProxyType string    `json:"proxy_type"`
-	Rule      *string   `json:"rule"`
-	LastSeen  time.Time `json:"last_seen"`
-	Since     time.Time `json:"since"`
-	Count     int       `json:"count_since"`
-	Reason    string    `json:"reason,omitempty"`
-}
-
-type policyLogDocument struct {
-	Blocked []policyLogRecord `json:"blocked_hosts"`
-	Allowed []policyLogRecord `json:"allowed_hosts"`
-}
-
 func validatePolicyCommand(args []string) error {
 	valid := false
 	if len(args) == 4 && args[1] == "ls" && args[2] == "--include-inactive" && args[3] == "--json" {
@@ -55,20 +39,9 @@ func validatePolicyCommand(args []string) error {
 }
 
 func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance provider.Instance, port int, startedAt time.Time) error {
-	result, err := p.run(ctx, commandRequest{
-		args:        []string{"policy", "log", instance.Name, "--json"},
-		operation:   "verify Docker Sandboxes host-trust relay route",
-		outputLimit: diagnosticOutputLimit,
-		timeout:     providerReadbackTimeout,
-	})
+	document, err := p.readHostTrustRelayPolicyLog(ctx, instance)
 	if err != nil {
 		return err
-	}
-	decoder := json.NewDecoder(strings.NewReader(result.Stdout))
-	decoder.DisallowUnknownFields()
-	var document policyLogDocument
-	if err := decoder.Decode(&document); err != nil || requireJSONEOF(decoder) != nil {
-		return fmt.Errorf("Docker Sandboxes policy log returned an unsupported json schema")
 	}
 	cutoff := startedAt.Add(-5 * time.Second)
 	relayHosts := map[string]struct{}{
@@ -76,7 +49,7 @@ func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance prov
 		netJoinHostPort("host.docker.internal", port): {},
 	}
 	for _, record := range document.Blocked {
-		if record.VMName == instance.Name && !record.LastSeen.Before(cutoff) {
+		if record.SandboxName == instance.Name && !record.LastSeen.Before(cutoff) {
 			if _, exactRelay := relayHosts[record.Host]; exactRelay {
 				return fmt.Errorf("Docker Sandboxes blocked the exact EPAR host-trust relay endpoint")
 			}
@@ -84,7 +57,7 @@ func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance prov
 	}
 	foundTransparentRelay := false
 	for _, record := range document.Allowed {
-		if record.VMName != instance.Name || record.LastSeen.Before(cutoff) {
+		if record.SandboxName != instance.Name || record.LastSeen.Before(cutoff) {
 			continue
 		}
 		if record.Host == "registry-1.docker.io:443" && record.ProxyType == "forward" {
@@ -141,9 +114,15 @@ func (p *Provider) ApplyNetworkPolicy(ctx context.Context, instance provider.Ins
 			return err
 		}
 		args := []string{"policy", string(rule.Decision), "network", "--sandbox", instance.Name, strings.Join(rule.Resources, ",")}
-		result, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy", timeout: providerCleanupTimeout})
-		if runErr != nil && !strings.Contains(strings.ToLower(result.Stdout+"\n"+result.Stderr), "already covered") {
-			return classifyApplyNetworkPolicyAdmissionTimeout(ctx, runErr)
+		_, runErr := p.run(ctx, commandRequest{args: args, operation: "apply docker sandbox network policy", timeout: providerCleanupTimeout})
+		if runErr != nil {
+			if ctx.Err() != nil || !isOnlyCommandExitOne(runErr) {
+				return classifyApplyNetworkPolicyAdmissionTimeout(ctx, runErr)
+			}
+			actual, readbackErr := p.ReadNetworkPolicy(ctx, instance)
+			if readbackErr != nil || !containsSandboxPolicyRule(actual, rule, instance.Name) {
+				return classifyApplyNetworkPolicyAdmissionTimeout(ctx, errors.Join(runErr, readbackErr))
+			}
 		}
 	}
 	actual, err := p.readNetworkPolicyVerified(ctx, instance)
@@ -228,13 +207,19 @@ func (p *Provider) RemoveNetworkPolicy(ctx context.Context, instance provider.In
 		if !sameStablePolicyRuleIdentity(matched, rule) {
 			return fmt.Errorf("refusing to remove a network policy rule whose stable identity changed")
 		}
-		result, runErr := p.run(ctx, commandRequest{
+		_, runErr := p.run(ctx, commandRequest{
 			args:      []string{"policy", "rm", "network", "--sandbox", instance.Name, "--id", rule.ID},
 			operation: "remove docker sandbox network policy",
 			timeout:   providerCleanupTimeout,
 		})
-		if runErr != nil && !isMissingPolicyRule(result.Stdout+"\n"+result.Stderr+"\n"+runErr.Error()) {
-			return runErr
+		if runErr != nil {
+			if ctx.Err() != nil || !isOnlyCommandExitOne(runErr) {
+				return errors.Join(runErr, ctx.Err())
+			}
+			remaining, readbackErr := p.ReadNetworkPolicy(ctx, instance)
+			if readbackErr != nil || containsPolicyRuleID(remaining, rule.ID) {
+				return errors.Join(runErr, readbackErr)
+			}
 		}
 	}
 	remaining, err := p.readNetworkPolicyVerified(ctx, instance)
@@ -481,9 +466,4 @@ func sameStablePolicyRuleIdentity(actual, expected provider.NetworkPolicyRule) b
 	sort.Strings(actualResources)
 	sort.Strings(expectedResources)
 	return slices.Equal(actualResources, expectedResources)
-}
-
-func isMissingPolicyRule(text string) bool {
-	text = strings.ToLower(text)
-	return strings.Contains(text, "rule not found") || strings.Contains(text, "no matching rule") || strings.Contains(text, "status 404")
 }
