@@ -2880,6 +2880,17 @@ func TestVerifyHostReadinessAcceptsWarningsWithPassingChecksAndNoFailures(t *tes
 	done()
 }
 
+func TestVerifyHostReadinessAcceptsDiagnosticsWithoutPresentationText(t *testing.T) {
+	p, done := scriptedProvider(t,
+		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"pass"},{"name":"update","status":"warn"}],"summary":{"pass":1,"warn":1,"fail":0,"skip":0}}`}},
+	)
+	readiness, err := p.VerifyHostReadiness(context.Background())
+	if err != nil || readiness.ChecksPassed != 1 || readiness.ChecksWarned != 1 {
+		t.Fatalf("minimal diagnostic readiness = %#v, %v", readiness, err)
+	}
+	done()
+}
+
 func TestVerifyHostReadinessRejectsFailedOrEmptyDiagnostics(t *testing.T) {
 	tests := []struct {
 		name    string

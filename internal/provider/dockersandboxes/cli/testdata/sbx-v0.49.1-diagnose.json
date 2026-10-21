@@ -1,0 +1,130 @@
+{
+  "version": "1.0",
+  "checks": [
+    {
+      "name": "CLI binary",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "Binary version",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Host processes",
+      "status": "warn",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "Daemon",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "Daemon diagnostics",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Virtualization",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "mkfs.erofs",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "mkfs.ext4",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "Storage directories",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Directory permissions",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Disk space",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "[captured descriptive text redacted]",
+      "hint": ""
+    },
+    {
+      "name": "ZFS offset sync",
+      "status": "skip",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Version match",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Socket",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "SSH client config",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Authentication",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    },
+    {
+      "name": "Global network policy",
+      "status": "pass",
+      "message": "[captured descriptive text redacted]",
+      "detail": "",
+      "hint": ""
+    }
+  ],
+  "summary": {
+    "pass": 15,
+    "warn": 1,
+    "fail": 0,
+    "skip": 1
+  }
+}

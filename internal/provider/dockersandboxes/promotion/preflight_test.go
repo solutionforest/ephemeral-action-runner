@@ -249,6 +249,26 @@ func TestRunPreflightAcceptsDiagnosticWarningsAndSkips(t *testing.T) {
 	}
 }
 
+func TestRunPreflightAcceptsDiagnosticsWithoutPresentationText(t *testing.T) {
+	record, outputs := validPreflightFixture(t)
+	outputs["diagnose\x00--format\x00json"] = []byte(`{"version":"1.0","checks":[{"name":"daemon","status":"pass"},{"name":"update","status":"warn"}],"summary":{"pass":1,"warn":1,"fail":0,"skip":0}}`)
+	required, _ := requiredHostFreeBytes(record, 500<<30)
+	result := RunPreflight(context.Background(), record, PreflightOptions{
+		ProjectRoot:        t.TempDir(),
+		StorageRoot:        t.TempDir(),
+		NativeController:   true,
+		ControllerRevision: record.EPARRevision,
+		RunSBX:             fixtureCommandRunner(outputs),
+		HostSpace: func(string) (HostSpace, error) {
+			return HostSpace{AvailableBytes: required, TotalBytes: 500 << 30}, nil
+		},
+		CheckVirtualization: func() error { return nil },
+	})
+	if !result.Passed() {
+		t.Fatalf("preflight rejected diagnostics without presentation text: %+v", result.Failures)
+	}
+}
+
 func TestRunPreflightDiagnosticFailureExplainsHowToInspectHints(t *testing.T) {
 	record, outputs := validPreflightFixture(t)
 	outputs["diagnose\x00--format\x00json"] = []byte(diagnosticsFixture("Daemon", "fail"))
