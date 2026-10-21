@@ -1,0 +1,13 @@
+[
+  {
+    "name": "epar-compat-mountless-20261021-01",
+    "id": "aa47c1a0-f963-4234-a6aa-836cd6c7d079",
+    "agent": "shell",
+    "status": "stopped",
+    "last_used_at": "2026-10-21T10:25:16.115587Z",
+    "cpus": 1,
+    "memory": "1g",
+    "memory_mib": 1024,
+    "created_at": "2026-10-21T10:25:14Z"
+  }
+]

@@ -3,25 +3,58 @@ package dockersandboxes
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
+func inventoryArray(t *testing.T, wrapper, key string) string {
+	t.Helper()
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(wrapper), &document); err != nil {
+		t.Fatal(err)
+	}
+	return string(document[key])
+}
+
+func TestTemplateInventorySupportedEnvelopes(t *testing.T) {
+	legacy, err := parseTemplateInventory([]byte(templateListJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	modern := inventoryArray(t, templateListJSON, "images")
+	images, err := parseTemplateInventory([]byte(modern))
+	if err != nil || !reflect.DeepEqual(images, legacy) {
+		t.Fatalf("array inventory = %v, %v; want %v", images, err, legacy)
+	}
+	p, done := scriptedProvider(t, commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: modern}})
+	if err := p.verifyImportedTemplate(context.Background(), testTemplate, "39cf20eca861"); err != nil {
+		t.Fatal(err)
+	}
+	done()
+}
+
 func TestTemplateInventoryDiagnosticCategories(t *testing.T) {
-	images, err := parseTemplateInventory([]byte(`{"images":[]}`))
-	if err != nil || images == nil || len(images) != 0 {
-		t.Fatalf("explicit empty inventory = %v, %v", images, err)
+	for _, fixture := range []string{`{"images":[]}`, `[]`} {
+		images, err := parseTemplateInventory([]byte(fixture))
+		if err != nil || images == nil || len(images) != 0 {
+			t.Fatalf("explicit empty inventory = %v, %v", images, err)
+		}
 	}
 	for _, test := range []struct{ input, category string }{
 		{"secret-token", "invalid_json"},
 		{`{"images":[]} secret-token`, "invalid_json"},
 		{`null`, "invalid_root_type"},
-		{`[]`, "invalid_root_type"},
+		{`"secret-token"`, "invalid_root_type"},
+		{`[] {}`, "invalid_json"},
+		{`[null]`, "invalid_image_schema"},
+		{`[{"id":"secret-token","id":"other"}]`, "duplicate_json_key"},
 		{`{"secret-token":[]}`, "missing_images"},
 		{`{"images":null}`, "invalid_images_type"},
 		{`{"images":"secret-token"}`, "invalid_images_type"},

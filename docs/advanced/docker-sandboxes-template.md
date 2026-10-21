@@ -7,10 +7,10 @@ Docker Sandboxes requires an EPAR runner template built from the desired Cattheh
 Use a native Docker server that matches the template platform. An amd64 server builds `linux/amd64`; an ARM64 server builds `linux/arm64`. The pinned build intentionally does not use emulation. Confirm Docker Sandboxes readiness before loading a template:
 
 ```bash
-sbx diagnose --output json
+sbx diagnose --format json
 ```
 
-EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) pins build tooling and platform inputs. The selected Catthehacker source tag and Actions runner selector are resolved independently to exact immutable identities when the update schedule is due.
+Before sbx v0.48, use `sbx diagnose --output json` instead. EPAR requires at least one diagnostic pass and no diagnostic failures. Warnings and skipped checks are accepted. When a diagnostic fails, review the failed item and its hint in the JSON output. The lock file at [`templates/docker-sandboxes/sources.lock.json`](../../templates/docker-sandboxes/sources.lock.json) pins build tooling and platform inputs. The selected Catthehacker source tag and Actions runner selector are resolved independently to exact immutable identities when the update schedule is due.
 
 ## Build, Import, And Review
 
@@ -48,7 +48,7 @@ The template cache and archive are host-cache measurements, not each sandbox's r
 
 ## Retention And Replacement
 
-Docker Sandboxes retains loaded templates after individual sandboxes are deleted. At startup and after activating a replacement, EPAR removes a superseded template only when its catalog receipt, configurations, leases, and live-sandbox inventory prove it is unreferenced. It verifies absence after `sbx template rm <exact-tag>`. Do not use `sbx reset`: it removes the whole Docker Sandboxes cache.
+Docker Sandboxes retains loaded templates after individual sandboxes are deleted. At startup and after activating a replacement, EPAR removes a superseded template only when its catalog receipt, configurations, leases, and live-sandbox inventory prove it is unreferenced. It verifies absence after `sbx template rm --force <exact-cache-id>`; `--force` skips the CLI confirmation prompt so unattended cleanup can finish after EPAR's ownership and reference checks. Do not use `sbx reset`: it removes the whole Docker Sandboxes cache.
 
 The direct build does not create a Docker staging image. Once the imported template is authoritative, EPAR removes the transient archive workspace and retains only compact evidence. A completely verified archive left by an interrupted import can resume directly; partial or malformed archives are never activated. Prefix-era or shared templates remain report-only until `storage prune --legacy` produces an approved exact plan. EPAR never broadly prunes Docker images, BuildKit state, Docker Sandboxes templates, WSL distributions, or Tart images. Docker Desktop VHDX compaction is separate offline host maintenance.
 

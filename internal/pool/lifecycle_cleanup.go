@@ -462,6 +462,13 @@ func (m *Manager) removeExactProviderInstance(ctx context.Context, record poolst
 		}
 	}
 	if exact == nil {
+		if finalizer, ok := m.providerLifecycle().(provider.AbsentInstanceFinalizer); ok {
+			instance := provider.Instance{Name: record.Name, ProviderID: record.ProviderID, ReceiptVersion: record.Receipt.Version, Receipt: append([]byte(nil), record.Receipt.Payload...)}
+			cleanupCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			defer cancel()
+			err := finalizer.FinalizeAbsentInstance(cleanupCtx, instance)
+			return classifyProviderOperationError(ctx, cleanupCtx, instance, "finalize exact absent provider instance", err)
+		}
 		return nil
 	}
 	exact.ReceiptVersion = record.Receipt.Version

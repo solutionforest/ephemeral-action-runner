@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
+	sandboxcli "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/cli"
 )
 
 var cachedTemplateIDPattern = regexp.MustCompile(`^[a-f0-9]{12}$`)
@@ -36,13 +37,18 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, invalid("duplicate_json_key")
 	}
-	var wrapper map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &wrapper); err != nil || wrapper == nil {
-		return nil, invalid("invalid_root_type")
-	}
-	rawImages, ok := wrapper["images"]
-	if !ok {
-		return nil, invalid("missing_images")
+	// v0.48+ returns an array; earlier releases wrap it in {"images":...}.
+	rawImages := bytes.TrimSpace(data)
+	if rawImages[0] != '[' {
+		var wrapper map[string]json.RawMessage
+		if err := decodeStrictJSON(data, &wrapper); err != nil || wrapper == nil {
+			return nil, invalid("invalid_root_type")
+		}
+		var ok bool
+		rawImages, ok = wrapper["images"]
+		if !ok {
+			return nil, invalid("missing_images")
+		}
 	}
 	if bytes.Equal(bytes.TrimSpace(rawImages), []byte("null")) || bytes.TrimSpace(rawImages)[0] != '[' {
 		return nil, invalid("invalid_images_type")
@@ -93,18 +99,17 @@ func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 	if err := rejectDuplicateJSONKeys(data); err != nil {
 		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var wrapper map[string]json.RawMessage
-	if err := decoder.Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
+	// Both documented envelopes carry the same identity/workspace contract.
+	rawSandboxes := bytes.TrimSpace(data)
+	if rawSandboxes[0] != '[' {
+		var wrapper map[string]json.RawMessage
+		if err := decodeStrictJSON(data, &wrapper); err != nil {
+			return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
+		}
+		rawSandboxes = wrapper["sandboxes"]
 	}
 	var records []map[string]json.RawMessage
-	rawSandboxes, ok := wrapper["sandboxes"]
-	if !ok || bytes.Equal(bytes.TrimSpace(rawSandboxes), []byte("null")) || json.Unmarshal(rawSandboxes, &records) != nil {
+	if bytes.Equal(bytes.TrimSpace(rawSandboxes), []byte("null")) || json.Unmarshal(rawSandboxes, &records) != nil {
 		return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported json schema")
 	}
 	items := make([]provider.InventoryItem, 0, len(records))
@@ -127,9 +132,9 @@ func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 		if err != nil {
 			return nil, fmt.Errorf("docker sandboxes inventory returned an unsupported agent field")
 		}
-		workspaces, err := requiredStringArray(record, "workspaces")
-		if err != nil || len(workspaces) == 0 {
-			return nil, fmt.Errorf("docker sandboxes inventory omitted workspaces")
+		workspaces, err := inventoryWorkspaces(record)
+		if err != nil {
+			return nil, fmt.Errorf("docker sandboxes inventory contained invalid workspaces")
 		}
 		if _, duplicate := seenNames[name]; duplicate {
 			return nil, fmt.Errorf("docker sandboxes inventory returned a duplicate name")
@@ -146,77 +151,19 @@ func parseInventory(data []byte) ([]provider.InventoryItem, error) {
 }
 
 func rejectDuplicateJSONKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := consumeUniqueJSONValue(decoder); err != nil {
-		return err
-	}
-	return requireJSONEOF(decoder)
+	return sandboxcli.RejectDuplicateJSONKeys(data)
 }
 
-func consumeUniqueJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, composite := token.(json.Delim)
-	if !composite {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return fmt.Errorf("json object key must be a string")
-			}
-			if _, duplicate := seen[key]; duplicate {
-				return fmt.Errorf("duplicate json object key %q", key)
-			}
-			seen[key] = struct{}{}
-			if err := consumeUniqueJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		if closing != json.Delim('}') {
-			return fmt.Errorf("json object did not end with a closing delimiter")
-		}
-		return nil
-	case '[':
-		for decoder.More() {
-			if err := consumeUniqueJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		if closing != json.Delim(']') {
-			return fmt.Errorf("json array did not end with a closing delimiter")
-		}
-		return nil
-	default:
-		return fmt.Errorf("unexpected json delimiter %q", delimiter)
-	}
-}
-
-func requiredStringArray(record map[string]json.RawMessage, key string) ([]string, error) {
-	raw, ok := record[key]
+func inventoryWorkspaces(record map[string]json.RawMessage) ([]string, error) {
+	raw, ok := record["workspaces"]
 	if !ok {
-		return nil, fmt.Errorf("missing field")
+		// sbx omits this field for a sandbox created without workspace mounts.
+		// Normalize that documented state to an explicit, known-empty list;
+		// EPAR-owned instances still require their exact staging workspace.
+		return []string{}, nil
 	}
 	var values []string
-	if err := json.Unmarshal(raw, &values); err != nil || len(values) == 0 {
+	if err := json.Unmarshal(raw, &values); err != nil || values == nil {
 		return nil, fmt.Errorf("invalid field")
 	}
 	seen := make(map[string]struct{}, len(values))
@@ -246,64 +193,8 @@ func parseDaemonStatus(data []byte) (state string, healthy bool, err error) {
 }
 
 func parseDiagnose(data []byte) (passed, warned, failed, skipped int, err error) {
-	var record map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &record); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported json schema")
-	}
-	version, versionErr := requiredJSONString(record, "version")
-	if versionErr != nil || version != "1.0" {
-		return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported schema version")
-	}
-	rawChecks, ok := record["checks"]
-	if !ok {
-		return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported json schema")
-	}
-	var checks []map[string]json.RawMessage
-	if err := json.Unmarshal(rawChecks, &checks); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported json schema")
-	}
-	for _, check := range checks {
-		if _, fieldErr := requiredJSONString(check, "name"); fieldErr != nil {
-			return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported check schema")
-		}
-		for _, field := range []string{"message", "detail", "hint"} {
-			if _, fieldErr := requiredStringField(check, field); fieldErr != nil {
-				return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported check schema")
-			}
-		}
-		status, statusErr := requiredJSONString(check, "status")
-		if statusErr != nil {
-			return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unsupported check schema")
-		}
-		switch strings.ToLower(status) {
-		case "pass":
-			passed++
-		case "warn":
-			warned++
-		case "fail":
-			failed++
-		case "skip":
-			skipped++
-		default:
-			return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics returned an unknown check status")
-		}
-	}
-	var summary map[string]json.RawMessage
-	rawSummary, ok := record["summary"]
-	if !ok || json.Unmarshal(rawSummary, &summary) != nil {
-		return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics summary did not match its checks")
-	}
-	summaryCounts := make([]int, 4)
-	for index, key := range []string{"pass", "warn", "fail", "skip"} {
-		rawCount, present := summary[key]
-		if !present || json.Unmarshal(rawCount, &summaryCounts[index]) != nil || summaryCounts[index] < 0 {
-			return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics summary did not match its checks")
-		}
-	}
-	if summaryCounts[0] != passed || summaryCounts[1] != warned || summaryCounts[2] != failed || summaryCounts[3] != skipped {
-		return 0, 0, 0, 0, fmt.Errorf("docker sandboxes diagnostics summary did not match its checks")
-	}
-	return passed, warned, failed, skipped, nil
+	report, err := sandboxcli.ParseDiagnostics(data)
+	return report.Passed, report.Warned, report.Failed, report.Skipped, err
 }
 
 func requiredJSONString(record map[string]json.RawMessage, key string) (string, error) {
@@ -326,18 +217,6 @@ func optionalJSONString(record map[string]json.RawMessage, key string) (string, 
 	var value string
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return "", err
-	}
-	return value, nil
-}
-
-func requiredStringField(record map[string]json.RawMessage, key string) (string, error) {
-	raw, ok := record[key]
-	if !ok {
-		return "", fmt.Errorf("missing field")
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", fmt.Errorf("invalid field")
 	}
 	return value, nil
 }

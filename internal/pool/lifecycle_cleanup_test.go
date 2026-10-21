@@ -865,6 +865,62 @@ type prefixOrphanLifecycle struct {
 	deleteCalls       int
 }
 
+func TestResumePendingLifecycleCleanupFinalizesAbsentInstanceBeforeTombstone(t *testing.T) {
+	manager, store, name := readyLifecycleManager(t)
+	for _, transition := range []poolstate.Transition{
+		{Action: poolstate.ActionFenceIntent},
+		{Action: poolstate.ActionFenced},
+		{Action: poolstate.ActionVerifyRemoteIntent},
+		{Action: poolstate.ActionRemoteAbsent},
+		{Action: poolstate.ActionRemoveLocalIntent},
+		{Action: poolstate.ActionCleanupPending},
+	} {
+		if _, err := store.Transition(context.Background(), name, transition); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := store.Read(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := &absentFinalizingLifecycle{finalizeErr: errors.New("local cleanup not finished")}
+	manager.Lifecycle = lifecycle
+	if err := manager.resumePendingLifecycleCleanup(context.Background()); err == nil {
+		t.Fatal("unfinished local cleanup was accepted")
+	}
+	record, err := store.Read(context.Background(), name)
+	if err != nil || record.Phase != poolstate.PhaseCleanupPending {
+		t.Fatalf("unfinished local cleanup lost its fence: phase=%s error=%v", record.Phase, err)
+	}
+	if got := lifecycle.finalized; got.Name != before.Name || got.ProviderID != before.ProviderID || got.ReceiptVersion != before.Receipt.Version || !bytes.Equal(got.Receipt, before.Receipt.Payload) {
+		t.Fatalf("finalization lost the durable identity or receipt: %+v", got)
+	}
+	lifecycle.finalizeErr = nil
+	if err := manager.resumePendingLifecycleCleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.Read(context.Background(), name)
+	if err != nil || record.Phase != poolstate.PhaseTombstoned {
+		t.Fatalf("completed local cleanup did not tombstone: phase=%s error=%v", record.Phase, err)
+	}
+	if lifecycle.finalizeCalls != 2 || lifecycle.deleteCalls != 0 || lifecycle.stopCalls != 0 {
+		t.Fatalf("unexpected finalization/mutation counts: %+v", lifecycle)
+	}
+}
+
+type absentFinalizingLifecycle struct {
+	prefixOrphanLifecycle
+	finalized     provider.Instance
+	finalizeErr   error
+	finalizeCalls int
+}
+
+func (lifecycle *absentFinalizingLifecycle) FinalizeAbsentInstance(_ context.Context, instance provider.Instance) error {
+	lifecycle.finalized = instance
+	lifecycle.finalizeCalls++
+	return lifecycle.finalizeErr
+}
+
 func (lifecycle *prefixOrphanLifecycle) Inventory(context.Context) ([]provider.InventoryItem, error) {
 	return append([]provider.InventoryItem(nil), lifecycle.items...), nil
 }

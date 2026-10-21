@@ -1,0 +1,24 @@
+{
+  "allowed": [
+    {
+      "sandbox_id": "joe-mac.sbx-bff676-20261021-183206-002",
+      "host": "broker.actions.githubusercontent.com:443",
+      "proxy_type": "forward-bypass",
+      "count": 1,
+      "first_seen": "2026-10-21T18:32:50.495843+08:00",
+      "last_seen": "2026-10-21T18:32:50.495843+08:00"
+    }
+  ],
+  "blocked": [
+    {
+      "sandbox_id": "joe-mac.sbx-bff676-20261021-183206-002",
+      "host": "joe-mac.sbx-bff676-20261021-183206-002",
+      "proxy_type": "network",
+      "rule": "<dns proxy policy>",
+      "reason": "DNS lookup blocked by proxy policy",
+      "count": 28,
+      "first_seen": "2026-10-21T18:32:13.585338+08:00",
+      "last_seen": "2026-10-21T18:32:18.140455+08:00"
+    }
+  ]
+}

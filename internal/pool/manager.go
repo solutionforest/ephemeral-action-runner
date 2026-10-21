@@ -2616,6 +2616,7 @@ const (
 	candidateReadinessListenerEnded         candidateRecoveryOutcome = "listener-ended"
 	candidateReadinessHealthUnknown         candidateRecoveryOutcome = "health-unknown"
 	candidateReadinessTimedOut              candidateRecoveryOutcome = "github-readiness-timeout"
+	candidateHostTrustLeaseTimedOut         candidateRecoveryOutcome = "host-trust-lease-timeout"
 	candidatePackageManagerContention       candidateRecoveryOutcome = "package-manager-contention"
 	candidatePackageManagerContentionMarker                          = "EPAR_CANDIDATE_RECOVERY=package-manager-contention"
 )
@@ -2635,6 +2636,8 @@ func (e *candidateRecoveryError) Error() string {
 		return fmt.Sprintf("runner process health remained unknown while waiting for readiness: %v", e.cause)
 	case candidateReadinessTimedOut:
 		return fmt.Sprintf("GitHub runner readiness was not observed before the timeout: %v", e.cause)
+	case candidateHostTrustLeaseTimedOut:
+		return fmt.Sprintf("host trust lease renewal timed out while waiting for runner readiness: %v", e.cause)
 	case candidatePackageManagerContention:
 		return fmt.Sprintf("candidate package-manager contention prevented runner configuration: %v", e.cause)
 	default:
@@ -2718,6 +2721,13 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 					return gh.Runner{}, fmt.Errorf("host trust changed while runner %s was registering (%s -> %s)", vm.Name, vm.HostTrustGeneration, current.Generation)
 				}
 				if err := m.issueHostTrustLease(waitCtx, vm.Name, current); err != nil {
+					// A timed-out write leaves this candidate unsafe to admit,
+					// even if revocation also times out. Preserve quarantine and
+					// exact capacity through the ordinary candidate recovery path.
+					// Cancellation and permanent trust/write failures stay terminal.
+					if waitCtx.Err() == nil && errors.Is(err, errHostTrustLeaseWriteTimeout) {
+						return gh.Runner{}, &candidateRecoveryError{outcome: candidateHostTrustLeaseTimedOut, cause: err}
+					}
 					cancel()
 					return gh.Runner{}, fmt.Errorf("refresh host trust lease while waiting for runner readiness: %w", err)
 				}

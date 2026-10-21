@@ -766,10 +766,10 @@ func providerInventoryEvidenceSet(items []provider.InventoryItem) ([]string, err
 		if item.Instance.Source != item.Source {
 			return nil, fmt.Errorf("inventory item %q has inconsistent instance and inventory source", name)
 		}
-		workspaces := append([]string(nil), item.Workspaces...)
-		if len(workspaces) == 0 {
+		if item.Workspaces == nil {
 			return nil, fmt.Errorf("inventory item %q omitted workspaces", name)
 		}
+		workspaces := append([]string{}, item.Workspaces...)
 		seenWorkspaces := make(map[string]struct{}, len(workspaces))
 		for _, workspace := range workspaces {
 			if strings.TrimSpace(workspace) != workspace || workspace == "" || strings.ContainsRune(workspace, 0) {

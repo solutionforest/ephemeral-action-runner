@@ -16,6 +16,7 @@ import (
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	sandboxcapacity "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/capacity"
+	sandboxcli "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/cli"
 	sandboxpolicy "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/policy"
 )
 
@@ -129,7 +130,7 @@ func RunPreflight(ctx context.Context, record Record, opts PreflightOptions) Pre
 		}
 	}
 	if opts.RunSBX == nil {
-		add("sbx command", "the Docker Sandboxes command runner is unavailable", "Install sbx on the native host, then run sbx diagnose --output json and review the hints for any failed checks.")
+		add("sbx command", "the Docker Sandboxes command runner is unavailable", "Install sbx on the native host, then run sbx diagnose --format json and review the hints for any failed checks.")
 		return result
 	}
 
@@ -140,19 +141,19 @@ func RunPreflight(ctx context.Context, record Record, opts PreflightOptions) Pre
 		add("daemon health", err.Error(), "Start or repair the Docker Sandboxes daemon, confirm sbx daemon status --json reports running, then rerun setup.")
 	}
 
-	diagnoseOutput, diagnoseErr := opts.RunSBX(ctx, []string{"diagnose", "--output", "json"})
+	diagnoseOutput, diagnoseErr := sandboxcli.Diagnose(ctx, opts.RunSBX)
 	if diagnoseErr != nil {
-		add("daemon diagnostics", diagnoseErr.Error(), "Run sbx diagnose --output json and review the hints for any failed checks, then rerun setup.")
+		add("daemon diagnostics", diagnoseErr.Error(), "Run sbx diagnose --format json and review the hints for any failed checks, then rerun setup.")
 	} else {
-		checks, err := parseDiagnostics(diagnoseOutput)
+		report, err := sandboxcli.ParseDiagnostics(diagnoseOutput)
 		if err != nil {
-			add("daemon diagnostics", err.Error(), "Run sbx diagnose --output json and review the hints for any failed checks, then rerun setup.")
+			add("daemon diagnostics", err.Error(), "Run sbx diagnose --format json and review the hints for any failed checks, then rerun setup.")
 		} else {
-			passed, failed := diagnosticPassAndFailureCounts(checks)
+			passed, failed := report.Passed, report.Failed
 			if failed != 0 {
-				add("daemon diagnostics", fmt.Sprintf("diagnostics reported %d failed check(s)", failed), "Run sbx diagnose --output json and review the hints for each failed check, then rerun setup.")
+				add("daemon diagnostics", fmt.Sprintf("diagnostics reported %d failed check(s)", failed), "Run sbx diagnose --format json and review the hints for each failed check, then rerun setup.")
 			} else if passed == 0 {
-				add("daemon diagnostics", "diagnostics reported no passing checks", "Run sbx diagnose --output json and review its check details, then rerun setup.")
+				add("daemon diagnostics", "diagnostics reported no passing checks", "Run sbx diagnose --format json and review its check details, then rerun setup.")
 			}
 		}
 	}
@@ -298,72 +299,6 @@ func verifyDaemonRunning(data []byte) error {
 	return nil
 }
 
-type diagnosticCheck struct {
-	Name   string
-	Status string
-}
-
-func parseDiagnostics(data []byte) ([]diagnosticCheck, error) {
-	var record map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &record); err != nil {
-		return nil, errors.New("Docker Sandboxes diagnostics returned unsupported JSON")
-	}
-	var version string
-	if raw, ok := record["version"]; !ok || json.Unmarshal(raw, &version) != nil || version != "1.0" {
-		return nil, errors.New("Docker Sandboxes diagnostics returned an unsupported schema version")
-	}
-	var rawChecks []map[string]json.RawMessage
-	if raw, ok := record["checks"]; !ok || json.Unmarshal(raw, &rawChecks) != nil || len(rawChecks) == 0 {
-		return nil, errors.New("Docker Sandboxes diagnostics omitted its checks")
-	}
-	checks := make([]diagnosticCheck, 0, len(rawChecks))
-	counts := map[string]int{"pass": 0, "warn": 0, "fail": 0, "skip": 0}
-	for _, rawCheck := range rawChecks {
-		name, err := requiredString(rawCheck, "name", false)
-		if err != nil {
-			return nil, errors.New("Docker Sandboxes diagnostics returned an unsupported check schema")
-		}
-		status, err := requiredString(rawCheck, "status", false)
-		if err != nil {
-			return nil, errors.New("Docker Sandboxes diagnostics returned an unsupported check schema")
-		}
-		for _, field := range []string{"message", "detail", "hint"} {
-			if _, err := requiredString(rawCheck, field, true); err != nil {
-				return nil, errors.New("Docker Sandboxes diagnostics returned an unsupported check schema")
-			}
-		}
-		status = strings.ToLower(status)
-		if _, ok := counts[status]; !ok {
-			return nil, errors.New("Docker Sandboxes diagnostics returned an unknown check status")
-		}
-		counts[status]++
-		checks = append(checks, diagnosticCheck{Name: name, Status: status})
-	}
-	var summary map[string]json.RawMessage
-	if raw, ok := record["summary"]; !ok || json.Unmarshal(raw, &summary) != nil {
-		return nil, errors.New("Docker Sandboxes diagnostic summary is missing")
-	}
-	for _, key := range []string{"pass", "warn", "fail", "skip"} {
-		var count int
-		if raw, ok := summary[key]; !ok || json.Unmarshal(raw, &count) != nil || count != counts[key] {
-			return nil, errors.New("Docker Sandboxes diagnostic summary did not match its checks")
-		}
-	}
-	return checks, nil
-}
-
-func diagnosticPassAndFailureCounts(checks []diagnosticCheck) (passed, failed int) {
-	for _, check := range checks {
-		switch check.Status {
-		case "pass":
-			passed++
-		case "fail":
-			failed++
-		}
-	}
-	return passed, failed
-}
-
 func verifyPromotedTemplate(data []byte, reference, cacheID string) error {
 	repository, tag, err := splitTemplateReference(reference)
 	if err != nil {
@@ -372,12 +307,16 @@ func verifyPromotedTemplate(data []byte, reference, cacheID string) error {
 	if !validTemplateCacheID(cacheID) {
 		return errors.New("promoted Docker Sandboxes template cache ID is invalid")
 	}
-	var wrapper map[string]json.RawMessage
-	if err := decodeStrictJSON(data, &wrapper); err != nil {
-		return errors.New("Docker Sandboxes template inventory returned unsupported JSON")
+	rawImages := bytes.TrimSpace(data)
+	if len(rawImages) == 0 || rawImages[0] != '[' {
+		var wrapper map[string]json.RawMessage
+		if err := decodeStrictJSON(data, &wrapper); err != nil {
+			return errors.New("Docker Sandboxes template inventory returned unsupported JSON")
+		}
+		rawImages = wrapper["images"]
 	}
 	var images []map[string]json.RawMessage
-	if raw, ok := wrapper["images"]; !ok || json.Unmarshal(raw, &images) != nil {
+	if err := decodeStrictJSON(rawImages, &images); err != nil || images == nil {
 		return errors.New("Docker Sandboxes template inventory omitted images")
 	}
 	for _, image := range images {

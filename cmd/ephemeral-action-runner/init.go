@@ -1465,8 +1465,8 @@ func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpr
 			result.DockerSandboxesStatus = fmt.Sprintf("READY — Docker and sbx diagnostics passed (%d pass, %d warn, %d fail, %d skip)", readiness.ChecksPassed, readiness.ChecksWarned, readiness.ChecksFailed, readiness.ChecksSkipped)
 		} else {
 			result.DockerSandboxesStatus = fmt.Sprintf("UNAVAILABLE — sbx readiness failed: %v", err)
-			if !strings.Contains(err.Error(), "sbx diagnose --output json") {
-				result.DockerSandboxesStatus += ". Run 'sbx diagnose --output json' and review the hints for each failed check."
+			if !strings.Contains(err.Error(), "sbx diagnose --format json") {
+				result.DockerSandboxesStatus += ". Run 'sbx diagnose --format json' and review the hints for each failed check."
 			}
 		}
 	}
@@ -1606,7 +1606,7 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 			if selected != nil {
 				fmt.Fprintf(out, "%s is unavailable: %s\n", selected.Label, selected.Status)
 				if selected.Type == "docker-sandboxes" {
-					fmt.Fprintln(out, "Action: Install or start Docker and Docker Sandboxes, verify Docker with 'docker info', then run 'sbx diagnose --output json' and resolve each failed-check hint. Choose R to refresh; EPAR will not fall back to another provider.")
+					fmt.Fprintln(out, "Action: Install or start Docker and Docker Sandboxes, verify Docker with 'docker info', then run 'sbx diagnose --format json' and resolve each failed-check hint. Choose R to refresh; EPAR will not fall back to another provider.")
 				}
 			} else {
 				fmt.Fprintln(out, "Choose an available provider number or name shown above, C to show compatibility providers, R to refresh, or 0 to go back when shown.")
