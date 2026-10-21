@@ -15,22 +15,6 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
-type policyLogRecord struct {
-	Host      string    `json:"host"`
-	VMName    string    `json:"vm_name"`
-	ProxyType string    `json:"proxy_type"`
-	Rule      *string   `json:"rule"`
-	LastSeen  time.Time `json:"last_seen"`
-	Since     time.Time `json:"since"`
-	Count     int       `json:"count_since"`
-	Reason    string    `json:"reason,omitempty"`
-}
-
-type policyLogDocument struct {
-	Blocked []policyLogRecord `json:"blocked_hosts"`
-	Allowed []policyLogRecord `json:"allowed_hosts"`
-}
-
 func validatePolicyCommand(args []string) error {
 	valid := false
 	if len(args) == 4 && args[1] == "ls" && args[2] == "--include-inactive" && args[3] == "--json" {
@@ -55,20 +39,9 @@ func validatePolicyCommand(args []string) error {
 }
 
 func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance provider.Instance, port int, startedAt time.Time) error {
-	result, err := p.run(ctx, commandRequest{
-		args:        []string{"policy", "log", instance.Name, "--json"},
-		operation:   "verify Docker Sandboxes host-trust relay route",
-		outputLimit: diagnosticOutputLimit,
-		timeout:     providerReadbackTimeout,
-	})
+	document, err := p.readHostTrustRelayPolicyLog(ctx, instance)
 	if err != nil {
 		return err
-	}
-	decoder := json.NewDecoder(strings.NewReader(result.Stdout))
-	decoder.DisallowUnknownFields()
-	var document policyLogDocument
-	if err := decoder.Decode(&document); err != nil || requireJSONEOF(decoder) != nil {
-		return fmt.Errorf("Docker Sandboxes policy log returned an unsupported json schema")
 	}
 	cutoff := startedAt.Add(-5 * time.Second)
 	relayHosts := map[string]struct{}{
@@ -76,7 +49,7 @@ func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance prov
 		netJoinHostPort("host.docker.internal", port): {},
 	}
 	for _, record := range document.Blocked {
-		if record.VMName == instance.Name && !record.LastSeen.Before(cutoff) {
+		if record.SandboxName == instance.Name && !record.LastSeen.Before(cutoff) {
 			if _, exactRelay := relayHosts[record.Host]; exactRelay {
 				return fmt.Errorf("Docker Sandboxes blocked the exact EPAR host-trust relay endpoint")
 			}
@@ -84,7 +57,7 @@ func (p *Provider) verifyHostTrustRelayPolicy(ctx context.Context, instance prov
 	}
 	foundTransparentRelay := false
 	for _, record := range document.Allowed {
-		if record.VMName != instance.Name || record.LastSeen.Before(cutoff) {
+		if record.SandboxName != instance.Name || record.LastSeen.Before(cutoff) {
 			continue
 		}
 		if record.Host == "registry-1.docker.io:443" && record.ProxyType == "forward" {

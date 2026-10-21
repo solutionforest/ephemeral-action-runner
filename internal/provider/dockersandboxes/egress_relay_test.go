@@ -196,6 +196,14 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 }
 
 func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		t.Run(fmt.Sprintf("modern=%t", modern), func(t *testing.T) {
+			testHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t, modern)
+		})
+	}
+}
+
+func testHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T, modern bool) {
 	const ruleID = "22222222-2222-2222-2222-222222222222"
 	p := NewWithDryRun("sbx", false)
 	p.ConfigureHostTrustRelay(true, "commit-test")
@@ -238,9 +246,9 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 			now := time.Now().UTC()
 			entry := policyLogEntryWithRule(net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort)), testName, "transparent", "", now)
 			if !rulePresent {
-				return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)}, nil
+				return provider.ExecResult{Stdout: policyLogWireFixture(fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry), modern)}, nil
 			}
-			return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry)}, nil
+			return provider.ExecResult{Stdout: policyLogWireFixture(fmt.Sprintf(`{"blocked_hosts":[],"allowed_hosts":[%s]}`, entry), modern)}, nil
 		default:
 			t.Fatalf("unexpected command: %v", request.args)
 			return provider.ExecResult{}, nil
@@ -263,6 +271,14 @@ func TestHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T) 
 }
 
 func TestHostTrustRelayBeforeAllowRequiresConsistentEvidence(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		t.Run(fmt.Sprintf("modern=%t", modern), func(t *testing.T) {
+			testHostTrustRelayBeforeAllowRequiresConsistentEvidence(t, modern)
+		})
+	}
+}
+
+func testHostTrustRelayBeforeAllowRequiresConsistentEvidence(t *testing.T, modern bool) {
 	for _, test := range []struct {
 		name        string
 		probeOutput string
@@ -321,7 +337,7 @@ func TestHostTrustRelayBeforeAllowRequiresConsistentEvidence(t *testing.T) {
 				case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/dev/tcp/host.docker.internal/"):
 					return provider.ExecResult{Stdout: test.probeOutput}, nil
 				case args == "policy log "+testName+" --json" && test.policyLog != nil:
-					return provider.ExecResult{Stdout: test.policyLog(testName, binding.Port)}, nil
+					return provider.ExecResult{Stdout: policyLogWireFixture(test.policyLog(testName, binding.Port), modern)}, nil
 				default:
 					t.Fatalf("unexpected command: %v", request.args)
 					return provider.ExecResult{}, nil
@@ -594,6 +610,14 @@ func TestSelectPublicTLSDestinationPrefersIPv4WithIPv6Fallback(t *testing.T) {
 }
 
 func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		t.Run(fmt.Sprintf("modern=%t", modern), func(t *testing.T) {
+			testVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t, modern)
+		})
+	}
+}
+
+func testVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.T, modern bool) {
 	started := time.Now().UTC().Truncate(time.Second)
 	instance := provider.Instance{Name: "sandbox-one", ProviderID: "12345678-1234-1234-1234-123456789abc"}
 	for _, test := range []struct {
@@ -605,6 +629,8 @@ func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.
 		{name: "accepted", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), blocked: ""},
 		{name: "stale", allowed: policyLogEntry("localhost:43123", "sandbox-one", "transparent", started.Add(-time.Nanosecond)), wantErr: "did not confirm"},
 		{name: "wrong port", allowed: policyLogEntry("localhost:43124", "sandbox-one", "transparent", started), wantErr: "did not confirm"},
+		{name: "wrong sandbox", allowed: policyLogEntry("localhost:43123", "sandbox-two", "transparent", started), wantErr: "did not confirm"},
+		{name: "immutable id is not name", allowed: policyLogEntry("localhost:43123", instance.ProviderID, "transparent", started), wantErr: "did not confirm"},
 		{name: "wrong route", allowed: policyLogEntry("localhost:43123", "sandbox-one", "forward", started), wantErr: "unexpected"},
 		{name: "wrong rule", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "other-rule", started), wantErr: "unexpected policy rule"},
 		{name: "empty rule without causal proof", allowed: policyLogEntryWithRule("localhost:43123", "sandbox-one", "transparent", "", started), wantErr: "pre-rule policy proof"},
@@ -620,13 +646,16 @@ func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.
 		{name: "credential forward", allowed: policyLogEntry("registry-1.docker.io:443", "sandbox-one", "forward", started) + "," + policyLogEntry("localhost:43123", "sandbox-one", "transparent", started), wantErr: "credential-bearing"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if modern && test.name == "missing rule" {
+				test.wantErr = "pre-rule policy proof"
+			}
 			p := NewWithDryRun("sbx", false)
 			binding := relayBindingSnapshot{Instance: instance, Port: 43123, PolicyRules: map[string]struct{}{testRelayPolicyRule: {}}}
 			p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 				if strings.Join(request.args, " ") != "policy log sandbox-one --json" {
 					t.Fatalf("unexpected command: %v", request.args)
 				}
-				return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[%s]}`, test.blocked, test.allowed)}, nil
+				return provider.ExecResult{Stdout: policyLogWireFixture(fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[%s]}`, test.blocked, test.allowed), modern)}, nil
 			}
 			err := p.verifyBoundHostTrustRelayPolicy(context.Background(), binding, started)
 			if test.wantErr == "" && err != nil {
@@ -637,6 +666,14 @@ func TestVerifyHostTrustRelayPolicyRequiresFreshTransparentExactPort(t *testing.
 			}
 		})
 	}
+}
+
+// Match the v0.48+ wire names and its omission of empty rules.
+func policyLogWireFixture(legacy string, modern bool) string {
+	if !modern {
+		return legacy
+	}
+	return strings.NewReplacer(`"allowed_hosts":`, `"allowed":`, `"blocked_hosts":`, `"blocked":`, `"vm_name":`, `"sandbox_id":`, `"count_since":`, `"count":`, `"since":`, `"first_seen":`, `"rule":"",`, "").Replace(legacy)
 }
 
 func policyLogEntry(host, vmName, proxyType string, lastSeen time.Time) string {
