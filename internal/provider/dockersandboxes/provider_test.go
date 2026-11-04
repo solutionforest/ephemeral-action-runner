@@ -1602,6 +1602,96 @@ func TestCreateFencesWorkspaceFreeReadback(t *testing.T) {
 	done()
 }
 
+func TestCreateInspectionBindingMismatchNamesEachFailedBinding(t *testing.T) {
+	otherWorkspace := filepath.Join(filepath.Dir(testWorkspace), "job-other")
+	for _, test := range []struct {
+		name     string
+		old      string
+		new      string
+		want     []string
+		unwanted []string
+	}{
+		{
+			name:     "template reference",
+			old:      `"image":"docker.io/docker/sandbox-templates:shell-docker"`,
+			new:      `"image":"docker.io/sbx/shell-docker-image:latest"`,
+			want:     []string{`template reference: expected "` + testTemplate + `", observed image "docker.io/sbx/shell-docker-image:latest"`},
+			unwanted: []string{"cache identity:", "staging path:"},
+		},
+		{
+			name:     "cache identity",
+			old:      testDigest,
+			new:      "sha256:ec2006fea720" + strings.Repeat("9", 52),
+			want:     []string{`cache identity: expected "39cf20eca861", observed image_digest "sha256:ec2006fea720`},
+			unwanted: []string{"template reference:", "staging path:"},
+		},
+		{
+			name:     "absent digest",
+			old:      `"image_digest":"` + testDigest + `",`,
+			new:      ``,
+			want:     []string{`cache identity: expected "39cf20eca861", observed image_digest <absent> is not a full sha256 digest`},
+			unwanted: []string{"template reference:", "staging path:"},
+		},
+		{
+			name:     "non-string digest is not echoed",
+			old:      `"image_digest":"` + testDigest + `"`,
+			new:      `"image_digest":{"token":"digest-secret-metadata"}`,
+			want:     []string{`observed image_digest <non-string object> is not a full sha256 digest`},
+			unwanted: []string{"digest-secret-metadata"},
+		},
+		{
+			name:     "staging path",
+			old:      `"workspace":` + strconv.Quote(testWorkspace),
+			new:      `"workspace":` + strconv.Quote(otherWorkspace),
+			want:     []string{`staging path: expected ` + strconv.Quote(testWorkspace) + `, observed workspace ` + strconv.Quote(otherWorkspace)},
+			unwanted: []string{"template reference:", "cache identity:"},
+		},
+		{
+			name: "all bindings",
+			old:  `"image":"docker.io/docker/sandbox-templates:shell-docker","image_digest":"` + testDigest + `","workspace":` + strconv.Quote(testWorkspace),
+			new:  `"image":"docker.io/sbx/shell:latest"`,
+			want: []string{"template reference:", "cache identity:", "staging path: expected " + strconv.Quote(testWorkspace) + ", observed workspace <absent>"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := strings.Replace(inspectionJSON, test.old, test.new, 1)
+			if fixture == inspectionJSON {
+				t.Fatal("fixture mutation did not apply")
+			}
+			p, done := scriptedProvider(t,
+				commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
+				commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
+				commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
+				commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
+				commandStep{args: []string{"inspect", "--json", testName}, result: provider.ExecResult{Stdout: fixture}},
+			)
+			instance, err := p.Create(context.Background(), validCreateRequest())
+			if err == nil {
+				t.Fatal("mismatched inspection binding was accepted")
+			}
+			if !strings.Contains(err.Error(), "did not bind the exact template reference, cache identity, and staging path") {
+				t.Fatalf("Create() error = %v, want binding mismatch", err)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("Create() error = %v, want it to contain %q", err, want)
+				}
+			}
+			for _, unwanted := range test.unwanted {
+				if strings.Contains(err.Error(), unwanted) {
+					t.Fatalf("Create() error = %v, must not contain %q", err, unwanted)
+				}
+			}
+			if instance.ReceiptVersion != "v1" {
+				t.Fatalf("binding mismatch dropped the exact receipted instance needed for cleanup: %#v", instance)
+			}
+			done()
+		})
+	}
+}
+
 func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
 	opaqueTemplateList := strings.Replace(templateListJSON, "39cf20eca861", "ec2006fea720", 1)
 	opaqueInspection := strings.Replace(inspectionJSON, testDigest, "sha256:ec2006fea720"+strings.Repeat("9", 52), 1)
