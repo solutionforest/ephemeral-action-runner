@@ -1043,13 +1043,8 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
 	if expected != nil {
-		inspectionDigest := stringValue(inspection["image_digest"])
-		runtimeCacheID := ""
-		if validFullTemplateDigest(inspectionDigest) {
-			runtimeCacheID = strings.TrimPrefix(inspectionDigest, "sha256:")[:12]
-		}
-		if stringValue(inspection["image"]) != expected.Template || runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
-			return fmt.Errorf("docker sandbox inspection did not bind the exact template reference, cache identity, and staging path")
+		if err := verifyInspectionBinding(inspection, expected, expectedCacheID); err != nil {
+			return err
 		}
 	}
 	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
@@ -1062,6 +1057,79 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 		}
 	}
 	return nil
+}
+
+// inspectionBindingValueLimit bounds each observed value echoed in a binding
+// mismatch so an unexpected CLI payload cannot flood controller diagnostics.
+const inspectionBindingValueLimit = 256
+
+// verifyInspectionBinding requires the exact template reference, the recorded
+// cache identity, and the owned staging path. Each mismatched binding is
+// reported with its expected and observed value: these are non-secret
+// identities, and naming the failed binding is what makes a changed sbx wire
+// format diagnosable from the last-error log instead of requiring a live
+// reproduction.
+func verifyInspectionBinding(inspection map[string]json.RawMessage, expected *provider.CreateRequest, expectedCacheID string) error {
+	var mismatches []string
+	if image := stringValue(inspection["image"]); image != expected.Template {
+		mismatches = append(mismatches, fmt.Sprintf("template reference: expected %q, observed image %s", expected.Template, observedInspectionValue(inspection, "image")))
+	}
+	inspectionDigest := stringValue(inspection["image_digest"])
+	switch {
+	case !validFullTemplateDigest(inspectionDigest):
+		mismatches = append(mismatches, fmt.Sprintf("cache identity: expected %q, observed image_digest %s is not a full sha256 digest", expectedCacheID, observedInspectionValue(inspection, "image_digest")))
+	case strings.TrimPrefix(inspectionDigest, "sha256:")[:12] != expectedCacheID:
+		mismatches = append(mismatches, fmt.Sprintf("cache identity: expected %q, observed image_digest %s", expectedCacheID, observedInspectionValue(inspection, "image_digest")))
+	}
+	if workspace := stringValue(inspection["workspace"]); workspace != expected.StagingPath {
+		mismatches = append(mismatches, fmt.Sprintf("staging path: expected %q, observed workspace %s", expected.StagingPath, observedInspectionValue(inspection, "workspace")))
+	}
+	if len(mismatches) == 0 {
+		return nil
+	}
+	return fmt.Errorf("docker sandbox inspection did not bind the exact template reference, cache identity, and staging path (%s)", strings.Join(mismatches, "; "))
+}
+
+func observedInspectionValue(inspection map[string]json.RawMessage, field string) string {
+	raw, ok := inspection[field]
+	if !ok {
+		return "<absent>"
+	}
+	if value, isString := rawString(raw); isString {
+		return strconv.Quote(truncate(value, inspectionBindingValueLimit))
+	}
+	return "<non-string " + jsonKind(raw) + ">"
+}
+
+func rawString(raw json.RawMessage) (string, bool) {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	return value, true
+}
+
+// jsonKind names the JSON type without echoing a non-string value, which
+// could carry nested metadata the controller never expects in these fields.
+func jsonKind(raw json.RawMessage) string {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return "invalid"
+	}
+	switch value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case float64:
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return "value"
+	}
 }
 
 func stringValue(raw json.RawMessage) string {
