@@ -7,10 +7,17 @@ import (
 )
 
 type DiagnosticSummary struct {
-	Passed  int
-	Warned  int
-	Failed  int
-	Skipped int
+	Passed   int
+	Warned   int
+	Failed   int
+	Skipped  int
+	Failures []DiagnosticFailure
+}
+
+type DiagnosticFailure struct {
+	Name    string
+	Message string
+	Hint    string
 }
 
 // ParseDiagnostics validates the versioned report shared by startup and
@@ -30,6 +37,7 @@ func ParseDiagnostics(data []byte) (DiagnosticSummary, error) {
 		return DiagnosticSummary{}, fmt.Errorf("docker sandboxes diagnostics omitted its checks")
 	}
 	counts := map[string]int{"pass": 0, "warn": 0, "fail": 0, "skip": 0}
+	var failures []DiagnosticFailure
 	for _, check := range checks {
 		var name, status string
 		if json.Unmarshal(check["name"], &name) != nil || strings.TrimSpace(name) == "" || strings.ContainsRune(name, 0) {
@@ -51,6 +59,14 @@ func ParseDiagnostics(data []byte) (DiagnosticSummary, error) {
 			return DiagnosticSummary{}, fmt.Errorf("docker sandboxes diagnostics returned an unknown check status")
 		}
 		counts[status]++
+		if status == "fail" {
+			failure := DiagnosticFailure{Name: name}
+			// The optional presentation fields were validated above. Omitted or
+			// null strings remain empty; verbose detail stays in the full report.
+			_ = json.Unmarshal(check["message"], &failure.Message)
+			_ = json.Unmarshal(check["hint"], &failure.Hint)
+			failures = append(failures, failure)
+		}
 	}
 	var summary map[string]json.RawMessage
 	if json.Unmarshal(report["summary"], &summary) != nil {
@@ -62,5 +78,5 @@ func ParseDiagnostics(data []byte) (DiagnosticSummary, error) {
 			return DiagnosticSummary{}, fmt.Errorf("docker sandboxes diagnostics summary did not match its checks")
 		}
 	}
-	return DiagnosticSummary{Passed: counts["pass"], Warned: counts["warn"], Failed: counts["fail"], Skipped: counts["skip"]}, nil
+	return DiagnosticSummary{Passed: counts["pass"], Warned: counts["warn"], Failed: counts["fail"], Skipped: counts["skip"], Failures: failures}, nil
 }
