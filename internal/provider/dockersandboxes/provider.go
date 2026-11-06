@@ -439,13 +439,16 @@ func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, erro
 	if err != nil {
 		return HostReadiness{}, fmt.Errorf("%w; run 'sbx diagnose --format json' and review its output", err)
 	}
-	if readiness.ChecksFailed != 0 {
-		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported %d failed check(s); run 'sbx diagnose --format json' and review the hints for each failed check", readiness.ChecksFailed)
+	if readiness.Failed != 0 {
+		return HostReadiness{}, fmt.Errorf("%s; run 'sbx diagnose --format json' for the full report", diagnosticFailureSummary(readiness))
 	}
-	if readiness.ChecksPassed == 0 {
+	if readiness.Passed == 0 {
 		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported no passing checks; run 'sbx diagnose --format json' and review its check details")
 	}
-	return readiness, nil
+	return HostReadiness{
+		ChecksPassed: readiness.Passed, ChecksWarned: readiness.Warned,
+		ChecksFailed: readiness.Failed, ChecksSkipped: readiness.Skipped,
+	}, nil
 }
 
 func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (provider.Instance, error) {
@@ -1439,17 +1442,17 @@ func (p *Provider) Diagnostics(ctx context.Context, instance provider.Instance) 
 		return provider.Diagnostics{}, err
 	}
 	return provider.Diagnostics{
-		Healthy:       daemonHealthy && readiness.ChecksPassed > 0 && readiness.ChecksFailed == 0,
+		Healthy:       daemonHealthy && readiness.Passed > 0 && readiness.Failed == 0,
 		DaemonState:   daemonState,
-		ChecksPassed:  readiness.ChecksPassed,
-		ChecksWarned:  readiness.ChecksWarned,
-		ChecksFailed:  readiness.ChecksFailed,
-		ChecksSkipped: readiness.ChecksSkipped,
+		ChecksPassed:  readiness.Passed,
+		ChecksWarned:  readiness.Warned,
+		ChecksFailed:  readiness.Failed,
+		ChecksSkipped: readiness.Skipped,
 	}, nil
 }
 
-func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error) {
-	output, err := sandboxcli.Diagnose(ctx, func(ctx context.Context, args []string) ([]byte, error) {
+func (p *Provider) readHostReadiness(ctx context.Context) (sandboxcli.DiagnosticSummary, error) {
+	output, commandErr := sandboxcli.Diagnose(ctx, func(ctx context.Context, args []string) ([]byte, error) {
 		result, err := p.run(ctx, commandRequest{
 			args:        args,
 			operation:   "diagnose docker sandboxes",
@@ -1458,19 +1461,34 @@ func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error)
 		})
 		return []byte(result.Stdout), err
 	})
-	if err != nil {
-		return HostReadiness{}, err
+	report, parseErr := sandboxcli.ParseDiagnostics(output)
+	if commandErr != nil {
+		// sbx exits nonzero when a check fails, while still returning its JSON
+		// report. Surface validated failures without losing the command error
+		// (including cancellation/deadline identity) or accepting partial JSON.
+		if parseErr == nil && report.Failed > 0 {
+			return sandboxcli.DiagnosticSummary{}, fmt.Errorf("%w; %s", commandErr, diagnosticFailureSummary(report))
+		}
+		return sandboxcli.DiagnosticSummary{}, commandErr
 	}
-	passed, warned, failed, skipped, err := parseDiagnose(output)
-	if err != nil {
-		return HostReadiness{}, err
+	return report, parseErr
+}
+
+func diagnosticFailureSummary(report sandboxcli.DiagnosticSummary) string {
+	failures := make([]string, 0, len(report.Failures))
+	for _, failure := range report.Failures {
+		// Quote each field to keep multiline/control characters inside one log
+		// event, and redact decoded text as well as the command's raw output.
+		detail := fmt.Sprintf("%q", provider.RedactText(failure.Name))
+		if failure.Message != "" {
+			detail += fmt.Sprintf(": %q", provider.RedactText(failure.Message))
+		}
+		if failure.Hint != "" {
+			detail += fmt.Sprintf(" (hint: %q)", provider.RedactText(failure.Hint))
+		}
+		failures = append(failures, detail)
 	}
-	return HostReadiness{
-		ChecksPassed:  passed,
-		ChecksWarned:  warned,
-		ChecksFailed:  failed,
-		ChecksSkipped: skipped,
-	}, nil
+	return fmt.Sprintf("docker sandboxes diagnostics reported %d failed check(s): %s", report.Failed, strings.Join(failures, "; "))
 }
 
 func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
