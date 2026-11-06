@@ -1,0 +1,21 @@
+{
+  "id": "default-deny-all",
+  "name": "default-deny-all",
+  "policy_name": "default-deny-all",
+  "scope": "global",
+  "applies_to": "all",
+  "resource_type": "network",
+  "decision": "deny",
+  "resources": [
+    "**"
+  ],
+  "origin": "local",
+  "layer": "local",
+  "status": "active",
+  "reason": "Implicit fallback when no applicable policy decides the request.",
+  "editable": false,
+  "actions": [
+    "net:connect:tcp",
+    "net:connect:udp"
+  ]
+}

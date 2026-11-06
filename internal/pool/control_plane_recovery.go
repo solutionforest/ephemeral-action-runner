@@ -823,10 +823,19 @@ func (m *Manager) waitForProviderRecoveryWindow(ctx context.Context) error {
 		}
 		m.providerRecoveryMu.Lock()
 		next := m.providerRecoveryNext
+		reservationToken := m.providerRecoveryReservationToken
+		reservationPhase := m.providerRecoveryReservationPhase
 		verificationRequired := providerRecoveryReservationNeedsVerification(m.providerRecoveryReservationToken, m.providerRecoveryReservationPhase)
 		m.providerRecoveryMu.Unlock()
+		// A cooldown without a reservation limits daemon intervention, not normal
+		// lifecycle checks. Authentication or the daemon may already have recovered
+		// externally. Keep the durable deadline for recoverProviderControlPlane.
+		if reservationToken == 0 {
+			return nil
+		}
 		now := m.currentTime()
 		if !next.IsZero() && now.Before(next) {
+			m.infof("Docker Sandboxes startup is waiting for a durable recovery reservation: phase=%s resumeAfter=%s wait=%s\n", reservationPhase, next.In(time.Local).Format(time.RFC3339), next.Sub(now).Round(time.Second))
 			if err := waitWithContext(ctx, next.Sub(now)); err != nil {
 				return err
 			}

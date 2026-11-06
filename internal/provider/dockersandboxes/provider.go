@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +38,12 @@ const (
 )
 
 const sandboxContainerFailureSignature = "failed to run sandbox container"
+
+// This resolved v3 shell kit declares only a bash entrypoint/command, with no
+// credentials, mounts, or extra capabilities. Unknown revisions fail closed.
+const verifiedShellKit = "docker.io/sbx/shell@sha256:32c458ddd69a0a6ad67c9f08d436d9814f3a8cb374b84c2a6acf4aa4f1630688"
+
+var assembledShellTemplatePattern = regexp.MustCompile(`^(docker\.io/library/)?sandbox-kit-assembled:[a-f0-9]{16}$`)
 
 const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may expose host SSH-agent forwarding; this generic container-start failure does not prove its cause. EPAR removes SSH-agent variables when its commands start a stopped daemon, but sbx v0.42+ also has persistent SSH forwarding settings. Inspect `sbx settings get ssh.agentForwardingEnabled`; if enabled, coordinate with other local sbx users before running `sbx settings set ssh.agentForwardingEnabled false` and restarting the daemon. EPAR does not change shared settings automatically. In recoveryMode=exclusive-auto, the pool may make one bounded stop-wait-start recovery attempt for this create-stage signature; recoveryMode=observe never mutates the daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry. If creation still fails, inspect the sbx daemon logs and template entrypoint instead of repeating daemon restarts."
 
@@ -856,7 +863,8 @@ func (p *Provider) RemoveTemplate(ctx context.Context, artifact provider.Templat
 			return fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, item.Reference, artifact.Reference)
 		}
 		found = true
-		break
+		// Removal by cache ID affects every alias. Inspect the remaining rows
+		// too, and refuse to remove a reference outside this exact receipt.
 	}
 	if !found {
 		return nil
@@ -890,14 +898,19 @@ func (p *Provider) ObserveTemplate(ctx context.Context, artifact provider.Templa
 	if err != nil {
 		return false, err
 	}
+	var otherReference string
 	for _, item := range templates {
 		if item.CacheID != artifact.CacheID {
 			continue
 		}
 		if item.Reference != artifact.Reference {
-			return false, fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, item.Reference, artifact.Reference)
+			otherReference = item.Reference
+			continue
 		}
 		return true, nil
+	}
+	if otherReference != "" {
+		return false, fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, otherReference, artifact.Reference)
 	}
 	return false, nil
 }
@@ -1045,20 +1058,35 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
+	var kits []string
+	verifiedShell := json.Unmarshal(inspection["kits"], &kits) == nil && len(kits) == 1 && kits[0] == verifiedShellKit
 	if expected != nil {
 		inspectionDigest := stringValue(inspection["image_digest"])
 		runtimeCacheID := ""
 		if validFullTemplateDigest(inspectionDigest) {
 			runtimeCacheID = strings.TrimPrefix(inspectionDigest, "sha256:")[:12]
 		}
-		if stringValue(inspection["image"]) != expected.Template || runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
+		if runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
 			return fmt.Errorf("docker sandbox inspection did not bind the exact template reference, cache identity, and staging path")
+		}
+		if image := stringValue(inspection["image"]); image != expected.Template {
+			if !verifiedShell || !assembledShellTemplatePattern.MatchString(image) {
+				return fmt.Errorf("docker sandbox inspection did not bind the exact template reference")
+			}
+			// The requested reference was checked before creation. The generated
+			// alias must independently resolve to that same recorded cache ID.
+			if err := p.verifyImportedTemplate(ctx, image, expectedCacheID); err != nil {
+				return fmt.Errorf("verify assembled Docker Sandboxes template alias: %w", err)
+			}
 		}
 	}
 	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
 		value, ok := inspection[field]
 		if field == "kits" && !ok {
 			return fmt.Errorf("docker sandbox inspection omitted required attached-capability field %q", field)
+		}
+		if field == "kits" && verifiedShell {
+			continue
 		}
 		if ok && !emptyJSONValue(value) {
 			return fmt.Errorf("docker sandbox inspection reported forbidden attached capability %q", field)

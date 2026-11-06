@@ -58,7 +58,7 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 		return nil, invalid("invalid_image_schema")
 	}
 	images := make([]cachedTemplate, 0, len(records))
-	seenIDs := make(map[string]struct{}, len(records))
+	seenIDs := make(map[string]cachedTemplate, len(records))
 	seenReferences := make(map[string]struct{}, len(records))
 	for _, record := range records {
 		id, idErr := requiredJSONString(record, "id")
@@ -78,15 +78,23 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 			return nil, invalid("invalid_image_identity")
 		}
 		reference := repository + ":" + tag
-		if _, duplicate := seenIDs[id]; duplicate {
-			return nil, invalid("duplicate_image_id")
+		if previous, duplicate := seenIDs[id]; duplicate {
+			if previous.Repository+":"+previous.Tag == reference {
+				return nil, invalid("duplicate_image_id")
+			}
+			// v0.51 adds an assembled-kit alias for the unchanged template image.
+			// Aliases must agree on the immutable image's metadata.
+			if previous.Size != sizeValue || !previous.CreatedAt.Equal(createdAt) {
+				return nil, invalid("conflicting_image_metadata")
+			}
 		}
 		if _, duplicate := seenReferences[reference]; duplicate {
 			return nil, invalid("duplicate_image_reference")
 		}
-		seenIDs[id] = struct{}{}
+		image := cachedTemplate{ID: id, Repository: repository, Tag: tag, Flavor: flavor, CreatedAt: createdAt, Size: sizeValue}
+		seenIDs[id] = image
 		seenReferences[reference] = struct{}{}
-		images = append(images, cachedTemplate{ID: id, Repository: repository, Tag: tag, Flavor: flavor, CreatedAt: createdAt, Size: sizeValue})
+		images = append(images, image)
 	}
 	return images, nil
 }
