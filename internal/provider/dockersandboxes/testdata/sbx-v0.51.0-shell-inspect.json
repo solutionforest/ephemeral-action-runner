@@ -1,0 +1,12 @@
+{
+  "name": "epar-sandbox-1",
+  "agent": "shell",
+  "kits": [
+    "docker.io/sbx/shell@sha256:32c458ddd69a0a6ad67c9f08d436d9814f3a8cb374b84c2a6acf4aa4f1630688"
+  ],
+  "state": "running",
+  "image": "sandbox-kit-assembled:f48e59b12e899635",
+  "image_digest": "sha256:39cf20eca8610000000000000000000000000000000000000000000000000000",
+  "workspace": "/var/lib/epar/staging/job-1",
+  "daemon_version": "v0.51.0"
+}
