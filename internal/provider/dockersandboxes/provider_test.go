@@ -1897,7 +1897,7 @@ func TestDiagnosticsGateFailsClosedBeforeMutation(t *testing.T) {
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: `{"version":"1.0","checks":[{"name":"daemon","status":"fail","message":"unhealthy","detail":"","hint":"restart the daemon"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`}},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
-	if err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --format json") || !strings.Contains(err.Error(), "hints for each failed check") {
+	if err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --format json") || !strings.Contains(err.Error(), `hint: "restart the daemon"`) {
 		t.Fatalf("err = %v", err)
 	}
 	done()
@@ -1921,7 +1921,7 @@ func TestAdmissionRechecksDiagnostics(t *testing.T) {
 	if err := p.VerifyAdmission(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.VerifyAdmission(context.Background()); err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --format json") || !strings.Contains(err.Error(), "hints for each failed check") {
+	if err := p.VerifyAdmission(context.Background()); err == nil || !strings.Contains(err.Error(), "1 failed check") || !strings.Contains(err.Error(), "sbx diagnose --format json") || !strings.Contains(err.Error(), `hint: "restart the daemon"`) {
 		t.Fatalf("failed diagnostics were accepted: %v", err)
 	}
 	done()
@@ -2898,6 +2898,83 @@ func TestVerifyHostReadinessRejectsFailedOrEmptyDiagnostics(t *testing.T) {
 			done()
 		})
 	}
+}
+
+func TestVerifyHostReadinessReportsFailedChecksEvenWhenCommandFails(t *testing.T) {
+	fixture := `{"version":"1.0","checks":[{"name":"Daemon","status":"pass","message":"healthy"},{"name":"Binary version","status":"warn","message":"update available"},{"name":"Authentication","status":"fail","message":"not signed in","detail":"verbose authentication detail","hint":"Run: sbx login"},{"name":"Disk space","status":"FAIL","message":"insufficient space","hint":null}],"summary":{"pass":1,"warn":1,"fail":2,"skip":0}}`
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "zero exit"},
+		{name: "nonzero exit", err: errors.New("exit status 1")},
+		{name: "cancellation", err: context.Canceled},
+		{name: "deadline", err: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p, done := scriptedProvider(t, commandStep{
+				args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: fixture}, err: test.err,
+			})
+			_, err := p.VerifyHostReadiness(context.Background())
+			if err == nil {
+				t.Fatal("failed diagnostics admitted the host")
+			}
+			if test.err != nil && !errors.Is(err, test.err) {
+				t.Fatalf("original command error lost: %v", err)
+			}
+			for _, want := range []string{"2 failed check(s)", `"Authentication": "not signed in" (hint: "Run: sbx login")`, `"Disk space": "insufficient space"`, "sbx diagnose --format json"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("diagnostic error = %v, missing %q", err, want)
+				}
+			}
+			for _, unwanted := range []string{"Daemon", "Binary version", "verbose authentication detail"} {
+				if strings.Contains(err.Error(), unwanted) {
+					t.Errorf("diagnostic error includes unrelated or verbose output: %v", err)
+				}
+			}
+			done()
+		})
+	}
+}
+
+func TestVerifyHostReadinessKeepsCommandFailureWithoutValidatedFailedChecks(t *testing.T) {
+	commandErr := errors.New("diagnostic process failed")
+	for _, fixture := range []string{
+		"",
+		`{"version":"1.0","checks":[{"name":"Authentication","status":"fail","hint":"unvalidated hint"}]}`,
+		`{"version":"1.0","checks":[{"name":"Authentication","status":"fail","hint":"unvalidated hint"}],"summary":{"pass":1,"warn":0,"fail":0,"skip":0}}`,
+		`{"version":"1.0","checks":[{"name":"Authentication","status":"pass"}],"summary":{"pass":1,"warn":0,"fail":0,"skip":0}}`,
+	} {
+		p, done := scriptedProvider(t, commandStep{
+			args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: fixture}, err: commandErr,
+		})
+		_, err := p.VerifyHostReadiness(context.Background())
+		if !errors.Is(err, commandErr) {
+			t.Fatalf("command failure lost for %s: %v", fixture, err)
+		}
+		if strings.Contains(err.Error(), "Authentication") || strings.Contains(err.Error(), "unvalidated hint") {
+			t.Fatalf("command failure includes invalid or passing check: %v", err)
+		}
+		done()
+	}
+}
+
+func TestVerifyHostReadinessQuotesAndRedactsFailedCheckText(t *testing.T) {
+	fixture := `{"version":"1.0","checks":[{"name":"Authentication\u001b[31m","status":"fail","message":"API_TOKEN\u003dhidden-value unavailable\nnext line","hint":"Run: sbx login\r\nthen retry"}],"summary":{"pass":0,"warn":0,"fail":1,"skip":0}}`
+	p, done := scriptedProvider(t, commandStep{
+		args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: fixture}, err: errors.New("exit status 1"),
+	})
+	_, err := p.VerifyHostReadiness(context.Background())
+	if err == nil {
+		t.Fatal("failed diagnostics admitted the host")
+	}
+	if strings.ContainsAny(err.Error(), "\x1b\r\n") || strings.Contains(err.Error(), "hidden-value") {
+		t.Fatalf("unsafe diagnostic text: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "API_TOKEN=[REDACTED]") || !strings.Contains(err.Error(), "Run: sbx login") {
+		t.Fatalf("safe diagnostic context missing: %v", err)
+	}
+	done()
 }
 
 func TestVerifyHostReadinessRejectsCommandAndSchemaFailures(t *testing.T) {

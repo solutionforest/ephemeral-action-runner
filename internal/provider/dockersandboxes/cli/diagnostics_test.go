@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,7 @@ func TestParseDiagnosticsAcceptsOptionalTextAndValidatesResults(t *testing.T) {
 		strings.Replace(minimal, `"summary":{`, `"metadata":{"source":"sbx"},"summary":{"metadata":{"source":"sbx"},"description":"ok",`, 1),
 	} {
 		report, err := ParseDiagnostics([]byte(fixture))
-		if err != nil || report != (DiagnosticSummary{Passed: 1, Warned: 1, Failed: 1, Skipped: 1}) {
+		if err != nil || !reflect.DeepEqual(report, DiagnosticSummary{Passed: 1, Warned: 1, Failed: 1, Skipped: 1, Failures: []DiagnosticFailure{{Name: "runtime"}}}) {
 			t.Fatalf("diagnostic results = %#v, %v", report, err)
 		}
 	}
@@ -48,7 +49,7 @@ func TestParseCapturedDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	report, err := ParseDiagnostics(data)
-	if err != nil || report != (DiagnosticSummary{Passed: 15, Warned: 1, Skipped: 1}) {
+	if err != nil || !reflect.DeepEqual(report, DiagnosticSummary{Passed: 15, Warned: 1, Skipped: 1}) {
 		t.Fatalf("captured diagnostic results = %#v, %v", report, err)
 	}
 }

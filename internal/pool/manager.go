@@ -368,6 +368,19 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 	if ctx.Err() != nil {
 		return cleanup()
 	}
+	var startupRetryStage string
+	var startupRetryReportAfter time.Time
+	waitForStartupRetry := func(stage string, cause error) error {
+		now := m.currentTime()
+		if stage != startupRetryStage || !now.Before(startupRetryReportAfter) {
+			m.warnf("Pool startup is waiting for provider recovery; preserving exact capacity and retrying: stage=%s retryIn=%s: %v\n", stage, opts.MonitorInterval, cause)
+			startupRetryStage = stage
+			startupRetryReportAfter = now.Add(time.Minute)
+		}
+		// Normal checks can resume during an intervention cooldown, but failures
+		// must not turn the startup loops into a busy retry loop.
+		return waitWithContext(ctx, opts.MonitorInterval)
+	}
 	var active map[string]ProvisionedInstance
 	for {
 		if waitErr := providerDeadlineRecovery.wait(ctx, m.currentTime()); waitErr != nil {
@@ -407,6 +420,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				return cleanup()
 			}
 			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+		}
+		if waitForStartupRetry("initial-pool-reconciliation", err) != nil {
+			return cleanup()
 		}
 	}
 	if err != nil {
@@ -453,6 +469,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			}
 			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
 		}
+		if waitForStartupRetry("initial-over-capacity-reconciliation", err) != nil {
+			return cleanup()
+		}
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -496,6 +515,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				return cleanup()
 			}
 			m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+		}
+		if waitForStartupRetry("initial-host-trust-preparation", err) != nil {
+			return cleanup()
 		}
 	}
 	if err != nil {
@@ -547,6 +569,9 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 						return cleanup()
 					}
 					m.warnf("Docker Sandboxes control-plane recovery supervisor warning; preserving exact capacity and retrying: %v\n", recoveryErr)
+				}
+				if waitForStartupRetry("initial-capacity-provisioning", err) != nil {
+					return cleanup()
 				}
 				continue
 			}

@@ -249,6 +249,9 @@ func parseGlobalNetworkPolicy(data []byte) ([]provider.NetworkPolicyRule, error)
 }
 
 func parseNetworkPolicy(data []byte, sandboxName string) ([]provider.NetworkPolicyRule, error) {
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return nil, fmt.Errorf("docker sandbox network policy returned an unsupported json schema")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	var raw json.RawMessage
 	if err := decoder.Decode(&raw); err != nil || requireJSONEOF(decoder) != nil {
@@ -274,6 +277,15 @@ func parseNetworkPolicy(data []byte, sandboxName string) ([]provider.NetworkPoli
 		id, err := requiredJSONString(record, "id")
 		if err != nil || !providerIDPattern.MatchString(id) {
 			return nil, fmt.Errorf("docker sandbox network policy rule omitted a valid id")
+		}
+		if _, duplicate := seenIDs[id]; duplicate {
+			return nil, fmt.Errorf("docker sandbox network policy returned a duplicate rule id")
+		}
+		seenIDs[id] = struct{}{}
+		if isImplicitNetworkPolicyFallback(record) {
+			// v0.51 lists the engine's no-match fallback alongside actual rules.
+			// It has no policy ID and is not an explicit global deny-all policy.
+			continue
 		}
 		decisionText, err := requiredJSONString(record, "decision")
 		if err != nil {
@@ -322,10 +334,6 @@ func parseNetworkPolicy(data []byte, sandboxName string) ([]provider.NetworkPoli
 				}
 			}
 		}
-		if _, duplicate := seenIDs[id]; duplicate {
-			return nil, fmt.Errorf("docker sandbox network policy returned a duplicate rule id")
-		}
-		seenIDs[id] = struct{}{}
 		if scope != "global" {
 			sandboxID, sandboxIDErr := requiredJSONString(record, "sandbox_id")
 			if sandboxIDErr != nil || scope != "sandbox:"+sandboxID || appliesTo != scope {
@@ -355,6 +363,31 @@ func parseNetworkPolicy(data []byte, sandboxName string) ([]provider.NetworkPoli
 		})
 	}
 	return out, nil
+}
+
+func isImplicitNetworkPolicyFallback(record map[string]json.RawMessage) bool {
+	if _, present := record["policy_id"]; present {
+		return false
+	}
+	if _, present := record["sandbox_id"]; present {
+		return false
+	}
+	for field, expected := range map[string]string{
+		"id": "default-deny-all", "name": "default-deny-all", "policy_name": "default-deny-all",
+		"scope": "global", "applies_to": "all", "resource_type": "network", "decision": "deny",
+		"origin": "local", "layer": "local", "status": "active",
+		"reason": "Implicit fallback when no applicable policy decides the request.",
+	} {
+		if stringValue(record[field]) != expected {
+			return false
+		}
+	}
+	var resources, actions []string
+	if !bytes.Equal(bytes.TrimSpace(record["editable"]), []byte("false")) || json.Unmarshal(record["resources"], &resources) != nil || !slices.Equal(resources, []string{"**"}) || json.Unmarshal(record["actions"], &actions) != nil {
+		return false
+	}
+	slices.Sort(actions)
+	return slices.Equal(actions, []string{"net:connect:tcp", "net:connect:udp"})
 }
 
 func validateReadbackPolicyResource(resource string) error {

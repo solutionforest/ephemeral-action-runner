@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +38,12 @@ const (
 )
 
 const sandboxContainerFailureSignature = "failed to run sandbox container"
+
+// This resolved v3 shell kit declares only a bash entrypoint/command, with no
+// credentials, mounts, or extra capabilities. Unknown revisions fail closed.
+const verifiedShellKit = "docker.io/sbx/shell@sha256:32c458ddd69a0a6ad67c9f08d436d9814f3a8cb374b84c2a6acf4aa4f1630688"
+
+var assembledShellTemplatePattern = regexp.MustCompile(`^(docker\.io/library/)?sandbox-kit-assembled:[a-f0-9]{16}$`)
 
 const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may expose host SSH-agent forwarding; this generic container-start failure does not prove its cause. EPAR removes SSH-agent variables when its commands start a stopped daemon, but sbx v0.42+ also has persistent SSH forwarding settings. Inspect `sbx settings get ssh.agentForwardingEnabled`; if enabled, coordinate with other local sbx users before running `sbx settings set ssh.agentForwardingEnabled false` and restarting the daemon. EPAR does not change shared settings automatically. In recoveryMode=exclusive-auto, the pool may make one bounded stop-wait-start recovery attempt for this create-stage signature; recoveryMode=observe never mutates the daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry. If creation still fails, inspect the sbx daemon logs and template entrypoint instead of repeating daemon restarts."
 
@@ -439,13 +446,16 @@ func (p *Provider) VerifyHostReadiness(ctx context.Context) (HostReadiness, erro
 	if err != nil {
 		return HostReadiness{}, fmt.Errorf("%w; run 'sbx diagnose --format json' and review its output", err)
 	}
-	if readiness.ChecksFailed != 0 {
-		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported %d failed check(s); run 'sbx diagnose --format json' and review the hints for each failed check", readiness.ChecksFailed)
+	if readiness.Failed != 0 {
+		return HostReadiness{}, fmt.Errorf("%s; run 'sbx diagnose --format json' for the full report", diagnosticFailureSummary(readiness))
 	}
-	if readiness.ChecksPassed == 0 {
+	if readiness.Passed == 0 {
 		return HostReadiness{}, fmt.Errorf("docker sandboxes diagnostics reported no passing checks; run 'sbx diagnose --format json' and review its check details")
 	}
-	return readiness, nil
+	return HostReadiness{
+		ChecksPassed: readiness.Passed, ChecksWarned: readiness.Warned,
+		ChecksFailed: readiness.Failed, ChecksSkipped: readiness.Skipped,
+	}, nil
 }
 
 func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (provider.Instance, error) {
@@ -853,7 +863,8 @@ func (p *Provider) RemoveTemplate(ctx context.Context, artifact provider.Templat
 			return fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, item.Reference, artifact.Reference)
 		}
 		found = true
-		break
+		// Removal by cache ID affects every alias. Inspect the remaining rows
+		// too, and refuse to remove a reference outside this exact receipt.
 	}
 	if !found {
 		return nil
@@ -887,14 +898,19 @@ func (p *Provider) ObserveTemplate(ctx context.Context, artifact provider.Templa
 	if err != nil {
 		return false, err
 	}
+	var otherReference string
 	for _, item := range templates {
 		if item.CacheID != artifact.CacheID {
 			continue
 		}
 		if item.Reference != artifact.Reference {
-			return false, fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, item.Reference, artifact.Reference)
+			otherReference = item.Reference
+			continue
 		}
 		return true, nil
+	}
+	if otherReference != "" {
+		return false, fmt.Errorf("Docker Sandboxes template cache identity %s now belongs to %s, not %s", artifact.CacheID, otherReference, artifact.Reference)
 	}
 	return false, nil
 }
@@ -1042,20 +1058,35 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	if stringValue(inspection["name"]) != instance.Name || stringValue(inspection["agent"]) != "shell" || strings.TrimSpace(stringValue(inspection["daemon_version"])) == "" {
 		return fmt.Errorf("docker sandbox inspection did not match the exact shell runtime")
 	}
+	var kits []string
+	verifiedShell := json.Unmarshal(inspection["kits"], &kits) == nil && len(kits) == 1 && kits[0] == verifiedShellKit
 	if expected != nil {
 		inspectionDigest := stringValue(inspection["image_digest"])
 		runtimeCacheID := ""
 		if validFullTemplateDigest(inspectionDigest) {
 			runtimeCacheID = strings.TrimPrefix(inspectionDigest, "sha256:")[:12]
 		}
-		if stringValue(inspection["image"]) != expected.Template || runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
+		if runtimeCacheID != expectedCacheID || stringValue(inspection["workspace"]) != expected.StagingPath {
 			return fmt.Errorf("docker sandbox inspection did not bind the exact template reference, cache identity, and staging path")
+		}
+		if image := stringValue(inspection["image"]); image != expected.Template {
+			if !verifiedShell || !assembledShellTemplatePattern.MatchString(image) {
+				return fmt.Errorf("docker sandbox inspection did not bind the exact template reference")
+			}
+			// The requested reference was checked before creation. The generated
+			// alias must independently resolve to that same recorded cache ID.
+			if err := p.verifyImportedTemplate(ctx, image, expectedCacheID); err != nil {
+				return fmt.Errorf("verify assembled Docker Sandboxes template alias: %w", err)
+			}
 		}
 	}
 	for _, field := range []string{"kits", "published_ports", "ports", "auth", "auth_mode", "docker_auth"} {
 		value, ok := inspection[field]
 		if field == "kits" && !ok {
 			return fmt.Errorf("docker sandbox inspection omitted required attached-capability field %q", field)
+		}
+		if field == "kits" && verifiedShell {
+			continue
 		}
 		if ok && !emptyJSONValue(value) {
 			return fmt.Errorf("docker sandbox inspection reported forbidden attached capability %q", field)
@@ -1439,17 +1470,17 @@ func (p *Provider) Diagnostics(ctx context.Context, instance provider.Instance) 
 		return provider.Diagnostics{}, err
 	}
 	return provider.Diagnostics{
-		Healthy:       daemonHealthy && readiness.ChecksPassed > 0 && readiness.ChecksFailed == 0,
+		Healthy:       daemonHealthy && readiness.Passed > 0 && readiness.Failed == 0,
 		DaemonState:   daemonState,
-		ChecksPassed:  readiness.ChecksPassed,
-		ChecksWarned:  readiness.ChecksWarned,
-		ChecksFailed:  readiness.ChecksFailed,
-		ChecksSkipped: readiness.ChecksSkipped,
+		ChecksPassed:  readiness.Passed,
+		ChecksWarned:  readiness.Warned,
+		ChecksFailed:  readiness.Failed,
+		ChecksSkipped: readiness.Skipped,
 	}, nil
 }
 
-func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error) {
-	output, err := sandboxcli.Diagnose(ctx, func(ctx context.Context, args []string) ([]byte, error) {
+func (p *Provider) readHostReadiness(ctx context.Context) (sandboxcli.DiagnosticSummary, error) {
+	output, commandErr := sandboxcli.Diagnose(ctx, func(ctx context.Context, args []string) ([]byte, error) {
 		result, err := p.run(ctx, commandRequest{
 			args:        args,
 			operation:   "diagnose docker sandboxes",
@@ -1458,19 +1489,34 @@ func (p *Provider) readHostReadiness(ctx context.Context) (HostReadiness, error)
 		})
 		return []byte(result.Stdout), err
 	})
-	if err != nil {
-		return HostReadiness{}, err
+	report, parseErr := sandboxcli.ParseDiagnostics(output)
+	if commandErr != nil {
+		// sbx exits nonzero when a check fails, while still returning its JSON
+		// report. Surface validated failures without losing the command error
+		// (including cancellation/deadline identity) or accepting partial JSON.
+		if parseErr == nil && report.Failed > 0 {
+			return sandboxcli.DiagnosticSummary{}, fmt.Errorf("%w; %s", commandErr, diagnosticFailureSummary(report))
+		}
+		return sandboxcli.DiagnosticSummary{}, commandErr
 	}
-	passed, warned, failed, skipped, err := parseDiagnose(output)
-	if err != nil {
-		return HostReadiness{}, err
+	return report, parseErr
+}
+
+func diagnosticFailureSummary(report sandboxcli.DiagnosticSummary) string {
+	failures := make([]string, 0, len(report.Failures))
+	for _, failure := range report.Failures {
+		// Quote each field to keep multiline/control characters inside one log
+		// event, and redact decoded text as well as the command's raw output.
+		detail := fmt.Sprintf("%q", provider.RedactText(failure.Name))
+		if failure.Message != "" {
+			detail += fmt.Sprintf(": %q", provider.RedactText(failure.Message))
+		}
+		if failure.Hint != "" {
+			detail += fmt.Sprintf(" (hint: %q)", provider.RedactText(failure.Hint))
+		}
+		failures = append(failures, detail)
 	}
-	return HostReadiness{
-		ChecksPassed:  passed,
-		ChecksWarned:  warned,
-		ChecksFailed:  failed,
-		ChecksSkipped: skipped,
-	}, nil
+	return fmt.Sprintf("docker sandboxes diagnostics reported %d failed check(s): %s", report.Failed, strings.Join(failures, "; "))
 }
 
 func (p *Provider) Stop(ctx context.Context, instance provider.Instance) error {
