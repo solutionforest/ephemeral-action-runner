@@ -23,6 +23,7 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	sandboxcli "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/cli"
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/staging"
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -44,6 +45,7 @@ const sandboxContainerFailureSignature = "failed to run sandbox container"
 const verifiedShellKit = "docker.io/sbx/shell@sha256:32c458ddd69a0a6ad67c9f08d436d9814f3a8cb374b84c2a6acf4aa4f1630688"
 
 var assembledShellTemplatePattern = regexp.MustCompile(`^(docker\.io/library/)?sandbox-kit-assembled:[a-f0-9]{16}$`)
+var sbxClientVersionPattern = regexp.MustCompile(`^(?:sbx version:?|Client Version:) +(v?[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*)(?: +[a-f0-9]{7,64})?$`)
 
 const sandboxContainerFailureRemediation = "The shared Docker Sandboxes daemon may expose host SSH-agent forwarding; this generic container-start failure does not prove its cause. EPAR removes SSH-agent variables when its commands start a stopped daemon, but sbx v0.42+ also has persistent SSH forwarding settings. Inspect `sbx settings get ssh.agentForwardingEnabled`; if enabled, coordinate with other local sbx users before running `sbx settings set ssh.agentForwardingEnabled false` and restarting the daemon. EPAR does not change shared settings automatically. In recoveryMode=exclusive-auto, the pool may make one bounded stop-wait-start recovery attempt for this create-stage signature; recoveryMode=observe never mutates the daemon. Coordinate with every process using that daemon before an interruption, then run `sbx daemon stop` followed by `env -u SSH_AUTH_SOCK -u SSH_AUTH_SOCK_GATEWAY -u SSH_AGENT_PID sbx daemon start --detach` and retry. If creation still fails, inspect the sbx daemon logs and template entrypoint instead of repeating daemon restarts."
 
@@ -501,6 +503,10 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			return provider.Instance{}, fmt.Errorf("docker sandbox name is already allocated")
 		}
 	}
+	shellSelector, err := p.shellCreateSelector(ctx)
+	if err != nil {
+		return provider.Instance{}, err
+	}
 	var (
 		stagingRoot  *staging.Staging
 		ownedStaging staging.OwnedDirectory
@@ -529,7 +535,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		"--memory", request.Memory,
 		"--template", request.Template,
 	}
-	args = append(args, "shell", request.StagingPath)
+	args = append(args, shellSelector, request.StagingPath)
 	environment := make(map[string]string, 2)
 	if request.RootDisk != "" {
 		environment["DOCKER_SANDBOXES_ROOT_SIZE"] = request.RootDisk
@@ -626,7 +632,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 			if err := p.verifyNoPublishedPorts(ctx, item.Instance); err != nil {
 				return instance, classifyCreateAdmissionFailure(ctx, err)
 			}
-			if err := p.verifyInspection(ctx, item.Instance, &request, cacheID); err != nil {
+			if err := p.verifyInspection(ctx, item.Instance, &request, cacheID, shellSelector == verifiedShellKit); err != nil {
 				return instance, classifyCreateAdmissionFailure(ctx, err)
 			}
 			if err := p.verifyDirectWorkspace(ctx, item.Instance); err != nil {
@@ -647,6 +653,34 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		return provider.Instance{}, provider.NewCallerOwnedUncertainCreateFailure("create Docker Sandboxes instance", fmt.Errorf("docker sandbox was not present in inventory after create: %w", ctx.Err()))
 	}
 	return provider.Instance{}, provider.NewUncertainCreateFailure("create Docker Sandboxes instance", fmt.Errorf("docker sandbox was not present in inventory after create"))
+}
+
+func (p *Provider) shellCreateSelector(ctx context.Context) (string, error) {
+	result, err := p.run(ctx, commandRequest{
+		args:        []string{"version"},
+		operation:   "read Docker Sandboxes CLI version for shell selection",
+		outputLimit: diagnosticOutputLimit,
+		timeout:     providerReadbackTimeout,
+	})
+	if err != nil {
+		return "", err
+	}
+	// Older releases can print the client and daemon versions on separate lines.
+	clientLine, _, _ := strings.Cut(strings.TrimSpace(result.Stdout), "\n")
+	match := sbxClientVersionPattern.FindStringSubmatch(strings.TrimSpace(clientLine))
+	if match == nil {
+		return "", fmt.Errorf("cannot select Docker Sandboxes shell: unrecognized 'sbx version' output")
+	}
+	version := "v" + strings.TrimPrefix(match[1], "v")
+	if !semver.IsValid(version) {
+		return "", fmt.Errorf("cannot select Docker Sandboxes shell: invalid version from 'sbx version'")
+	}
+	// Starting with v0.51 the shell shortcut follows a mutable published kit.
+	// Pass the verified digest directly so sbx never resolves shell:latest.
+	if semver.Compare(semver.MajorMinor(version), "v0.51") >= 0 {
+		return verifiedShellKit, nil
+	}
+	return "shell", nil
 }
 
 func (p *Provider) createOperationTimeout() time.Duration {
@@ -963,7 +997,7 @@ func (p *Provider) VerifyInstanceAdmission(ctx context.Context, instance provide
 	if err := p.verifyNoPublishedPorts(ctx, instance); err != nil {
 		return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes instance admission", err)
 	}
-	if err := p.verifyInspection(ctx, instance, nil, ""); err != nil {
+	if err := p.verifyInspection(ctx, instance, nil, "", false); err != nil {
 		return classifyAdmissionTimeout(ctx, "verify Docker Sandboxes instance admission", err)
 	}
 	if p.architectureEmulation == nil {
@@ -1041,7 +1075,7 @@ func classifyCreateAdmissionFailure(ctx context.Context, err error) error {
 	return classifyAdmissionTimeout(ctx, "verify newly created Docker Sandboxes instance admission", err)
 }
 
-func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest, expectedCacheID string) error {
+func (p *Provider) verifyInspection(ctx context.Context, instance provider.Instance, expected *provider.CreateRequest, expectedCacheID string, requireVerifiedShellKit bool) error {
 	result, err := p.run(ctx, commandRequest{
 		args:        []string{"inspect", "--json", instance.Name},
 		operation:   "verify docker sandbox attached capabilities",
@@ -1060,6 +1094,9 @@ func (p *Provider) verifyInspection(ctx context.Context, instance provider.Insta
 	}
 	var kits []string
 	verifiedShell := json.Unmarshal(inspection["kits"], &kits) == nil && len(kits) == 1 && kits[0] == verifiedShellKit
+	if requireVerifiedShellKit && !verifiedShell {
+		return fmt.Errorf("docker sandbox inspection did not report the pinned shell kit")
+	}
 	if expected != nil {
 		inspectionDigest := stringValue(inspection["image_digest"])
 		runtimeCacheID := ""
