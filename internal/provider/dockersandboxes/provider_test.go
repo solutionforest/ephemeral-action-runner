@@ -30,6 +30,7 @@ const (
 	testDigest          = "sha256:39cf20eca8610000000000000000000000000000000000000000000000000000"
 	emptyPortsJSON      = `[]`
 	templateListJSON    = `{"images":[{"id":"39cf20eca861","repository":"docker.io/docker/sandbox-templates","tag":"shell-docker","flavor":"shell-docker","created_at":"2026-07-22T07:13:19Z","size":599103243}]}`
+	legacyVersionOutput = "sbx version: v0.39.0 def8cb0523a77e757bdd6ef52b459fe374f3783e\n"
 	healthyDiagnoseJSON = `{"version":"1.0","checks":[{"name":"daemon","status":"pass","message":"healthy","detail":"","hint":""}],"summary":{"pass":1,"warn":0,"fail":0,"skip":0}}`
 )
 
@@ -740,6 +741,7 @@ func TestCreateUsesHealthyDiagnosticsAndExactArgv(t *testing.T) {
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{
 			args: wantCreate,
 			environment: map[string]string{
@@ -788,6 +790,7 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: daemonFailure}, err: cause},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
@@ -839,6 +842,8 @@ func TestCreateProviderDeadlineBecomesAdmissionFailureAndPreservesExactIdentity(
 				return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
 			}
 			return provider.ExecResult{Stdout: readyListJSON}, nil
+		case "version":
+			return provider.ExecResult{Stdout: legacyVersionOutput}, nil
 		case "create":
 			<-ctx.Done()
 			return provider.ExecResult{}, ctx.Err()
@@ -876,6 +881,8 @@ func TestCreateCallerCancellationIsNotAdmissionFailure(t *testing.T) {
 			return provider.ExecResult{Stdout: templateListJSON}, nil
 		case "ls":
 			return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+		case "version":
+			return provider.ExecResult{Stdout: legacyVersionOutput}, nil
 		case "create":
 			cancel()
 			<-ctx.Done()
@@ -923,6 +930,8 @@ func TestCreateCallerCancellationDuringTimedOutReadbackIsNotAdmissionFailure(t *
 			close(readbackStarted)
 			<-allowReadback
 			return provider.ExecResult{Stdout: `{"sandboxes":[]}`}, nil
+		case "version":
+			return provider.ExecResult{Stdout: legacyVersionOutput}, nil
 		case "create":
 			<-ctx.Done()
 			return provider.ExecResult{}, ctx.Err()
@@ -983,6 +992,7 @@ func TestCreateDoesNotClassifyWrappedSignatureWithoutCreateStderr(t *testing.T) 
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, result: provider.ExecResult{Stderr: "permission denied"}, err: errors.New(signature)},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
@@ -1010,10 +1020,11 @@ case "$1:$2" in
 diagnose:--format) printf '%%s' '%s' ;;
 template:ls) printf '%%s' '%s' ;;
 ls:--json) printf '%%s' '{"sandboxes":[]}' ;;
+version:) printf '%%s' '%s' ;;
 create:*) printf '%%s\n' '500 Internal Server Error: failed to run sandbox container' >&2; exit 1 ;;
 *) exit 91 ;;
 esac
-`, healthyDiagnoseJSON, templateListJSON)
+`, healthyDiagnoseJSON, templateListJSON, legacyVersionOutput)
 	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1034,6 +1045,7 @@ func TestCreateUnrelatedFailureDoesNotAddSSHDaemonRemediation(t *testing.T) {
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}, err: cause},
 	)
 	_, err := p.Create(context.Background(), validCreateRequest())
@@ -1053,6 +1065,7 @@ func TestCreateBestEffortContinuesAfterQEMUFailureWithExactReceipt(t *testing.T)
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1120,6 +1133,7 @@ func TestCreateArchitectureProviderDeadlineIsAdmissionFailureWithExactReceipt(t 
 				{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 				{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 				{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+				{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 				{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 				{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 				{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1152,6 +1166,7 @@ func TestCreateCallerCancellationDuringArchitectureAdmissionIsNotRecoveryAuthori
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1189,6 +1204,7 @@ func TestCreateArchitectureNonDeadlinePreservesOrdinaryFailure(t *testing.T) {
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1487,6 +1503,7 @@ func TestCreateReturnsExactReceiptWhenPostCreateVerificationFails(t *testing.T) 
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1515,6 +1532,7 @@ func TestCreateReturnsExactReceiptWhenArchitectureEmulationSetupFails(t *testing
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1571,6 +1589,7 @@ func TestCreateSucceedsWithImportedTemplateAndNoDockerStagingImage(t *testing.T)
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
@@ -1589,6 +1608,7 @@ func TestCreateFencesWorkspaceFreeReadback(t *testing.T) {
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: templateListJSON}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: workspaceFree}},
 	)
@@ -1609,6 +1629,7 @@ func TestCreateUsesActiveProviderAssignedOpaqueCacheID(t *testing.T) {
 		commandStep{args: []string{"diagnose", "--format", "json"}, result: provider.ExecResult{Stdout: healthyDiagnoseJSON}},
 		commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: opaqueTemplateList}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `{"sandboxes":[]}`}},
+		commandStep{args: []string{"version"}, result: provider.ExecResult{Stdout: legacyVersionOutput}},
 		commandStep{args: []string{"create", "--name", testName, "--cpus", "4", "--memory", "8g", "--template", testTemplate, "shell", testWorkspace}, environment: map[string]string{}},
 		commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 		commandStep{args: []string{"ports", testName, "--json"}, result: provider.ExecResult{Stdout: emptyPortsJSON}},
