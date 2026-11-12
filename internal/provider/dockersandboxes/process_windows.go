@@ -60,10 +60,14 @@ func attachManagedProcess(command *exec.Cmd, preserveDescendantsOnSuccess bool) 
 		closeJob()
 		return nil, fmt.Errorf("assign managed process to Windows job: %w", assignErr)
 	}
-	if err := assignExistingDescendantsToJob(job, command.Process.Pid); err != nil {
-		_ = windows.TerminateJobObject(job, 1)
-		closeJob()
-		return nil, fmt.Errorf("assign pre-existing Docker Sandboxes descendants to Windows job: %w", err)
+	if !managedProcessWasCreatedSuspended(command) {
+		// Suspended launchers cannot have children yet. Older processes can
+		// retain this PID as their parent after PID reuse; do not adopt them.
+		if err := assignExistingDescendantsToJob(job, command.Process.Pid); err != nil {
+			_ = windows.TerminateJobObject(job, 1)
+			closeJob()
+			return nil, fmt.Errorf("assign pre-existing Docker Sandboxes descendants to Windows job: %w", err)
+		}
 	}
 	if managedProcessWasCreatedSuspended(command) {
 		if err := resumeManagedProcess(command); err != nil {

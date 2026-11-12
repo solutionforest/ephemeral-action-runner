@@ -100,7 +100,7 @@ func (m *Manager) recoverProviderControlPlane(ctx context.Context, cause error) 
 			}
 			return true, nil
 		}
-		m.warnf("Docker Sandboxes provider-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
+		m.warnf("Docker Sandboxes provider-admission recovery was already attempted; next daemon intervention review in %s; ordinary lifecycle checks may continue\n", time.Until(next).Round(time.Second))
 		return true, nil
 	}
 	proofOnly := false
@@ -259,7 +259,7 @@ func (m *Manager) recoverProviderControlPlaneUnderLease(ctx context.Context, cau
 			}
 		}
 		if start.admissionIncident {
-			m.warnf("Docker Sandboxes provider-admission recovery was already attempted; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
+			m.warnf("Docker Sandboxes provider-admission recovery was already attempted; next daemon intervention review in %s; ordinary lifecycle checks may continue\n", time.Until(next).Round(time.Second))
 		} else {
 			m.warnf("Docker Sandboxes inventory recovery is cooling down; preserving exact capacity and retrying after %s\n", time.Until(next).Round(time.Second))
 		}

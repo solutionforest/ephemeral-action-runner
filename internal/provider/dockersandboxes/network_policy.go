@@ -29,7 +29,7 @@ func validatePolicyCommand(args []string) error {
 	if len(args) == 6 && (args[1] == "allow" || args[1] == "deny") && args[2] == "network" && args[3] == "--sandbox" && sandboxNamePattern.MatchString(args[4]) && args[5] != "" {
 		valid = true
 	}
-	if len(args) == 7 && args[1] == "rm" && args[2] == "network" && args[3] == "--sandbox" && sandboxNamePattern.MatchString(args[4]) && args[5] == "--id" && providerIDPattern.MatchString(args[6]) {
+	if len(args) == 8 && args[1] == "rm" && args[2] == "network" && args[3] == "--sandbox" && sandboxNamePattern.MatchString(args[4]) && args[5] == "--id" && providerIDPattern.MatchString(args[6]) && args[7] == "--force" {
 		valid = true
 	}
 	if !valid {
@@ -208,7 +208,7 @@ func (p *Provider) RemoveNetworkPolicy(ctx context.Context, instance provider.In
 			return fmt.Errorf("refusing to remove a network policy rule whose stable identity changed")
 		}
 		_, runErr := p.run(ctx, commandRequest{
-			args:      []string{"policy", "rm", "network", "--sandbox", instance.Name, "--id", rule.ID},
+			args:      []string{"policy", "rm", "network", "--sandbox", instance.Name, "--id", rule.ID, "--force"},
 			operation: "remove docker sandbox network policy",
 			timeout:   providerCleanupTimeout,
 		})

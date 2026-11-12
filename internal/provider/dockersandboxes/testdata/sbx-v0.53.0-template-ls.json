@@ -1,0 +1,27 @@
+[
+  {
+    "id": "sha256:d86a6cdc105a1b299667a20c40bcf8d0584e56f21d44490a0737bb1baeb44299",
+    "repository": "docker.io/docker/sandbox-templates",
+    "tag": "shell-docker",
+    "digest": "sha256:d86a6cdc105a1b299667a20c40bcf8d0584e56f21d44490a0737bb1baeb44299",
+    "flavor": "shell-docker",
+    "created_at": "2026-08-04T19:08:40Z",
+    "size": 605932711
+  },
+  {
+    "id": "sha256:9f6ff1ca4a2580ee4cd19ef102e6bd5bb9a672552efe6156586c385071f33a49",
+    "repository": "docker.io/library/epar-docker-sandboxes-prebuilt-base",
+    "tag": "6bda3be539a7ad3a2a01c4a0d2a21b6743d8c408e24ea5a5bde1e5cc30c700a9",
+    "digest": "sha256:9f6ff1ca4a2580ee4cd19ef102e6bd5bb9a672552efe6156586c385071f33a49",
+    "created_at": "2026-10-22T23:57:41Z",
+    "size": 19850892400
+  },
+  {
+    "id": "sha256:9f6ff1ca4a2580ee4cd19ef102e6bd5bb9a672552efe6156586c385071f33a49",
+    "repository": "docker.io/library/sandbox-kit-assembled",
+    "tag": "90d0c1e9696e60df",
+    "digest": "sha256:9f6ff1ca4a2580ee4cd19ef102e6bd5bb9a672552efe6156586c385071f33a49",
+    "created_at": "2026-10-22T23:57:41Z",
+    "size": 19850892400
+  }
+]

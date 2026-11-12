@@ -142,11 +142,11 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 		case args == "policy ls "+testName+" --include-inactive --json":
 			rules := "[]"
 			if rulePresent {
-				resource := net.JoinHostPort("host.docker.internal", fmt.Sprint(p.hostTrustRelayPort))
+				resource := net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort))
 				rules = fmt.Sprintf(`[{"id":%q,"name":"host relay","policy_id":"local","scope":%q,"applies_to":%q,"resource_type":"network","decision":"allow","resources":[%q],"origin":"scoped","status":"active","editable":true,"sandbox_id":%q}]`, ruleID, "sandbox:"+testName, "sandbox:"+testName, resource, testName)
 			}
 			return provider.ExecResult{Stdout: policyFixture(rules)}, nil
-		case strings.HasPrefix(args, "policy allow network --sandbox "+testName+" host.docker.internal:"):
+		case strings.HasPrefix(args, "policy allow network --sandbox "+testName+" localhost:"):
 			rulePresent = true
 			return provider.ExecResult{}, nil
 		case strings.HasPrefix(args, "exec -i "+testName+" -- bash -lc ") && strings.Contains(args, "/dev/tcp/host.docker.internal/"):
@@ -155,7 +155,7 @@ func TestHostTrustRelayActivationFailureRollsBackExactAddedPolicy(t *testing.T) 
 			now := time.Now().UTC()
 			entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort)), testName, "transparent", now)
 			return provider.ExecResult{Stdout: fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[]}`, entry)}, nil
-		case args == "policy rm network --sandbox "+testName+" --id "+ruleID:
+		case args == "policy rm network --sandbox "+testName+" --id "+ruleID+" --force":
 			rulePresent = false
 			removed = true
 			return provider.ExecResult{}, nil
@@ -213,7 +213,7 @@ func testHostTrustRelayActivationCommitsOnlyAfterFreshPolicyProof(t *testing.T, 
 	committed := false
 	p.runCommand = func(_ context.Context, request commandRequest) (provider.ExecResult, error) {
 		args := strings.Join(request.args, " ")
-		resource := net.JoinHostPort("host.docker.internal", fmt.Sprint(p.hostTrustRelayPort))
+		resource := net.JoinHostPort("localhost", fmt.Sprint(p.hostTrustRelayPort))
 		switch {
 		case args == "ls --json":
 			return provider.ExecResult{Stdout: readyListJSON}, nil
@@ -284,12 +284,32 @@ func testHostTrustRelayBeforeAllowRequiresConsistentEvidence(t *testing.T, moder
 		probeOutput string
 		policyLog   func(string, int) string
 		wantErr     string
+		wantHost    string
 	}{
 		{
-			name: "accepted blocked transition",
+			name:     "accepted blocked transition",
+			wantHost: "localhost",
 			policyLog: func(name string, port int) string {
 				entry := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(port)), name, "transparent", time.Now().UTC())
 				return fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[]}`, entry)
+			},
+		},
+		{
+			name:     "accepted host alias authority",
+			wantHost: "host.docker.internal",
+			policyLog: func(name string, port int) string {
+				entry := policyLogEntry(net.JoinHostPort("host.docker.internal", fmt.Sprint(port)), name, "transparent", time.Now().UTC())
+				return fmt.Sprintf(`{"blocked_hosts":[%s],"allowed_hosts":[]}`, entry)
+			},
+		},
+		{
+			name:    "ambiguous authorities",
+			wantErr: "ambiguous relay endpoint authorities",
+			policyLog: func(name string, port int) string {
+				now := time.Now().UTC()
+				first := policyLogEntry(net.JoinHostPort("host.docker.internal", fmt.Sprint(port)), name, "transparent", now)
+				second := policyLogEntry(net.JoinHostPort("localhost", fmt.Sprint(port)), name, "transparent", now)
+				return fmt.Sprintf(`{"blocked_hosts":[%s,%s],"allowed_hosts":[]}`, first, second)
 			},
 		},
 		{
@@ -343,9 +363,12 @@ func testHostTrustRelayBeforeAllowRequiresConsistentEvidence(t *testing.T, moder
 					return provider.ExecResult{}, nil
 				}
 			}
-			_, err = p.verifyHostTrustRelayBeforeAllow(context.Background(), binding)
+			precondition, err := p.verifyHostTrustRelayBeforeAllow(context.Background(), binding)
 			if test.wantErr == "" && err != nil {
 				t.Fatal(err)
+			}
+			if test.wantHost != "" && precondition.Resource != net.JoinHostPort(test.wantHost, fmt.Sprint(binding.Port)) {
+				t.Fatalf("policy authority = %q, want observed host %q", precondition.Resource, test.wantHost)
 			}
 			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
 				t.Fatalf("error = %v, want substring %q", err, test.wantErr)
@@ -694,14 +717,14 @@ func TestValidatePolicyCommandRejectsBroadPolicyAccess(t *testing.T) {
 		{"policy", "ls", "--include-inactive", "--json"},
 		{"policy", "ls", "sandbox-one", "--include-inactive", "--json"},
 		{"policy", "allow", "network", "--sandbox", "sandbox-one", "host.docker.internal:43123"},
-		{"policy", "rm", "network", "--sandbox", "sandbox-one", "--id", "12345678-1234-1234-1234-123456789abc"},
+		{"policy", "rm", "network", "--sandbox", "sandbox-one", "--id", "12345678-1234-1234-1234-123456789abc", "--force"},
 	}
 	for _, args := range accepted {
 		if err := validatePolicyCommand(args); err != nil {
 			t.Errorf("validatePolicyCommand(%v) rejected: %v", args, err)
 		}
 	}
-	for _, args := range [][]string{{"policy", "log"}, {"policy", "set", "global"}, {"policy", "log", "sandbox-one"}, {"policy", "allow", "filesystem", "--sandbox", "sandbox-one", "**"}} {
+	for _, args := range [][]string{{"policy", "log"}, {"policy", "set", "global"}, {"policy", "log", "sandbox-one"}, {"policy", "allow", "filesystem", "--sandbox", "sandbox-one", "**"}, {"policy", "rm", "network", "--id", "12345678-1234-1234-1234-123456789abc", "--force"}, {"policy", "rm", "network", "--sandbox", "sandbox-one", "--id", "12345678-1234-1234-1234-123456789abc"}} {
 		if err := validatePolicyCommand(args); err == nil {
 			t.Errorf("validatePolicyCommand(%v) accepted", args)
 		}

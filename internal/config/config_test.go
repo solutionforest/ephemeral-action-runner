@@ -1590,6 +1590,7 @@ dockerSandboxes:
   networkBaseline: balanced
   recoveryMode: observe
   recoveryQuiescenceSeconds: 90
+  createTimeoutSeconds: 3600
   additionalAllow: [api.github.com, '*.githubusercontent.com:443']
   additionalDeny:
     - telemetry.example.invalid
@@ -1629,6 +1630,9 @@ dockerSandboxes:
 	}
 	if got, want := cfg.DockerSandboxes.RecoveryQuiescenceSeconds, 90; got != want {
 		t.Fatalf("dockerSandboxes.recoveryQuiescenceSeconds = %d, want %d", got, want)
+	}
+	if got := cfg.DockerSandboxes.CreateTimeoutSeconds; got != 3600 {
+		t.Fatalf("dockerSandboxes.createTimeoutSeconds = %d, want 3600", got)
 	}
 	if got, want := cfg.DockerSandboxes.AdditionalAllow, []string{"api.github.com", "*.githubusercontent.com:443"}; !slices.Equal(got, want) {
 		t.Fatalf("dockerSandboxes.additionalAllow = %#v, want %#v", got, want)
@@ -1675,6 +1679,9 @@ func TestLoadDockerSandboxesArchitectureEmulation(t *testing.T) {
 
 func TestDockerSandboxesRecoveryDefaults(t *testing.T) {
 	cfg := Default()
+	if cfg.DockerSandboxes.CreateTimeoutSeconds != 600 {
+		t.Fatalf("default create timeout = %d, want 600", cfg.DockerSandboxes.CreateTimeoutSeconds)
+	}
 	if got, want := cfg.DockerSandboxes.Memory, "4GiB"; got != want {
 		t.Fatalf("dockerSandboxes.memory = %q, want default %q", got, want)
 	}
@@ -1687,6 +1694,23 @@ func TestDockerSandboxesRecoveryDefaults(t *testing.T) {
 	cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
 	if err := ValidateDockerSandboxes(cfg.DockerSandboxes); err != nil {
 		t.Fatalf("ValidateDockerSandboxes() rejected recovery defaults: %v", err)
+	}
+}
+
+func TestDockerSandboxesCreateTimeoutBounds(t *testing.T) {
+	cfg := Default()
+	if err := apply(&cfg, "dockerSandboxes", "createTimeoutSeconds", "forever"); err == nil {
+		t.Fatal("non-integer creation timeout was accepted")
+	}
+	for _, seconds := range []int{-1, 0, 1, 3600, 86400, 86401} {
+		cfg := Default()
+		cfg.DockerSandboxes.PolicyGeneration = "sha256:" + strings.Repeat("a", 64)
+		cfg.DockerSandboxes.CreateTimeoutSeconds = seconds
+		err := ValidateDockerSandboxes(cfg.DockerSandboxes)
+		wantError := seconds < 1 || seconds > 86400
+		if (err != nil) != wantError {
+			t.Fatalf("create timeout %d: error = %v", seconds, err)
+		}
 	}
 }
 
