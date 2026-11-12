@@ -188,6 +188,7 @@ type DockerSandboxesConfig struct {
 	ArchitectureEmulation     string
 	RecoveryMode              string
 	RecoveryQuiescenceSeconds int
+	CreateTimeoutSeconds      int
 	AdditionalAllow           []string
 	AdditionalDeny            []string
 	StagingRoot               string
@@ -207,6 +208,7 @@ const (
 	DockerSandboxesRecoveryModeExclusiveAuto        = "exclusive-auto"
 	DockerSandboxesRecoveryModeObserve              = "observe"
 	DockerSandboxesDefaultRecoveryQuiescenceSeconds = 60
+	DockerSandboxesDefaultCreateTimeoutSeconds      = 600
 	DockerSandboxesMinimumRecoveryQuiescenceSeconds = 1
 	DockerSandboxesMaximumRecoveryQuiescenceSeconds = 300
 )
@@ -318,6 +320,7 @@ func Default() Config {
 			ArchitectureEmulation:     DockerSandboxesArchitectureEmulationNativeOnly,
 			RecoveryMode:              DockerSandboxesRecoveryModeExclusiveAuto,
 			RecoveryQuiescenceSeconds: DockerSandboxesDefaultRecoveryQuiescenceSeconds,
+			CreateTimeoutSeconds:      DockerSandboxesDefaultCreateTimeoutSeconds,
 			StagingRoot:               ".local/cache/docker-sandboxes/staging",
 			CPUs:                      4,
 			Memory:                    "4GiB",
@@ -778,6 +781,12 @@ func apply(cfg *Config, section, key, value string) error {
 			cfg.DockerSandboxes.RecoveryQuiescenceSeconds = v
 		case "additionalAllow", "additionalDeny":
 			return setListValue(cfg, section, key, parseList(value))
+		case "createTimeoutSeconds":
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("invalid dockerSandboxes.createTimeoutSeconds: %w", err)
+			}
+			cfg.DockerSandboxes.CreateTimeoutSeconds = v
 		case "stagingRoot":
 			cfg.DockerSandboxes.StagingRoot = value
 		case "cpus":
@@ -1391,6 +1400,9 @@ func ValidateDockerSandboxes(sandboxes DockerSandboxesConfig) error {
 	}
 	if sandboxes.RecoveryQuiescenceSeconds < DockerSandboxesMinimumRecoveryQuiescenceSeconds || sandboxes.RecoveryQuiescenceSeconds > DockerSandboxesMaximumRecoveryQuiescenceSeconds {
 		return fmt.Errorf("dockerSandboxes.recoveryQuiescenceSeconds must be between %d and %d", DockerSandboxesMinimumRecoveryQuiescenceSeconds, DockerSandboxesMaximumRecoveryQuiescenceSeconds)
+	}
+	if sandboxes.CreateTimeoutSeconds < 1 || sandboxes.CreateTimeoutSeconds > 86400 {
+		return fmt.Errorf("dockerSandboxes.createTimeoutSeconds must be between 1 and 86400")
 	}
 	if err := validateDockerSandboxHostnameList("additionalAllow", sandboxes.AdditionalAllow); err != nil {
 		return err

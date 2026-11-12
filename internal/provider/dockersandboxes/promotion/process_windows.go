@@ -52,10 +52,14 @@ func attachPreflightProcess(command *exec.Cmd) (func(), error) {
 		closeJob()
 		return nil, fmt.Errorf("assign preflight process to Windows job: %w", assignErr)
 	}
-	if err := assignExistingPreflightDescendantsToJob(job, command.Process.Pid); err != nil {
-		_ = windows.TerminateJobObject(job, 1)
-		closeJob()
-		return nil, fmt.Errorf("assign pre-existing preflight descendants to Windows job: %w", err)
+	if !preflightProcessWasCreatedSuspended(command) {
+		// Suspended launchers cannot have children yet. Older processes can
+		// retain this PID as their parent after PID reuse; do not adopt them.
+		if err := assignExistingPreflightDescendantsToJob(job, command.Process.Pid); err != nil {
+			_ = windows.TerminateJobObject(job, 1)
+			closeJob()
+			return nil, fmt.Errorf("assign pre-existing preflight descendants to Windows job: %w", err)
+		}
 	}
 	if preflightProcessWasCreatedSuspended(command) {
 		if err := resumePreflightProcess(command); err != nil {

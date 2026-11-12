@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +12,6 @@ import (
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 	sandboxcli "github.com/solutionforest/ephemeral-action-runner/internal/provider/dockersandboxes/cli"
 )
-
-var cachedTemplateIDPattern = regexp.MustCompile(`^[a-f0-9]{12}$`)
 
 type cachedTemplate struct {
 	ID         string
@@ -59,9 +56,11 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 	}
 	images := make([]cachedTemplate, 0, len(records))
 	seenIDs := make(map[string]cachedTemplate, len(records))
+	seenImageIDs := make(map[string]string, len(records))
 	seenReferences := make(map[string]struct{}, len(records))
 	for _, record := range records {
-		id, idErr := requiredJSONString(record, "id")
+		imageID, idErr := requiredJSONString(record, "id")
+		id, validID := sandboxcli.TemplateCacheID(imageID)
 		repository, repositoryErr := requiredJSONString(record, "repository")
 		tag, tagErr := requiredJSONString(record, "tag")
 		flavor, flavorErr := optionalJSONString(record, "flavor")
@@ -71,7 +70,7 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 		rawSize, sizePresent := record["size"]
 		sizeErr := json.Unmarshal(rawSize, &size)
 		sizeValue, integerErr := strconv.ParseInt(size.String(), 10, 64)
-		if idErr != nil || !cachedTemplateIDPattern.MatchString(id) || repositoryErr != nil || tagErr != nil || flavorErr != nil || createdAtErr != nil || timestampErr != nil || !sizePresent || len(rawSize) == 0 || rawSize[0] < '0' || rawSize[0] > '9' || sizeErr != nil || integerErr != nil || sizeValue <= 0 {
+		if idErr != nil || !validID || repositoryErr != nil || tagErr != nil || flavorErr != nil || createdAtErr != nil || timestampErr != nil || !sizePresent || len(rawSize) == 0 || rawSize[0] < '0' || rawSize[0] > '9' || sizeErr != nil || integerErr != nil || sizeValue <= 0 {
 			return nil, invalid("invalid_image_schema")
 		}
 		if !templatePattern.MatchString(repository) || !profilePattern.MatchString(tag) || flavor != "" && !profilePattern.MatchString(flavor) {
@@ -79,6 +78,9 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 		}
 		reference := repository + ":" + tag
 		if previous, duplicate := seenIDs[id]; duplicate {
+			if seenImageIDs[id] != imageID {
+				return nil, invalid("ambiguous_image_id")
+			}
 			if previous.Repository+":"+previous.Tag == reference {
 				return nil, invalid("duplicate_image_id")
 			}
@@ -93,6 +95,7 @@ func parseTemplateInventory(data []byte) ([]cachedTemplate, error) {
 		}
 		image := cachedTemplate{ID: id, Repository: repository, Tag: tag, Flavor: flavor, CreatedAt: createdAt, Size: sizeValue}
 		seenIDs[id] = image
+		seenImageIDs[id] = imageID
 		seenReferences[reference] = struct{}{}
 		images = append(images, image)
 	}

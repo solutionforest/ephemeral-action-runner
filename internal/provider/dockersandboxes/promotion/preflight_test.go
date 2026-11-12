@@ -36,6 +36,38 @@ func TestPromotedTemplateSupportsBothInventoryEnvelopes(t *testing.T) {
 	}
 }
 
+func TestPromotedTemplateSupportsFullImageIDs(t *testing.T) {
+	record, outputs := validPreflightFixture(t)
+	full := strings.Replace(string(outputs["template\x00ls\x00--json"]), `"`+record.TemplateCacheID+`"`, `"`+record.TemplateDigest+`"`, 1)
+	var wrapper map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(full), &wrapper); err != nil {
+		t.Fatal(err)
+	}
+	for _, inventory := range []string{full, string(wrapper["images"])} {
+		if err := verifyPromotedTemplate([]byte(inventory), record.Template, record.TemplateCacheID); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyPromotedTemplate([]byte(inventory), record.Template, "bbbbbbbbbbbb"); err == nil {
+			t.Fatal("mismatched full image identity was accepted")
+		}
+	}
+	for _, id := range []string{record.TemplateDigest[:len(record.TemplateDigest)-1], record.TemplateDigest + "0", strings.ToUpper(record.TemplateDigest)} {
+		if err := verifyPromotedTemplate([]byte(strings.Replace(full, record.TemplateDigest, id, 1)), record.Template, record.TemplateCacheID); err == nil {
+			t.Fatalf("malformed full image identity %q was accepted", id)
+		}
+	}
+	image := strings.TrimSuffix(strings.TrimPrefix(string(wrapper["images"]), "["), "]")
+	alias := strings.Replace(image, `"tag":"promoted"`, `"tag":"alias"`, 1)
+	for _, id := range []string{record.TemplateDigest[:len(record.TemplateDigest)-1] + "b", record.TemplateCacheID} {
+		ambiguous := strings.Replace(alias, record.TemplateDigest, id, 1)
+		for _, inventory := range []string{"[" + image + "," + ambiguous + "]", "[" + ambiguous + "," + image + "]"} {
+			if err := verifyPromotedTemplate([]byte(inventory), record.Template, record.TemplateCacheID); err == nil || !strings.Contains(err.Error(), "ambiguous image ID") {
+				t.Fatalf("ambiguous full image identity accepted: %v", err)
+			}
+		}
+	}
+}
+
 func TestSandboxCommandEnvironmentStripsHostSSHAgentAndSandboxOverrides(t *testing.T) {
 	t.Setenv("DOCKER_SANDBOXES_TEST_OVERRIDE", "should-not-reach-sbx")
 	t.Setenv("ssh_auth_sock", "/tmp/host-agent.sock")

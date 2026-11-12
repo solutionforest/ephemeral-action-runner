@@ -79,12 +79,26 @@ type relayPolicyProof struct {
 type relayPolicyPrecondition struct {
 	InventoryDigest string
 	Proof           string
+	Resource        string
 }
 
 const (
 	relayPolicyPreAllowBlocked           = "blocked"
 	relayPolicyPreAllowAuthenticatedOpen = "authenticated-open"
 )
+
+const hostTrustRelayActivationScript = `set -euo pipefail
+# Published shell kits can replace the image entrypoint. Initialize the
+# existing trusted template when it has not started its guest-local bridge.
+# Redirect every bootstrap descriptor so its long-lived sudo/bridge children
+# do not retain this exec session's streams or consume the relay JSON input.
+if sudo -n test ! -e /run/epar/egress-bridge.pid && sudo -n test ! -L /run/epar/egress-bridge.pid; then
+  if ! /opt/epar/template-entrypoint.sh true </dev/null >/dev/null 2>&1; then
+    echo "EPAR host-trust relay: template initialization failed" >&2
+    exit 1
+  fi
+fi
+sudo -n /opt/epar/configure-egress-relay.sh`
 
 const hostTrustRelayVerificationScript = `set -euo pipefail
 test -f /run/epar/egress-relay-active
@@ -160,7 +174,7 @@ func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provid
 	addedPolicyRules, policyProof, err = p.applyHostTrustRelayPolicy(ctx, instance, provider.NetworkPolicyRule{
 		Name:      "epar-host-trust-relay",
 		Decision:  provider.NetworkPolicyAllow,
-		Resources: []string{resource},
+		Resources: []string{precondition.Resource},
 	}, precondition)
 	if err != nil {
 		return fmt.Errorf("allow exact Docker Sandboxes host-trust relay endpoint: %w", err)
@@ -185,7 +199,7 @@ func (p *Provider) ActivateHostTrustRuntime(ctx context.Context, instance provid
 	payload = append(payload, '\n')
 	guestActivationAttempted = true
 	probeStarted := hostTrustRelayPolicyProbeStart()
-	if _, err := p.Exec(ctx, instance, provider.ShellCommand("sudo -n /opt/epar/configure-egress-relay.sh"), provider.ExecOptions{
+	if _, err := p.Exec(ctx, instance, provider.ShellCommand(hostTrustRelayActivationScript), provider.ExecOptions{
 		Stdin:              string(payload),
 		SensitiveValues:    []string{token},
 		SuppressTranscript: true,
@@ -338,11 +352,11 @@ func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding 
 	if err != nil {
 		return relayPolicyPrecondition{}, fmt.Errorf("read Docker Sandboxes policy before relay proof: %w", err)
 	}
-	resource := net.JoinHostPort("host.docker.internal", strconv.Itoa(binding.Port))
+	relayHosts := hostTrustRelayPolicyHosts(binding.Port)
 	for _, rule := range rules {
 		if rule.Active && rule.Decision == provider.NetworkPolicyAllow && rule.ResourceType == "network" && isSandboxPolicyTarget(rule.Scope, rule.AppliesTo, binding.Instance.Name) {
 			for _, candidate := range rule.Resources {
-				if candidate == resource {
+				if _, exactRelay := relayHosts[candidate]; exactRelay {
 					return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes host-trust relay endpoint already had an exact allow rule before activation")
 				}
 			}
@@ -364,9 +378,9 @@ func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding 
 	if err != nil {
 		return relayPolicyPrecondition{}, err
 	}
-	relayHosts := hostTrustRelayPolicyHosts(binding.Port)
 	foundBlocked := false
 	foundAllowed := false
+	observedResources := make(map[string]struct{})
 	for _, record := range document.Allowed {
 		if record.SandboxName != binding.Instance.Name || record.LastSeen.Before(startedAt) {
 			continue
@@ -378,6 +392,7 @@ func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding 
 			return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes returned invalid allowed evidence for the pre-rule relay proof")
 		}
 		foundAllowed = true
+		observedResources[record.Host] = struct{}{}
 	}
 	for _, record := range document.Blocked {
 		if record.SandboxName != binding.Instance.Name || record.LastSeen.Before(startedAt) || record.Count <= 0 {
@@ -385,14 +400,22 @@ func (p *Provider) verifyHostTrustRelayBeforeAllow(ctx context.Context, binding 
 		}
 		if _, exactRelay := relayHosts[record.Host]; exactRelay {
 			foundBlocked = true
+			observedResources[record.Host] = struct{}{}
 		}
+	}
+	if len(observedResources) > 1 {
+		return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes returned ambiguous relay endpoint authorities")
+	}
+	var resource string
+	for host := range observedResources {
+		resource = host
 	}
 	probeOutput := strings.TrimSpace(result.Stdout)
 	switch {
 	case probeOutput == "PONG" && foundAllowed && !foundBlocked:
-		return relayPolicyPrecondition{InventoryDigest: inventoryDigest, Proof: relayPolicyPreAllowAuthenticatedOpen}, nil
+		return relayPolicyPrecondition{InventoryDigest: inventoryDigest, Proof: relayPolicyPreAllowAuthenticatedOpen, Resource: resource}, nil
 	case probeOutput == "" && foundBlocked && !foundAllowed:
-		return relayPolicyPrecondition{InventoryDigest: inventoryDigest, Proof: relayPolicyPreAllowBlocked}, nil
+		return relayPolicyPrecondition{InventoryDigest: inventoryDigest, Proof: relayPolicyPreAllowBlocked, Resource: resource}, nil
 	case probeOutput != "" && probeOutput != "PONG":
 		return relayPolicyPrecondition{}, fmt.Errorf("Docker Sandboxes host-trust relay returned an unexpected pre-rule authenticated response")
 	default:
@@ -490,10 +513,13 @@ func (p *Provider) verifyUnattributedRelayPolicyProof(ctx context.Context, bindi
 	if relayPolicyInventoryDigest(rules) != binding.PolicyInventoryDigest {
 		return fmt.Errorf("Docker Sandboxes policy changed after the unattributed relay proof was bound")
 	}
-	resource := net.JoinHostPort("host.docker.internal", strconv.Itoa(binding.Port))
+	relayHosts := hostTrustRelayPolicyHosts(binding.Port)
 	matched := 0
 	for _, rule := range rules {
-		if !rule.Active || rule.Decision != provider.NetworkPolicyAllow || rule.ResourceType != "network" || len(rule.Resources) != 1 || rule.Resources[0] != resource || !isRemovableSandboxPolicyRule(rule, binding.Instance.Name) {
+		if !rule.Active || rule.Decision != provider.NetworkPolicyAllow || rule.ResourceType != "network" || len(rule.Resources) != 1 || !isRemovableSandboxPolicyRule(rule, binding.Instance.Name) {
+			continue
+		}
+		if _, exactRelay := relayHosts[rule.Resources[0]]; !exactRelay {
 			continue
 		}
 		if _, expected := binding.PolicyRules[rule.Name]; expected {

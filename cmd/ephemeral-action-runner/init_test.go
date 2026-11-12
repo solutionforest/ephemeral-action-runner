@@ -1134,6 +1134,9 @@ func TestInitDockerSandboxesGeneratesDesiredImageConfigAndProvisionsTemplate(t *
 	if got, want := cfg.DockerSandboxes.RecoveryQuiescenceSeconds, config.DockerSandboxesDefaultRecoveryQuiescenceSeconds; got != want {
 		t.Fatalf("dockerSandboxes.recoveryQuiescenceSeconds = %d, want wizard value %d", got, want)
 	}
+	if cfg.DockerSandboxes.CreateTimeoutSeconds != config.DockerSandboxesDefaultCreateTimeoutSeconds {
+		t.Fatalf("wizard create timeout = %d", cfg.DockerSandboxes.CreateTimeoutSeconds)
+	}
 	if !strings.Contains(string(configContent), "architectureEmulation: native-only") {
 		t.Fatalf("wizard config omitted native-only architecture emulation:\n%s", configContent)
 	}

@@ -2061,6 +2061,7 @@ dockerSandboxes:
   architectureEmulation: %s
   recoveryMode: exclusive-auto
   recoveryQuiescenceSeconds: 60
+  createTimeoutSeconds: 600
   stagingRoot: .local/cache/docker-sandboxes/staging
   cpus: 4
   memory: 4GiB
