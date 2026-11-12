@@ -828,7 +828,7 @@ func TestCreateKnownSandboxContainerFailureAddsSSHDaemonRemediation(t *testing.T
 
 func TestCreateProviderDeadlineBecomesAdmissionFailureAndPreservesExactIdentity(t *testing.T) {
 	p := New("sbx-test-double")
-	p.createTimeout = 10 * time.Millisecond
+	p.ConfigureCreateTimeout(10 * time.Millisecond)
 	var inventoryCalls int
 	p.runCommand = func(ctx context.Context, request commandRequest) (provider.ExecResult, error) {
 		switch request.args[0] {
@@ -3079,7 +3079,7 @@ func TestPolicyCommandsAreSandboxScopedAndReadBackExactRules(t *testing.T) {
 		p, done := scriptedProvider(t,
 			commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: readyListJSON}},
 			commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: policyJSON}},
-			commandStep{args: []string{"policy", "rm", "network", "--sandbox", testName, "--id", "rule-1"}},
+			commandStep{args: []string{"policy", "rm", "network", "--sandbox", testName, "--id", "rule-1", "--force"}},
 			commandStep{args: []string{"policy", "ls", testName, "--include-inactive", "--json"}, result: provider.ExecResult{Stdout: policyFixture(`[` + globalRule + `]`)}},
 		)
 		remove := provider.NetworkPolicyRule{

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -38,6 +39,99 @@ func TestTemplateInventorySupportedEnvelopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	done()
+}
+
+func TestTemplateInventoryFullImageIDsKeepExistingCacheIdentity(t *testing.T) {
+	full := strings.Replace(templateListJSON, `"39cf20eca861"`, `"`+testDigest+`"`, 1)
+	for name, inventory := range map[string]string{"wrapped": full, "array": inventoryArray(t, full, "images")} {
+		t.Run(name, func(t *testing.T) {
+			artifact := provider.TemplateArtifact{Reference: "docker.io/library/epar-template:one", CacheID: "39cf20eca861", Digest: testDigest}
+			inventory = strings.Replace(inventory, `"docker.io/docker/sandbox-templates"`, `"docker.io/library/epar-template"`, 1)
+			inventory = strings.Replace(inventory, `"tag":"shell-docker"`, `"tag":"one"`, 1)
+			read := commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: inventory}}
+			p, done := scriptedProvider(t, read, read, read, read,
+				commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}}, read,
+				commandStep{args: []string{"template", "rm", "--force", artifact.CacheID}},
+				commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
+			)
+			templates, err := p.CachedTemplates(context.Background())
+			if err != nil || len(templates) != 1 || templates[0].CacheID != artifact.CacheID || templates[0].Reference != artifact.Reference {
+				t.Fatalf("cached templates = %v, %v", templates, err)
+			}
+			if id, found, err := p.ResolveTemplateCacheID(context.Background(), artifact.Reference); err != nil || !found || id != artifact.CacheID {
+				t.Fatalf("resolved cache identity = %q, %t, %v", id, found, err)
+			}
+			if err := p.VerifyImportedTemplate(context.Background(), artifact); err != nil {
+				t.Fatal(err)
+			}
+			if exists, err := p.ObserveTemplate(context.Background(), artifact); err != nil || !exists {
+				t.Fatalf("existing receipt observation = %t, %v", exists, err)
+			}
+			if err := p.RemoveTemplate(context.Background(), artifact); err != nil {
+				t.Fatal(err)
+			}
+			done()
+		})
+	}
+}
+
+func TestTemplateInventoryV053WindowsCapture(t *testing.T) {
+	data, err := os.ReadFile("testdata/sbx-v0.53.0-template-ls.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	templates, err := parseTemplateInventory(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(templates) != 3 || templates[0].ID != "d86a6cdc105a" || templates[1].ID != "9f6ff1ca4a25" || templates[2].ID != templates[1].ID {
+		t.Fatalf("captured Windows template identities = %v", templates)
+	}
+	if templates[1].Repository+":"+templates[1].Tag != "docker.io/library/epar-docker-sandboxes-prebuilt-base:6bda3be539a7ad3a2a01c4a0d2a21b6743d8c408e24ea5a5bde1e5cc30c700a9" || templates[2].Repository+":"+templates[2].Tag != "docker.io/library/sandbox-kit-assembled:90d0c1e9696e60df" || templates[1].Size != 19850892400 {
+		t.Fatalf("captured Windows template aliases = %v", templates)
+	}
+}
+
+func TestTemplateInventoryRejectsMalformedFullImageIDs(t *testing.T) {
+	for _, id := range []string{
+		"sha256:39cf20eca861",
+		testDigest[:len(testDigest)-1],
+		testDigest + "0",
+		testDigest[:len(testDigest)-1] + "g",
+		strings.ToUpper(testDigest),
+		" " + testDigest,
+	} {
+		inventory := strings.Replace(templateListJSON, `"39cf20eca861"`, `"`+id+`"`, 1)
+		if images, err := parseTemplateInventory([]byte(inventory)); err == nil || images != nil || !strings.Contains(err.Error(), "category=invalid_image_schema") {
+			t.Fatalf("malformed full ID %q = %v, %v", id, images, err)
+		}
+	}
+}
+
+func TestTemplateInventoryFullImageAliasesRejectAmbiguousShortIDs(t *testing.T) {
+	for _, aliasFirst := range []bool{false, true} {
+		inventory := strings.ReplaceAll(templateAliasesJSON(t, aliasFirst), `"39cf20eca861"`, `"`+testDigest+`"`)
+		inventory = strings.Replace(inventory, `"docker.io/docker/sandbox-templates"`, `"docker.io/library/epar-template"`, 1)
+		inventory = strings.Replace(inventory, `"tag":"shell-docker"`, `"tag":"one"`, 1)
+		images, err := parseTemplateInventory([]byte(inventory))
+		if err != nil || len(images) != 2 || images[0].ID != "39cf20eca861" || images[1].ID != "39cf20eca861" {
+			t.Fatalf("full image aliases = %v, %v", images, err)
+		}
+		p, done := scriptedProvider(t,
+			commandStep{args: []string{"ls", "--json"}, result: provider.ExecResult{Stdout: `[]`}},
+			commandStep{args: []string{"template", "ls", "--json"}, result: provider.ExecResult{Stdout: inventory}},
+		)
+		if err := p.RemoveTemplate(context.Background(), provider.TemplateArtifact{Reference: "docker.io/library/epar-template:one", CacheID: "39cf20eca861"}); err == nil {
+			t.Fatal("cache-ID deletion accepted an additional unowned full-ID alias")
+		}
+		done()
+		for _, id := range []string{testDigest[:len(testDigest)-1] + "1", "39cf20eca861"} {
+			ambiguous := strings.Replace(inventory, testDigest, id, 1)
+			if images, err := parseTemplateInventory([]byte(ambiguous)); err == nil || images != nil || !strings.Contains(err.Error(), "category=ambiguous_image_id") {
+				t.Fatalf("ambiguous full image aliases = %v, %v", images, err)
+			}
+		}
+	}
 }
 
 func TestTemplateInventoryDiagnosticCategories(t *testing.T) {

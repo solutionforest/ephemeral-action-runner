@@ -199,7 +199,7 @@ func TestPolicyMutationErrorsRequireExactObservedOutcome(t *testing.T) {
 				args := []string{"policy", "allow", "network", "--sandbox", testName, "api.example.com"}
 				readArgs := []string{"policy", "ls", testName, "--include-inactive", "--json"}
 				if remove {
-					args = []string{"policy", "rm", "network", "--sandbox", testName, "--id", rule.ID}
+					args = []string{"policy", "rm", "network", "--sandbox", testName, "--id", rule.ID, "--force"}
 					steps = append(steps, commandStep{args: readArgs, result: provider.ExecResult{Stdout: present}})
 				}
 				steps = append(steps, commandStep{args: args, result: provider.ExecResult{Stderr: "new CLI result wording"}, err: exitOne})

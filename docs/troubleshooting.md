@@ -146,7 +146,11 @@ The `best-effort` and `required` modes remain available as explicit configuratio
 
 The wizard marks Docker Sandboxes unavailable, or `sbx diagnose --format json` reports failures. Before sbx v0.48, use `sbx diagnose --output json` instead.
 
+This upgrade targets sbx v0.53.0, which includes the upstream fix for affected native Windows installations described in [Docker issue #157](https://github.com/docker/sbx-releases/issues/157#issuecomment-6809608122). The current EPAR checkout has been validated only on the Windows amd64 test machine; live macOS and Linux validation with v0.53.0 remains pending.
+
 If upgrading to sbx v0.48 or later causes `docker sandbox template inventory parse failure: category=invalid_root_type`, update EPAR and rerun `./start`. Those sbx versions changed inventory JSON from wrapped objects to arrays. This error occurs while parsing the inventory and does not indicate image corruption; clearing the image cache or rebuilding Full is unnecessary for this failure.
+
+If upgrading to sbx v0.53 causes `category=invalid_image_schema`, that release changed structured template listings to preserve full image IDs instead of abbreviating them to 12 characters. Update EPAR to a version that accepts full SHA-256 template IDs and rerun `./start`; existing cache receipts remain usable. This failure does not require deleting cached templates, rebuilding the runner image, or installing Go. An `ambiguous_image_id` category instead means that different or incomplete identities share one 12-character cache prefix; EPAR intentionally blocks that snapshot rather than guessing which image to verify or delete.
 
 ### Diagnosis and remediation
 

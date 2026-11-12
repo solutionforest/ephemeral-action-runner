@@ -544,6 +544,9 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		environment["DOCKER_SANDBOXES_DOCKER_SIZE"] = request.DockerDisk
 	}
 	createCtx, cancelCreate := context.WithTimeout(ctx, p.createOperationTimeout())
+	if p.logger != nil {
+		p.logger.Info(fmt.Sprintf("Docker Sandboxes instance creation budget: %s", p.createOperationTimeout()))
+	}
 	result, createErr := p.run(createCtx, commandRequest{args: args, environment: environment, operation: "create docker sandbox"})
 	createTimedOut := errors.Is(createCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 	cancelCreate()
@@ -562,6 +565,7 @@ func (p *Provider) Create(ctx context.Context, request provider.CreateRequest) (
 		}
 		failure := withSandboxContainerFailureRemediation(createErr)
 		if createTimedOut {
+			failure = fmt.Errorf("Docker Sandboxes creation exceeded %s; first-use template unpacking may need a larger dockerSandboxes.createTimeoutSeconds value; inspect the sbx daemon log before retrying: %w", p.createOperationTimeout(), failure)
 			// A provider-owned deadline is an ambiguous outcome: sbx may have
 			// materialized the runtime after the client stopped waiting. Make one
 			// bounded, read-only inventory attempt so an exact identity and
@@ -688,6 +692,12 @@ func (p *Provider) createOperationTimeout() time.Duration {
 		return p.createTimeout
 	}
 	return providerCreateTimeout
+}
+
+// ConfigureCreateTimeout sets the creation budget before the provider is used.
+// Configuration validation bounds the duration; zero retains the default.
+func (p *Provider) ConfigureCreateTimeout(timeout time.Duration) {
+	p.createTimeout = timeout
 }
 
 func (p *Provider) reconcileTimedOutCreate(ctx context.Context, request provider.CreateRequest, ownedStaging staging.OwnedDirectory) (provider.Instance, error) {
@@ -2046,6 +2056,19 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 			p.logger.Debug("Docker Sandboxes command admitted", "operation", request.operation, "lockWait", time.Since(lockStarted))
 		}
 	}
+	if runtime.GOOS == "windows" && commandMayAutoStartDaemon(request.args) {
+		// sbx can implicitly launch its daemon for ordinary commands. That daemon
+		// would inherit this command's kill-on-close job and die when the command
+		// returns. Only the explicit detached StartDaemon path may launch it.
+		state, err := p.readDaemonControlState(provider.WithControlPlaneLock(withControlPlaneGate(ctx)))
+		if err != nil {
+			return provider.ExecResult{}, fmt.Errorf("verify Docker Sandboxes daemon before command: %w", err)
+		}
+		if state != daemonControlStateRunning {
+			failure := provider.NewControlPlaneFailure("verify Docker Sandboxes daemon before command", errors.New("daemon is stopped"))
+			return provider.ExecResult{}, fmt.Errorf("Docker Sandboxes daemon is stopped; run 'sbx daemon start --detach' before retrying ./start: %w", failure)
+		}
+	}
 	commandStarted := time.Now()
 	cmd := exec.CommandContext(ctx, p.Binary, request.args...)
 	isolateManagedProcess(cmd)
@@ -2098,6 +2121,18 @@ func (p *Provider) runRaw(ctx context.Context, request commandRequest) (provider
 		p.logger.Debug("Docker Sandboxes command completed", "operation", request.operation, "executionDuration", time.Since(commandStarted), "contextError", ctx.Err())
 	}
 	return result, err
+}
+
+func commandMayAutoStartDaemon(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "create", "exec", "stop", "rm", "ls", "template", "policy", "inspect", "ports":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateCommandRequest(request commandRequest) error {

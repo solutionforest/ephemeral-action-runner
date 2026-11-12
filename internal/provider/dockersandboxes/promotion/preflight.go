@@ -319,26 +319,36 @@ func verifyPromotedTemplate(data []byte, reference, cacheID string) error {
 	if err := decodeStrictJSON(rawImages, &images); err != nil || images == nil {
 		return errors.New("Docker Sandboxes template inventory omitted images")
 	}
+	seenImageIDs := make(map[string]string, len(images))
+	found := false
 	for _, image := range images {
 		actualRepository, repositoryErr := requiredString(image, "repository", false)
 		actualTag, tagErr := requiredString(image, "tag", false)
-		actualID, idErr := requiredString(image, "id", false)
+		imageID, idErr := requiredString(image, "id", false)
+		actualID, validID := sandboxcli.TemplateCacheID(imageID)
 		createdAt, createdAtErr := requiredString(image, "created_at", false)
 		var size json.Number
 		sizeErr := json.Unmarshal(image["size"], &size)
 		sizeValue, integerErr := strconv.ParseInt(size.String(), 10, 64)
-		if repositoryErr != nil || tagErr != nil || idErr != nil || !validTemplateCacheID(actualID) || createdAtErr != nil || sizeErr != nil || integerErr != nil || sizeValue <= 0 {
+		if repositoryErr != nil || tagErr != nil || idErr != nil || !validID || createdAtErr != nil || sizeErr != nil || integerErr != nil || sizeValue <= 0 {
 			return errors.New("Docker Sandboxes template inventory returned an unsupported image schema")
 		}
 		if _, err := time.Parse(time.RFC3339, createdAt); err != nil {
 			return errors.New("Docker Sandboxes template inventory returned an invalid creation time")
 		}
+		if previous, duplicate := seenImageIDs[actualID]; duplicate && previous != imageID {
+			return errors.New("Docker Sandboxes template inventory returned an ambiguous image ID")
+		}
+		seenImageIDs[actualID] = imageID
 		if actualRepository == repository && actualTag == tag {
 			if actualID != cacheID {
 				return fmt.Errorf("cached template cache ID %s does not match promoted cache ID %s", actualID, cacheID)
 			}
-			return nil
+			found = true
 		}
+	}
+	if found {
+		return nil
 	}
 	return fmt.Errorf("promoted template %s is not present in the Docker Sandboxes cache", reference)
 }
