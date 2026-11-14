@@ -509,7 +509,7 @@ func manifestHasMutableRemoteInputs(manifest Manifest) bool {
 	if normalizedRunnerSelector(manifest.RunnerSelector) == "latest" {
 		return true
 	}
-	if manifest.SourceType == config.ImageSourceDockerImage && !strings.Contains(strings.ToLower(manifest.SourceImage), "@sha256:") {
+	if (manifest.SourceType == config.ImageSourceDockerImage || manifest.SourceType == config.ImageSourceTartImage) && !strings.Contains(strings.ToLower(manifest.SourceImage), "@sha256:") {
 		return true
 	}
 	return false

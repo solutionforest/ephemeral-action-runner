@@ -66,7 +66,7 @@ func (m *Coordinator) resolveActionsRunner(ctx context.Context, manifest Manifes
 	switch platform {
 	case "linux/amd64":
 		architecture = "x64"
-	case "linux/arm64":
+	case "linux/arm64", "darwin/arm64":
 		architecture = "arm64"
 	default:
 		return manifest, fmt.Errorf("GitHub Actions runner packages are not configured for %s", platform)
@@ -200,7 +200,11 @@ func applyActionsRunnerRelease(manifest Manifest, selector, architecture string,
 	if selector != "latest" && selector != version {
 		return manifest, fmt.Errorf("GitHub Actions runner release returned version %q for selector %q", version, selector)
 	}
-	assetName := fmt.Sprintf("actions-runner-linux-%s-%s.tar.gz", architecture, version)
+	runnerOS := "linux"
+	if manifest.ProviderType == "tart" && manifest.ProviderPlatform == "darwin/arm64" {
+		runnerOS = "osx"
+	}
+	assetName := fmt.Sprintf("actions-runner-%s-%s-%s.tar.gz", runnerOS, architecture, version)
 	var selected *actionsRunnerAsset
 	for index := range release.Assets {
 		if release.Assets[index].Name == assetName {
@@ -227,6 +231,9 @@ func applyActionsRunnerRelease(manifest Manifest, selector, architecture string,
 }
 
 func actionsRunnerPlatform(manifest Manifest, providerType string) (string, error) {
+	if providerType == "tart" && manifest.ProviderPlatform == "darwin/arm64" {
+		return "darwin/arm64", nil
+	}
 	for _, candidate := range []string{manifest.SourcePlatform, manifest.ProviderPlatform} {
 		if platform, ok := NormalizedDockerPlatform(candidate, "linux"); ok {
 			return platform.OS + "/" + platform.Architecture, nil

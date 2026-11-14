@@ -1,0 +1,57 @@
+# Tart macOS preview on Apple Silicon. Docker containers are NOT supported in Tart macOS VMs.
+# GitHub Actions using job containers, service containers, Docker-based actions, or Docker commands will fail in this mode.
+github:
+  appId: 123456
+  organization: your-org
+  privateKeyPath: ~/.config/ephemeral-action-runner/github-app.pem
+  apiBaseUrl: https://api.github.com
+  webBaseUrl: https://github.com
+
+image:
+  sourceType: tart-image
+  sourceImage: ghcr.io/cirruslabs/macos-tahoe-xcode:26.2
+  outputImage: epar-tart-macos-mobile
+  runnerVersion: latest
+  updateFrequency: weekly
+  updateTime: "07:00"
+  hostTrustMode: disabled
+  customInstallScripts:
+    - examples/custom-install/prepare-macos-mobile.sh
+
+pool:
+  instances: 1
+  namePrefix: CHANGE-ME-unique-machine-prefix
+
+storage:
+  minimumFree: 10GiB
+
+logging:
+  directory: work/logs/tart-mobile
+
+runner:
+  group: your-runner-group
+  labels: [macOS, ARM64, epar-tart-macos-mobile]
+  noDefaultLabels: true
+  includeHostLabel: true
+  ephemeral: true
+
+security:
+  runnerGroup:
+    enforcement: enforce
+    requireExplicitGroup: true
+    requireNonDefaultGroup: true
+    requiredRepositoryAccess: selected
+    requirePublicRepositoriesDisabled: true
+
+provider:
+  type: tart
+  platform: darwin/arm64
+  sourceImage: epar-tart-macos-mobile
+  # Use bridged:en0 explicitly if NAT cannot reach required services through the host's VPN.
+  # Bridged guests join that interface's LAN; choose the actual interface on your Mac.
+  network: default
+
+timeouts:
+  bootSeconds: 180
+  githubOnlineSeconds: 180
+  commandSeconds: 900

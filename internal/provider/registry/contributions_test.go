@@ -51,7 +51,7 @@ func TestEveryProviderRegistersRequiredContributions(t *testing.T) {
 	}
 }
 
-func TestProviderOnboardingTiersAndRuntimeOnlyTart(t *testing.T) {
+func TestProviderOnboardingTiers(t *testing.T) {
 	want := map[string]struct {
 		supported bool
 		tier      provider.WizardTier
@@ -60,7 +60,7 @@ func TestProviderOnboardingTiersAndRuntimeOnlyTart(t *testing.T) {
 		"docker-sandboxes": {supported: true, tier: provider.WizardTierPrimary, number: "1"},
 		"docker-container": {supported: true, tier: provider.WizardTierCompatibility, number: "2"},
 		"wsl":              {supported: true, tier: provider.WizardTierCompatibility, number: "3"},
-		"tart":             {supported: false},
+		"tart":             {supported: true, tier: provider.WizardTierCompatibility, number: "4"},
 	}
 	for _, descriptor := range Descriptors() {
 		expected := want[descriptor.Type]

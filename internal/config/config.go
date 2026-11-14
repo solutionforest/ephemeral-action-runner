@@ -84,6 +84,16 @@ const (
 	DockerSandboxesPrebuiltFullReference = DockerSandboxesPrebuiltRepository + ":full-latest"
 )
 
+// TartMacOSPlatform selects native Apple Silicon macOS guests. Empty Tart
+// platforms retain the historical Ubuntu ARM64 configuration defaults.
+const TartMacOSPlatform = "darwin/arm64"
+const ImageSourceTartImage = "tart-image"
+const DefaultTartMacOSImage = "ghcr.io/cirruslabs/macos-tahoe-xcode:26.2"
+
+func (cfg Config) TartMacOS() bool {
+	return cfg.Provider.Type == "tart" && cfg.Provider.Platform == TartMacOSPlatform
+}
+
 type PoolConfig struct {
 	Instances                      int
 	NamePrefix                     string
@@ -854,9 +864,15 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 	case "tart":
 		if !explicit["image.sourceImage"] {
 			cfg.Image.SourceImage = "ghcr.io/cirruslabs/ubuntu:latest"
+			if cfg.TartMacOS() {
+				cfg.Image.SourceImage = DefaultTartMacOSImage
+			}
 		}
 		if !explicit["image.outputImage"] {
 			cfg.Image.OutputImage = "epar-ubuntu-24-arm64"
+			if cfg.TartMacOS() {
+				cfg.Image.OutputImage = "epar-tart-macos-mobile"
+			}
 		}
 		if !explicit["provider.sourceImage"] {
 			cfg.Provider.SourceImage = cfg.Image.OutputImage
@@ -866,6 +882,17 @@ func applyProviderDefaults(cfg *Config, explicit map[string]bool) {
 		}
 		if !explicit["runner.labels"] {
 			cfg.Runner.Labels = []string{"self-hosted", "linux", "ARM64", "epar-tart-ubuntu-24.04-base"}
+			if cfg.TartMacOS() {
+				cfg.Runner.Labels = []string{"macOS", "ARM64", "epar-tart-macos-mobile"}
+			}
+		}
+		if cfg.TartMacOS() {
+			if !explicit["image.sourceType"] {
+				cfg.Image.SourceType = ImageSourceTartImage
+			}
+			if !explicit["runner.noDefaultLabels"] {
+				cfg.Runner.NoDefaultLabels = true
+			}
 		}
 	case "wsl":
 		if !explicit["provider.installRoot"] {
@@ -1246,11 +1273,34 @@ func Validate(cfg Config) error {
 		}
 	}
 	if cfg.Provider.Platform != "" {
-		if cfg.Provider.Type != "docker-container" && cfg.Provider.Type != "docker-sandboxes" {
+		if cfg.Provider.Type == "tart" {
+			if cfg.Provider.Platform != TartMacOSPlatform && cfg.Provider.Platform != "linux/arm64" {
+				return fmt.Errorf("Tart provider.platform must be darwin/arm64 or linux/arm64")
+			}
+		} else if cfg.Provider.Type != "docker-container" && cfg.Provider.Type != "docker-sandboxes" {
 			return fmt.Errorf("provider.platform is only supported with provider.type=docker-container or docker-sandboxes")
-		}
-		if err := ValidateDockerPlatform(cfg.Provider.Platform); err != nil {
+		} else if err := ValidateDockerPlatform(cfg.Provider.Platform); err != nil {
 			return err
+		}
+	}
+	if cfg.Image.SourceType == ImageSourceTartImage && cfg.Provider.Type != "tart" {
+		return fmt.Errorf("image.sourceType=tart-image requires provider.type=tart")
+	}
+	if cfg.TartMacOS() {
+		if cfg.Image.SourceType != ImageSourceTartImage {
+			return fmt.Errorf("Tart macOS requires image.sourceType=tart-image")
+		}
+		if cfg.Image.SourcePlatform != "" {
+			return fmt.Errorf("Tart macOS selects its platform with provider.platform; omit image.sourcePlatform")
+		}
+		if cfg.Image.HostTrustMode != "" && cfg.Image.HostTrustMode != HostTrustModeDisabled || len(cfg.Image.TrustedCACertificatePaths) != 0 {
+			return fmt.Errorf("Tart macOS preview requires image.hostTrustMode=disabled and no trustedCaCertificatePaths; host trust inheritance is not supported")
+		}
+		if cfg.Provider.RosettaTag != "" || len(cfg.Docker.RegistryMirrors) != 0 || cfg.Docker.HTTPProxy != "" || cfg.Docker.HTTPSProxy != "" || cfg.Docker.NoProxy != "" {
+			return fmt.Errorf("Tart macOS does not support Docker containers or Linux Rosetta mounts; remove docker settings and provider.rosettaTag")
+		}
+		if !cfg.Runner.Ephemeral {
+			return fmt.Errorf("Tart macOS requires runner.ephemeral=true")
 		}
 	}
 	for _, script := range cfg.Image.CustomInstallScripts {
@@ -1273,7 +1323,7 @@ func Validate(cfg Config) error {
 		return err
 	}
 	switch cfg.Image.SourceType {
-	case "", ImageSourceDockerImage, ImageSourceRootFSTar:
+	case "", ImageSourceDockerImage, ImageSourceRootFSTar, ImageSourceTartImage:
 	default:
 		return fmt.Errorf("unsupported image.sourceType %q", cfg.Image.SourceType)
 	}

@@ -1,6 +1,6 @@
 # Image Customization
 
-EPAR prepares a reusable runner artifact before it creates disposable instances. Docker Sandboxes is the primary artifact path on Linux, macOS, and Windows hosts; compatibility providers retain their existing artifact forms, and Tart's image path is retained only for existing configurations.
+EPAR prepares a reusable runner artifact before it creates disposable instances. Docker Sandboxes is the primary artifact path on Linux, macOS, and Windows hosts; compatibility providers retain their artifact forms, and Tart macOS preview prepares native VM images for mobile builds.
 
 ```mermaid
 flowchart LR
@@ -19,9 +19,9 @@ flowchart LR
 | Docker Sandboxes (primary) | Selected Catthehacker Full/Act source or the matching official EPAR prebuilt package | Verified imported runner template | `image build` or startup prebuilt acquisition |
 | Docker Container (compatibility) | `ghcr.io/catthehacker/ubuntu:full-latest` | Docker image tag | `image build --replace` |
 | WSL2 (compatibility) | Catthehacker Docker image converted to rootfs | Rootfs tar | `image build --replace` |
-| Tart (retired) | `ghcr.io/cirruslabs/ubuntu:latest` | Tart VM image for existing configurations | `image build --replace` |
+| Tart macOS (preview) | `ghcr.io/cirruslabs/macos-tahoe-xcode:26.2` | Native macOS VM; Ubuntu retains runtime compatibility | `image build --replace` |
 
-The first-run wizard offers Docker Sandboxes with four choices: verified prebuilt Full as the default, verified prebuilt Act, local Catthehacker Full, and local Catthehacker Act; choose `C. Show compatibility providers` to reach Docker Container and WSL, which retain another validated Catthehacker tag. Tart is retired from onboarding, although existing Tart configurations continue to build and clean up their VM image. Docker Sandboxes local builds offer only `full-latest` and `act-latest` because the reusable template must already contain the private Docker daemon and runtime closure. The local Full choice warns that preparation can take 30–60 minutes. Every local-build path includes platform resolution and a storage estimate; prebuilt acquisition and import sizing are resolved during startup after digest and attestation verification. The generated config uses no custom scripts and schedules updates weekly at 07:00 local time; edit the config after initialization to change those advanced settings. `./start` always verifies local inputs and the active artifact, but checks mutable package aliases, source tags, and `runnerVersion: latest` only when the configured schedule is due. Docker Sandboxes imports a replacement into its template cache and activates it only after exact readback succeeds.
+The first-run wizard offers Docker Sandboxes with four choices: verified prebuilt Full as the default, verified prebuilt Act, local Catthehacker Full, and local Catthehacker Act; choose `C. Show compatibility providers` to reach Docker Container and WSL, which retain another validated Catthehacker tag. Tart macOS preview is option `4` and uses native Tart metadata; existing Ubuntu configurations retain runtime compatibility. Docker Sandboxes local builds offer only `full-latest` and `act-latest` because the reusable template must already contain the private Docker daemon and runtime closure. The local Full choice warns that preparation can take 30–60 minutes. Every local-build path includes platform resolution and a storage estimate; prebuilt acquisition and import sizing are resolved during startup after digest and attestation verification. The generated config uses no custom scripts and schedules updates weekly at 07:00 local time; edit the config after initialization to change those advanced settings. `./start` always verifies local inputs and the active artifact, but checks mutable package aliases, source tags, and `runnerVersion: latest` only when the configured schedule is due. Docker Sandboxes imports a replacement into its template cache and activates it only after exact readback succeeds.
 
 Use `./start image update` for an immediate remote check that rebuilds only when an immutable source or Actions runner identity changed. Use `./start image build` to force a build. Actions runner packages are selected by exact platform, downloaded into a content-addressed cache by the native controller, and SHA-256 verified before entering any provider build; guests do not resolve `latest`.
 
@@ -73,9 +73,9 @@ The output is a Docker image named by `image.outputImage`; `provider.sourceImage
 
 The default source is converted from a Docker image to an intermediate rootfs tar, then EPAR produces `image.outputImage` as the reusable WSL tar. Docker is required during this conversion. For `image.sourceType: rootfs-tar`, export a clean Ubuntu WSL distribution once and use that tar as `image.sourceImage`; see [WSL2 Provider](providers/wsl.md).
 
-### Tart (retired compatibility)
+### Tart macOS preview and Ubuntu compatibility
 
-Tart has no onboarding path, but existing configurations continue to use a local Tart VM image. The default is intentionally lean; use a custom bootable Ubuntu source image or focused install scripts when a workflow needs more tooling. EPAR builds and verifies a content-named candidate, keeps a rollback clone until the configured output passes immutable identity readback, and disables Tart's unrelated automatic cache pruning for its clone operations. `provider.rosettaTag` remains an opt-in Tart-only layer for selected Linux amd64 user-space workloads.
+Tart macOS onboarding selects a native ARM64 image and warns that Docker containers are unsupported. See [the Tart guide](providers/tart.md) for Xcode/Android preparation, routing, and preview limits. EPAR builds and verifies a content-named candidate, keeps a rollback clone until the configured output passes immutable identity readback, and disables Tart's unrelated automatic cache pruning for its clone operations. `provider.rosettaTag` remains an opt-in Tart-only layer for selected Linux amd64 user-space workloads.
 
 ### Docker Sandboxes
 

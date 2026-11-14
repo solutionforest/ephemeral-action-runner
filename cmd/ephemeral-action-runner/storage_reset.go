@@ -91,7 +91,9 @@ func runStorageReset(args []string) error {
 		if err != nil {
 			return fmt.Errorf("storage reset requires the host-trust wrapper to be stopped: %w", err)
 		}
-		defer hostTrustLock.Close()
+		if hostTrustLock != nil {
+			defer hostTrustLock.Close()
+		}
 		backendLocks, lockErr := acquireStorageResetBackendLocks(projectRoot, configPath)
 		if lockErr != nil {
 			return lockErr

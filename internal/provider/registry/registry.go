@@ -86,9 +86,11 @@ var entries = []entry{
 		},
 	},
 	{
-		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart (retired)", WizardSupported: false, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative},
+		descriptor: provider.Descriptor{Type: "tart", DisplayName: "Tart macOS (preview)", WizardSupported: true, WizardTier: provider.WizardTierCompatibility, WizardNumber: "4", WizardLabel: "Tart macOS — preview, no Docker containers", WizardWarning: tart.MacOSDockerWarning, WizardAliases: []string{"tart", "tart-macos"}, WizardPrerequisite: provider.WizardPrerequisiteTart, WizardOnboarding: provider.WizardOnboardingTartMacOS, WizardHostTrust: provider.WizardHostTrustNone, WizardReview: provider.WizardReviewNativeImage, GuidedArtifacts: true, ConfigurationDecoder: true, ConfigurationDefaults: true, ConfigurationValidator: true, LifecycleSupported: true, StorageSupported: true, ImageMode: provider.ImageModeNative},
 		factory: func(cfg config.Config, projectRoot string, dryRun bool) Runtime {
-			return adaptLegacy(tart.New("", dryRun), providerStorage(cfg, projectRoot), dryRun)
+			guest := tart.New("", dryRun)
+			guest.Platform = cfg.Provider.Platform
+			return adaptLegacy(guest, providerStorage(cfg, projectRoot), dryRun)
 		},
 	},
 }

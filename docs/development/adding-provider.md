@@ -4,7 +4,7 @@ Read [Development and Extension Principles](principles.md) and [Design](design.m
 
 Put provider commands and host integration in `internal/provider/<provider>`. Shared onboarding, naming, image, pool lifecycle, GitHub, state, capacity, and retention behavior stays in its common package.
 
-The registry currently accepts four provider identities at runtime and configuration. Docker Sandboxes is the primary onboarding path; Docker Container and WSL2 are compatibility providers revealed by `C. Show compatibility providers`; Tart remains registered only so existing configurations can keep runtime and exact cleanup behavior, and it is retired from onboarding. A new provider must not bypass this tiered wizard contract or silently become a fallback.
+The registry currently accepts four provider identities at runtime and configuration. Docker Sandboxes is the primary onboarding path; Docker Container and WSL2 are compatibility providers revealed by `C. Show compatibility providers`; Tart offers macOS preview onboarding as option `4`, with native image setup and a no-Docker warning; existing Ubuntu configurations retain runtime and exact cleanup compatibility. A new provider must not bypass this tiered wizard contract or silently become a fallback.
 
 A provider is complete only when it:
 

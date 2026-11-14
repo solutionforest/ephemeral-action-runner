@@ -8,7 +8,7 @@ flowchart LR
   Pool --> Provider["Provider contracts"]
   Pool --> GitHub["GitHub runner API"]
   Pool --> Storage["Capacity and retention"]
-  Provider --> Implementations["Docker Sandboxes primary; Docker Container and WSL compatibility; Tart retired runtime"]
+  Provider --> Implementations["Docker Sandboxes primary; Docker Container and WSL compatibility; Tart macOS preview and Ubuntu runtime compatibility"]
 ```
 
 ## Responsibilities

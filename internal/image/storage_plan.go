@@ -169,7 +169,7 @@ func PlanArtifactStorage(providerType string, source SourceSizeEstimate, cached 
 		)
 		plan.Notes = append(plan.Notes, "WSL Docker image-store, project rootfs, and temporary distribution allocations overlap during build/export.")
 	case "tart":
-		tartBytes, err := sumStorageBytes(source.ExpandedBytes, CustomizationAllowanceBytes)
+		tartBytes, err := sumStorageBytes(source.CompressedBytes, source.ExpandedBytes, CustomizationAllowanceBytes)
 		if err != nil {
 			return ArtifactStoragePlan{}, err
 		}
@@ -264,6 +264,9 @@ func operationPlanAggregatePeak(operationPlan storage.OperationPlan) (uint64, er
 
 func (m *Coordinator) configuredArtifactStoragePlan(ctx context.Context, cached bool) (ArtifactStoragePlan, error) {
 	if m.Config.Provider.Type == "tart" {
+		if m.Config.Image.SourceType == config.ImageSourceTartImage && !cached {
+			return m.tartArtifactStoragePlan(ctx, m.Config.Image.SourceImage)
+		}
 		return PlanArtifactStorage(m.Config.Provider.Type, SourceSizeEstimate{Confidence: EstimateDerived}, cached, 0)
 	}
 	if m.Config.Provider.Type == "wsl" && m.Config.Image.SourceType == config.ImageSourceRootFSTar {
@@ -302,4 +305,24 @@ func (m *Coordinator) configuredArtifactStoragePlan(ctx context.Context, cached 
 		dockerDiskBytes = uint64(parsed)
 	}
 	return PlanArtifactStorage(m.Config.Provider.Type, estimate, cached, dockerDiskBytes)
+}
+
+func (m *Coordinator) tartArtifactStoragePlan(ctx context.Context, reference string) (ArtifactStoragePlan, error) {
+	trust, err := m.resolveBuildTrust(ctx)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	client, err := buildTrustHTTPClient(trust)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	platform := m.Config.Provider.Platform
+	if platform == "" {
+		platform = "linux/arm64"
+	}
+	source, err := resolveTartSource(ctx, reference, platform, client.Transport)
+	if err != nil {
+		return ArtifactStoragePlan{}, err
+	}
+	return PlanArtifactStorage("tart", SourceSizeEstimate{CompressedBytes: source.CompressedBytes, ExpandedBytes: source.ExpandedBytes, Confidence: EstimateExact}, false, 0)
 }

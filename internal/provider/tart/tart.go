@@ -10,14 +10,54 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/solutionforest/ephemeral-action-runner/internal/provider"
 )
 
+const MacOSDockerWarning = "Docker containers are NOT supported in Tart macOS VMs. GitHub Actions using job containers, service containers, Docker-based actions, or Docker commands will fail in this mode."
+
+const MinimumMacOSVersion = "2.41.1"
+
+// ValidateMacOSVersion keeps native macOS on the headless/guest-agent runtime
+// used by the live mobile proof; older Ubuntu configurations are unaffected.
+func ValidateMacOSVersion(version string) error {
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(version), "v"), ".")
+	want := []int{2, 41, 1}
+	if len(parts) == 3 {
+		values := make([]int, 3)
+		valid := true
+		for index, part := range parts {
+			number, err := strconv.Atoi(part)
+			if err != nil || number < 0 {
+				valid = false
+				break
+			}
+			values[index] = number
+		}
+		if valid {
+			for index, number := range values {
+				if number > want[index] {
+					return nil
+				}
+				if number < want[index] {
+					break
+				}
+				if index == 2 {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("Tart macOS preview requires Tart %s or newer; found %q. Update Tart before using native macOS runners", MinimumMacOSVersion, strings.TrimSpace(version))
+}
+
 type Provider struct {
 	Binary     string
 	DryRun     bool
+	Platform   string
 	runCommand runCommandFunc
 	identities func() (map[string]string, error)
 }
@@ -32,6 +72,17 @@ func New(binary string, dryRun bool) *Provider {
 }
 
 func (p *Provider) Clone(ctx context.Context, source, name string) error {
+	if p.Platform == "darwin/arm64" && !p.DryRun {
+		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		version, err := p.run(checkCtx, nil, "--version")
+		if err != nil {
+			return fmt.Errorf("check Tart macOS prerequisite: %w", err)
+		}
+		if err := ValidateMacOSVersion(version.Stdout); err != nil {
+			return err
+		}
+	}
 	_, err := p.run(ctx, nil, "clone", source, name)
 	return err
 }
@@ -45,7 +96,11 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 	case "host":
 		args = append(args, "--net-host")
 	default:
-		return nil, fmt.Errorf("unsupported tart network mode %q", opts.Network)
+		bridge, ok := strings.CutPrefix(opts.Network, "bridged:")
+		if !ok || strings.TrimSpace(bridge) == "" || bridge == "list" {
+			return nil, fmt.Errorf("unsupported tart network mode %q; use default, softnet, host, or bridged:<interface>", opts.Network)
+		}
+		args = append(args, "--net-bridged="+bridge)
 	}
 	if opts.RosettaTag != "" {
 		args = append(args, "--rosetta", opts.RosettaTag)
@@ -55,10 +110,21 @@ func (p *Provider) Start(ctx context.Context, name string, opts provider.StartOp
 		fmt.Printf("[dry-run] %s %s\n", p.Binary, strings.Join(args, " "))
 		return &provider.RunningProcess{Name: name, PID: 0, LogPath: opts.LogPath}, nil
 	}
-	cmd := exec.CommandContext(ctx, p.Binary, args...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Start's context bounds admission, not the VM lifetime. The common pool
+	// cancels a successful replacement attempt immediately after provisioning;
+	// its exact Stop/Delete lifecycle owns termination of the running VM.
+	cmd := exec.Command(p.Binary, args...)
 	cmd.Stdout = writerOrDiscard(opts.Stdout)
 	cmd.Stderr = writerOrDiscard(opts.Stderr)
 	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, err
 	}
 	go func() {
@@ -82,11 +148,34 @@ func (p *Provider) Exec(ctx context.Context, name string, command []string, opts
 }
 
 func (p *Provider) IP(ctx context.Context, name string, waitSeconds int) (string, error) {
-	result, err := p.run(ctx, nil, "ip", name, "--wait", fmt.Sprintf("%d", waitSeconds), "--resolver", "agent")
-	if err != nil {
-		return "", err
+	if waitSeconds <= 0 || p.DryRun {
+		result, err := p.run(ctx, nil, "ip", name, "--wait", fmt.Sprintf("%d", waitSeconds), "--resolver", "agent")
+		return strings.TrimSpace(result.Stdout), err
 	}
-	return strings.TrimSpace(result.Stdout), nil
+	bootCtx, cancel := context.WithTimeout(ctx, time.Duration(waitSeconds)*time.Second)
+	defer cancel()
+	for {
+		result, err := p.run(bootCtx, nil, "ip", name, "--wait", fmt.Sprintf("%d", waitSeconds), "--resolver", "agent")
+		if ctxErr := bootCtx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("Tart guest agent did not become ready: %w; last attempt: %v", ctxErr, err)
+		}
+		if err == nil {
+			return strings.TrimSpace(result.Stdout), nil
+		}
+		// Tart can terminate --wait early when its guest-agent RPC times out
+		// during boot. Retry that same transport within the original budget.
+		message := strings.ToLower(err.Error())
+		if !strings.Contains(message, "rpc timed out") && !strings.Contains(message, "no ip address found") {
+			return "", err
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-bootCtx.Done():
+			timer.Stop()
+			return "", fmt.Errorf("Tart guest agent did not become ready: %w; last attempt: %v", bootCtx.Err(), err)
+		case <-timer.C:
+		}
+	}
 }
 
 func (p *Provider) Stop(ctx context.Context, name string) error {
