@@ -7,10 +7,43 @@ import (
 	"testing"
 	"time"
 
+	"github.com/solutionforest/ephemeral-action-runner/internal/config"
+	"github.com/solutionforest/ephemeral-action-runner/internal/pool"
 	"github.com/solutionforest/ephemeral-action-runner/internal/projectlayout"
 	"github.com/solutionforest/ephemeral-action-runner/internal/storage"
 	storagecatalog "github.com/solutionforest/ephemeral-action-runner/internal/storage/catalog"
 )
+
+func TestStorageResetCommandWithDisabledHostTrust(t *testing.T) {
+	t.Setenv("EPAR_STATE_HOME", filepath.Join(t.TempDir(), "host-state"))
+	root := t.TempDir()
+	path := filepath.Join(root, "config.yml")
+	if err := os.WriteFile(path, []byte("provider:\n  type: tart\n  platform: darwin/arm64\nimage:\n  hostTrustMode: disabled\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &pool.Manager{ProjectRoot: root, ConfigPath: path, Config: cfg}
+	lock, err := manager.AcquirePoolControllerLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report, err := buildStorageResetReport(root, path, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runStorageReset([]string{"--project-root", root, "--config", path, "--execute", "--plan", report.ApprovalHash}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("configuration was removed: %v", err)
+	}
+}
 
 func TestStorageResetRemovesConfigStateAndReleasesSharedResource(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), "host-state")

@@ -12,6 +12,7 @@ type Descriptor struct {
 	WizardTier             WizardTier
 	WizardNumber           string
 	WizardLabel            string
+	WizardWarning          string
 	WizardAliases          []string
 	ConfigurationDecoder   bool
 	ConfigurationDefaults  bool
@@ -61,11 +62,12 @@ const (
 	WizardPrerequisiteDocker          WizardPrerequisiteKind = "docker"
 	WizardPrerequisiteDockerSandboxes WizardPrerequisiteKind = "docker-sandboxes"
 	WizardPrerequisiteWSL2            WizardPrerequisiteKind = "wsl2"
+	WizardPrerequisiteTart            WizardPrerequisiteKind = "tart"
 )
 
 func (kind WizardPrerequisiteKind) Valid() bool {
 	switch kind {
-	case WizardPrerequisiteDocker, WizardPrerequisiteDockerSandboxes, WizardPrerequisiteWSL2:
+	case WizardPrerequisiteDocker, WizardPrerequisiteDockerSandboxes, WizardPrerequisiteWSL2, WizardPrerequisiteTart:
 		return true
 	default:
 		return false
@@ -76,11 +78,12 @@ type WizardOnboardingKind string
 
 const (
 	WizardOnboardingCatthehackerDocker WizardOnboardingKind = "catthehacker-docker"
+	WizardOnboardingTartMacOS          WizardOnboardingKind = "tart-macos"
 )
 
 func (kind WizardOnboardingKind) Valid() bool {
 	switch kind {
-	case WizardOnboardingCatthehackerDocker:
+	case WizardOnboardingCatthehackerDocker, WizardOnboardingTartMacOS:
 		return true
 	default:
 		return false
@@ -107,11 +110,12 @@ type WizardReviewKind string
 
 const (
 	WizardReviewDockerImage WizardReviewKind = "docker-image"
+	WizardReviewNativeImage WizardReviewKind = "native-image"
 )
 
 func (kind WizardReviewKind) Valid() bool {
 	switch kind {
-	case WizardReviewDockerImage:
+	case WizardReviewDockerImage, WizardReviewNativeImage:
 		return true
 	default:
 		return false
@@ -160,6 +164,10 @@ func ValidateWizardContributions(descriptor Descriptor) error {
 	}
 
 	switch descriptor.WizardOnboarding {
+	case WizardOnboardingTartMacOS:
+		if descriptor.ImageMode != ImageModeNative || descriptor.WizardReview != WizardReviewNativeImage || !descriptor.GuidedArtifacts || descriptor.WizardPrerequisite != WizardPrerequisiteTart || descriptor.WizardHostTrust != WizardHostTrustNone || descriptor.WizardWarning == "" {
+			return fmt.Errorf("Tart macOS onboarding requires native image mode/review, Tart prerequisites, explicit warning, guided artifacts, and no host trust inheritance")
+		}
 	case WizardOnboardingCatthehackerDocker:
 		if descriptor.WizardReview != WizardReviewDockerImage {
 			return fmt.Errorf("Catthehacker onboarding requires the Docker-image review contribution")

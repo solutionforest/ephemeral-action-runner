@@ -1312,9 +1312,50 @@ func TestValidateDockerPlatform(t *testing.T) {
 	}
 
 	cfg = defaultTartConfig()
-	cfg.Provider.Platform = "linux/arm64"
+	cfg.Provider.Platform = "linux/amd64"
 	if err := Validate(cfg); err == nil {
-		t.Fatal("provider.platform accepted for Tart")
+		t.Fatal("unsupported x64 guest platform accepted for Tart")
+	}
+}
+
+func TestTartMacOSDefaultsAndUnsupportedCapabilities(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, []byte("provider:\n  type: tart\n  platform: darwin/arm64\nrunner:\n  includeHostLabel: false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TartMacOS() || cfg.Image.SourceType != ImageSourceTartImage || cfg.Image.SourceImage != DefaultTartMacOSImage || cfg.Provider.SourceImage != cfg.Image.OutputImage {
+		t.Fatalf("unexpected native source defaults: %+v", cfg)
+	}
+	if !cfg.Runner.NoDefaultLabels || !slices.Equal(cfg.Runner.Labels, []string{"macOS", "ARM64", "epar-tart-macos-mobile"}) {
+		t.Fatalf("unsafe macOS routing defaults: %+v", cfg.Runner)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*Config)
+	}{
+		{"host overlay", func(c *Config) { c.Image.HostTrustMode = HostTrustModeOverlay }},
+		{"explicit CA", func(c *Config) { c.Image.TrustedCACertificatePaths = []string{"ca.pem"} }},
+		{"Docker mirror", func(c *Config) { c.Docker.RegistryMirrors = []string{"https://mirror.example.test"} }},
+		{"Docker proxy", func(c *Config) { c.Docker.HTTPSProxy = "https://proxy.example.test" }},
+		{"Linux Rosetta mount", func(c *Config) { c.Provider.RosettaTag = "rosetta" }},
+		{"non ephemeral runner", func(c *Config) { c.Runner.Ephemeral = false }},
+		{"Docker source", func(c *Config) { c.Image.SourceType = ImageSourceDockerImage }},
+		{"conflicting source platform", func(c *Config) { c.Image.SourcePlatform = "linux/arm64" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := cfg
+			test.change(&invalid)
+			if err := Validate(invalid); err == nil {
+				t.Fatal("unsupported macOS capability accepted")
+			}
+		})
 	}
 }
 

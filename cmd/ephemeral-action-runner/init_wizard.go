@@ -398,6 +398,8 @@ func promptProviderSetupWizard(ctx context.Context, projectRoot, providerType st
 		return initWizardResult[*initDockerSandboxesProfile]{}, nil, fmt.Errorf("unsupported provider.type %q", providerType)
 	}
 	switch descriptor.WizardOnboarding {
+	case provider.WizardOnboardingTartMacOS:
+		return promptTartImageWizard(ctx, projectRoot, existing, out, reader)
 	case provider.WizardOnboardingCatthehackerDocker:
 		if existing != nil && existing.Provider == providerType {
 			fmt.Fprintln(out, "")
@@ -464,7 +466,17 @@ func promptInitReview(out io.Writer, reader *bufio.Reader, draft initWizardDraft
 	if !found || !descriptor.WizardReview.Valid() {
 		return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q has no valid wizard review contribution", draft.ProviderType)
 	}
+	if descriptor.WizardWarning != "" {
+		fmt.Fprintf(out, "  WARNING: %s\n", descriptor.WizardWarning)
+	}
 	switch descriptor.WizardReview {
+	case provider.WizardReviewNativeImage:
+		if draft.Profile == nil {
+			return initWizardResult[initWizardStep]{}, fmt.Errorf("Tart macOS review requires an image profile")
+		}
+		fmt.Fprintf(out, "  Native macOS runner image: %s\n", draft.Profile.SourceImage)
+		fmt.Fprintln(out, "  Source digest: resolved and pinned at startup; prepared tools are preserved in disposable clones.")
+		fmt.Fprintln(out, "  Host trust inheritance: disabled (macOS preview); standard guest trust remains enabled.")
 	case provider.WizardReviewDockerImage:
 		if draft.Profile == nil {
 			return initWizardResult[initWizardStep]{}, fmt.Errorf("provider %q review requires an image profile", draft.ProviderType)
@@ -558,10 +570,12 @@ func renderInitWizardConfig(draft initWizardDraft) (string, error) {
 	if !found {
 		return "", fmt.Errorf("unsupported provider.type %q", draft.ProviderType)
 	}
-	if descriptor.WizardOnboarding == provider.WizardOnboardingCatthehackerDocker && draft.Profile == nil {
+	if descriptor.GuidedArtifacts && draft.Profile == nil {
 		return "", fmt.Errorf("%s image selection did not produce a provisioning profile", draft.ProviderType)
 	}
 	switch draft.ProviderType {
+	case "tart":
+		return defaultTartMacOSConfig(draft), nil
 	case "docker-container":
 		return defaultDockerContainerConfig(draft.AppID, draft.Organization, draft.PrivateKeyPath, draft.PoolNamePrefix, draft.HostTrustMode, draft.HostTrustScopes, draft.RunnerGroup, *draft.Profile, draft.UpdatePolicy), nil
 	case "wsl":

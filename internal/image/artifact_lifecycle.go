@@ -236,7 +236,7 @@ func (m *Coordinator) logEffectiveUpdatePolicy(forceRemote bool) {
 
 func (m *Coordinator) buildResolvedImage(ctx context.Context, manifest Manifest) error {
 	originalSource := m.Config.Image.SourceImage
-	if manifest.SourceType == config.ImageSourceDockerImage && strings.Contains(manifest.SourceDigest, "@sha256:") {
+	if (manifest.SourceType == config.ImageSourceDockerImage || manifest.SourceType == config.ImageSourceTartImage) && strings.Contains(manifest.SourceDigest, "@sha256:") {
 		m.Config.Image.SourceImage = manifest.SourceDigest
 	}
 	defer func() {
@@ -418,7 +418,7 @@ func (m *Coordinator) desiredLocalImageManifestWithHostTrust(snapshot hosttrust.
 		HostTrust:          hostTrustMetadata(snapshot),
 	}
 	switch sourceType {
-	case config.ImageSourceDockerImage:
+	case config.ImageSourceDockerImage, config.ImageSourceTartImage:
 	case config.ImageSourceRootFSTar:
 		if m.Config.Provider.Type == "wsl" {
 			digest, err := m.fileSHA256(config.ProjectPath(m.ProjectRoot, m.Config.Image.SourceImage))
@@ -457,7 +457,7 @@ func (m *Coordinator) desiredLocalImageManifestWithHostTrust(snapshot hosttrust.
 }
 
 func (m *Coordinator) resolveRemoteImageManifest(ctx context.Context, manifest ImageManifest) (ImageManifest, error) {
-	if manifest.SourceType == config.ImageSourceDockerImage {
+	if manifest.SourceType == config.ImageSourceDockerImage || manifest.SourceType == config.ImageSourceTartImage {
 		switch m.Config.Provider.Type {
 		case "docker-container", "wsl":
 			source, err := m.resolveDockerSandboxesSource(ctx)
@@ -563,7 +563,7 @@ func (m *Coordinator) eparScriptDigests() ([]fileDigest, error) {
 			filepath.Join(m.ProjectRoot, "scripts", "container", "ubuntu"),
 		}
 	case "wsl", "tart":
-		roots = []string{filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu")}
+		roots = []string{m.guestScriptDirectory()}
 	default:
 		return nil, nil
 	}

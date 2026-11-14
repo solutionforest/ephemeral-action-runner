@@ -353,7 +353,21 @@ func (m *Coordinator) buildTartImageLocked(ctx context.Context, opts ImageBuildO
 	m.infof("building Tart image candidate %s from %s\n", buildName, m.Config.Image.SourceImage)
 	m.infof("logs: %s, %s\n", buildLogPath, guestLogPath)
 	m.infof("cloning source image\n")
-	if err := m.Provider.Clone(ctx, m.Config.Image.SourceImage, buildName); err != nil {
+	source := m.Config.Image.SourceImage
+	if m.Config.Image.SourceType == config.ImageSourceTartImage {
+		if opts.Manifest.SourceDigest == "" {
+			return fmt.Errorf("Tart OCI build requires a resolved immutable source digest")
+		}
+		source = opts.Manifest.SourceDigest
+		plan, err := m.tartArtifactStoragePlan(ctx, source)
+		if err != nil {
+			return err
+		}
+		if err := m.preflightStorage(plan.OperationPlan); err != nil {
+			return err
+		}
+	}
+	if err := m.Provider.Clone(ctx, source, buildName); err != nil {
 		return err
 	}
 	if err := m.recordTartStagingImage(ctx, buildName, "build-candidate"); err != nil {
@@ -1088,7 +1102,7 @@ func (m *Coordinator) refreshWSLScripts(ctx context.Context) error {
 }
 
 func (m *Coordinator) installGuestScripts(ctx context.Context, vmName string) error {
-	scriptDir := filepath.Join(m.ProjectRoot, "scripts", "guest", "ubuntu")
+	scriptDir := m.guestScriptDirectory()
 	entries, err := os.ReadDir(scriptDir)
 	if err != nil {
 		return err
@@ -1110,6 +1124,14 @@ func (m *Coordinator) installGuestScripts(ctx context.Context, vmName string) er
 		}
 	}
 	return nil
+}
+
+func (m *Coordinator) guestScriptDirectory() string {
+	guestOS := "ubuntu"
+	if m.Config.TartMacOS() {
+		guestOS = "macos"
+	}
+	return filepath.Join(m.ProjectRoot, "scripts", "guest", guestOS)
 }
 
 func (m *Coordinator) startOptions(logPath, instance string) (provider.StartOptions, error) {

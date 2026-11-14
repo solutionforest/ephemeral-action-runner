@@ -1,6 +1,6 @@
 # Security
 
-EPAR provides disposable GitHub self-hosted runners with provider-dependent isolation. Docker Sandboxes is the primary provider on Linux, macOS, and Windows hosts when its capability checks pass; it places each runner inside a dedicated microVM sandbox and provides EPAR's strongest current host-isolation boundary. Docker Container and WSL remain compatibility infrastructure for trusted workflows, while Tart is retired and retained only for existing configurations. No provider is guaranteed to be universally safe for arbitrary hostile workflows.
+EPAR provides disposable GitHub self-hosted runners with provider-dependent isolation. Docker Sandboxes is the primary provider on Linux, macOS, and Windows hosts when its capability checks pass; it places each runner inside a dedicated microVM sandbox and provides EPAR's strongest current host-isolation boundary. Docker Container and WSL remain compatibility infrastructure for trusted workflows, while Tart macOS preview provides native VM runners and Ubuntu Tart retains compatibility. No provider is guaranteed to be universally safe for arbitrary hostile workflows.
 
 GitHub's self-hosted runner warning still applies: GitHub recommends using self-hosted runners only with private repositories because public repository forks can run code on the runner machine through pull request workflows. Read the official GitHub guidance before exposing any self-hosted runner to public or untrusted workflows: [Adding self-hosted runners](https://docs.github.com/actions/hosting-your-own-runners/adding-self-hosted-runners).
 
@@ -18,7 +18,7 @@ Disposable instances reduce host pollution, stale runner state, and accidental c
 
 ## What EPAR Does Not Guarantee
 
-A workflow controls its runner environment while it runs and can access any secrets and reachable services exposed to that workflow. Ephemeral cleanup alone is not a sandbox boundary: Docker Sandboxes supplies a dedicated microVM boundary, while compatibility providers use their documented isolation models and Tart remains a retired runtime path.
+A workflow controls its runner environment while it runs and can access any secrets and reachable services exposed to that workflow. Ephemeral cleanup alone is not a sandbox boundary: Docker Sandboxes supplies a dedicated microVM boundary, while compatibility providers use their documented isolation models and Tart supplies a macOS VM preview with native-workflow limitations.
 
 Do not mount host source directories, Docker sockets, private keys, or long-lived cloud credentials into runner instances unless that is inside your trust boundary.
 
@@ -38,7 +38,7 @@ For sbx v0.42+, process-environment sanitization does not override the persisten
 
 sbx v0.42.1 supplies an inert `SSH_AUTH_SOCK=/run/ssh-agent.sock` even when forwarding is disabled. EPAR clears only that exact default when `/run` is traversable and the endpoint, any symlink, gateway, and agent PID are all absent. All actual endpoint types and non-default agent paths remain rejected at template startup and runtime verification. The published prebuilt template must also carry this compatibility fix; local source edits do not silently alter a verified package.
 
-Tart is a retired Apple Silicon macOS VM path retained for existing configurations. It provides a VM boundary, but workflows still control the guest and any secrets exposed to the job.
+Tart macOS preview runs native workflows in Apple Silicon VMs. Docker containers are unsupported; Ubuntu configurations retain compatibility. It provides a VM boundary, but workflows still control the guest and any secrets exposed to the job.
 
 WSL2 has a weaker isolation story than one full VM per job. Treat the WSL provider as trusted-job infrastructure unless your environment has reviewed and accepted that model.
 

@@ -793,6 +793,8 @@ type initProviderPrerequisites struct {
 	DockerSandboxesStatus    string
 	WSLAvailable             bool
 	WSLStatus                string
+	TartAvailable            bool
+	TartStatus               string
 }
 
 type initProviderMenuState struct {
@@ -817,6 +819,9 @@ func promptInitProvider(ctx context.Context, projectRoot string, out io.Writer, 
 			return "", sandboxpromotion.Record{}, nil, fmt.Errorf("provider %q has no registry contribution", providerType)
 		}
 		switch descriptor.WizardOnboarding {
+		case provider.WizardOnboardingTartMacOS:
+			result, _, err := promptTartImageWizard(ctx, projectRoot, nil, out, reader)
+			return providerType, sandboxpromotion.Record{}, result.Value, err
 		case provider.WizardOnboardingCatthehackerDocker:
 			profile, accepted, profileErr := promptDockerImageProfile(ctx, projectRoot, providerType, hostPlatform, out, reader)
 			if profileErr != nil {
@@ -1435,6 +1440,7 @@ func canonicalDockerSandboxesTemplateReference(reference string) (string, error)
 
 func detectInitProviderPrerequisites(ctx context.Context, hostPlatform sandboxpromotion.Platform, skipDockerCheck bool) initProviderPrerequisites {
 	result := initProviderPrerequisites{}
+	result.TartAvailable, result.TartStatus = initTartPrerequisites(ctx, hostPlatform)
 	if skipDockerCheck {
 		result.DockerAvailable = true
 		result.DockerStatus = "AVAILABLE — Docker check skipped by --skip-docker-check"
@@ -1511,6 +1517,9 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 		case provider.WizardPrerequisiteWSL2:
 			option.Available = prerequisites.WSLAvailable
 			option.Status = prerequisites.WSLStatus
+		case provider.WizardPrerequisiteTart:
+			option.Available = prerequisites.TartAvailable
+			option.Status = prerequisites.TartStatus
 		default:
 			return initWizardResult[string]{}, fmt.Errorf("registered provider %q has no prerequisite contribution", descriptor.Type)
 		}
@@ -1543,6 +1552,10 @@ func promptProviderOptionsWizard(out io.Writer, reader *bufio.Reader, prerequisi
 			}
 			fmt.Fprintf(out, "  %s. %s%s\n", option.Number, option.Label, defaultLabel)
 			fmt.Fprintf(out, "     Prerequisites: %s\n", option.Status)
+			descriptor, _ := providerregistry.DescriptorFor(option.Type)
+			if descriptor.WizardWarning != "" {
+				fmt.Fprintf(out, "     WARNING: %s\n", descriptor.WizardWarning)
+			}
 		}
 		if !menuState.CompatibilityRevealed {
 			fmt.Fprintln(out, "  C. Show compatibility providers")

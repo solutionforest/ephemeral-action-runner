@@ -46,9 +46,11 @@ Make sure you ran `sbx` once, which will have a wizard to guide on first time se
 
 The first run opens a guided setup wizard for the GitHub App, runner group, Docker Sandboxes host checks, and runner image. Just follow the wizard to setup and start EPAR. Keep the process open while runners should accept work. Press `Ctrl-C` once to stop and wait for cleanup to finish before closing the terminal. See [Usage](docs/usage.md) for configuration, verification, no-Go startup, and cleanup details.
 
+For native iOS and Android builds on Apple Silicon, see [Tart macOS preview](docs/providers/tart.md). Tart macOS VMs do not support Docker containers.
+
 ## Route a workflow to EPAR
 
-Every EPAR runner has GitHub's `self-hosted` label. Add the EPAR Sandboxes label when a workflow should use this environment:
+Default Linux EPAR runners include GitHub's `self-hosted` label. Tart macOS uses explicit native labels to avoid generic Linux/Docker jobs. Add the EPAR Sandboxes label when a workflow should use this environment:
 
 ```yaml
 runs-on: [self-hosted, linux]

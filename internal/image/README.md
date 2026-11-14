@@ -1,3 +1,3 @@
 # Image Package
 
-Provider-neutral image build abstractions can move here if the image build surface grows beyond the current manager-owned flow. Tart, WSL, and Docker Container have provider-specific build steps, while shared Ubuntu guest provisioning and image install scripts remain coordinated from the pool manager.
+The provider-neutral coordinator owns artifact identity, acquisition, customization, updates, activation, and rollback. The pool supplies shared lifecycle and host operations. Ubuntu and macOS scripts are selected by configured platform; Tart macOS does not use Docker tooling to resolve or prepare VM artifacts.

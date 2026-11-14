@@ -1,6 +1,6 @@
 # EPAR documentation
 
-Use these guides after the short [README quick start](../README.md). Docker Sandboxes is the primary provider for Linux, macOS, and Windows hosts when its capability checks pass; open a compatibility guide only when an existing configuration needs that provider.
+Use these guides after the short [README quick start](../README.md). Docker Sandboxes is the primary provider for Linux, macOS, and Windows hosts when its capability checks pass; use Tart macOS preview for native Apple Silicon mobile builds and compatibility guides for other provider requirements.
 
 ## Start and configure
 
@@ -13,7 +13,7 @@ Use these guides after the short [README quick start](../README.md). Docker Sand
 
 - [Docker Sandboxes](providers/docker-sandboxes.md): the primary provider with dedicated microVM runners and guided template provisioning on Linux, macOS, and Windows hosts.
 
-Four provider identities remain accepted at runtime, while three are onboarding-capable. The first-run wizard shows only Docker Sandboxes initially; choose `C. Show compatibility providers` to reveal [Docker Container](providers/docker-container.md) and [WSL2](providers/wsl.md) for existing compatibility deployments. [Tart](providers/tart.md) is retired and has no onboarding path; its guide remains for existing configurations and exact runtime/cleanup compatibility.
+Four provider identities remain accepted at runtime, and all four have onboarding contributions. The first-run wizard shows only Docker Sandboxes initially; choose `C. Show compatibility providers` to reveal [Docker Container](providers/docker-container.md) and [WSL2](providers/wsl.md) for existing compatibility deployments. [Tart macOS preview](providers/tart.md) is option `4`, requires Apple Silicon, and does not support Docker containers; Ubuntu configurations retain runtime compatibility.
 
 ## Operate and maintain
 
