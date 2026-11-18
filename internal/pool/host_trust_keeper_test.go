@@ -171,7 +171,8 @@ func TestReplacementProvisioningMaintainsSurvivorLeases(t *testing.T) {
 			}
 		}}
 		fake.instances = []provider.Instance{{Name: "survivor", ProviderID: "fake:survivor", State: "running"}}
-		_, err := m.provisionWithHostTrustMaintenance(context.Background(), "candidate", true, true, active, make(map[string]bool))
+		opts := RunOptions{Register: true, ReplaceCompleted: true}
+		_, err := m.provisionWithHostTrustMaintenance(context.Background(), "candidate", opts, true, active, make(map[string]bool))
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("replacement returned %v, want controlled completion after renewals", err)
 		}
@@ -188,7 +189,7 @@ func TestReplacementProvisioningMaintainsSurvivorLeases(t *testing.T) {
 			time.Sleep(5 * hostTrustRefreshInterval)
 			return provider.Instance{}, wantErr
 		}}
-		_, err = m.provisionWithHostTrustMaintenance(context.Background(), "candidate-2", true, true, active, make(map[string]bool))
+		_, err = m.provisionWithHostTrustMaintenance(context.Background(), "candidate-2", opts, true, active, make(map[string]bool))
 		if !errors.Is(err, wantErr) || writes.Load() != previousWrites {
 			t.Fatalf("quarantined survivor renewed in next provisioning phase: writes=%d->%d error=%v", previousWrites, writes.Load(), err)
 		}

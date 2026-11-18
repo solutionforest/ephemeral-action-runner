@@ -72,23 +72,37 @@ func TestReadinessHostTrustLeaseFailureClassification(t *testing.T) {
 	}
 }
 
-func TestRunPoolRecoversReadinessHostTrustLeaseTimeout(t *testing.T) {
+func TestCandidateHostTrustLeaseRecovery(t *testing.T) {
 	oldRefresh := hostTrustRefreshInterval
 	hostTrustRefreshInterval = time.Second
 	t.Cleanup(func() { hostTrustRefreshInterval = oldRefresh })
+	permanentWriteError := errors.New("permission denied writing host trust lease")
 	for _, test := range []struct {
-		name         string
-		replacement  bool
-		blockCleanup bool
-		outagePolicy string
+		name               string
+		replacement        bool
+		beforeRegistration bool
+		blockCleanup       bool
+		outagePolicy       string
+		oneShot            bool
+		disableReplacement bool
+		writeError         error
 	}{
 		{name: "initial", outagePolicy: "off"},
 		{name: "replacement", replacement: true, outagePolicy: "off"},
 		{name: "continuous external outage policy", replacement: true, outagePolicy: "continuous"},
 		{name: "unresolved cleanup retains capacity", blockCleanup: true, outagePolicy: "off"},
+		{name: "first lease during startup", beforeRegistration: true, outagePolicy: "continuous"},
+		{name: "first lease during replacement", beforeRegistration: true, replacement: true, outagePolicy: "off"},
+		{name: "first lease with unresolved cleanup", beforeRegistration: true, blockCleanup: true, outagePolicy: "off"},
+		{name: "first lease during one-shot verification", beforeRegistration: true, oneShot: true, outagePolicy: "off"},
+		{name: "first lease with replacement disabled", beforeRegistration: true, disableReplacement: true, outagePolicy: "off"},
+		{name: "permanent first lease write failure", beforeRegistration: true, writeError: permanentWriteError, outagePolicy: "off"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv("EPAR_STATE_HOME", t.TempDir())
+			stateHome := t.TempDir()
+			t.Setenv("EPAR_STATE_HOME", stateHome)
+			t.Setenv("XDG_CACHE_HOME", stateHome)
+			t.Setenv("LOCALAPPDATA", stateHome)
 			synctest.Test(t, func(t *testing.T) {
 				fake := &fakeProvider{ip: "127.0.0.1"}
 				github := &fakeGitHub{}
@@ -101,9 +115,19 @@ func TestRunPoolRecoversReadinessHostTrustLeaseTimeout(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				failureAttempt := int32(1)
+				instances := 1
+				if test.replacement {
+					failureAttempt, instances = 3, 2
+				}
 				fake.execFunc = func(ctx context.Context, name string, command []string, opts provider.ExecOptions) (provider.ExecResult, error) {
 					text := strings.Join(command, " ")
 					if text == "cat "+hostTrustMarkerGuest {
+						if test.beforeRegistration && atomic.LoadInt32(&fake.cloneCalls) == failureAttempt {
+							mu.Lock()
+							failedName = name
+							mu.Unlock()
+						}
 						return provider.ExecResult{Stdout: string(marker)}, nil
 					}
 					mu.Lock()
@@ -112,6 +136,8 @@ func TestRunPoolRecoversReadinessHostTrustLeaseTimeout(t *testing.T) {
 					if strings.Contains(text, hostTrustLeaseGuest) && failed {
 						if opts.Stdin == "" {
 							revocations.Add(1)
+						} else if test.writeError != nil {
+							return provider.ExecResult{}, test.writeError
 						}
 						<-ctx.Done()
 						return provider.ExecResult{}, ctx.Err()
@@ -121,13 +147,9 @@ func TestRunPoolRecoversReadinessHostTrustLeaseTimeout(t *testing.T) {
 					}
 					return provider.ExecResult{Stdout: runnerProcessRunningSentinel}, nil
 				}
-				failureAttempt := int32(1)
-				instances := 1
-				if test.replacement {
-					failureAttempt, instances = 3, 2
-				}
 				github.waitFunc = func(ctx context.Context, name string, _ time.Duration) (gh.Runner, error) {
 					call := waits.Add(1)
+					failDuringReadiness := !test.beforeRegistration && call == failureAttempt
 					runner := gh.Runner{Name: name, ID: int64(call), Status: "online"}
 					mu.Lock()
 					runners[name] = runner
@@ -138,11 +160,11 @@ func TestRunPoolRecoversReadinessHostTrustLeaseTimeout(t *testing.T) {
 						survivorName = name
 						delete(runners, firstName)
 					}
-					if call == failureAttempt {
+					if failDuringReadiness {
 						failedName = name
 					}
 					mu.Unlock()
-					if call == failureAttempt {
+					if failDuringReadiness {
 						<-ctx.Done()
 						return gh.Runner{}, ctx.Err()
 					}
@@ -208,28 +230,57 @@ func TestRunPoolRecoversReadinessHostTrustLeaseTimeout(t *testing.T) {
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 				defer cancel()
-				err = manager.RunPool(ctx, RunOptions{Instances: instances, Register: true, ReplaceCompleted: true, KeepOnExit: true, MonitorInterval: time.Second, PoolLockHeld: true, HostTrustLockHeld: true, ExternalOutageRetry: policy})
+				if test.oneShot {
+					err = manager.Verify(ctx, VerifyOptions{Instances: instances, RegisterOnly: true})
+				} else {
+					err = manager.RunPool(ctx, RunOptions{Instances: instances, Register: true, ReplaceCompleted: !test.disableReplacement, KeepOnExit: true, MonitorInterval: time.Second, PoolLockHeld: true, HostTrustLockHeld: true, ExternalOutageRetry: policy})
+				}
+				if test.oneShot || test.disableReplacement || test.writeError != nil {
+					wantErr := test.writeError
+					if wantErr == nil {
+						wantErr = errHostTrustLeaseWriteTimeout
+					}
+					registrations := atomic.LoadInt32(&github.registrationCalls)
+					if !errors.Is(err, wantErr) || ctx.Err() != nil || revocations.Load() == 0 ||
+						registrations != 0 || !slices.Contains(fake.deletedNames, failedName) {
+						t.Fatalf("terminal lease failure did not stop before registration and roll back the candidate: error=%v registrations=%d revocations=%d local=%v", err, registrations, revocations.Load(), fake.deletedNames)
+					}
+					return
+				}
 				if err != nil || ctx.Err() == nil {
 					t.Fatalf("supervisor exited before cancellation: %v", err)
 				}
-				wantAttempts := failureAttempt + 1
+				wantCreates := failureAttempt + 1
 				if test.blockCleanup {
-					wantAttempts--
+					wantCreates--
 				}
-				if waits.Load() != wantAttempts || atomic.LoadInt32(&fake.maxInventory) > int32(instances) || revocations.Load() == 0 {
-					t.Fatalf("attempts=%d want=%d maxInventory=%d capacity=%d revocations=%d", waits.Load(), wantAttempts, fake.maxInventory, instances, revocations.Load())
+				wantWaits := wantCreates
+				if test.beforeRegistration {
+					wantWaits--
+				}
+				creates := atomic.LoadInt32(&fake.cloneCalls)
+				registrations := atomic.LoadInt32(&github.registrationCalls)
+				maxInventory := atomic.LoadInt32(&fake.maxInventory)
+				if creates != wantCreates || waits.Load() != wantWaits || registrations != wantWaits ||
+					maxInventory > int32(instances) || revocations.Load() == 0 {
+					t.Fatalf("created=%d want=%d waits=%d registrations=%d want=%d maxInventory=%d capacity=%d revocations=%d", creates, wantCreates, waits.Load(), registrations, wantWaits, maxInventory, instances, revocations.Load())
 				}
 				if test.replacement && peerRenewals.Load() < 2 {
 					t.Fatalf("peer lease renewals=%d, want continued maintenance", peerRenewals.Load())
 				}
-				if !slices.Contains(github.deletedIDs, int64(failureAttempt)) || slices.Contains(fake.deletedNames, survivorName) {
-					t.Fatalf("cleanup remote=%v local=%v, want exact candidate and preserved peer", github.deletedIDs, fake.deletedNames)
+				if got := slices.Contains(github.deletedIDs, int64(failureAttempt)); got == test.beforeRegistration {
+					t.Fatalf("GitHub deletions=%v, want failed candidate removed only if it reached registration", github.deletedIDs)
 				}
+				if slices.Contains(fake.deletedNames, survivorName) || (!test.blockCleanup && !slices.Contains(fake.deletedNames, failedName)) {
+					t.Fatalf("local cleanup=%v, want exact candidate and preserved peer", fake.deletedNames)
+				}
+				wantPhase := poolstate.PhaseTombstoned
 				if test.blockCleanup {
-					record, err := manager.LifecycleState.Read(context.Background(), failedName)
-					if err != nil || record.Phase != poolstate.PhaseCleanupPending {
-						t.Fatalf("unresolved candidate phase=%s error=%v, want durable cleanup-pending", record.Phase, err)
-					}
+					wantPhase = poolstate.PhaseCleanupPending
+				}
+				record, err := manager.LifecycleState.Read(context.Background(), failedName)
+				if err != nil || record.Phase != wantPhase {
+					t.Fatalf("candidate phase=%s error=%v, want %s", record.Phase, err, wantPhase)
 				}
 			})
 		})

@@ -673,10 +673,10 @@ func (m *Manager) reconcileHostTrustRunnersMode(ctx context.Context, active map[
 
 // provisionWithHostTrustMaintenance brackets only candidate provisioning. The
 // keeper has joined before the caller reconciles, retires, or recovers survivors.
-func (m *Manager) provisionWithHostTrustMaintenance(ctx context.Context, name string, register, allowBusy bool, active map[string]ProvisionedInstance, handoffs map[string]bool) (ProvisionedInstance, error) {
+func (m *Manager) provisionWithHostTrustMaintenance(ctx context.Context, name string, opts RunOptions, allowBusy bool, active map[string]ProvisionedInstance, handoffs map[string]bool) (ProvisionedInstance, error) {
 	_, stop := m.startHostTrustLeaseKeeperForRunners(ctx, active, handoffs)
 	defer stop(active)
-	return m.provisionOne(ctx, name, register, allowBusy)
+	return m.provisionOneAttempt(ctx, name, opts.Register, allowBusy, opts.ReplaceCompleted)
 }
 
 // startHostTrustLeaseKeeper is the verification entry point. Pool startup and

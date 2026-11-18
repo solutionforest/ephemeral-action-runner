@@ -552,7 +552,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 			name := RunnerName(m.Config.Pool.NamePrefix, sequence, time.Now())
 			sequence++
 			var provisionErr error
-			vm, provisionErr = m.provisionWithHostTrustMaintenance(attemptCtx, name, opts.Register, opts.Register && opts.ReplaceCompleted, active, hostTrustBusyHandoff)
+			vm, provisionErr = m.provisionWithHostTrustMaintenance(attemptCtx, name, opts, opts.Register && opts.ReplaceCompleted, active, hostTrustBusyHandoff)
 			if isPhysicalPhase(vm.Phase) {
 				active[vm.Name] = vm
 			}
@@ -1124,7 +1124,7 @@ func (m *Manager) RunPool(ctx context.Context, opts RunOptions) error {
 				if attemptErr != nil {
 					return errors.Join(attemptErr, m.cleanupAfterTerminalFailure(active, opts.KeepOnExit))
 				}
-				vm, err := m.provisionWithHostTrustMaintenance(attemptCtx, name, opts.Register, true, active, hostTrustBusyHandoff)
+				vm, err := m.provisionWithHostTrustMaintenance(attemptCtx, name, opts, true, active, hostTrustBusyHandoff)
 				cancelAttempt()
 				if isPhysicalPhase(vm.Phase) {
 					active[vm.Name] = vm
@@ -2165,10 +2165,10 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 var errHostTrustImageMismatch = errors.New("runner image host trust generation does not match current host trust")
 
 func (m *Manager) provisionOne(ctx context.Context, name string, register, allowBusy bool) (ProvisionedInstance, error) {
-	return m.provisionOneAttempt(ctx, name, register, allowBusy)
+	return m.provisionOneAttempt(ctx, name, register, allowBusy, false)
 }
 
-func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy bool) (vm ProvisionedInstance, err error) {
+func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register, allowBusy, recoverInitialLeaseTimeout bool) (vm ProvisionedInstance, err error) {
 	logPath := m.instanceLogPath(name, "."+m.Config.Provider.Type+".log")
 	guestLogPath := m.instanceLogPath(name, ".guest.log")
 	vm = ProvisionedInstance{Name: name, LogPath: logPath, GuestLogPath: guestLogPath, ProviderOwned: true}
@@ -2515,7 +2515,11 @@ func (m *Manager) provisionOneAttempt(ctx context.Context, name string, register
 			return vm, fmt.Errorf("record GitHub registration intent: %w", err)
 		}
 		if err := m.issueHostTrustLease(ctx, name, trustSnapshot); err != nil {
-			return vm, fmt.Errorf("issue host trust lease: %w", err)
+			err = fmt.Errorf("issue host trust lease: %w", err)
+			if recoverInitialLeaseTimeout && ctx.Err() == nil && errors.Is(err, errHostTrustLeaseWriteTimeout) {
+				return vm, &candidateRecoveryError{outcome: candidateHostTrustLeaseTimedOut, cause: err}
+			}
+			return vm, err
 		}
 		if err := m.verifyProviderAdmission(ctx, created); err != nil {
 			return vm, err
@@ -2662,7 +2666,7 @@ func (e *candidateRecoveryError) Error() string {
 	case candidateReadinessTimedOut:
 		return fmt.Sprintf("GitHub runner readiness was not observed before the timeout: %v", e.cause)
 	case candidateHostTrustLeaseTimedOut:
-		return fmt.Sprintf("host trust lease renewal timed out while waiting for runner readiness: %v", e.cause)
+		return e.cause.Error()
 	case candidatePackageManagerContention:
 		return fmt.Sprintf("candidate package-manager contention prevented runner configuration: %v", e.cause)
 	default:
@@ -2746,6 +2750,7 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 					return gh.Runner{}, fmt.Errorf("host trust changed while runner %s was registering (%s -> %s)", vm.Name, vm.HostTrustGeneration, current.Generation)
 				}
 				if err := m.issueHostTrustLease(waitCtx, vm.Name, current); err != nil {
+					err = fmt.Errorf("refresh host trust lease while waiting for runner readiness: %w", err)
 					// A timed-out write leaves this candidate unsafe to admit,
 					// even if revocation also times out. Preserve quarantine and
 					// exact capacity through the ordinary candidate recovery path.
@@ -2754,7 +2759,7 @@ func (m *Manager) waitRunnerReadyAndHealthy(ctx context.Context, vm ProvisionedI
 						return gh.Runner{}, &candidateRecoveryError{outcome: candidateHostTrustLeaseTimedOut, cause: err}
 					}
 					cancel()
-					return gh.Runner{}, fmt.Errorf("refresh host trust lease while waiting for runner readiness: %w", err)
+					return gh.Runner{}, err
 				}
 				nextLeaseRefresh = time.Now().Add(hostTrustRefreshInterval)
 			}
